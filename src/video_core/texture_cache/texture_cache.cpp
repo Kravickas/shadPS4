@@ -795,8 +795,17 @@ void TextureCache::RefreshImage(Image& image) {
     }
 
     if (image_copies.empty()) {
+        if (image.info.props.is_volume) {
+            LOG_ERROR(Render_Vulkan, "LUT_DBG RefreshImage: volume image_copies EMPTY, skipping upload addr={:#x}",
+                      image.info.guest_address);
+        }
         image.flags &= ~ImageFlagBits::Dirty;
         return;
+    }
+
+    if (image.info.props.is_volume) {
+        LOG_ERROR(Render_Vulkan, "LUT_DBG RefreshImage: uploading volume addr={:#x} guest_size={:#x} copies={}",
+                  image.info.guest_address, image.info.guest_size, image_copies.size());
     }
 
     scheduler.EndRendering();
