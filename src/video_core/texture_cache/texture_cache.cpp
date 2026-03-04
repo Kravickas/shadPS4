@@ -806,6 +806,15 @@ void TextureCache::RefreshImage(Image& image) {
     if (image.info.props.is_volume) {
         LOG_ERROR(Render_Vulkan, "LUT_DBG RefreshImage: uploading volume addr={:#x} guest_size={:#x} copies={}",
                   image.info.guest_address, image.info.guest_size, image_copies.size());
+        const u32* ptr = std::bit_cast<const u32*>(image.info.guest_address);
+        LOG_ERROR(Render_Vulkan, "LUT_DBG LUT data peek [0..7]: {:08x} {:08x} {:08x} {:08x} {:08x} {:08x} {:08x} {:08x}",
+                  ptr[0], ptr[1], ptr[2], ptr[3], ptr[4], ptr[5], ptr[6], ptr[7]);
+        // Also peek middle of texture (offset into middle slice)
+        const u32 mid_offset = (image.info.size.depth / 2) * image.info.mips_layout[0].height *
+                               image.info.mips_layout[0].pitch;
+        LOG_ERROR(Render_Vulkan, "LUT_DBG LUT data peek mid[{}..{}+7]: {:08x} {:08x} {:08x} {:08x}",
+                  mid_offset, mid_offset,
+                  ptr[mid_offset], ptr[mid_offset+1], ptr[mid_offset+2], ptr[mid_offset+3]);
     }
 
     scheduler.EndRendering();
