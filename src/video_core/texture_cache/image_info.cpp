@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include "common/assert.h"
+#include "common/logging/log.h"
 #include "core/libraries/kernel/process.h"
 #include "core/libraries/videoout/buffer.h"
 #include "shader_recompiler/resource.h"
@@ -143,6 +144,14 @@ ImageInfo::ImageInfo(const AmdGpu::Image& image, const Shader::ImageResource& de
 
     alt_tile = Libraries::Kernel::sceKernelIsNeoMode() && image.alt_tile_mode;
     UpdateSize();
+    if (props.is_volume) {
+        LOG_ERROR(Render_Vulkan,
+                  "LUT_DBG Color3D: addr={:#x} size={}x{}x{} tile={} array={} guest_size={:#x}",
+                  guest_address, size.width, size.height, size.depth,
+                  magic_enum::enum_name(tile_mode),
+                  magic_enum::enum_name(AmdGpu::GetArrayMode(tile_mode)),
+                  guest_size);
+    }
 }
 
 bool ImageInfo::IsCompatible(const ImageInfo& info) const {
