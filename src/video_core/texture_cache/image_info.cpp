@@ -186,12 +186,23 @@ void ImageInfo::UpdateSize() {
                 ImageSizeMicroTiled(mip_w, mip_h, thickness, num_bits, num_samples);
             break;
         }
+        case AmdGpu::ArrayMode::Array2DTiledXThick:
         case AmdGpu::ArrayMode::Array2DTiledThick:
-            thickness = 4;
+            thickness = (array_mode == AmdGpu::ArrayMode::Array2DTiledXThick) ? 8 : 4;
             mip_d += (-mip_d) & (thickness - 1);
             [[fallthrough]];
         case AmdGpu::ArrayMode::Array2DTiledThin1: {
             ASSERT(!props.is_block);
+            std::tie(mip_info.pitch, mip_info.height, mip_info.size) = ImageSizeMacroTiled(
+                mip_w, mip_h, thickness, num_bits, num_samples, tile_mode, mip, alt_tile);
+            break;
+        }
+        case AmdGpu::ArrayMode::Array3DTiledXThick:
+        case AmdGpu::ArrayMode::Array3DTiledThick:
+            thickness = (array_mode == AmdGpu::ArrayMode::Array3DTiledXThick) ? 8 : 4;
+            mip_d += (-mip_d) & (thickness - 1);
+            [[fallthrough]];
+        case AmdGpu::ArrayMode::Array3DTiledThin1: {
             std::tie(mip_info.pitch, mip_info.height, mip_info.size) = ImageSizeMacroTiled(
                 mip_w, mip_h, thickness, num_bits, num_samples, tile_mode, mip, alt_tile);
             break;
