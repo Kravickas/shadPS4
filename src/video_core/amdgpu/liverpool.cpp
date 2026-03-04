@@ -6,6 +6,7 @@
 #include "common/assert.h"
 #include "common/config.h"
 #include "common/debug.h"
+#include "common/logging/log.h"
 #include "common/polyfill_thread.h"
 #include "common/thread.h"
 #include "core/debug_state.h"
@@ -735,7 +736,12 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 } else if (dma_data->src_sel == DmaDataSrc::Data &&
                            (dma_data->dst_sel == DmaDataDst::Memory ||
                             dma_data->dst_sel == DmaDataDst::MemoryUsingL2)) {
-                    rasterizer->FillBuffer(dma_data->DstAddress<VAddr>(), dma_data->NumBytes(),
+                    const VAddr dst_addr = dma_data->DstAddress<VAddr>();
+                    if (dst_addr >= 0x27300000000ULL && dst_addr < 0x274000000000ULL) {
+                        LOG_ERROR(Render, "LUT_DBG DmaData Fill->Mem: dst={:#x} size={:#x} val={:#x}",
+                                  dst_addr, dma_data->NumBytes(), dma_data->data);
+                    }
+                    rasterizer->FillBuffer(dst_addr, dma_data->NumBytes(),
                                            dma_data->data, false);
                 } else if (dma_data->src_sel == DmaDataSrc::Gds &&
                            (dma_data->dst_sel == DmaDataDst::Memory ||
@@ -746,9 +752,15 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                             dma_data->src_sel == DmaDataSrc::MemoryUsingL2) &&
                            (dma_data->dst_sel == DmaDataDst::Memory ||
                             dma_data->dst_sel == DmaDataDst::MemoryUsingL2)) {
-                    rasterizer->CopyBuffer(dma_data->DstAddress<VAddr>(),
-                                           dma_data->SrcAddress<VAddr>(), dma_data->NumBytes(),
-                                           false, false);
+                    const VAddr dst_addr = dma_data->DstAddress<VAddr>();
+                    const VAddr src_addr = dma_data->SrcAddress<VAddr>();
+                    const u32 nbytes = dma_data->NumBytes();
+                    if ((dst_addr >= 0x27300000000ULL && dst_addr < 0x274000000000ULL) ||
+                        (src_addr >= 0x27300000000ULL && src_addr < 0x274000000000ULL)) {
+                        LOG_ERROR(Render, "LUT_DBG DmaData Mem->Mem: src={:#x} dst={:#x} size={:#x}",
+                                  src_addr, dst_addr, nbytes);
+                    }
+                    rasterizer->CopyBuffer(dst_addr, src_addr, nbytes, false, false);
                 } else {
                     UNREACHABLE_MSG("WriteData src_sel = {}, dst_sel = {}",
                                     u32(dma_data->src_sel.Value()), u32(dma_data->dst_sel.Value()));
