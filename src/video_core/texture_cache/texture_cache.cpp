@@ -767,6 +767,13 @@ void TextureCache::RefreshImage(Image& image) {
             if (image.mip_hashes[m] == hash) {
                 continue;
             }
+            // If hash was zero, no CPU baseline has ever been established for this mip.
+            // The GPU wrote first (e.g. a compute-generated 3D LUT), so don't overwrite
+            // GPU content with CPU data — just record the current CPU state and skip.
+            if (image.mip_hashes[m] == 0) {
+                image.mip_hashes[m] = hash;
+                continue;
+            }
             image.mip_hashes[m] = hash;
         }
 
