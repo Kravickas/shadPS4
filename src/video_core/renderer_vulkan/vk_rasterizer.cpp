@@ -580,15 +580,29 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
                              Shader::PushData& push_data) {
     buffer_bindings.clear();
 
+    u32 _buf_idx = 0;
     for (const auto& desc : stage.buffers) {
         const auto vsharp = desc.GetSharp(stage);
         if (!desc.IsSpecial() && vsharp.base_address != 0 && vsharp.GetSize() > 0) {
             const u64 size = memory->ClampRangeSize(vsharp.base_address, vsharp.GetSize());
             const auto buffer_id = buffer_cache.FindBuffer(vsharp.base_address, size);
             buffer_bindings.emplace_back(buffer_id, vsharp, size);
+            if (_buf_idx == 4) {
+                LOG_ERROR(Render_Vulkan, "LUT_DBG ssbo_5 binding={} addr={:#x} size={:#x}",
+                          _buf_idx, vsharp.base_address, size);
+                // Peek at dwords 0,1,2,3 in guest memory
+                const u32* ptr = std::bit_cast<const u32*>(vsharp.base_address);
+                LOG_ERROR(Render_Vulkan, "LUT_DBG ssbo_5 dwords[0..3] = {:08x} {:08x} {:08x} {:08x}",
+                          ptr[0], ptr[1], ptr[2], ptr[3]);
+            }
         } else {
             buffer_bindings.emplace_back(VideoCore::BufferId{}, vsharp, 0);
+            if (_buf_idx == 4) {
+                LOG_ERROR(Render_Vulkan, "LUT_DBG ssbo_5 binding={} is NULL (addr={:#x} size={:#x})",
+                          _buf_idx, vsharp.base_address, vsharp.GetSize());
+            }
         }
+        ++_buf_idx;
     }
 
     // Second pass to re-bind buffers that were updated after binding
