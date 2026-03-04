@@ -320,7 +320,12 @@ std::tuple<ImageId, int, int> TextureCache::ResolveOverlap(const ImageInfo& imag
              cache_image.info.type == AmdGpu::ImageType::Color3D)) {
             return {ExpandImage(image_info, cache_image_id), -1, -1};
         }
-
+        if (image_info.type == AmdGpu::ImageType::Color3D &&
+            cache_image.info.type != AmdGpu::ImageType::Color3D) {
+            // Can't satisfy a 3D request with a 2D image even if it covers the address range.
+            // Let it fall through to create a new image.
+            return {merged_image_id, -1, -1};
+        }
         // Size and resources are less than or equal, use image view.
         if (image_info.pixel_format != cache_image.info.pixel_format ||
             image_info.guest_size <= cache_image.info.guest_size) {
