@@ -815,6 +815,8 @@ void TextureCache::RefreshImage(Image& image) {
         LOG_ERROR(Render_Vulkan, "LUT_DBG LUT data peek mid[{}..{}+7]: {:08x} {:08x} {:08x} {:08x}",
                   mid_offset, mid_offset,
                   ptr[mid_offset], ptr[mid_offset+1], ptr[mid_offset+2], ptr[mid_offset+3]);
+        const bool gpu_mod = buffer_cache.IsRegionGpuModified(image.info.guest_address, image.info.guest_size);
+        LOG_ERROR(Render_Vulkan, "LUT_DBG LUT IsRegionGpuModified={}", gpu_mod);
     }
 
     scheduler.EndRendering();
