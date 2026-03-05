@@ -658,7 +658,7 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
             }
             if (desc.is_written) {
                 texture_cache.InvalidateMemoryFromGPU(vsharp.base_address, size);
-                if (vsharp.base_address >= 0x27300000000ULL && vsharp.base_address < 0x274000000000ULL) {
+                if (vsharp.base_address >= 0x270000000ULL && vsharp.base_address < 0x280000000ULL) {
                     LOG_ERROR(Render_Vulkan, "LUT_DBG Buffer write to LUT range: addr={:#x} size={:#x} formatted={}",
                               vsharp.base_address, size, desc.is_formatted);
                 }
@@ -696,7 +696,7 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
                                                              std::tuple{tsharp, image_desc});
         image_id = texture_cache.FindImage(desc);
         auto* image = &texture_cache.GetImage(image_id);
-        if (image_desc.is_written && tsharp.Address() >= 0x27300000000ULL && tsharp.Address() < 0x274000000000ULL) {
+        if (image_desc.is_written && tsharp.Address() >= 0x270000000ULL && tsharp.Address() < 0x280000000ULL) {
             LOG_ERROR(Render_Vulkan, "LUT_DBG Storage IMAGE write to LUT range: addr={:#x}",
                       tsharp.Address());
         }
