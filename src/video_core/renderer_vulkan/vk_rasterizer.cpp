@@ -700,6 +700,12 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
             LOG_ERROR(Render_Vulkan, "LUT_DBG Storage IMAGE write to LUT range: addr={:#x}",
                       tsharp.Address());
         }
+        // Log raw T# dwords for 3D images when the color grading shader runs
+        if (stage.pgm_hash == 0x90b7ac50 && image->info.props.is_volume) {
+            const u32* raw = reinterpret_cast<const u32*>(&tsharp);
+            LOG_ERROR(Render_Vulkan, "LUT_DBG FS 0x90b7ac50 3D T# addr={:#x} dwords: {:08x} {:08x} {:08x} {:08x} {:08x} {:08x} {:08x} {:08x}",
+                      tsharp.Address(), raw[0], raw[1], raw[2], raw[3], raw[4], raw[5], raw[6], raw[7]);
+        }
         if (image->depth_id) {
             // If this image has an associated depth image, it's a stencil attachment.
             // Redirect the access to the actual depth-stencil buffer.
