@@ -737,7 +737,7 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                            (dma_data->dst_sel == DmaDataDst::Memory ||
                             dma_data->dst_sel == DmaDataDst::MemoryUsingL2)) {
                     const VAddr dst_addr = dma_data->DstAddress<VAddr>();
-                    if (dst_addr >= 0x27300000000ULL && dst_addr < 0x274000000000ULL) {
+                    if (dst_addr >= 0x270000000ULL && dst_addr < 0x280000000ULL) {
                         LOG_ERROR(Render, "LUT_DBG DmaData Fill->Mem: dst={:#x} size={:#x} val={:#x}",
                                   dst_addr, dma_data->NumBytes(), dma_data->data);
                     }
@@ -755,8 +755,8 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                     const VAddr dst_addr = dma_data->DstAddress<VAddr>();
                     const VAddr src_addr = dma_data->SrcAddress<VAddr>();
                     const u32 nbytes = dma_data->NumBytes();
-                    if ((dst_addr >= 0x27300000000ULL && dst_addr < 0x274000000000ULL) ||
-                        (src_addr >= 0x27300000000ULL && src_addr < 0x274000000000ULL)) {
+                    if ((dst_addr >= 0x270000000ULL && dst_addr < 0x280000000ULL) ||
+                        (src_addr >= 0x270000000ULL && src_addr < 0x280000000ULL)) {
                         LOG_ERROR(Render, "LUT_DBG DmaData Mem->Mem: src={:#x} dst={:#x} size={:#x}",
                                   src_addr, dst_addr, nbytes);
                     }
