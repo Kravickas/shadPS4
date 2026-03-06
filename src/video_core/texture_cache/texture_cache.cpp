@@ -512,6 +512,16 @@ ImageId TextureCache::ExpandImage(const ImageInfo& info, ImageId image_id) {
     auto& src_image = slot_images[image_id];
     auto& new_image = slot_images[new_image_id];
 
+    // Log Color3D <-> Color2DArray conversions to help diagnose LUT issues
+    if (info.type == AmdGpu::ImageType::Color3D ||
+        src_image.info.type == AmdGpu::ImageType::Color3D) {
+        LOG_DEBUG(Render_Vulkan,
+                  "ExpandImage: {} ({}) -> {} ({}) addr={:#x} size={:#x}",
+                  static_cast<int>(src_image.info.type), src_image.info.resources.layers,
+                  static_cast<int>(info.type), info.resources.layers,
+                  info.guest_address, info.guest_size);
+    }
+
     RefreshImage(new_image);
     new_image.CopyImage(src_image);
 
@@ -761,20 +771,19 @@ void TextureCache::RefreshImage(Image& image) {
         const auto [mip_size, mip_pitch, mip_height, mip_offset] = image.info.mips_layout[m];
 
         // Protect GPU modified resources from accidental CPU reuploads.
+        // Once the GPU has written to an image, CPU data is never authoritative for it
+        // unless the GPU explicitly dirtied the mapping (GpuDirty). This protects
+        // framebuffers, 3D LUTs rendered via Color2DArray RTs, and compute outputs
+        // from being overwritten by stale emulated-RAM content.
         if (is_gpu_modified && !is_gpu_dirty) {
             const u8* addr = std::bit_cast<u8*>(image.info.guest_address);
             const u64 hash = XXH3_64bits(addr + mip_offset, mip_size);
-            if (image.mip_hashes[m] == hash) {
-                continue;
-            }
-            // If hash was zero, no CPU baseline has ever been established for this mip.
-            // The GPU wrote first (e.g. a compute-generated 3D LUT), so don't overwrite
-            // GPU content with CPU data — just record the current CPU state and skip.
-            if (image.mip_hashes[m] == 0) {
+            // Always update the hash to track the current CPU baseline,
+            // but never upload: the GPU-rendered content takes priority.
+            if (image.mip_hashes[m] != hash) {
                 image.mip_hashes[m] = hash;
-                continue;
             }
-            image.mip_hashes[m] = hash;
+            continue;
         }
 
         const u32 extent_width = mip_pitch ? std::min(mip_pitch, width) : width;
