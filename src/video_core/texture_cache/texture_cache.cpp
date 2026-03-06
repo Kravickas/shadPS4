@@ -320,12 +320,18 @@ std::tuple<ImageId, int, int> TextureCache::ResolveOverlap(const ImageInfo& imag
              cache_image.info.type == AmdGpu::ImageType::Color3D)) {
             return {ExpandImage(image_info, cache_image_id), -1, -1};
         }
-        // Reject dimensionality mismatch early.
-        // A 3D image cannot be satisfied by a 2D cache image and vice versa.
+        // Reject dimensionality mismatch early, but allow Color2DArray <-> Color3D
+        // aliasing: games often render 3D LUT slices as a 2D array render target then
+        // sample the same memory as a 3D texture.  Flat Color2D is still rejected.
         if (image_info.type == AmdGpu::ImageType::Color3D ||
             cache_image.info.type == AmdGpu::ImageType::Color3D) {
-            if (image_info.type != cache_image.info.type) {
-                return {ImageId{}, -1, -1};  // ← key difference
+            const auto other_type = (image_info.type == AmdGpu::ImageType::Color3D)
+                                        ? cache_image.info.type
+                                        : image_info.type;
+            // Only a 2DArray with matching layer count may alias a 3D volume.
+            if (other_type != AmdGpu::ImageType::Color3D &&
+                other_type != AmdGpu::ImageType::Color2DArray) {
+                return {ImageId{}, -1, -1};
             }
         }
         // Size and resources are less than or equal, use image view.
@@ -797,56 +803,6 @@ void TextureCache::RefreshImage(Image& image) {
     if (image_copies.empty()) {
         image.flags &= ~ImageFlagBits::Dirty;
         return;
-    }
-
-    // For volume textures (3D LUTs), guard against a race condition where the CPU
-    // writes the LUT data concurrently with the GPU worker processing the command
-    // buffer. On real PS4 the GPU executes strictly after the CPU submit, but in
-    // shadPS4 the GPU worker thread is asynchronous. If the CPU hasn't finished
-    // writing yet, guest memory still contains the pool initialization value
-    // (typically 0xFF000000 or 0x00000000 repeated uniformly). Uploading that
-    // stale data produces a black LUT and a black screen.
-    //
-    // Fix: issue a full memory fence so any in-flight CPU writes from other threads
-    // become visible, then scan the first mip for a uniform fill. If every texel is
-    // the same value the data is not yet valid; keep the image dirty so RefreshImage
-    // is called again on the next bind, by which time the CPU write will be complete.
-    if (image.info.props.is_volume && !is_gpu_modified) {
-        std::atomic_thread_fence(std::memory_order_seq_cst);
-        const u32* ptr = std::bit_cast<const u32*>(image.info.guest_address);
-        const u32 num_texels = image.info.mips_layout[0].size / sizeof(u32);
-        if (num_texels > 0) {
-            const u32 first = ptr[0];
-            bool is_uniform = true;
-            // Sample every 64th texel to keep the check cheap for large LUTs.
-            const u32 step = std::max(1u, num_texels / 256u);
-            for (u32 i = step; i < num_texels; i += step) {
-                if (ptr[i] != first) {
-                    is_uniform = false;
-                    break;
-                }
-            }
-            if (is_uniform) {
-                // Data looks like an uninitialised fill; the CPU probably hasn't
-                // written the real LUT values yet. Leave the image dirty so we
-                // retry on the next access rather than caching stale black data.
-                LOG_WARNING(Render_Vulkan,
-                            "Volume texture at {:#x} appears uninitialized (uniform={:#010x}), "
-                            "deferring upload.",
-                            image.info.guest_address, first);
-                // Keep CpuDirty set so RefreshImage is invoked again next bind.
-                image.flags |= ImageFlagBits::CpuDirty;
-                return;
-            }
-            // Log what we're actually uploading so we can verify it's real LUT data.
-            LOG_WARNING(Render_Vulkan,
-                        "Volume texture at {:#x} uploading non-uniform data: "
-                        "[0]={:#010x} [1]={:#010x} [2]={:#010x} [3]={:#010x} "
-                        "[mid]={:#010x} [last]={:#010x}",
-                        image.info.guest_address,
-                        ptr[0], ptr[1], ptr[2], ptr[3],
-                        ptr[num_texels / 2], ptr[num_texels - 1]);
-        }
     }
 
     scheduler.EndRendering();
