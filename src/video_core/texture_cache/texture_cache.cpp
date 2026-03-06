@@ -320,17 +320,11 @@ std::tuple<ImageId, int, int> TextureCache::ResolveOverlap(const ImageInfo& imag
              cache_image.info.type == AmdGpu::ImageType::Color3D)) {
             return {ExpandImage(image_info, cache_image_id), -1, -1};
         }
-        // Reject dimensionality mismatch early, but allow Color2DArray <-> Color3D
-        // aliasing: games often render 3D LUT slices as a 2D array render target then
-        // sample the same memory as a 3D texture.  Flat Color2D is still rejected.
-        if (image_info.type == AmdGpu::ImageType::Color3D ||
-            cache_image.info.type == AmdGpu::ImageType::Color3D) {
-            const auto other_type = (image_info.type == AmdGpu::ImageType::Color3D)
-                                        ? cache_image.info.type
-                                        : image_info.type;
-            // Only a 2DArray with matching layer count may alias a 3D volume.
-            if (other_type != AmdGpu::ImageType::Color3D &&
-                other_type != AmdGpu::ImageType::Color2DArray) {
+        // Reject dimensionality mismatch: Color3D images must not alias Color2D/Color2DArray.
+        // Equal-size Color3D<->Color2DArray aliasing is already handled above via ExpandImage.
+        if (image_info.type != cache_image.info.type) {
+            if (image_info.type == AmdGpu::ImageType::Color3D ||
+                cache_image.info.type == AmdGpu::ImageType::Color3D) {
                 return {ImageId{}, -1, -1};
             }
         }
