@@ -795,28 +795,50 @@ void TextureCache::RefreshImage(Image& image) {
     }
 
     if (image_copies.empty()) {
-        if (image.info.props.is_volume) {
-            LOG_ERROR(Render_Vulkan, "LUT_DBG RefreshImage: volume image_copies EMPTY, skipping upload addr={:#x}",
-                      image.info.guest_address);
-        }
         image.flags &= ~ImageFlagBits::Dirty;
         return;
     }
 
-    if (image.info.props.is_volume) {
-        LOG_ERROR(Render_Vulkan, "LUT_DBG RefreshImage: uploading volume addr={:#x} guest_size={:#x} copies={}",
-                  image.info.guest_address, image.info.guest_size, image_copies.size());
+    // For volume textures (3D LUTs), guard against a race condition where the CPU
+    // writes the LUT data concurrently with the GPU worker processing the command
+    // buffer. On real PS4 the GPU executes strictly after the CPU submit, but in
+    // shadPS4 the GPU worker thread is asynchronous. If the CPU hasn't finished
+    // writing yet, guest memory still contains the pool initialization value
+    // (typically 0xFF000000 or 0x00000000 repeated uniformly). Uploading that
+    // stale data produces a black LUT and a black screen.
+    //
+    // Fix: issue a full memory fence so any in-flight CPU writes from other threads
+    // become visible, then scan the first mip for a uniform fill. If every texel is
+    // the same value the data is not yet valid; keep the image dirty so RefreshImage
+    // is called again on the next bind, by which time the CPU write will be complete.
+    if (image.info.props.is_volume && !is_gpu_modified) {
+        std::atomic_thread_fence(std::memory_order_seq_cst);
         const u32* ptr = std::bit_cast<const u32*>(image.info.guest_address);
-        LOG_ERROR(Render_Vulkan, "LUT_DBG LUT data peek [0..7]: {:08x} {:08x} {:08x} {:08x} {:08x} {:08x} {:08x} {:08x}",
-                  ptr[0], ptr[1], ptr[2], ptr[3], ptr[4], ptr[5], ptr[6], ptr[7]);
-        // Also peek middle of texture (offset into middle slice)
-        const u32 mid_offset = (image.info.size.depth / 2) * image.info.mips_layout[0].height *
-                               image.info.mips_layout[0].pitch;
-        LOG_ERROR(Render_Vulkan, "LUT_DBG LUT data peek mid[{}..{}+7]: {:08x} {:08x} {:08x} {:08x}",
-                  mid_offset, mid_offset,
-                  ptr[mid_offset], ptr[mid_offset+1], ptr[mid_offset+2], ptr[mid_offset+3]);
-        const bool gpu_mod = buffer_cache.IsRegionGpuModified(image.info.guest_address, image.info.guest_size);
-        LOG_ERROR(Render_Vulkan, "LUT_DBG LUT IsRegionGpuModified={}", gpu_mod);
+        const u32 num_texels = image.info.mips_layout[0].size / sizeof(u32);
+        if (num_texels > 0) {
+            const u32 first = ptr[0];
+            bool is_uniform = true;
+            // Sample every 64th texel to keep the check cheap for large LUTs.
+            const u32 step = std::max(1u, num_texels / 256u);
+            for (u32 i = step; i < num_texels; i += step) {
+                if (ptr[i] != first) {
+                    is_uniform = false;
+                    break;
+                }
+            }
+            if (is_uniform) {
+                // Data looks like an uninitialised fill; the CPU probably hasn't
+                // written the real LUT values yet. Leave the image dirty so we
+                // retry on the next access rather than caching stale black data.
+                LOG_DEBUG(Render_Vulkan,
+                          "Volume texture at {:#x} appears uninitialized (uniform={:#010x}), "
+                          "deferring upload.",
+                          image.info.guest_address, first);
+                // Keep CpuDirty set so RefreshImage is invoked again next bind.
+                image.flags |= ImageFlagBits::CpuDirty;
+                return;
+            }
+        }
     }
 
     scheduler.EndRendering();
