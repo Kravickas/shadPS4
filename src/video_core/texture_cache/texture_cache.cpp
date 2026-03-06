@@ -830,14 +830,22 @@ void TextureCache::RefreshImage(Image& image) {
                 // Data looks like an uninitialised fill; the CPU probably hasn't
                 // written the real LUT values yet. Leave the image dirty so we
                 // retry on the next access rather than caching stale black data.
-                LOG_DEBUG(Render_Vulkan,
-                          "Volume texture at {:#x} appears uninitialized (uniform={:#010x}), "
-                          "deferring upload.",
-                          image.info.guest_address, first);
+                LOG_WARNING(Render_Vulkan,
+                            "Volume texture at {:#x} appears uninitialized (uniform={:#010x}), "
+                            "deferring upload.",
+                            image.info.guest_address, first);
                 // Keep CpuDirty set so RefreshImage is invoked again next bind.
                 image.flags |= ImageFlagBits::CpuDirty;
                 return;
             }
+            // Log what we're actually uploading so we can verify it's real LUT data.
+            LOG_WARNING(Render_Vulkan,
+                        "Volume texture at {:#x} uploading non-uniform data: "
+                        "[0]={:#010x} [1]={:#010x} [2]={:#010x} [3]={:#010x} "
+                        "[mid]={:#010x} [last]={:#010x}",
+                        image.info.guest_address,
+                        ptr[0], ptr[1], ptr[2], ptr[3],
+                        ptr[num_texels / 2], ptr[num_texels - 1]);
         }
     }
 
