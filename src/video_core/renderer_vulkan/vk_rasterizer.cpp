@@ -587,20 +587,8 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
             const u64 size = memory->ClampRangeSize(vsharp.base_address, vsharp.GetSize());
             const auto buffer_id = buffer_cache.FindBuffer(vsharp.base_address, size);
             buffer_bindings.emplace_back(buffer_id, vsharp, size);
-            if (_buf_idx == 4) {
-                LOG_ERROR(Render_Vulkan, "LUT_DBG ssbo_5 binding={} addr={:#x} size={:#x}",
-                          _buf_idx, vsharp.base_address, size);
-                // Peek at dwords 0,1,2,3 in guest memory
-                const u32* ptr = std::bit_cast<const u32*>(vsharp.base_address);
-                LOG_ERROR(Render_Vulkan, "LUT_DBG ssbo_5 dwords[0..3] = {:08x} {:08x} {:08x} {:08x}",
-                          ptr[0], ptr[1], ptr[2], ptr[3]);
-            }
         } else {
             buffer_bindings.emplace_back(VideoCore::BufferId{}, vsharp, 0);
-            if (_buf_idx == 4) {
-                LOG_ERROR(Render_Vulkan, "LUT_DBG ssbo_5 binding={} is NULL (addr={:#x} size={:#x})",
-                          _buf_idx, vsharp.base_address, vsharp.GetSize());
-            }
         }
         ++_buf_idx;
     }
@@ -658,10 +646,6 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
             }
             if (desc.is_written) {
                 texture_cache.InvalidateMemoryFromGPU(vsharp.base_address, size);
-                if (vsharp.base_address >= 0x270000000ULL && vsharp.base_address < 0x280000000ULL) {
-                    LOG_ERROR(Render_Vulkan, "LUT_DBG Buffer write to LUT range: addr={:#x} size={:#x} formatted={}",
-                              vsharp.base_address, size, desc.is_formatted);
-                }
             }
         }
 
@@ -696,16 +680,6 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
                                                              std::tuple{tsharp, image_desc});
         image_id = texture_cache.FindImage(desc);
         auto* image = &texture_cache.GetImage(image_id);
-        if (image_desc.is_written && tsharp.Address() >= 0x270000000ULL && tsharp.Address() < 0x280000000ULL) {
-            LOG_ERROR(Render_Vulkan, "LUT_DBG Storage IMAGE write to LUT range: addr={:#x}",
-                      tsharp.Address());
-        }
-        // Log raw T# dwords for 3D images when the color grading shader runs
-        if (stage.pgm_hash == 0x90b7ac50 && image->info.props.is_volume) {
-            const u32* raw = reinterpret_cast<const u32*>(&tsharp);
-            LOG_ERROR(Render_Vulkan, "LUT_DBG FS 0x90b7ac50 3D T# addr={:#x} dwords: {:08x} {:08x} {:08x} {:08x} {:08x} {:08x} {:08x} {:08x}",
-                      tsharp.Address(), raw[0], raw[1], raw[2], raw[3], raw[4], raw[5], raw[6], raw[7]);
-        }
         if (image->depth_id) {
             // If this image has an associated depth image, it's a stencil attachment.
             // Redirect the access to the actual depth-stencil buffer.
