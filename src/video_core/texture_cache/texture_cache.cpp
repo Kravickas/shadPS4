@@ -515,8 +515,8 @@ ImageId TextureCache::ExpandImage(const ImageInfo& info, ImageId image_id) {
     // Log Color3D <-> Color2DArray conversions to help diagnose LUT issues
     if (info.type == AmdGpu::ImageType::Color3D ||
         src_image.info.type == AmdGpu::ImageType::Color3D) {
-        LOG_DEBUG(Render_Vulkan,
-                  "ExpandImage: {} ({}) -> {} ({}) addr={:#x} size={:#x}",
+        LOG_WARNING(Render_Vulkan,
+                    "ExpandImage Color3D: {} ({}) -> {} ({}) addr={:#x} size={:#x}",
                   static_cast<int>(src_image.info.type), src_image.info.resources.layers,
                   static_cast<int>(info.type), info.resources.layers,
                   info.guest_address, info.guest_size);
@@ -598,9 +598,21 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_fmt) {
             image_id = {};
         } else if (image_resolved.info.resources < info.resources) {
             // The image was clearly picked up wrong.
+            LOG_WARNING(Render_Vulkan,
+                        "Image overlap resolve failed: "
+                        "resolved type={} levels={} layers={} size={}x{}x{} addr={:#x} gsz={:#x} | "
+                        "requested type={} levels={} layers={} size={}x{}x{} addr={:#x} gsz={:#x}",
+                        static_cast<int>(image_resolved.info.type),
+                        image_resolved.info.resources.levels, image_resolved.info.resources.layers,
+                        image_resolved.info.size.width, image_resolved.info.size.height,
+                        image_resolved.info.size.depth,
+                        image_resolved.info.guest_address, image_resolved.info.guest_size,
+                        static_cast<int>(info.type),
+                        info.resources.levels, info.resources.layers,
+                        info.size.width, info.size.height, info.size.depth,
+                        info.guest_address, info.guest_size);
             FreeImage(image_id);
             image_id = {};
-            LOG_WARNING(Render_Vulkan, "Image overlap resolve failed");
         }
     }
     // Create and register a new image
@@ -781,6 +793,11 @@ void TextureCache::RefreshImage(Image& image) {
             // Always update the hash to track the current CPU baseline,
             // but never upload: the GPU-rendered content takes priority.
             if (image.mip_hashes[m] != hash) {
+                LOG_WARNING(Render_Vulkan,
+                            "RefreshImage: skipping CPU upload for GpuModified image "
+                            "addr={:#x} mip={} hash_changed={} (old={:#x} new={:#x})",
+                            image.info.guest_address, m,
+                            image.mip_hashes[m] != 0, image.mip_hashes[m], hash);
                 image.mip_hashes[m] = hash;
             }
             continue;
