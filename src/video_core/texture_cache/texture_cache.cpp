@@ -525,6 +525,11 @@ ImageId TextureCache::ExpandImage(const ImageInfo& info, ImageId image_id) {
     RefreshImage(new_image);
     new_image.CopyImage(src_image);
 
+    // Propagate GpuModified flag: if the source had GPU-rendered content, so does the new image.
+    if (True(src_image.flags & ImageFlagBits::GpuModified)) {
+        new_image.flags |= ImageFlagBits::GpuModified;
+    }
+
     if (src_image.binding.is_bound || src_image.binding.is_target) {
         src_image.binding.needs_rebind = 1u;
     }
@@ -597,22 +602,35 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_fmt) {
             // Cannot reuse this image as we need the exact requested format.
             image_id = {};
         } else if (image_resolved.info.resources < info.resources) {
-            // The image was clearly picked up wrong.
-            LOG_WARNING(Render_Vulkan,
-                        "Image overlap resolve failed: "
-                        "resolved type={} levels={} layers={} size={}x{}x{} addr={:#x} gsz={:#x} | "
-                        "requested type={} levels={} layers={} size={}x{}x{} addr={:#x} gsz={:#x}",
-                        static_cast<int>(image_resolved.info.type),
-                        image_resolved.info.resources.levels, image_resolved.info.resources.layers,
-                        image_resolved.info.size.width, image_resolved.info.size.height,
-                        image_resolved.info.size.depth,
-                        image_resolved.info.guest_address, image_resolved.info.guest_size,
-                        static_cast<int>(info.type),
-                        info.resources.levels, info.resources.layers,
-                        info.size.width, info.size.height, info.size.depth,
-                        info.guest_address, info.guest_size);
-            FreeImage(image_id);
-            image_id = {};
+            // The resolved image has fewer mips/layers than the texture request needs.
+            // This happens when the game first renders to an address as a 1-mip RT
+            // then samples the same address as a multi-mip texture. Expand the existing
+            // image to match the requested resources while preserving GPU-rendered content.
+            if (image_resolved.info.type == info.type &&
+                image_resolved.info.pixel_format == info.pixel_format &&
+                image_resolved.info.guest_address == info.guest_address) {
+                LOG_WARNING(Render_Vulkan,
+                          "FindImage: expanding image resources ({},{}) -> ({},{}) at addr={:#x}",
+                          image_resolved.info.resources.levels,
+                          image_resolved.info.resources.layers,
+                          info.resources.levels, info.resources.layers,
+                          info.guest_address);
+                image_id = ExpandImage(info, image_id);
+            } else {
+                LOG_WARNING(Render_Vulkan,
+                            "Image overlap resolve failed (incompatible): "
+                            "resolved type={} levels={} layers={} addr={:#x} gsz={:#x} | "
+                            "requested type={} levels={} layers={} addr={:#x} gsz={:#x}",
+                            static_cast<int>(image_resolved.info.type),
+                            image_resolved.info.resources.levels,
+                            image_resolved.info.resources.layers,
+                            image_resolved.info.guest_address, image_resolved.info.guest_size,
+                            static_cast<int>(info.type),
+                            info.resources.levels, info.resources.layers,
+                            info.guest_address, info.guest_size);
+                FreeImage(image_id);
+                image_id = {};
+            }
         }
     }
     // Create and register a new image
