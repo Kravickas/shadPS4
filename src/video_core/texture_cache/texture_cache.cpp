@@ -604,23 +604,28 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_fmt) {
         } else if (image_resolved.info.resources < info.resources) {
             if (image_resolved.info.type == info.type &&
                 image_resolved.info.guest_address == info.guest_address &&
-                info.guest_size > image_resolved.info.guest_size &&
                 IsVulkanFormatCompatible(image_resolved.info.pixel_format, info.pixel_format)) {
-                LOG_WARNING(Render_Vulkan,
-                            "FindImage: expanding image resources ({},{}) -> ({},{}) at addr={:#x}",
-                            image_resolved.info.resources.levels,
-                            image_resolved.info.resources.layers,
-                            info.resources.levels, info.resources.layers,
-                            info.guest_address);
-                image_id = ExpandImage(info, image_id);
+                if (info.guest_size > image_resolved.info.guest_size) {
+                    // New request covers more memory — safe to expand.
+                    LOG_WARNING(Render_Vulkan,
+                                "FindImage: expanding image resources ({},{}) -> ({},{}) at "
+                                "addr={:#x}",
+                                image_resolved.info.resources.levels,
+                                image_resolved.info.resources.layers, info.resources.levels,
+                                info.resources.layers, info.guest_address);
+                    image_id = ExpandImage(info, image_id);
+                }
+                // else: guest_size unchanged — the extra mip/layers don't fit in the
+                // allocated memory. Reuse the existing image with its lower resource count.
+                // Do NOT free (would lose RT content) and do NOT expand (would read OOB
+                // into adjacent pool slots, causing scrambled colour artifacts).
             } else {
                 LOG_WARNING(Render_Vulkan,
                             "FindImage: resources mismatch (free-and-blank): "
                             "resolved ({},{}) -> requested ({},{}) at addr={:#x}",
                             image_resolved.info.resources.levels,
-                            image_resolved.info.resources.layers,
-                            info.resources.levels, info.resources.layers,
-                            info.guest_address);
+                            image_resolved.info.resources.layers, info.resources.levels,
+                            info.resources.layers, info.guest_address);
                 FreeImage(image_id);
                 image_id = {};
             }
