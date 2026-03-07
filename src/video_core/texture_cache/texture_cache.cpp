@@ -610,7 +610,7 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_fmt) {
                 image_resolved.info.guest_address == info.guest_address &&
                 IsVulkanFormatCompatible(image_resolved.info.pixel_format, info.pixel_format)) {
                 LOG_WARNING(Render_Vulkan,
-                          "FindImage: expanding image resources ({},{}) -> ({},{}) at addr={:#x}",
+                            "FindImage: expanding image resources ({},{}) -> ({},{}) at addr={:#x}",
                           image_resolved.info.resources.levels,
                           image_resolved.info.resources.layers,
                           info.resources.levels, info.resources.layers,
@@ -800,26 +800,7 @@ void TextureCache::RefreshImage(Image& image) {
             image.info.props.is_volume ? std::max(image.info.size.depth >> m, 1u) : 1u;
         const auto [mip_size, mip_pitch, mip_height, mip_offset] = image.info.mips_layout[m];
 
-        // Protect GPU modified resources from accidental CPU reuploads.
-        // Once the GPU has written to an image, CPU data is never authoritative for it
-        // unless the GPU explicitly dirtied the mapping (GpuDirty). This protects
-        // framebuffers, 3D LUTs rendered via Color2DArray RTs, and compute outputs
-        // from being overwritten by stale emulated-RAM content.
-        if (is_gpu_modified && !is_gpu_dirty) {
-            const u8* addr = std::bit_cast<u8*>(image.info.guest_address);
-            const u64 hash = XXH3_64bits(addr + mip_offset, mip_size);
-            // Always update the hash to track the current CPU baseline,
-            // but never upload: the GPU-rendered content takes priority.
-            if (image.mip_hashes[m] != hash) {
-                LOG_WARNING(Render_Vulkan,
-                            "RefreshImage: skipping CPU upload for GpuModified image "
-                            "addr={:#x} mip={} hash_changed={} (old={:#x} new={:#x})",
-                            image.info.guest_address, m,
-                            image.mip_hashes[m] != 0, image.mip_hashes[m], hash);
-                image.mip_hashes[m] = hash;
-            }
-            continue;
-        }
+        // [GpuModified skip REMOVED for diagnostics - testing if this causes black screen]
 
         const u32 extent_width = mip_pitch ? std::min(mip_pitch, width) : width;
         const u32 extent_height = mip_height ? std::min(mip_height, height) : height;
