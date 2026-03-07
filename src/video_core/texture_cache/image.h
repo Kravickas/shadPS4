@@ -31,6 +31,8 @@ enum ImageFlagBits : u32 {
     GpuDirty = 1 << 2, ///< Contents have been modified from the GPU (valid data in buffer cache)
     Dirty = MaybeCpuDirty | CpuDirty | GpuDirty,
     GpuModified = 1 << 3, ///< Contents have been modified from the GPU
+    TrackingInstalled = 1 << 4, ///< Write-watch (mprotect) has been installed at least once
+    VolumeDeferredUpload = 1 << 5, ///< First upload of a linear volume texture was deferred once
     Registered = 1 << 6,  ///< True when the image is registered
     Picked = 1 << 7,      ///< Temporary flag to mark the image as picked
 };
