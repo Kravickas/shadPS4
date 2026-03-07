@@ -25,26 +25,42 @@ namespace {
 
 constexpr u32 kLutInitPatternOpaque = 0xff000000u;
 constexpr u32 kLutInitPatternZero   = 0x00000000u;
-constexpr u32 kLutMaxCheckDwords    = 64u;
+constexpr u32 kLutCheckDwords       = 64u; // dwords sampled at each end
 
 // Returns true if the buffer looks like a freshly-allocated, uninitialised LUT slot.
 // Some games (e.g. NHL 19) allocate a rotating pool of linear 3D LUT buffers and
-// memset them to a uniform sentinel value before the CPU thread finishes writing the
-// real colour data. Because shadPS4's GPU worker runs asynchronously, RefreshImage
-// can sample this placeholder before the CPU write completes. Deferring the upload
-// until real data is present avoids baking black/transparent LUT values into the
-// texture cache.
+// memset them to a uniform sentinel before the CPU thread finishes writing real data.
+// Because shadPS4's GPU worker runs asynchronously, RefreshImage can sample this
+// placeholder before the CPU write completes.
+//
+// Checking only the start is insufficient: the CPU writes sequentially, so after the
+// first few pixels are committed the start looks valid while the tail is still the init
+// pattern. We therefore check both the first and last kLutCheckDwords dwords. A fully
+// written LUT will have non-uniform data at both ends; a partial or unwritten one will
+// have the init pattern at the tail.
 bool LooksUninitializedLUT(const u32* data, u32 guest_size_bytes) {
     if (!data || guest_size_bytes < sizeof(u32)) {
         return false;
     }
-    const u32 first = data[0];
-    if (first != kLutInitPatternOpaque && first != kLutInitPatternZero) {
+    const u32 total_dwords = guest_size_bytes / static_cast<u32>(sizeof(u32));
+    const u32 check_n = std::min(total_dwords, kLutCheckDwords);
+
+    // Check the tail first — cheapest way to catch partial CPU writes.
+    const u32 tail_start = total_dwords - check_n;
+    const u32 tail_first = data[tail_start];
+    if (tail_first == kLutInitPatternOpaque || tail_first == kLutInitPatternZero) {
+        if (std::all_of(data + tail_start + 1, data + total_dwords,
+                        [tail_first](u32 v) { return v == tail_first; })) {
+            return true;
+        }
+    }
+
+    // Also check the head — catches the very first bind before any CPU write.
+    const u32 head_first = data[0];
+    if (head_first != kLutInitPatternOpaque && head_first != kLutInitPatternZero) {
         return false;
     }
-    const u32 dword_count = std::min(guest_size_bytes / static_cast<u32>(sizeof(u32)),
-                                     kLutMaxCheckDwords);
-    return std::all_of(data + 1, data + dword_count, [first](u32 v) { return v == first; });
+    return std::all_of(data + 1, data + check_n, [head_first](u32 v) { return v == head_first; });
 }
 
 } // anonymous namespace
@@ -366,9 +382,12 @@ std::tuple<ImageId, int, int> TextureCache::ResolveOverlap(const ImageInfo& imag
             return {is_compatible ? result_id : ImageId{}, -1, -1};
         }
 
-        // Size and resources are greater, expand the image.
+        // Size and resources are greater, expand the image — but only if guest memory
+        // footprint actually grew. If guest_size is unchanged, the extra resources don't
+        // fit in the allocated range; expanding would read into adjacent pool slots.
         if (image_info.type == cache_image.info.type &&
-            image_info.resources > cache_image.info.resources) {
+            image_info.resources > cache_image.info.resources &&
+            image_info.guest_size > cache_image.info.guest_size) {
             return {ExpandImage(image_info, cache_image_id), -1, -1};
         }
 
@@ -633,21 +652,27 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_fmt) {
             if (image_resolved.info.type == info.type &&
                 image_resolved.info.guest_address == info.guest_address &&
                 IsVulkanFormatCompatible(image_resolved.info.pixel_format, info.pixel_format)) {
-                LOG_WARNING(Render_Vulkan,
-                            "FindImage: expanding image resources ({},{}) -> ({},{}) at addr={:#x}",
-                            image_resolved.info.resources.levels,
-                            image_resolved.info.resources.layers,
-                            info.resources.levels, info.resources.layers,
-                            info.guest_address);
-                image_id = ExpandImage(info, image_id);
+                if (info.guest_size > image_resolved.info.guest_size) {
+                    // New request covers more memory — safe to expand.
+                    LOG_WARNING(Render_Vulkan,
+                                "FindImage: expanding image resources ({},{}) -> ({},{}) at "
+                                "addr={:#x}",
+                                image_resolved.info.resources.levels,
+                                image_resolved.info.resources.layers, info.resources.levels,
+                                info.resources.layers, info.guest_address);
+                    image_id = ExpandImage(info, image_id);
+                }
+                // else: guest_size unchanged — the extra mip/layers don't fit in the
+                // allocated memory. Reuse the existing image with its lower resource count.
+                // Do NOT free (would lose RT content) and do NOT expand (would read OOB
+                // into adjacent pool slots, causing scrambled colour artifacts).
             } else {
                 LOG_WARNING(Render_Vulkan,
                             "FindImage: resources mismatch (free-and-blank): "
                             "resolved ({},{}) -> requested ({},{}) at addr={:#x}",
                             image_resolved.info.resources.levels,
-                            image_resolved.info.resources.layers,
-                            info.resources.levels, info.resources.layers,
-                            info.guest_address);
+                            image_resolved.info.resources.layers, info.resources.levels,
+                            info.resources.layers, info.guest_address);
                 FreeImage(image_id);
                 image_id = {};
             }
@@ -810,8 +835,12 @@ void TextureCache::RefreshImage(Image& image) {
     const u32 num_layers = image.info.resources.layers;
     const u32 num_mips = image.info.resources.levels;
 
-    // Race condition guard: defer upload of linear volume textures that still contain
-    // the allocator's uniform init pattern. Leave Dirty set so we retry next bind.
+    // Race condition fix for linear volume textures (e.g. rotating 3D LUT pools).
+    // The game CPU writes LUT data to a rotating pool of addresses. shadPS4's GPU worker
+    // thread processes the command buffer asynchronously, so RefreshImage may read the
+    // memory before the CPU has finished writing. The init pattern (0xff000000 or 0x00000000)
+    // indicates the slot was just allocated but not yet filled. Defer the upload so the CPU
+    // has time to write real data. Leave Dirty set so we retry on the next bind.
     if (image.info.props.is_volume && !image.info.props.is_tiled) {
         const auto* data = std::bit_cast<const u32*>(image.info.guest_address);
         if (LooksUninitializedLUT(data, image.info.guest_size)) {
