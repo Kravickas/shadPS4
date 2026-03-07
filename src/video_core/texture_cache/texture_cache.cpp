@@ -607,8 +607,8 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_fmt) {
             // then samples the same address as a multi-mip texture. Expand the existing
             // image to match the requested resources while preserving GPU-rendered content.
             if (image_resolved.info.type == info.type &&
-                image_resolved.info.pixel_format == info.pixel_format &&
-                image_resolved.info.guest_address == info.guest_address) {
+                image_resolved.info.guest_address == info.guest_address &&
+                IsVulkanFormatCompatible(image_resolved.info.pixel_format, info.pixel_format)) {
                 LOG_WARNING(Render_Vulkan,
                           "FindImage: expanding image resources ({},{}) -> ({},{}) at addr={:#x}",
                           image_resolved.info.resources.levels,
