@@ -604,6 +604,7 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_fmt) {
         } else if (image_resolved.info.resources < info.resources) {
             if (image_resolved.info.type == info.type &&
                 image_resolved.info.guest_address == info.guest_address &&
+                info.guest_size > image_resolved.info.guest_size &&
                 IsVulkanFormatCompatible(image_resolved.info.pixel_format, info.pixel_format)) {
                 LOG_WARNING(Render_Vulkan,
                             "FindImage: expanding image resources ({},{}) -> ({},{}) at addr={:#x}",
@@ -782,25 +783,33 @@ void TextureCache::RefreshImage(Image& image) {
     const u32 num_layers = image.info.resources.layers;
     const u32 num_mips = image.info.resources.levels;
 
-    // Race condition fix for Color3D volume LUTs:
-    // The game CPU writes LUT data to a rotating pool of addresses. shadPS4's GPU worker
-    // thread processes the command buffer asynchronously, so RefreshImage may peek the memory
-    // before the CPU has finished writing. The init pattern (0xff000000) indicates the slot
-    // was just allocated but not yet filled. Defer the upload so the CPU has time to write.
-    if (image.info.props.is_volume && !image.info.props.is_tiled) {
+    // Race condition fix for linear volume textures (e.g. rotating 3D LUT pools).
+    //
+    // UpdateImage calls TrackImage before RefreshImage, so mprotect is already installed
+    // on the image pages by the time we arrive here. On the FIRST bind, however, the CPU
+    // thread may not have finished writing real data yet — the memory still holds the pool
+    // allocator's uniform init pattern (0xff000000 or 0x00000000).
+    //
+    // If we detect that pattern we defer the upload once: the next CPU write triggers the
+    // page fault, sets CpuDirty, and the second bind uploads correct data.
+    //
+    // If the memory already has real data (e.g. replay/capture mode where the guest state
+    // is already finalised) we skip the defer and upload immediately.
+    if (image.info.props.is_volume && !image.info.props.is_tiled &&
+        False(image.flags & ImageFlagBits::VolumeDeferredUpload)) {
+        image.flags |= ImageFlagBits::VolumeDeferredUpload;
         const auto* data = std::bit_cast<const u32*>(image.info.guest_address);
-        const u32 first = data[0];
-        if (first == 0xff000000u || first == 0u) {
-            const u32 check_dwords = std::min(image.info.guest_size / 4u, 64u);
-            bool uniform = true;
-            for (u32 i = 1; i < check_dwords; i++) {
-                if (data[i] != first) { uniform = false; break; }
-            }
-            if (uniform) {
-                // Leave Dirty set so we re-check next bind. Don't upload init data.
-                return;
+        if (image.info.guest_size >= sizeof(u32)) {
+            const u32 first = data[0];
+            if (first == 0xff000000u || first == 0u) {
+                const u32 n =
+                    std::min(image.info.guest_size / static_cast<u32>(sizeof(u32)), 64u);
+                if (std::all_of(data + 1, data + n, [first](u32 v) { return v == first; })) {
+                    return; // uniform init pattern detected — defer; retry next bind
+                }
             }
         }
+        // Memory has real data — fall through and upload immediately.
     }
 
     boost::container::small_vector<vk::BufferImageCopy, 14> image_copies;
@@ -912,6 +921,7 @@ void TextureCache::TrackImage(ImageId image_id) {
         image.track_addr = image_begin;
         image.track_addr_end = image_end;
         tracker.UpdatePageWatchers<1>(image_begin, image.info.guest_size);
+        image.flags |= ImageFlagBits::TrackingInstalled;
     } else {
         if (image_begin < image.track_addr) {
             TrackImageHead(image_id);
