@@ -602,15 +602,27 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_fmt) {
             // Cannot reuse this image as we need the exact requested format.
             image_id = {};
         } else if (image_resolved.info.resources < info.resources) {
-            LOG_WARNING(Render_Vulkan,
-                        "FindImage: resources mismatch (free-and-blank): "
-                        "resolved ({},{}) -> requested ({},{}) at addr={:#x}",
-                        image_resolved.info.resources.levels,
-                        image_resolved.info.resources.layers,
-                        info.resources.levels, info.resources.layers,
-                        info.guest_address);
-            FreeImage(image_id);
-            image_id = {};
+            if (image_resolved.info.type == info.type &&
+                image_resolved.info.guest_address == info.guest_address &&
+                IsVulkanFormatCompatible(image_resolved.info.pixel_format, info.pixel_format)) {
+                LOG_WARNING(Render_Vulkan,
+                            "FindImage: expanding image resources ({},{}) -> ({},{}) at addr={:#x}",
+                            image_resolved.info.resources.levels,
+                            image_resolved.info.resources.layers,
+                            info.resources.levels, info.resources.layers,
+                            info.guest_address);
+                image_id = ExpandImage(info, image_id);
+            } else {
+                LOG_WARNING(Render_Vulkan,
+                            "FindImage: resources mismatch (free-and-blank): "
+                            "resolved ({},{}) -> requested ({},{}) at addr={:#x}",
+                            image_resolved.info.resources.levels,
+                            image_resolved.info.resources.layers,
+                            info.resources.levels, info.resources.layers,
+                            info.guest_address);
+                FreeImage(image_id);
+                image_id = {};
+            }
         }
     }
     // Create and register a new image
