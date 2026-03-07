@@ -21,6 +21,34 @@ namespace VideoCore {
 static constexpr u64 PageShift = 12;
 static constexpr u64 NumFramesBeforeRemoval = 32;
 
+namespace {
+
+constexpr u32 kLutInitPatternOpaque = 0xff000000u;
+constexpr u32 kLutInitPatternZero   = 0x00000000u;
+constexpr u32 kLutMaxCheckDwords    = 64u;
+
+// Returns true if the buffer looks like a freshly-allocated, uninitialised LUT slot.
+// Some games (e.g. NHL 19) allocate a rotating pool of linear 3D LUT buffers and
+// memset them to a uniform sentinel value before the CPU thread finishes writing the
+// real colour data. Because shadPS4's GPU worker runs asynchronously, RefreshImage
+// can sample this placeholder before the CPU write completes. Deferring the upload
+// until real data is present avoids baking black/transparent LUT values into the
+// texture cache.
+bool LooksUninitializedLUT(const u32* data, u32 guest_size_bytes) {
+    if (!data || guest_size_bytes < sizeof(u32)) {
+        return false;
+    }
+    const u32 first = data[0];
+    if (first != kLutInitPatternOpaque && first != kLutInitPatternZero) {
+        return false;
+    }
+    const u32 dword_count = std::min(guest_size_bytes / static_cast<u32>(sizeof(u32)),
+                                     kLutMaxCheckDwords);
+    return std::all_of(data + 1, data + dword_count, [first](u32 v) { return v == first; });
+}
+
+} // anonymous namespace
+
 TextureCache::TextureCache(const Vulkan::Instance& instance_, Vulkan::Scheduler& scheduler_,
                            AmdGpu::Liverpool* liverpool_, BufferCache& buffer_cache_,
                            PageManager& tracker_)
@@ -782,24 +810,12 @@ void TextureCache::RefreshImage(Image& image) {
     const u32 num_layers = image.info.resources.layers;
     const u32 num_mips = image.info.resources.levels;
 
-    // Race condition fix for Color3D volume LUTs:
-    // The game CPU writes LUT data to a rotating pool of addresses. shadPS4's GPU worker
-    // thread processes the command buffer asynchronously, so RefreshImage may peek the memory
-    // before the CPU has finished writing. The init pattern (0xff000000) indicates the slot
-    // was just allocated but not yet filled. Defer the upload so the CPU has time to write.
+    // Race condition guard: defer upload of linear volume textures that still contain
+    // the allocator's uniform init pattern. Leave Dirty set so we retry next bind.
     if (image.info.props.is_volume && !image.info.props.is_tiled) {
         const auto* data = std::bit_cast<const u32*>(image.info.guest_address);
-        const u32 first = data[0];
-        if (first == 0xff000000u || first == 0u) {
-            const u32 check_dwords = std::min(image.info.guest_size / 4u, 64u);
-            bool uniform = true;
-            for (u32 i = 1; i < check_dwords; i++) {
-                if (data[i] != first) { uniform = false; break; }
-            }
-            if (uniform) {
-                // Leave Dirty set so we re-check next bind. Don't upload init data.
-                return;
-            }
+        if (LooksUninitializedLUT(data, image.info.guest_size)) {
+            return;
         }
     }
 
