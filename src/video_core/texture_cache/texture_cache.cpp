@@ -25,42 +25,51 @@ namespace {
 
 constexpr u32 kLutInitPatternOpaque = 0xff000000u;
 constexpr u32 kLutInitPatternZero   = 0x00000000u;
-constexpr u32 kLutCheckDwords       = 64u; // dwords sampled at each end
+constexpr u32 kLutCheckDwords       = 32u; // dwords checked at each sample point
 
-// Returns true if the buffer looks like a freshly-allocated, uninitialised LUT slot.
-// Some games (e.g. NHL 19) allocate a rotating pool of linear 3D LUT buffers and
-// memset them to a uniform sentinel before the CPU thread finishes writing real data.
-// Because shadPS4's GPU worker runs asynchronously, RefreshImage can sample this
-// placeholder before the CPU write completes.
+// Returns true if the buffer looks like a freshly-allocated or partially-written LUT slot.
 //
-// Checking only the start is insufficient: the CPU writes sequentially, so after the
-// first few pixels are committed the start looks valid while the tail is still the init
-// pattern. We therefore check both the first and last kLutCheckDwords dwords. A fully
-// written LUT will have non-uniform data at both ends; a partial or unwritten one will
-// have the init pattern at the tail.
+// NHL 19 uses a rotating pool of 8 linear 3D LUT buffers (~128KB each). The CPU
+// memsets each slot to 0xff000000 then writes real data sequentially. shadPS4's GPU
+// worker is async so RefreshImage can fire at any point in that sequence:
+//
+//   - Before memset:       slot has previous frame's stale data  -> we must NOT upload
+//   - During memset:       head=0xff, tail=old data              -> must NOT upload
+//   - During real write:   head=real, mid/tail=0xff              -> must NOT upload
+//   - After full write:    all regions have varied real data     -> upload OK
+//
+// We sample the buffer at the head, 25%, 50%, 75%, and tail. If ANY sample window
+// is a uniform init pattern the buffer isn't fully written yet — defer.
 bool LooksUninitializedLUT(const u32* data, u32 guest_size_bytes) {
     if (!data || guest_size_bytes < sizeof(u32)) {
         return false;
     }
     const u32 total_dwords = guest_size_bytes / static_cast<u32>(sizeof(u32));
-    const u32 check_n = std::min(total_dwords, kLutCheckDwords);
-
-    // Check the tail first — cheapest way to catch partial CPU writes.
-    const u32 tail_start = total_dwords - check_n;
-    const u32 tail_first = data[tail_start];
-    if (tail_first == kLutInitPatternOpaque || tail_first == kLutInitPatternZero) {
-        if (std::all_of(data + tail_start + 1, data + total_dwords,
-                        [tail_first](u32 v) { return v == tail_first; })) {
-            return true;
-        }
-    }
-
-    // Also check the head — catches the very first bind before any CPU write.
-    const u32 head_first = data[0];
-    if (head_first != kLutInitPatternOpaque && head_first != kLutInitPatternZero) {
+    const u32 check_n = std::min(total_dwords / 5u, kLutCheckDwords); // per sample point
+    if (check_n == 0) {
         return false;
     }
-    return std::all_of(data + 1, data + check_n, [head_first](u32 v) { return v == head_first; });
+
+    // Sample offsets: head, 25%, 50%, 75%, tail
+    const u32 offsets[5] = {
+        0,
+        total_dwords / 4,
+        total_dwords / 2,
+        total_dwords * 3 / 4,
+        total_dwords - check_n,
+    };
+
+    for (const u32 off : offsets) {
+        const u32 first = data[off];
+        if (first != kLutInitPatternOpaque && first != kLutInitPatternZero) {
+            continue;
+        }
+        if (std::all_of(data + off + 1, data + off + check_n,
+                        [first](u32 v) { return v == first; })) {
+            return true; // this region is still uniform init data — not fully written
+        }
+    }
+    return false;
 }
 
 } // anonymous namespace
