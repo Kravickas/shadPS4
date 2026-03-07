@@ -602,35 +602,15 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_fmt) {
             // Cannot reuse this image as we need the exact requested format.
             image_id = {};
         } else if (image_resolved.info.resources < info.resources) {
-            // The resolved image has fewer mips/layers than the texture request needs.
-            // This happens when the game first renders to an address as a 1-mip RT
-            // then samples the same address as a multi-mip texture. Expand the existing
-            // image to match the requested resources while preserving GPU-rendered content.
-            if (image_resolved.info.type == info.type &&
-                image_resolved.info.guest_address == info.guest_address &&
-                IsVulkanFormatCompatible(image_resolved.info.pixel_format, info.pixel_format)) {
-                LOG_WARNING(Render_Vulkan,
-                            "FindImage: expanding image resources ({},{}) -> ({},{}) at addr={:#x}",
-                          image_resolved.info.resources.levels,
-                          image_resolved.info.resources.layers,
-                          info.resources.levels, info.resources.layers,
-                          info.guest_address);
-                image_id = ExpandImage(info, image_id);
-            } else {
-                LOG_WARNING(Render_Vulkan,
-                            "Image overlap resolve failed (incompatible): "
-                            "resolved type={} levels={} layers={} addr={:#x} gsz={:#x} | "
-                            "requested type={} levels={} layers={} addr={:#x} gsz={:#x}",
-                            static_cast<int>(image_resolved.info.type),
-                            image_resolved.info.resources.levels,
-                            image_resolved.info.resources.layers,
-                            image_resolved.info.guest_address, image_resolved.info.guest_size,
-                            static_cast<int>(info.type),
-                            info.resources.levels, info.resources.layers,
-                            info.guest_address, info.guest_size);
-                FreeImage(image_id);
-                image_id = {};
-            }
+            LOG_WARNING(Render_Vulkan,
+                        "FindImage: resources mismatch (free-and-blank): "
+                        "resolved ({},{}) -> requested ({},{}) at addr={:#x}",
+                        image_resolved.info.resources.levels,
+                        image_resolved.info.resources.layers,
+                        info.resources.levels, info.resources.layers,
+                        info.guest_address);
+            FreeImage(image_id);
+            image_id = {};
         }
     }
     // Create and register a new image
@@ -789,8 +769,27 @@ void TextureCache::RefreshImage(Image& image) {
 
     const u32 num_layers = image.info.resources.layers;
     const u32 num_mips = image.info.resources.levels;
-    const bool is_gpu_modified = True(image.flags & ImageFlagBits::GpuModified);
-    const bool is_gpu_dirty = True(image.flags & ImageFlagBits::GpuDirty);
+
+    // Race condition fix for Color3D volume LUTs:
+    // The game CPU writes LUT data to a rotating pool of addresses. shadPS4's GPU worker
+    // thread processes the command buffer asynchronously, so RefreshImage may peek the memory
+    // before the CPU has finished writing. The init pattern (0xff000000) indicates the slot
+    // was just allocated but not yet filled. Defer the upload so the CPU has time to write.
+    if (image.info.props.is_volume && !image.info.props.is_tiled) {
+        const auto* data = std::bit_cast<const u32*>(image.info.guest_address);
+        const u32 first = data[0];
+        if (first == 0xff000000u || first == 0u) {
+            const u32 check_dwords = std::min(image.info.guest_size / 4u, 64u);
+            bool uniform = true;
+            for (u32 i = 1; i < check_dwords; i++) {
+                if (data[i] != first) { uniform = false; break; }
+            }
+            if (uniform) {
+                // Leave Dirty set so we re-check next bind. Don't upload init data.
+                return;
+            }
+        }
+    }
 
     boost::container::small_vector<vk::BufferImageCopy, 14> image_copies;
     for (u32 m = 0; m < num_mips; m++) {
@@ -799,8 +798,6 @@ void TextureCache::RefreshImage(Image& image) {
         const u32 depth =
             image.info.props.is_volume ? std::max(image.info.size.depth >> m, 1u) : 1u;
         const auto [mip_size, mip_pitch, mip_height, mip_offset] = image.info.mips_layout[m];
-
-        // [GpuModified skip REMOVED for diagnostics - testing if this causes black screen]
 
         const u32 extent_width = mip_pitch ? std::min(mip_pitch, width) : width;
         const u32 extent_height = mip_height ? std::min(mip_height, height) : height;
