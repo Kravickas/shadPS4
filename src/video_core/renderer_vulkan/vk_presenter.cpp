@@ -294,17 +294,6 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
                                VAddr cpu_address) {
     auto desc = VideoCore::TextureCache::ImageDesc{attribute, cpu_address};
     const auto image_id = texture_cache.FindImage(desc);
-    {
-        const auto& dbg_img = texture_cache.GetImage(image_id);
-        LOG_WARNING(Render_Vulkan,
-                    "PrepareFrame: VideoOut addr={:#x} gsz={:#x} "
-                    "flags={:#x} GpuMod={} GpuDirty={} Dirty={}",
-                    cpu_address, dbg_img.info.guest_size,
-                    static_cast<u32>(dbg_img.flags),
-                    True(dbg_img.flags & VideoCore::ImageFlagBits::GpuModified),
-                    True(dbg_img.flags & VideoCore::ImageFlagBits::GpuDirty),
-                    True(dbg_img.flags & VideoCore::ImageFlagBits::Dirty));
-    }
     texture_cache.UpdateImage(image_id);
 
     Frame* frame = GetRenderFrame();
