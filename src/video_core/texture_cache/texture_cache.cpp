@@ -131,7 +131,7 @@ void TextureCache::ProcessPendingVolumeUploads() {
     std::scoped_lock lock{mutex};
     for (const ImageId image_id : pending_volume_uploads) {
         // Image may have been freed since the fault fired.
-        if (!slot_images.contains(image_id)) {
+        if (!slot_images.is_allocated(image_id)) {
             continue;
         }
         Image& image = slot_images[image_id];
