@@ -25,29 +25,60 @@ namespace {
 
 constexpr u32 kLutInitPatternOpaque = 0xff000000u;
 constexpr u32 kLutInitPatternZero   = 0x00000000u;
+constexpr u32 kLutWindowDwords      = 64u; // dwords per sample window
 
-// Returns true if the buffer contains any uninitialized region, indicating the CPU
-// has not finished writing real LUT data yet.
+// Returns true if the CPU has not yet finished writing real LUT data to this buffer.
 //
-// NHL 19 uses a rotating pool of 8 linear 3D LUT buffers (~128KB each). The CPU
-// memsets each slot to 0xff000000 then writes real data sequentially. shadPS4's GPU
-// worker is async so RefreshImage can fire at any point in that write sequence.
+// NHL 19 uses a rotating pool of 8 linear 3D LUT buffers (~128KB each, 32x32x32 RGBA8).
+// The CPU memsets each slot to 0xff000000 then writes real color data sequentially.
+// shadPS4's GPU worker is async: RefreshImage fires on the first page fault, which
+// happens when the CPU writes the first 4KB page. At that point only the head of the
+// buffer has real data — the remaining ~124KB is still the init pattern.
 //
-// Sampling only a few points misses partial writes: if the sample points happen to
-// land on already-written regions the check passes and we upload a corrupted LUT.
-// Scanning the full buffer is the only reliable check. At ~128KB sequential reads
-// (~16µs at 8GB/s) this is negligible compared to the texture upload cost (~100-500µs).
+// Approach: sample kLutWindowDwords-wide windows at several points in the second half
+// of the buffer. If any window is uniformly the init pattern, the CPU hasn't reached
+// that region yet — defer the upload and retry on the next bind.
 //
-// We scan in 64-dword strides to stay cache-friendly and exit early on first hit.
+// We check the second half only (not the head) because:
+//   - The head is written first, so it looks valid even mid-write.
+//   - Real LUT data will not have 64 consecutive identical ARGB values anywhere
+//     in a color grading table — this avoids false positives on valid data.
+//
+// Single-dword checks would false-positive on legitimate opaque-black (0xff000000)
+// or transparent (0x00000000) LUT entries, so we require the entire window to be
+// uniform before declaring the buffer uninitialized.
 bool LooksUninitializedLUT(const u32* data, u32 guest_size_bytes) {
     if (!data || guest_size_bytes < sizeof(u32)) {
         return false;
     }
     const u32 total_dwords = guest_size_bytes / static_cast<u32>(sizeof(u32));
+    if (total_dwords < kLutWindowDwords * 2) {
+        // Buffer too small to split meaningfully — fall back to head check only.
+        const u32 first = data[0];
+        if (first != kLutInitPatternOpaque && first != kLutInitPatternZero) {
+            return false;
+        }
+        const u32 n = std::min(total_dwords, kLutWindowDwords);
+        return std::all_of(data + 1, data + n, [first](u32 v) { return v == first; });
+    }
 
-    for (u32 i = 0; i < total_dwords; ++i) {
-        if (data[i] == kLutInitPatternOpaque || data[i] == kLutInitPatternZero) {
-            return true; // found at least one uninitialised dword — defer upload
+    // Sample windows at 50%, 66%, 75%, and 100% (tail) of the buffer.
+    // All are in the second half so the head's written data won't mask the race.
+    const u32 window_starts[4] = {
+        total_dwords / 2,
+        total_dwords * 2 / 3,
+        total_dwords * 3 / 4,
+        total_dwords - kLutWindowDwords,
+    };
+
+    for (const u32 off : window_starts) {
+        const u32 first = data[off];
+        if (first != kLutInitPatternOpaque && first != kLutInitPatternZero) {
+            continue; // this window has real data — not a uniform init region
+        }
+        if (std::all_of(data + off + 1, data + off + kLutWindowDwords,
+                        [first](u32 v) { return v == first; })) {
+            return true; // uniform init pattern found — CPU hasn't reached here yet
         }
     }
     return false;
@@ -802,6 +833,8 @@ void TextureCache::RefreshImage(Image& image) {
 
     const u32 num_layers = image.info.resources.layers;
     const u32 num_mips = image.info.resources.levels;
+    const bool is_gpu_modified = True(image.flags & ImageFlagBits::GpuModified);
+    const bool is_gpu_dirty = True(image.flags & ImageFlagBits::GpuDirty);
 
     // Race condition fix for linear volume textures (e.g. rotating 3D LUT pools).
     // The game CPU writes LUT data to a rotating pool of addresses. shadPS4's GPU worker
@@ -823,6 +856,16 @@ void TextureCache::RefreshImage(Image& image) {
         const u32 depth =
             image.info.props.is_volume ? std::max(image.info.size.depth >> m, 1u) : 1u;
         const auto [mip_size, mip_pitch, mip_height, mip_offset] = image.info.mips_layout[m];
+
+        // Protect GPU modified resources from accidental CPU reuploads.
+        if (is_gpu_modified && !is_gpu_dirty) {
+            const u8* addr = std::bit_cast<u8*>(image.info.guest_address);
+            const u64 hash = XXH3_64bits(addr + mip_offset, mip_size);
+            if (image.mip_hashes[m] == hash) {
+                continue;
+            }
+            image.mip_hashes[m] = hash;
+        }
 
         const u32 extent_width = mip_pitch ? std::min(mip_pitch, width) : width;
         const u32 extent_height = mip_height ? std::min(mip_height, height) : height;
