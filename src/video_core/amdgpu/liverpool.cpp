@@ -6,7 +6,6 @@
 #include "common/assert.h"
 #include "common/config.h"
 #include "common/debug.h"
-#include "common/logging/log.h"
 #include "common/polyfill_thread.h"
 #include "common/thread.h"
 #include "core/debug_state.h"
