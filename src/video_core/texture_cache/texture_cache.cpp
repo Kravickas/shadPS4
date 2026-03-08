@@ -25,26 +25,63 @@ namespace {
 
 constexpr u32 kLutInitPatternOpaque = 0xff000000u;
 constexpr u32 kLutInitPatternZero   = 0x00000000u;
-constexpr u32 kLutMaxCheckDwords    = 64u;
+constexpr u32 kLutWindowDwords      = 64u; // dwords per sample window
 
-// Returns true if the buffer looks like a freshly-allocated, uninitialised LUT slot.
-// Some games (e.g. NHL 19) allocate a rotating pool of linear 3D LUT buffers and
-// memset them to a uniform sentinel value before the CPU thread finishes writing the
-// real colour data. Because shadPS4's GPU worker runs asynchronously, RefreshImage
-// can sample this placeholder before the CPU write completes. Deferring the upload
-// until real data is present avoids baking black/transparent LUT values into the
-// texture cache.
+// Returns true if the CPU has not yet finished writing real LUT data to this buffer.
+//
+// NHL 19 uses a rotating pool of 8 linear 3D LUT buffers (~128KB each, 32x32x32 RGBA8).
+// The CPU memsets each slot to 0xff000000 then writes real color data sequentially.
+// shadPS4's GPU worker is async: RefreshImage fires on the first page fault, which
+// happens when the CPU writes the first 4KB page. At that point only the head of the
+// buffer has real data — the remaining ~124KB is still the init pattern.
+//
+// Approach: sample kLutWindowDwords-wide windows at several points in the second half
+// of the buffer. If any window is uniformly the init pattern, the CPU hasn't reached
+// that region yet — defer the upload and retry on the next bind.
+//
+// We check the second half only (not the head) because:
+//   - The head is written first, so it looks valid even mid-write.
+//   - Real LUT data will not have 64 consecutive identical ARGB values anywhere
+//     in a color grading table — this avoids false positives on valid data.
+//
+// Single-dword checks would false-positive on legitimate opaque-black (0xff000000)
+// or transparent (0x00000000) LUT entries, so we require the entire window to be
+// uniform before declaring the buffer uninitialized.
 bool LooksUninitializedLUT(const u32* data, u32 guest_size_bytes) {
     if (!data || guest_size_bytes < sizeof(u32)) {
         return false;
     }
-    const u32 first = data[0];
-    if (first != kLutInitPatternOpaque && first != kLutInitPatternZero) {
-        return false;
+    const u32 total_dwords = guest_size_bytes / static_cast<u32>(sizeof(u32));
+    if (total_dwords < kLutWindowDwords * 2) {
+        // Buffer too small to split meaningfully — fall back to head check only.
+        const u32 first = data[0];
+        if (first != kLutInitPatternOpaque && first != kLutInitPatternZero) {
+            return false;
+        }
+        const u32 n = std::min(total_dwords, kLutWindowDwords);
+        return std::all_of(data + 1, data + n, [first](u32 v) { return v == first; });
     }
-    const u32 dword_count = std::min(guest_size_bytes / static_cast<u32>(sizeof(u32)),
-                                     kLutMaxCheckDwords);
-    return std::all_of(data + 1, data + dword_count, [first](u32 v) { return v == first; });
+
+    // Sample windows at 50%, 66%, 75%, and 100% (tail) of the buffer.
+    // All are in the second half so the head's written data won't mask the race.
+    const u32 window_starts[4] = {
+        total_dwords / 2,
+        total_dwords * 2 / 3,
+        total_dwords * 3 / 4,
+        total_dwords - kLutWindowDwords,
+    };
+
+    for (const u32 off : window_starts) {
+        const u32 first = data[off];
+        if (first != kLutInitPatternOpaque && first != kLutInitPatternZero) {
+            continue; // this window has real data — not a uniform init region
+        }
+        if (std::all_of(data + off + 1, data + off + kLutWindowDwords,
+                        [first](u32 v) { return v == first; })) {
+            return true; // uniform init pattern found — CPU hasn't reached here yet
+        }
+    }
+    return false;
 }
 
 } // anonymous namespace
@@ -366,9 +403,12 @@ std::tuple<ImageId, int, int> TextureCache::ResolveOverlap(const ImageInfo& imag
             return {is_compatible ? result_id : ImageId{}, -1, -1};
         }
 
-        // Size and resources are greater, expand the image.
+        // Size and resources are greater, expand the image — but only if guest memory
+        // footprint actually grew. If guest_size is unchanged, the extra resources don't
+        // fit in the allocated range; expanding would read into adjacent pool slots.
         if (image_info.type == cache_image.info.type &&
-            image_info.resources > cache_image.info.resources) {
+            image_info.resources > cache_image.info.resources &&
+            image_info.guest_size > cache_image.info.guest_size) {
             return {ExpandImage(image_info, cache_image_id), -1, -1};
         }
 
@@ -540,16 +580,6 @@ ImageId TextureCache::ExpandImage(const ImageInfo& info, ImageId image_id) {
     auto& src_image = slot_images[image_id];
     auto& new_image = slot_images[new_image_id];
 
-    // Log Color3D <-> Color2DArray conversions to help diagnose LUT issues
-    if (info.type == AmdGpu::ImageType::Color3D ||
-        src_image.info.type == AmdGpu::ImageType::Color3D) {
-        LOG_WARNING(Render_Vulkan,
-                    "ExpandImage Color3D: {} ({}) -> {} ({}) addr={:#x} size={:#x}",
-                  static_cast<int>(src_image.info.type), src_image.info.resources.layers,
-                  static_cast<int>(info.type), info.resources.layers,
-                  info.guest_address, info.guest_size);
-    }
-
     RefreshImage(new_image);
     new_image.CopyImage(src_image);
 
@@ -633,21 +663,15 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_fmt) {
             if (image_resolved.info.type == info.type &&
                 image_resolved.info.guest_address == info.guest_address &&
                 IsVulkanFormatCompatible(image_resolved.info.pixel_format, info.pixel_format)) {
-                LOG_WARNING(Render_Vulkan,
-                            "FindImage: expanding image resources ({},{}) -> ({},{}) at addr={:#x}",
-                            image_resolved.info.resources.levels,
-                            image_resolved.info.resources.layers,
-                            info.resources.levels, info.resources.layers,
-                            info.guest_address);
-                image_id = ExpandImage(info, image_id);
+                if (info.guest_size > image_resolved.info.guest_size) {
+                    // New request covers more memory — safe to expand.
+                    image_id = ExpandImage(info, image_id);
+                }
+                // else: guest_size unchanged — the extra mip/layers don't fit in the
+                // allocated memory. Reuse the existing image with its lower resource count.
+                // Do NOT free (would lose RT content) and do NOT expand (would read OOB
+                // into adjacent pool slots, causing scrambled colour artifacts).
             } else {
-                LOG_WARNING(Render_Vulkan,
-                            "FindImage: resources mismatch (free-and-blank): "
-                            "resolved ({},{}) -> requested ({},{}) at addr={:#x}",
-                            image_resolved.info.resources.levels,
-                            image_resolved.info.resources.layers,
-                            info.resources.levels, info.resources.layers,
-                            info.guest_address);
                 FreeImage(image_id);
                 image_id = {};
             }
@@ -809,9 +833,15 @@ void TextureCache::RefreshImage(Image& image) {
 
     const u32 num_layers = image.info.resources.layers;
     const u32 num_mips = image.info.resources.levels;
+    const bool is_gpu_modified = True(image.flags & ImageFlagBits::GpuModified);
+    const bool is_gpu_dirty = True(image.flags & ImageFlagBits::GpuDirty);
 
-    // Race condition guard: defer upload of linear volume textures that still contain
-    // the allocator's uniform init pattern. Leave Dirty set so we retry next bind.
+    // Race condition fix for linear volume textures (e.g. rotating 3D LUT pools).
+    // The game CPU writes LUT data to a rotating pool of addresses. shadPS4's GPU worker
+    // thread processes the command buffer asynchronously, so RefreshImage may read the
+    // memory before the CPU has finished writing. The init pattern (0xff000000 or 0x00000000)
+    // indicates the slot was just allocated but not yet filled. Defer the upload so the CPU
+    // has time to write real data. Leave Dirty set so we retry on the next bind.
     if (image.info.props.is_volume && !image.info.props.is_tiled) {
         const auto* data = std::bit_cast<const u32*>(image.info.guest_address);
         if (LooksUninitializedLUT(data, image.info.guest_size)) {
@@ -826,6 +856,16 @@ void TextureCache::RefreshImage(Image& image) {
         const u32 depth =
             image.info.props.is_volume ? std::max(image.info.size.depth >> m, 1u) : 1u;
         const auto [mip_size, mip_pitch, mip_height, mip_offset] = image.info.mips_layout[m];
+
+        // Protect GPU modified resources from accidental CPU reuploads.
+        if (is_gpu_modified && !is_gpu_dirty) {
+            const u8* addr = std::bit_cast<u8*>(image.info.guest_address);
+            const u64 hash = XXH3_64bits(addr + mip_offset, mip_size);
+            if (image.mip_hashes[m] == hash) {
+                continue;
+            }
+            image.mip_hashes[m] = hash;
+        }
 
         const u32 extent_width = mip_pitch ? std::min(mip_pitch, width) : width;
         const u32 extent_height = mip_height ? std::min(mip_height, height) : height;
