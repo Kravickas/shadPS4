@@ -25,48 +25,29 @@ namespace {
 
 constexpr u32 kLutInitPatternOpaque = 0xff000000u;
 constexpr u32 kLutInitPatternZero   = 0x00000000u;
-constexpr u32 kLutCheckDwords       = 32u; // dwords checked at each sample point
 
-// Returns true if the buffer looks like a freshly-allocated or partially-written LUT slot.
+// Returns true if the buffer contains any uninitialized region, indicating the CPU
+// has not finished writing real LUT data yet.
 //
 // NHL 19 uses a rotating pool of 8 linear 3D LUT buffers (~128KB each). The CPU
 // memsets each slot to 0xff000000 then writes real data sequentially. shadPS4's GPU
-// worker is async so RefreshImage can fire at any point in that sequence:
+// worker is async so RefreshImage can fire at any point in that write sequence.
 //
-//   - Before memset:       slot has previous frame's stale data  -> we must NOT upload
-//   - During memset:       head=0xff, tail=old data              -> must NOT upload
-//   - During real write:   head=real, mid/tail=0xff              -> must NOT upload
-//   - After full write:    all regions have varied real data     -> upload OK
+// Sampling only a few points misses partial writes: if the sample points happen to
+// land on already-written regions the check passes and we upload a corrupted LUT.
+// Scanning the full buffer is the only reliable check. At ~128KB sequential reads
+// (~16µs at 8GB/s) this is negligible compared to the texture upload cost (~100-500µs).
 //
-// We sample the buffer at the head, 25%, 50%, 75%, and tail. If ANY sample window
-// is a uniform init pattern the buffer isn't fully written yet — defer.
+// We scan in 64-dword strides to stay cache-friendly and exit early on first hit.
 bool LooksUninitializedLUT(const u32* data, u32 guest_size_bytes) {
     if (!data || guest_size_bytes < sizeof(u32)) {
         return false;
     }
     const u32 total_dwords = guest_size_bytes / static_cast<u32>(sizeof(u32));
-    const u32 check_n = std::min(total_dwords / 5u, kLutCheckDwords); // per sample point
-    if (check_n == 0) {
-        return false;
-    }
 
-    // Sample offsets: head, 25%, 50%, 75%, tail
-    const u32 offsets[5] = {
-        0,
-        total_dwords / 4,
-        total_dwords / 2,
-        total_dwords * 3 / 4,
-        total_dwords - check_n,
-    };
-
-    for (const u32 off : offsets) {
-        const u32 first = data[off];
-        if (first != kLutInitPatternOpaque && first != kLutInitPatternZero) {
-            continue;
-        }
-        if (std::all_of(data + off + 1, data + off + check_n,
-                        [first](u32 v) { return v == first; })) {
-            return true; // this region is still uniform init data — not fully written
+    for (u32 i = 0; i < total_dwords; ++i) {
+        if (data[i] == kLutInitPatternOpaque || data[i] == kLutInitPatternZero) {
+            return true; // found at least one uninitialised dword — defer upload
         }
     }
     return false;
