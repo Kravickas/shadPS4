@@ -167,6 +167,14 @@ public:
     std::deque<BackingImage> backing_images;
     BackingImage* backing{};
     boost::container::static_vector<u64, 16> mip_hashes{};
+    // Number of times CPU has written to this image's memory since it was registered.
+    // Incremented by InvalidateMemory each time a page fault fires on this image's range.
+    // Used to distinguish "image just created, CPU hasn't written yet" (== 0) from
+    // "CPU has actually written at least once" (> 0). This is the RPCS3-inspired
+    // equivalent of their per-section write counter / synchronized state tracking.
+    // Never reset — only the initial value of 0 has special meaning.
+    u32 cpu_write_count = 0;
+
     u64 lru_id{};
     u64 tick_accessed_last{};
     u64 hash{};
