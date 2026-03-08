@@ -374,6 +374,11 @@ void Rasterizer::OnSubmit() {
         fault_process_pending = false;
         buffer_cache.ProcessFaultBuffer();
     }
+    // Proactively upload volume textures (LUTs) that received a CPU write since the
+    // last submit. The game may never rebind them, so we can't rely on UpdateImage.
+    // By OnSubmit time the CPU has finished writing (the page fault removed mprotect,
+    // then the CPU completed its write in microseconds before the next submit).
+    texture_cache.ProcessPendingVolumeUploads();
     texture_cache.ProcessDownloadImages();
     texture_cache.RunGarbageCollector();
     buffer_cache.RunGarbageCollector();
