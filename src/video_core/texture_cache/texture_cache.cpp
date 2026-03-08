@@ -549,16 +549,6 @@ ImageId TextureCache::ExpandImage(const ImageInfo& info, ImageId image_id) {
     auto& src_image = slot_images[image_id];
     auto& new_image = slot_images[new_image_id];
 
-    // Log Color3D <-> Color2DArray conversions to help diagnose LUT issues
-    if (info.type == AmdGpu::ImageType::Color3D ||
-        src_image.info.type == AmdGpu::ImageType::Color3D) {
-        LOG_WARNING(Render_Vulkan,
-                    "ExpandImage Color3D: {} ({}) -> {} ({}) addr={:#x} size={:#x}",
-                  static_cast<int>(src_image.info.type), src_image.info.resources.layers,
-                  static_cast<int>(info.type), info.resources.layers,
-                  info.guest_address, info.guest_size);
-    }
-
     RefreshImage(new_image);
     new_image.CopyImage(src_image);
 
@@ -644,12 +634,6 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_fmt) {
                 IsVulkanFormatCompatible(image_resolved.info.pixel_format, info.pixel_format)) {
                 if (info.guest_size > image_resolved.info.guest_size) {
                     // New request covers more memory — safe to expand.
-                    LOG_WARNING(Render_Vulkan,
-                                "FindImage: expanding image resources ({},{}) -> ({},{}) at "
-                                "addr={:#x}",
-                                image_resolved.info.resources.levels,
-                                image_resolved.info.resources.layers, info.resources.levels,
-                                info.resources.layers, info.guest_address);
                     image_id = ExpandImage(info, image_id);
                 }
                 // else: guest_size unchanged — the extra mip/layers don't fit in the
@@ -657,12 +641,6 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_fmt) {
                 // Do NOT free (would lose RT content) and do NOT expand (would read OOB
                 // into adjacent pool slots, causing scrambled colour artifacts).
             } else {
-                LOG_WARNING(Render_Vulkan,
-                            "FindImage: resources mismatch (free-and-blank): "
-                            "resolved ({},{}) -> requested ({},{}) at addr={:#x}",
-                            image_resolved.info.resources.levels,
-                            image_resolved.info.resources.layers, info.resources.levels,
-                            info.resources.layers, info.guest_address);
                 FreeImage(image_id);
                 image_id = {};
             }
