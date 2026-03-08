@@ -111,6 +111,7 @@ Image::Image(const Vulkan::Instance& instance_, Vulkan::Scheduler& scheduler_,
     if (info.pixel_format == vk::Format::eUndefined) {
         return;
     }
+    mip_hashes.resize(info.resources.levels);
     // Here we force `eExtendedUsage` as don't know all image usage cases beforehand. In normal case
     // the texture cache should re-create the resource with the usage requested
     vk::ImageCreateFlags flags{vk::ImageCreateFlagBits::eMutableFormat |
