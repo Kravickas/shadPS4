@@ -23,34 +23,42 @@ static constexpr u64 NumFramesBeforeRemoval = 32;
 
 namespace {
 
-constexpr u32 kLutInitPatternOpaque = 0xff000000u;
-constexpr u32 kLutInitPatternZero   = 0x00000000u;
-
-// Scan a linear 3D LUT buffer for any dword still holding an init-pattern sentinel.
+// Returns true if the entire buffer is a single uniform value (memset init pattern).
 //
-// NHL 19 allocates a pool of 8 linear 32×32×32 RGBA8 LUT slots (~131KB each).
-// The CPU memsets each slot to 0xff000000, then writes real color-grading data
-// sequentially. shadPS4's GPU worker is async: RefreshImage can fire while the CPU
-// is mid-write. Any surviving sentinel dword means the slot is not yet fully written.
+// NHL 19 allocates a rotating pool of linear 32×32×32 RGBA8 LUT slots (~131KB each).
+// Before writing, the CPU memsets each slot to 0xff000000. shadPS4's GPU worker is
+// async, so RefreshImage can fire before the CPU has written any real data.
 //
-// This check is ONLY called when cpu_write_count == 0 (image has never received a
-// page-fault, meaning the CPU hasn't started writing this slot yet at all). Once
-// cpu_write_count > 0, we skip the check to avoid false deferrals on legitimate
-// 0xff000000 (opaque-black) or 0x00000000 (transparent) LUT entries.
+// The CORRECT discriminator is: ALL dwords identical = memset = uninitialized.
+// Any non-uniform content = real LUT data, upload it.
 //
-// Full-scan exits on first hit. At ~128KB it costs ~16µs at 8GB/s — negligible
-// compared to the upload cost of ~100–500µs.
+// WHY NOT scan for specific sentinel values like 0xff000000:
+//   - 0xff000000 is a completely valid LUT entry (opaque black / identity mapping
+//     at lut[0][0][0]). Scanning for its presence always returns true on real data.
+//   - The previous full-scan approach caused permanent deferral of all LUTs.
+//
+// WHY uniformity works:
+//   - A real color grading LUT maps every (r,g,b) input to a different output.
+//     Consecutive entries differ in their R channel at minimum. A 32×32×32 cube
+//     with all-identical dwords cannot be valid color grading data.
+//   - The game's memset produces exactly this: every dword is 0xff000000.
+//   - We scan the whole buffer; early-exit on first differing dword.
+//
+// This check is gated on cpu_write_count == 0 in the caller. If a page fault has
+// fired (cpu_write_count > 0), we skip this check entirely — the CPU has written
+// to this range and the data is real regardless of what values it contains.
 bool LooksUninitializedLUT(const u32* data, u32 guest_size_bytes) {
-    if (!data || guest_size_bytes < sizeof(u32)) {
+    if (!data || guest_size_bytes < sizeof(u32) * 2) {
         return false;
     }
     const u32 total_dwords = guest_size_bytes / static_cast<u32>(sizeof(u32));
-    for (u32 i = 0; i < total_dwords; ++i) {
-        if (data[i] == kLutInitPatternOpaque || data[i] == kLutInitPatternZero) {
-            return true;
+    const u32 first = data[0];
+    for (u32 i = 1; i < total_dwords; ++i) {
+        if (data[i] != first) {
+            return false; // non-uniform → real data, upload it
         }
     }
-    return false;
+    return true; // all dwords identical → memset init pattern, defer
 }
 
 } // anonymous namespace
