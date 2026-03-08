@@ -23,42 +23,34 @@ static constexpr u64 NumFramesBeforeRemoval = 32;
 
 namespace {
 
-// Returns true if the entire buffer is a single uniform value (memset init pattern).
+constexpr u32 kLutInitPatternOpaque = 0xff000000u;
+constexpr u32 kLutInitPatternZero   = 0x00000000u;
+
+// Scan a linear 3D LUT buffer for any dword still holding an init-pattern sentinel.
 //
-// NHL 19 allocates a rotating pool of linear 32×32×32 RGBA8 LUT slots (~131KB each).
-// Before writing, the CPU memsets each slot to 0xff000000. shadPS4's GPU worker is
-// async, so RefreshImage can fire before the CPU has written any real data.
+// NHL 19 allocates a pool of 8 linear 32×32×32 RGBA8 LUT slots (~131KB each).
+// The CPU memsets each slot to 0xff000000, then writes real color-grading data
+// sequentially. shadPS4's GPU worker is async: RefreshImage can fire while the CPU
+// is mid-write. Any surviving sentinel dword means the slot is not yet fully written.
 //
-// The CORRECT discriminator is: ALL dwords identical = memset = uninitialized.
-// Any non-uniform content = real LUT data, upload it.
+// This check is ONLY called when cpu_write_count == 0 (image has never received a
+// page-fault, meaning the CPU hasn't started writing this slot yet at all). Once
+// cpu_write_count > 0, we skip the check to avoid false deferrals on legitimate
+// 0xff000000 (opaque-black) or 0x00000000 (transparent) LUT entries.
 //
-// WHY NOT scan for specific sentinel values like 0xff000000:
-//   - 0xff000000 is a completely valid LUT entry (opaque black / identity mapping
-//     at lut[0][0][0]). Scanning for its presence always returns true on real data.
-//   - The previous full-scan approach caused permanent deferral of all LUTs.
-//
-// WHY uniformity works:
-//   - A real color grading LUT maps every (r,g,b) input to a different output.
-//     Consecutive entries differ in their R channel at minimum. A 32×32×32 cube
-//     with all-identical dwords cannot be valid color grading data.
-//   - The game's memset produces exactly this: every dword is 0xff000000.
-//   - We scan the whole buffer; early-exit on first differing dword.
-//
-// This check is gated on cpu_write_count == 0 in the caller. If a page fault has
-// fired (cpu_write_count > 0), we skip this check entirely — the CPU has written
-// to this range and the data is real regardless of what values it contains.
+// Full-scan exits on first hit. At ~128KB it costs ~16µs at 8GB/s — negligible
+// compared to the upload cost of ~100–500µs.
 bool LooksUninitializedLUT(const u32* data, u32 guest_size_bytes) {
-    if (!data || guest_size_bytes < sizeof(u32) * 2) {
+    if (!data || guest_size_bytes < sizeof(u32)) {
         return false;
     }
     const u32 total_dwords = guest_size_bytes / static_cast<u32>(sizeof(u32));
-    const u32 first = data[0];
-    for (u32 i = 1; i < total_dwords; ++i) {
-        if (data[i] != first) {
-            return false; // non-uniform → real data, upload it
+    for (u32 i = 0; i < total_dwords; ++i) {
+        if (data[i] == kLutInitPatternOpaque || data[i] == kLutInitPatternZero) {
+            return true;
         }
     }
-    return true; // all dwords identical → memset init pattern, defer
+    return false;
 }
 
 } // anonymous namespace
@@ -132,6 +124,34 @@ void TextureCache::ProcessDownloadImages() {
     download_images.clear();
 }
 
+void TextureCache::ProcessPendingVolumeUploads() {
+    if (pending_volume_uploads.empty()) {
+        return;
+    }
+    std::scoped_lock lock{mutex};
+    for (const ImageId image_id : pending_volume_uploads) {
+        // Image may have been freed since the fault fired.
+        if (!slot_images.contains(image_id)) {
+            continue;
+        }
+        Image& image = slot_images[image_id];
+        if (False(image.flags & ImageFlagBits::Dirty)) {
+            continue; // already uploaded by a normal bind path
+        }
+        LOG_INFO(Render_Vulkan,
+                 "ProcessPendingVolumeUploads: proactive upload addr={:#x} size={:#x} "
+                 "{}x{}x{} fmt={} cpu_writes={}",
+                 image.info.guest_address, image.info.guest_size,
+                 image.info.size.width, image.info.size.height, image.info.size.depth,
+                 vk::to_string(image.info.pixel_format), image.cpu_write_count);
+        // cpu_write_count > 0 here (this function is only called after InvalidateMemory
+        // increments it). RefreshImage will skip the uniformity check and upload.
+        RefreshImage(image);
+        TrackImage(image_id); // re-install mprotect for future CPU writes
+    }
+    pending_volume_uploads.clear();
+}
+
 void TextureCache::DownloadImageMemory(ImageId image_id) {
     Image& image = slot_images[image_id];
     if (False(image.flags & ImageFlagBits::GpuModified)) {
@@ -192,9 +212,7 @@ void TextureCache::InvalidateMemory(VAddr addr, size_t size) {
             // Modified region overlaps image, so the image was definitely accessed by this fault.
             // Untrack the image, so that the range is unprotected and the guest can write freely.
             image.flags |= ImageFlagBits::CpuDirty;
-            // Increment write counter: this is the RPCS3-equivalent of tracking that the
-            // CPU has performed at least one real write to this image's memory region.
-            // RefreshImage checks this to gate the LUT uninitialised-pattern check.
+            // Increment write counter: RPCS3-equivalent of per-section CPU write tracking.
             ++image.cpu_write_count;
             LOG_DEBUG(Render_Vulkan,
                       "InvalidateMemory: CPU write #{} on image addr={:#x} size={:#x} "
@@ -202,6 +220,15 @@ void TextureCache::InvalidateMemory(VAddr addr, size_t size) {
                       image.cpu_write_count, image.info.guest_address, image.info.guest_size,
                       addr, size, static_cast<u32>(image.flags),
                       image.info.props.is_volume, image.info.props.is_tiled);
+            // For linear volume textures (LUTs), the game often writes the data AFTER
+            // submitting the CB that references it. Because the game may never rebind
+            // the texture, we can't rely on a future UpdateImage call to re-upload.
+            // Queue it for proactive re-upload at the next OnSubmit boundary, by which
+            // time the CPU will have finished writing the full LUT (a few microseconds
+            // after the first page fault removes the write-protection).
+            if (image.info.props.is_volume && !image.info.props.is_tiled) {
+                pending_volume_uploads.emplace(image_id);
+            }
             UntrackImage(image_id);
         } else if (pages_end < image_end) {
             // This page access may or may not modify the image.
