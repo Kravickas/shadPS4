@@ -96,6 +96,11 @@ public:
     /// Schedules a copy of pending images for download back to CPU memory.
     void ProcessDownloadImages();
 
+    /// Proactively re-uploads volume textures (LUTs) that were written by the CPU
+    /// after their last bind. Called at OnSubmit so uploads happen before the next
+    /// frame's draw calls, even if the game never rebinds the texture.
+    void ProcessPendingVolumeUploads();
+
     /// Retrieves the image handle of the image with the provided attributes.
     [[nodiscard]] ImageId FindImage(ImageDesc& desc, bool exact_fmt = false);
 
@@ -306,6 +311,9 @@ private:
     tsl::robin_map<u64, Sampler> samplers;
     tsl::robin_map<vk::Format, ImageId> null_images;
     std::unordered_set<ImageId> download_images;
+    // Volume textures (LUTs) that received a CPU write after their last bind.
+    // Flushed at OnSubmit so the data is uploaded before the next frame's draws.
+    std::unordered_set<ImageId> pending_volume_uploads;
     u64 total_used_memory = 0;
     u64 trigger_gc_memory = 0;
     u64 pressure_gc_memory = 0;
