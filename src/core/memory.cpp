@@ -535,8 +535,17 @@ s32 MemoryManager::MapMemory(void** out_addr, VAddr virtual_addr, u64 size, Memo
                    virtual_addr);
         auto vma = FindVMA(virtual_addr)->second;
         auto remaining_size = vma.base + vma.size - virtual_addr;
-        if (!vma.IsFree() || remaining_size < size) {
-            LOG_ERROR(Kernel_Vmm, "Unable to map {:#x} bytes at address {:#x}", size, virtual_addr);
+        if (!vma.IsFree()) {
+            // Region is already mapped; NoOverwrite means we must not clobber it.
+            // Return EBUSY so callers (e.g. FlexibleMemoryPageAllocator) can
+            // distinguish "occupied" from "out of memory" and retry at a different address.
+            LOG_DEBUG(Kernel_Vmm, "Unable to map {:#x} bytes at address {:#x}: region already mapped",
+                      size, virtual_addr);
+            return ORBIS_KERNEL_ERROR_EBUSY;
+        }
+        if (remaining_size < size) {
+            LOG_ERROR(Kernel_Vmm, "Unable to map {:#x} bytes at address {:#x}: insufficient space",
+                      size, virtual_addr);
             return ORBIS_KERNEL_ERROR_ENOMEM;
         }
     } else if (False(flags & MemoryMapFlags::Fixed)) {
