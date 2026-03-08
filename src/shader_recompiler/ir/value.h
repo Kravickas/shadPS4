@@ -103,7 +103,7 @@ public:
     explicit(false) TypedValue(const TypedValue<other_type>& value) : Value(value) {}
 
     explicit TypedValue(const Value& value) : Value(value) {
-        if ((value.Type() & type_) == IR::Type::Void) {
+        if (!AreTypesCompatible(value.Type(), type_)) {
             UNREACHABLE_MSG("Incompatible types {} and {}", type_, value.Type());
         }
     }
