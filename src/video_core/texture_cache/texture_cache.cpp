@@ -25,60 +25,29 @@ namespace {
 
 constexpr u32 kLutInitPatternOpaque = 0xff000000u;
 constexpr u32 kLutInitPatternZero   = 0x00000000u;
-constexpr u32 kLutWindowDwords      = 64u; // dwords per sample window
 
-// Returns true if the CPU has not yet finished writing real LUT data to this buffer.
+// Scan a linear 3D LUT buffer for any dword still holding an init-pattern sentinel.
 //
-// NHL 19 uses a rotating pool of 8 linear 3D LUT buffers (~128KB each, 32x32x32 RGBA8).
-// The CPU memsets each slot to 0xff000000 then writes real color data sequentially.
-// shadPS4's GPU worker is async: RefreshImage fires on the first page fault, which
-// happens when the CPU writes the first 4KB page. At that point only the head of the
-// buffer has real data — the remaining ~124KB is still the init pattern.
+// NHL 19 allocates a pool of 8 linear 32×32×32 RGBA8 LUT slots (~131KB each).
+// The CPU memsets each slot to 0xff000000, then writes real color-grading data
+// sequentially. shadPS4's GPU worker is async: RefreshImage can fire while the CPU
+// is mid-write. Any surviving sentinel dword means the slot is not yet fully written.
 //
-// Approach: sample kLutWindowDwords-wide windows at several points in the second half
-// of the buffer. If any window is uniformly the init pattern, the CPU hasn't reached
-// that region yet — defer the upload and retry on the next bind.
+// This check is ONLY called when cpu_write_count == 0 (image has never received a
+// page-fault, meaning the CPU hasn't started writing this slot yet at all). Once
+// cpu_write_count > 0, we skip the check to avoid false deferrals on legitimate
+// 0xff000000 (opaque-black) or 0x00000000 (transparent) LUT entries.
 //
-// We check the second half only (not the head) because:
-//   - The head is written first, so it looks valid even mid-write.
-//   - Real LUT data will not have 64 consecutive identical ARGB values anywhere
-//     in a color grading table — this avoids false positives on valid data.
-//
-// Single-dword checks would false-positive on legitimate opaque-black (0xff000000)
-// or transparent (0x00000000) LUT entries, so we require the entire window to be
-// uniform before declaring the buffer uninitialized.
+// Full-scan exits on first hit. At ~128KB it costs ~16µs at 8GB/s — negligible
+// compared to the upload cost of ~100–500µs.
 bool LooksUninitializedLUT(const u32* data, u32 guest_size_bytes) {
     if (!data || guest_size_bytes < sizeof(u32)) {
         return false;
     }
     const u32 total_dwords = guest_size_bytes / static_cast<u32>(sizeof(u32));
-    if (total_dwords < kLutWindowDwords * 2) {
-        // Buffer too small to split meaningfully — fall back to head check only.
-        const u32 first = data[0];
-        if (first != kLutInitPatternOpaque && first != kLutInitPatternZero) {
-            return false;
-        }
-        const u32 n = std::min(total_dwords, kLutWindowDwords);
-        return std::all_of(data + 1, data + n, [first](u32 v) { return v == first; });
-    }
-
-    // Sample windows at 50%, 66%, 75%, and 100% (tail) of the buffer.
-    // All are in the second half so the head's written data won't mask the race.
-    const u32 window_starts[4] = {
-        total_dwords / 2,
-        total_dwords * 2 / 3,
-        total_dwords * 3 / 4,
-        total_dwords - kLutWindowDwords,
-    };
-
-    for (const u32 off : window_starts) {
-        const u32 first = data[off];
-        if (first != kLutInitPatternOpaque && first != kLutInitPatternZero) {
-            continue; // this window has real data — not a uniform init region
-        }
-        if (std::all_of(data + off + 1, data + off + kLutWindowDwords,
-                        [first](u32 v) { return v == first; })) {
-            return true; // uniform init pattern found — CPU hasn't reached here yet
+    for (u32 i = 0; i < total_dwords; ++i) {
+        if (data[i] == kLutInitPatternOpaque || data[i] == kLutInitPatternZero) {
+            return true;
         }
     }
     return false;
@@ -215,6 +184,16 @@ void TextureCache::InvalidateMemory(VAddr addr, size_t size) {
             // Modified region overlaps image, so the image was definitely accessed by this fault.
             // Untrack the image, so that the range is unprotected and the guest can write freely.
             image.flags |= ImageFlagBits::CpuDirty;
+            // Increment write counter: this is the RPCS3-equivalent of tracking that the
+            // CPU has performed at least one real write to this image's memory region.
+            // RefreshImage checks this to gate the LUT uninitialised-pattern check.
+            ++image.cpu_write_count;
+            LOG_DEBUG(Render_Vulkan,
+                      "InvalidateMemory: CPU write #{} on image addr={:#x} size={:#x} "
+                      "fault_addr={:#x} fault_size={:#x} flags={:#x} is_volume={} is_tiled={}",
+                      image.cpu_write_count, image.info.guest_address, image.info.guest_size,
+                      addr, size, static_cast<u32>(image.flags),
+                      image.info.props.is_volume, image.info.props.is_tiled);
             UntrackImage(image_id);
         } else if (pages_end < image_end) {
             // This page access may or may not modify the image.
@@ -580,13 +559,54 @@ ImageId TextureCache::ExpandImage(const ImageInfo& info, ImageId image_id) {
     auto& src_image = slot_images[image_id];
     auto& new_image = slot_images[new_image_id];
 
-    RefreshImage(new_image);
+    // Propagate write counter so the new image inherits the CPU-write history of the
+    // source. Without this, the new image would have cpu_write_count == 0 and the LUT
+    // deferral check would incorrectly defer uploads for expanded LUT images that were
+    // previously uploaded successfully.
+    new_image.cpu_write_count = src_image.cpu_write_count;
+
+    LOG_DEBUG(Render_Vulkan,
+              "ExpandImage: addr={:#x} size={:#x} {} ({}L {}M) -> {} ({}L {}M) "
+              "src_gpu_modified={} src_cpu_writes={}",
+              info.guest_address, info.guest_size,
+              vk::to_string(src_image.info.pixel_format),
+              src_image.info.resources.layers, src_image.info.resources.levels,
+              vk::to_string(info.pixel_format),
+              info.resources.layers, info.resources.levels,
+              True(src_image.flags & ImageFlagBits::GpuModified),
+              src_image.cpu_write_count);
+
+    // Ordering fix for the RefreshImage → CopyImage race:
+    //
+    // Original order:  RefreshImage(new) → CopyImage(src → new)
+    // Problem: RefreshImage uploads fresh CPU data to ALL layers of new_image.
+    //          CopyImage then overwrites the layers covered by src_image with
+    //          potentially-stale GPU data. For a 3D LUT this means layer 0 ends
+    //          up with last-frame's GPU data instead of the freshly-written CPU data.
+    //
+    // Fix: CopyImage first (GPU data → new_image), then RefreshImage.
+    //      CopyImage only covers the layers/mips present in src_image. RefreshImage
+    //      then uploads CPU data for the newly-added layers/mips — without overwriting
+    //      what CopyImage just put in layer 0.
+    //
+    // For GPU-modified images, the CopyImage result IS the correct data for the shared
+    // layers, and RefreshImage's mip_hash check will see the GPU-written data matches
+    // the CPU copy and skip those layers anyway. No double-upload.
+    //
+    // For CPU-only images (no GpuModified), CopyImage copies the last-uploaded CPU
+    // data back into new_image, and RefreshImage skips those layers via mip_hashes
+    // (same content) — also fine.
     new_image.CopyImage(src_image);
 
-    // Propagate GpuModified flag: if the source had GPU-rendered content, so does the new image.
+    // Propagate GpuModified BEFORE RefreshImage so the mip_hashes protection path
+    // runs correctly for layers shared with src_image.
     if (True(src_image.flags & ImageFlagBits::GpuModified)) {
         new_image.flags |= ImageFlagBits::GpuModified;
     }
+
+    // Now upload CPU data for any layers not covered by src_image (the newly added ones).
+    // Layers already copied from src_image will be protected by the mip_hashes check.
+    RefreshImage(new_image);
 
     if (src_image.binding.is_bound || src_image.binding.is_target) {
         src_image.binding.needs_rebind = 1u;
@@ -679,8 +699,19 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_fmt) {
     }
     // Create and register a new image
     if (!image_id) {
+        LOG_DEBUG(Render_Vulkan,
+                  "FindImage: CREATE new addr={:#x} size={:#x} fmt={} {}x{}x{} mips={} layers={}",
+                  info.guest_address, info.guest_size, vk::to_string(info.pixel_format),
+                  info.size.width, info.size.height, info.size.depth,
+                  info.resources.levels, info.resources.layers);
         image_id = slot_images.insert(instance, scheduler, blit_helper, slot_image_views, info);
         RegisterImage(image_id);
+    } else {
+        LOG_TRACE(Render_Vulkan,
+                  "FindImage: REUSE addr={:#x} size={:#x} fmt={} {}x{}x{} mips={} layers={}",
+                  info.guest_address, info.guest_size, vk::to_string(info.pixel_format),
+                  info.size.width, info.size.height, info.size.depth,
+                  info.resources.levels, info.resources.layers);
     }
 
     Image& image = slot_images[image_id];
@@ -814,17 +845,34 @@ void TextureCache::RefreshImage(Image& image) {
     RENDERER_TRACE;
     TRACE_HINT(fmt::format("{:x}:{:x}", image.info.guest_address, image.info.guest_size));
 
+    LOG_DEBUG(Render_Vulkan,
+              "RefreshImage: addr={:#x} size={:#x} {}x{}x{} fmt={} mips={} layers={} "
+              "flags={:#x} gpu_modified={} gpu_dirty={} cpu_writes={} is_volume={} is_tiled={}",
+              image.info.guest_address, image.info.guest_size,
+              image.info.size.width, image.info.size.height, image.info.size.depth,
+              vk::to_string(image.info.pixel_format),
+              image.info.resources.levels, image.info.resources.layers,
+              static_cast<u32>(image.flags),
+              True(image.flags & ImageFlagBits::GpuModified),
+              True(image.flags & ImageFlagBits::GpuDirty),
+              image.cpu_write_count,
+              image.info.props.is_volume, image.info.props.is_tiled);
+
     if (True(image.flags & ImageFlagBits::MaybeCpuDirty) &&
         False(image.flags & ImageFlagBits::CpuDirty)) {
-        // The image size should be less than page size to be considered MaybeCpuDirty
-        // So this calculation should be very uncommon and reasonably fast
-        // For now we'll just check up to 64 first pixels
+        // The image size should be less than page size to be considered MaybeCpuDirty.
+        // Hash a region large enough to catch partial writes in volume textures.
         const auto addr = std::bit_cast<u8*>(image.info.guest_address);
-        const u32 w = std::min(image.info.size.width, u32(8));
-        const u32 h = std::min(image.info.size.height, u32(8));
-        const u32 size = w * h * image.info.num_bits >> (3 + image.info.props.is_block ? 4 : 0);
-        const u64 hash = XXH3_64bits(addr, size);
+        const u32 hash_size = image.info.props.is_volume
+            ? image.info.guest_size   // volume textures: hash the whole thing
+            : (std::min(image.info.size.width, u32(8)) *
+               std::min(image.info.size.height, u32(8)) *
+               image.info.num_bits >> (3 + image.info.props.is_block ? 4 : 0));
+        const u64 hash = XXH3_64bits(addr, hash_size);
         if (image.hash == hash) {
+            LOG_DEBUG(Render_Vulkan,
+                      "RefreshImage: MaybeCpuDirty hash unchanged addr={:#x} — skip upload",
+                      image.info.guest_address);
             image.flags &= ~ImageFlagBits::MaybeCpuDirty;
             return;
         }
@@ -837,19 +885,54 @@ void TextureCache::RefreshImage(Image& image) {
     const bool is_gpu_dirty = True(image.flags & ImageFlagBits::GpuDirty);
 
     // Race condition fix for linear volume textures (e.g. rotating 3D LUT pools).
-    // The game CPU writes LUT data to a rotating pool of addresses. shadPS4's GPU worker
-    // thread processes the command buffer asynchronously, so RefreshImage may read the
-    // memory before the CPU has finished writing. The init pattern (0xff000000 or 0x00000000)
-    // indicates the slot was just allocated but not yet filled. Defer the upload so the CPU
-    // has time to write real data. Leave Dirty set so we retry on the next bind.
+    //
+    // NHL 19 allocates a pool of 8 linear 32x32x32 RGBA8 LUT slots (~131KB each).
+    // The CPU memsets each slot to 0xff000000, then writes real color-grading data.
+    // shadPS4's GPU worker is async: UpdateImage installs mprotect then immediately
+    // calls RefreshImage — potentially before any CPU write has occurred at all.
+    //
+    // RPCS3 solution: track CPU write counts per texture section. A section with
+    // zero writes since creation is uninitialized. We implement the same approach:
+    //
+    //   cpu_write_count == 0: No page fault has ever fired on this image's range.
+    //     The CPU has NOT written yet. Apply the pattern scan — if any sentinel
+    //     dword survives, defer the upload and retry on the next bind.
+    //
+    //   cpu_write_count > 0: InvalidateMemory has fired at least once, meaning
+    //     the CPU has actually written to this memory region. Upload immediately,
+    //     regardless of content. The mip_hashes check below will still protect
+    //     GPU-resident data from accidental overwrites.
+    //
+    // This is superior to the old flag-state heuristic because:
+    //   - The ctor sets ALL dirty bits (MaybeCpuDirty|CpuDirty|GpuDirty), so
+    //     flag state CANNOT distinguish "just created" from "CPU wrote then more
+    //     dirty bits were OR'd in" — they look identical.
+    //   - cpu_write_count starts at 0 and is only ever incremented by
+    //     InvalidateMemory, so it correctly captures the first-ever CPU write.
     if (image.info.props.is_volume && !image.info.props.is_tiled) {
-        const auto* data = std::bit_cast<const u32*>(image.info.guest_address);
-        if (LooksUninitializedLUT(data, image.info.guest_size)) {
-            return;
+        if (image.cpu_write_count == 0) {
+            const auto* data = std::bit_cast<const u32*>(image.info.guest_address);
+            if (LooksUninitializedLUT(data, image.info.guest_size)) {
+                LOG_INFO(Render_Vulkan,
+                         "RefreshImage: LUT deferred (no CPU writes yet) "
+                         "addr={:#x} size={:#x} {}x{}x{} fmt={}",
+                         image.info.guest_address, image.info.guest_size,
+                         image.info.size.width, image.info.size.height, image.info.size.depth,
+                         vk::to_string(image.info.pixel_format));
+                return; // CPU hasn't written yet — defer, Dirty stays set, retry next bind
+            }
+            LOG_DEBUG(Render_Vulkan,
+                      "RefreshImage: LUT first upload (no prior CPU writes, "
+                      "pattern scan passed) addr={:#x}", image.info.guest_address);
+        } else {
+            LOG_DEBUG(Render_Vulkan,
+                      "RefreshImage: LUT upload after {} CPU write(s) addr={:#x}",
+                      image.cpu_write_count, image.info.guest_address);
         }
     }
 
     boost::container::small_vector<vk::BufferImageCopy, 14> image_copies;
+    u32 mips_skipped = 0;
     for (u32 m = 0; m < num_mips; m++) {
         const u32 width = std::max(image.info.size.width >> m, 1u);
         const u32 height = std::max(image.info.size.height >> m, 1u);
@@ -857,11 +940,17 @@ void TextureCache::RefreshImage(Image& image) {
             image.info.props.is_volume ? std::max(image.info.size.depth >> m, 1u) : 1u;
         const auto [mip_size, mip_pitch, mip_height, mip_offset] = image.info.mips_layout[m];
 
-        // Protect GPU modified resources from accidental CPU reuploads.
+        // Protect GPU-modified resources from accidental CPU reuploads.
+        // Hash each mip independently: if the CPU hasn't changed the data since the
+        // last GPU render into this image, skip the upload for that mip.
         if (is_gpu_modified && !is_gpu_dirty) {
             const u8* addr = std::bit_cast<u8*>(image.info.guest_address);
             const u64 hash = XXH3_64bits(addr + mip_offset, mip_size);
             if (image.mip_hashes[m] == hash) {
+                LOG_TRACE(Render_Vulkan,
+                          "RefreshImage: mip {} hash match — skip (gpu_modified, addr={:#x})",
+                          m, image.info.guest_address);
+                ++mips_skipped;
                 continue;
             }
             image.mip_hashes[m] = hash;
@@ -885,9 +974,21 @@ void TextureCache::RefreshImage(Image& image) {
     }
 
     if (image_copies.empty()) {
+        LOG_DEBUG(Render_Vulkan,
+                  "RefreshImage: all {} mip(s) skipped by hash match addr={:#x} — clear dirty",
+                  mips_skipped, image.info.guest_address);
         image.flags &= ~ImageFlagBits::Dirty;
         return;
     }
+
+    LOG_DEBUG(Render_Vulkan,
+              "RefreshImage: uploading {}/{} mips ({} skipped) addr={:#x} size={:#x} "
+              "fmt={} {}x{}x{} cpu_writes={}",
+              image_copies.size(), num_mips, mips_skipped,
+              image.info.guest_address, image.info.guest_size,
+              vk::to_string(image.info.pixel_format),
+              image.info.size.width, image.info.size.height, image.info.size.depth,
+              image.cpu_write_count);
 
     scheduler.EndRendering();
 
