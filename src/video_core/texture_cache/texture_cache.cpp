@@ -26,31 +26,43 @@ namespace {
 constexpr u32 kLutInitPatternOpaque = 0xff000000u;
 constexpr u32 kLutInitPatternZero   = 0x00000000u;
 
-// Scan a linear 3D LUT buffer for any dword still holding an init-pattern sentinel.
+// Detect whether a linear 3D LUT buffer is still in its initialisation state.
 //
 // NHL 19 allocates a pool of 8 linear 32×32×32 RGBA8 LUT slots (~131KB each).
-// The CPU memsets each slot to 0xff000000, then writes real color-grading data
-// sequentially. shadPS4's GPU worker is async: RefreshImage can fire while the CPU
-// is mid-write. Any surviving sentinel dword means the slot is not yet fully written.
+// Before writing real color-grading data the CPU memsets each slot uniformly to
+// either 0xff000000 (opaque black) or 0x00000000 (transparent black).
 //
-// This check is ONLY called when cpu_write_count == 0 (image has never received a
-// page-fault, meaning the CPU hasn't started writing this slot yet at all). Once
-// cpu_write_count > 0, we skip the check to avoid false deferrals on legitimate
-// 0xff000000 (opaque-black) or 0x00000000 (transparent) LUT entries.
+// This check is ONLY called when cpu_write_count == 0 (no page-fault has fired,
+// meaning the CPU has not yet dirtied this image's memory range). Once the CPU
+// starts writing, cpu_write_count > 0 and we skip this entirely, allowing uploads
+// even when the LUT legitimately contains 0xff000000 or 0x00000000 entries.
 //
-// Full-scan exits on first hit. At ~128KB it costs ~16µs at 8GB/s — negligible
-// compared to the upload cost of ~100–500µs.
+// CORRECTNESS NOTE: we require ALL dwords to equal the same sentinel value.
+// A real color-grading LUT will always contain variation (different RGB values
+// for different input colours), so a perfectly-uniform buffer is the only reliable
+// signal that the CPU hasn't written real data yet.
+//
+// The old element-level check ("return true if any dword matches a sentinel") was
+// inverted: it deferred a real LUT the moment it contained a single opaque-black
+// or transparent texel, which is routine in colour-grading curves near the black
+// point. That caused every LUT with a dark crush to stay black indefinitely.
 bool LooksUninitializedLUT(const u32* data, u32 guest_size_bytes) {
     if (!data || guest_size_bytes < sizeof(u32)) {
         return false;
     }
     const u32 total_dwords = guest_size_bytes / static_cast<u32>(sizeof(u32));
-    for (u32 i = 0; i < total_dwords; ++i) {
-        if (data[i] == kLutInitPatternOpaque || data[i] == kLutInitPatternZero) {
-            return true;
+    const u32 first = data[0];
+    // Only treat as uninitialised when the first dword is itself a sentinel.
+    if (first != kLutInitPatternOpaque && first != kLutInitPatternZero) {
+        return false;
+    }
+    // Require every dword to equal `first`.  Any variation means real data.
+    for (u32 i = 1; i < total_dwords; ++i) {
+        if (data[i] != first) {
+            return false;
         }
     }
-    return false;
+    return true;
 }
 
 } // anonymous namespace
