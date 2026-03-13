@@ -294,7 +294,24 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
                                VAddr cpu_address) {
     auto desc = VideoCore::TextureCache::ImageDesc{attribute, cpu_address};
     const auto image_id = texture_cache.FindImage(desc);
-    texture_cache.UpdateImage(image_id);
+    // Do NOT call UpdateImage here.
+    //
+    // The sceVideoOut display buffer is a GPU-rendered image: the game's own 3D pipeline
+    // writes its final output into the device-local VkImage registered at cpu_address.
+    // UpdateImage → RefreshImage → ObtainBufferForImage reads the CPU-mapped VkBuffer
+    // that backs the same PS4 guest address, but that buffer contains only the raw
+    // *tiled* PS4 framebuffer data — NOT the rendered pixel output.  The game's rendering
+    // commands write exclusively to the device-local VkImage; the host-side VkBuffer is
+    // never updated with finished pixel data.  Calling UpdateImage therefore:
+    //   (a) reads garbage / stale tiled data from the CPU buffer,
+    //   (b) runs DetileImage on it (another compute dispatch), and
+    //   (c) uploads the garbage, overwriting the correctly rendered VkImage content.
+    // The result is the VkImage contains whatever was last in host memory (zeros or an
+    // old frame's tiled data) rather than the game's rendered output → black screen.
+    //
+    // The VkImage in the texture cache already holds the current rendered frame thanks to
+    // the game's own rendering passes.  All we need to do is Transit it to
+    // ShaderReadOnlyOptimal (done below) and hand it to fsr_pass / pp_pass.
 
     Frame* frame = GetRenderFrame();
 
