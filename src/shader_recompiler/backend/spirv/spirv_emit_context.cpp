@@ -380,6 +380,15 @@ void EmitContext::DefineInputs() {
             sample_index = DefineVariable(U32[1], spv::BuiltIn::SampleId, spv::StorageClass::Input);
             Decorate(sample_index, spv::Decoration::Flat);
         }
+        // KHR_fragment_shader_barycentric provides three distinct built-ins for each
+        // perspective/no-persp × center/centroid/sample combination.  Each is a separate
+        // SPIR-V variable carrying the same BuiltIn enum but differentiated by the
+        // Centroid or Sample decoration.  Omitting those decorations (the old code had
+        // them commented out) caused all three smooth variants to alias the same
+        // center-sample variable, which (a) produces wrong results for centroid/sample
+        // shading and (b) emits duplicate BuiltIn decorations when more than one variant
+        // is loaded in the same shader – a SPIR-V validation error that can silently
+        // produce all-black output on strict drivers.
         if (info.loads.GetAny(IR::Attribute::BaryCoordSmooth)) {
             if (profile.supports_amd_shader_explicit_vertex_parameter) {
                 bary_coord_smooth = DefineVariable(F32[2], spv::BuiltIn::BaryCoordSmoothAMD,
@@ -387,6 +396,7 @@ void EmitContext::DefineInputs() {
             } else if (profile.supports_fragment_shader_barycentric) {
                 bary_coord_smooth =
                     DefineVariable(F32[3], spv::BuiltIn::BaryCoordKHR, spv::StorageClass::Input);
+                // No qualifier decoration – this is the center-sample (default) variant.
             }
         }
         if (info.loads.GetAny(IR::Attribute::BaryCoordSmoothCentroid)) {
@@ -396,7 +406,7 @@ void EmitContext::DefineInputs() {
             } else if (profile.supports_fragment_shader_barycentric) {
                 bary_coord_smooth_centroid =
                     DefineVariable(F32[3], spv::BuiltIn::BaryCoordKHR, spv::StorageClass::Input);
-                // Decorate(bary_coord_smooth_centroid, spv::Decoration::Centroid);
+                Decorate(bary_coord_smooth_centroid, spv::Decoration::Centroid);
             }
         }
         if (info.loads.GetAny(IR::Attribute::BaryCoordSmoothSample)) {
@@ -406,7 +416,7 @@ void EmitContext::DefineInputs() {
             } else if (profile.supports_fragment_shader_barycentric) {
                 bary_coord_smooth_sample =
                     DefineVariable(F32[3], spv::BuiltIn::BaryCoordKHR, spv::StorageClass::Input);
-                // Decorate(bary_coord_smooth_sample, spv::Decoration::Sample);
+                Decorate(bary_coord_smooth_sample, spv::Decoration::Sample);
             }
         }
         if (info.loads.GetAny(IR::Attribute::BaryCoordNoPersp)) {
