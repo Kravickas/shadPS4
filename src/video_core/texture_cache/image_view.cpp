@@ -98,12 +98,18 @@ ImageView::ImageView(const Vulkan::Instance& instance, const ImageViewInfo& info
     // When sampling D32/D16 texture from shader, the T# specifies R32/R16 format so adjust it.
     vk::Format format = info.format;
     vk::ImageAspectFlags aspect = image.aspect_mask;
-    if (image.aspect_mask & vk::ImageAspectFlagBits::eDepth &&
-        Vulkan::LiverpoolToVK::IsFormatDepthCompatible(format)) {
-        format = image.info.pixel_format;
+    if (image.aspect_mask & vk::ImageAspectFlagBits::eDepth) {
+        // The image is a depth image.  Always use the depth aspect — never COLOR_BIT.
+        // The shader T# may request R32_SFLOAT (depth-compatible), in which case we
+        // promote the view format to D32_SFLOAT so the driver sees a consistent pair.
+        // If the T# requests a non-depth-compatible format (e.g. because is_depth was
+        // not set in the shader resource desc), we still keep eDepth to avoid the
+        // validation error: "depth image with COLOR_BIT aspect".
+        if (Vulkan::LiverpoolToVK::IsFormatDepthCompatible(format)) {
+            format = image.info.pixel_format;
+        }
         aspect = vk::ImageAspectFlagBits::eDepth;
-    }
-    if (image.aspect_mask & vk::ImageAspectFlagBits::eStencil &&
+    } else if (image.aspect_mask & vk::ImageAspectFlagBits::eStencil &&
         Vulkan::LiverpoolToVK::IsFormatStencilCompatible(format)) {
         format = image.info.pixel_format;
         aspect = vk::ImageAspectFlagBits::eStencil;
