@@ -443,12 +443,21 @@ void EmitContext::DefineInputs() {
             const u32 num_components = info.loads.NumComponents(param);
             const auto [primary, auxiliary] = info.fs_interpolation[i];
             const Id type = F32[num_components];
+            const auto bind_location = input.param_index + (has_clip_distance_inputs ? 1 : 0);
             const Id attr_id = [&] {
-                const auto bind_location = input.param_index + (has_clip_distance_inputs ? 1 : 0);
                 if (primary == Qualifier::PerVertex &&
                     profile.supports_fragment_shader_barycentric) {
-                    return Name(DefineInput(TypeArray(type, ConstU32(3U)), bind_location),
-                                fmt::format("fs_in_attr{}_p", i));
+                    const Id id = Name(DefineInput(TypeArray(type, ConstU32(3U)), bind_location),
+                                       fmt::format("fs_in_attr{}_p", i));
+                    // DefineInput(type, location) should emit Location decoration, but the
+                    // generated SPIR-V shows spv::Decoration::Index (30) on PerVertexKHR
+                    // input variables instead of spv::Decoration::Location (33).
+                    // Without a Location decoration the driver cannot link the PerVertex
+                    // inputs to any vertex shader output → all three vertex values read as
+                    // zero → manual interpolation outputs zero for every fragment → black.
+                    // Explicitly re-emit Location here to guarantee correct linkage.
+                    Decorate(id, spv::Decoration::Location, bind_location);
+                    return id;
                 }
                 return Name(DefineInput(type, bind_location), fmt::format("fs_in_attr{}", i));
             }();
