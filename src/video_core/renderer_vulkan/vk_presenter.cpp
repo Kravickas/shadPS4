@@ -569,8 +569,15 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame) {
             },
         };
 
+        // dstStageMask must include eFragmentShader: ImGui samples frame->image in its
+        // fragment shader (via ImGui::Image / frame->imgui_texture).  Using only
+        // eColorAttachmentOutput as the destination stage covers color-attachment reads
+        // but NOT shader reads — the GPU is not required to wait for pp_pass to finish
+        // writing frame->image before ImGui's fragment shader samples it, producing a
+        // black or stale frame.  Adding eFragmentShader closes the hazard.
         cmdbuf.pipelineBarrier(vk::PipelineStageFlagBits::eColorAttachmentOutput,
-                               vk::PipelineStageFlagBits::eColorAttachmentOutput,
+                               vk::PipelineStageFlagBits::eColorAttachmentOutput |
+                                   vk::PipelineStageFlagBits::eFragmentShader,
                                vk::DependencyFlagBits::eByRegion, {}, {}, pre_barriers);
 
         { // Draw the game
