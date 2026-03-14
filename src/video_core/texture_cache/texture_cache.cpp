@@ -269,6 +269,14 @@ void TextureCache::InvalidateMemoryFromGPU(VAddr address, size_t max_size) {
         if (image.info.guest_address != address) {
             return;
         }
+        // VideoOut display buffers are exclusively GPU-rendered: the CPU never writes
+        // valid pixel data into them.  GPU-side buffer writes (e.g. the game's own
+        // composite compute shader) must not mark the VO image as needing a CPU
+        // re-upload — that would cause RefreshImage to overwrite the correctly rendered
+        // GPU content with garbage from the CPU-mapped buffer on the next access.
+        if (image.usage.vo_surface) {
+            return;
+        }
         // Ensure image is reuploaded when accessed again.
         image.flags |= ImageFlagBits::GpuDirty;
     });
@@ -886,6 +894,15 @@ ImageView& TextureCache::FindDepthTarget(ImageId image_id, const ImageDesc& desc
 
 void TextureCache::RefreshImage(Image& image) {
     if (False(image.flags & ImageFlagBits::Dirty) || image.info.num_samples > 1) {
+        return;
+    }
+    // VideoOut display buffers are exclusively GPU-rendered.  Their pixel content is
+    // written by the game's own rendering pipeline and composite shaders — never by the
+    // CPU.  Uploading from the CPU-mapped VkBuffer (ObtainBufferForImage) would
+    // overwrite the GPU-rendered content with zeros or stale tiled data.
+    // Skip the upload entirely; Transit() in PrepareFrame is all that is needed.
+    if (image.usage.vo_surface) {
+        image.flags &= ~ImageFlagBits::Dirty;
         return;
     }
 
