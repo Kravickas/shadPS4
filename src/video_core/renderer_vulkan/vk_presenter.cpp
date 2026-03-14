@@ -536,7 +536,12 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame) {
             },
             vk::ImageMemoryBarrier{
                 .srcAccessMask = vk::AccessFlagBits::eColorAttachmentWrite,
-                .dstAccessMask = vk::AccessFlagBits::eColorAttachmentRead,
+                // Must be eShaderRead: ImGui reads frame->image as a sampled texture
+                // in its fragment shader.  eColorAttachmentRead only covers
+                // blend/attachment reads, not shader sampler reads — so the GPU
+                // was not required to flush pp_pass writes before ImGui sampled the
+                // image, producing a black or stale frame.
+                .dstAccessMask = vk::AccessFlagBits::eShaderRead,
                 .oldLayout = vk::ImageLayout::eGeneral,
                 .newLayout = vk::ImageLayout::eShaderReadOnlyOptimal,
                 .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
