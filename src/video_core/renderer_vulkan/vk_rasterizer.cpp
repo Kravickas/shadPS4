@@ -859,11 +859,28 @@ RenderState Rasterizer::BeginRendering(const GraphicsPipeline* pipeline) {
         ASSERT(desc.view_info.range.extent.levels == 1 && !image.binding.needs_rebind);
 
         const bool has_stencil = image.info.props.has_stencil;
-        const auto new_layout = desc.view_info.is_storage
-                                    ? has_stencil ? vk::ImageLayout::eDepthStencilAttachmentOptimal
-                                                  : vk::ImageLayout::eDepthAttachmentOptimal
-                                : has_stencil ? vk::ImageLayout::eDepthStencilReadOnlyOptimal
-                                              : vk::ImageLayout::eDepthReadOnlyOptimal;
+        // Stencil writes are needed if writeMask is non-zero on either face.
+        // Using DepthStencilReadOnlyOptimal when stencil passOp=REPLACE and writeMask!=0
+        // triggers VUID-vkCmdDrawIndexed-None-06887.  Use the split layouts instead:
+        //  - depth write + stencil write → DepthStencilAttachmentOptimal
+        //  - depth write + stencil read  → DepthAttachmentStencilReadOnlyOptimal (no stencil)
+        //  - depth read  + stencil write → DepthReadOnlyStencilAttachmentOptimal
+        //  - depth read  + stencil read  → DepthStencilReadOnlyOptimal / DepthReadOnlyOptimal
+        const bool depth_write = desc.view_info.is_storage;
+        const bool stencil_write = has_stencil &&
+            (regs.stencil_ref_front.stencil_write_mask != 0 ||
+             regs.stencil_ref_back.stencil_write_mask != 0);
+        const auto new_layout = [&] {
+            if (depth_write) {
+                return has_stencil ? vk::ImageLayout::eDepthStencilAttachmentOptimal
+                                   : vk::ImageLayout::eDepthAttachmentOptimal;
+            } else if (stencil_write) {
+                return vk::ImageLayout::eDepthReadOnlyStencilAttachmentOptimal;
+            } else {
+                return has_stencil ? vk::ImageLayout::eDepthStencilReadOnlyOptimal
+                                   : vk::ImageLayout::eDepthReadOnlyOptimal;
+            }
+        }();
         image.Transit(new_layout,
                       vk::AccessFlagBits2::eDepthStencilAttachmentWrite |
                           vk::AccessFlagBits2::eDepthStencilAttachmentRead,
