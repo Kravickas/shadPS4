@@ -316,7 +316,20 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
 
     Frame* frame = GetRenderFrame();
 
-    const auto frame_subresources = vk::ImageSubresourceRange{
+    // If GetRenderFrame() could not recreate the frame (zero expected dimensions on
+    // the very first flip, before SetExpectedGameSize has run), frame->image is null.
+    // Recording Vulkan commands against null handles is undefined behaviour.
+    // Return the frame as-is; Present() will receive it and draw a blank until the
+    // next flip provides a valid frame.
+    if (!frame->image) {
+        frame->ready_semaphore = draw_scheduler.GetMasterSemaphore()->Handle();
+        frame->ready_tick = draw_scheduler.CurrentTick();
+        SubmitInfo info{};
+        draw_scheduler.Flush(info);
+        return frame;
+    }
+
+
         .aspectMask = vk::ImageAspectFlagBits::eColor,
         .baseMipLevel = 0,
         .levelCount = 1,
@@ -580,10 +593,20 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame) {
         // but NOT shader reads — the GPU is not required to wait for pp_pass to finish
         // writing frame->image before ImGui's fragment shader samples it, producing a
         // black or stale frame.  Adding eFragmentShader closes the hazard.
-        cmdbuf.pipelineBarrier(vk::PipelineStageFlagBits::eColorAttachmentOutput,
-                               vk::PipelineStageFlagBits::eColorAttachmentOutput |
-                                   vk::PipelineStageFlagBits::eFragmentShader,
-                               vk::DependencyFlagBits::eByRegion, {}, {}, pre_barriers);
+        //
+        // When frame->image is null (first flip, before RecreateFrame has run),
+        // only submit the swapchain image barrier to avoid a null-handle barrier.
+        if (frame->image) {
+            cmdbuf.pipelineBarrier(vk::PipelineStageFlagBits::eColorAttachmentOutput,
+                                   vk::PipelineStageFlagBits::eColorAttachmentOutput |
+                                       vk::PipelineStageFlagBits::eFragmentShader,
+                                   vk::DependencyFlagBits::eByRegion, {}, {}, pre_barriers);
+        } else {
+            cmdbuf.pipelineBarrier(vk::PipelineStageFlagBits::eColorAttachmentOutput,
+                                   vk::PipelineStageFlagBits::eColorAttachmentOutput,
+                                   vk::DependencyFlagBits::eByRegion, {}, {},
+                                   pre_barriers[0]); // swapchain barrier only
+        }
 
         { // Draw the game
             ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2{0.0f});
@@ -703,9 +726,20 @@ Frame* Presenter::GetRenderFrame() {
         }
     }
 
-    if (frame->width != expected_frame_width || frame->height != expected_frame_height ||
-        frame->is_hdr != swapchain.GetHDR()) {
-        RecreateFrame(frame, expected_frame_width, expected_frame_height);
+    // Recreate the frame image when dimensions change, HDR mode changes, or the image
+    // has never been created yet (frame->image is null on first use).
+    // Guard against zero dimensions: expected_frame_width/height start at 0 because
+    // expected_ratio is 0.0f until PrepareFrame runs on the GPU thread and sets it.
+    // If we call RecreateFrame(0, 0) the VkImage creation fails.  Defer creation
+    // until we have a valid size.  PrepareFrame will call GetRenderFrame() again on
+    // the next flip, at which point SetExpectedGameSize will have been called with
+    // the real content-area size and expected_ratio will be non-zero.
+    const bool needs_recreate = frame->width != static_cast<u32>(expected_frame_width) ||
+                                frame->height != static_cast<u32>(expected_frame_height) ||
+                                frame->is_hdr != swapchain.GetHDR() || !frame->image;
+    if (needs_recreate && expected_frame_width > 0 && expected_frame_height > 0) {
+        RecreateFrame(frame, static_cast<u32>(expected_frame_width),
+                      static_cast<u32>(expected_frame_height));
     }
 
     return frame;
