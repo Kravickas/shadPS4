@@ -117,14 +117,19 @@ Presenter::Presenter(Frontend::WindowSDL& window_, AmdGpu::Liverpool* liverpool_
     // Seed the expected dimensions from the swapchain so GetRenderFrame() calls
     // RecreateFrame on the very first flip, before SetExpectedGameSize() has run.
     // Without this seed, expected_frame_width/height stay 0, the 0==0 comparison
-    // in the old guard means RecreateFrame is never called, frame->image stays null,
+    // in the guard means RecreateFrame is never called, frame->image stays null,
     // and pp_pass records commands against a null VkImageView → black screen.
+    // NOTE: RecreateFrame itself is NOT called here because ImGui's descriptor pool
+    // is not yet initialised at this point — AddTexture would receive a null pool
+    // and frame->imgui_texture would end up null.  The !frame->image guard in
+    // GetRenderFrame() will call RecreateFrame on the first flip, by which time
+    // ImGui is fully initialised.
     expected_frame_width  = static_cast<s32>(swapchain.GetWidth());
     expected_frame_height = static_cast<s32>(swapchain.GetHeight());
     expected_ratio = static_cast<float>(swapchain.GetWidth()) /
                      static_cast<float>(swapchain.GetHeight());
 
-    // Create presentation frames and immediately allocate their backing images.
+    // Create presentation frames (image allocation deferred to first GetRenderFrame call).
     present_frames.resize(num_images);
     for (u32 i = 0; i < num_images; i++) {
         Frame& frame = present_frames[i];
@@ -132,8 +137,6 @@ Presenter::Presenter(Frontend::WindowSDL& window_, AmdGpu::Liverpool* liverpool_
         auto fence = Check<"create present done fence">(
             device.createFence({.flags = vk::FenceCreateFlagBits::eSignaled}));
         frame.present_done = fence;
-        RecreateFrame(&frame, static_cast<u32>(expected_frame_width),
-                      static_cast<u32>(expected_frame_height));
         free_queue.push(&frame);
     }
 
