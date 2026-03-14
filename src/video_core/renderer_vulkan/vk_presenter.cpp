@@ -3,6 +3,7 @@
 
 #include "common/config.h"
 #include "common/debug.h"
+#include "common/logging/log.h"
 #include "common/elf_info.h"
 #include "common/singleton.h"
 #include "core/debug_state.h"
@@ -341,14 +342,36 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
         .pImageMemoryBarriers = &pre_barrier,
     });
 
+    auto& image = texture_cache.GetImage(image_id);
+
+    // Diagnostic: log what image we found and whether it has GPU-rendered content.
+    // On first invocation image should already be GpuModified (the game rendered into
+    // it before the PatchedFlip).  Layout should be eGeneral (cs_dae98450 wrote it as
+    // a storage image).  If gpu_modified=0 or layout=eUndefined the display buffer image
+    // and the one the game rendered into are not the same object – investigate FindImage.
+    LOG_INFO(Render_Vulkan,
+             "PrepareFrame: addr={:#x} id={} gpu_modified={} flags={:#x} layout={}",
+             cpu_address, image_id.index,
+             True(image.flags & VideoCore::ImageFlagBits::GpuModified),
+             static_cast<u32>(image.flags),
+             vk::to_string(image.backing ? image.backing->state.layout
+                                         : vk::ImageLayout::eUndefined));
+
+    // Transition the display buffer to ShaderReadOnlyOptimal BEFORE obtaining the view.
+    // This ensures the image barrier is recorded into the command buffer ahead of any
+    // sampler access, and that Transit() can observe the correct source layout from
+    // the last GPU write (eGeneral after the game's composite CS).
+    image.Transit(vk::ImageLayout::eShaderReadOnlyOptimal, vk::AccessFlagBits2::eShaderRead, {});
+
     VideoCore::ImageViewInfo view_info{};
     view_info.format = GetFrameViewFormat(attribute.attrib.pixel_format);
     // Exclude alpha from output frame to avoid blending with UI.
     view_info.mapping.a = vk::ComponentSwizzle::eOne;
 
-    auto& image = texture_cache.GetImage(image_id);
     auto image_view = *image.FindView(view_info).image_view;
-    image.Transit(vk::ImageLayout::eShaderReadOnlyOptimal, vk::AccessFlagBits2::eShaderRead, {});
+    LOG_INFO(Render_Vulkan, "PrepareFrame: view={} fmt={}",
+             (VkImageView)image_view != VK_NULL_HANDLE ? "valid" : "NULL",
+             vk::to_string(view_info.format));
 
     const vk::Extent2D image_size = {image.info.size.width, image.info.size.height};
     expected_ratio = static_cast<float>(image_size.width) / static_cast<float>(image_size.height);
