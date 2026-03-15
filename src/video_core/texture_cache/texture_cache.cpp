@@ -990,16 +990,23 @@ void TextureCache::RefreshImage(Image& image) {
             const auto* data = std::bit_cast<const u32*>(image.info.guest_address);
             if (LooksUninitializedLUT(data, image.info.guest_size)) {
                 LOG_INFO(Render_Vulkan,
-                         "RefreshImage: LUT deferred (no CPU writes yet) "
+                         "RefreshImage: LUT deferred (no CPU writes yet, uniform sentinel) "
                          "addr={:#x} size={:#x} {}x{}x{} fmt={}",
                          image.info.guest_address, image.info.guest_size,
                          image.info.size.width, image.info.size.height, image.info.size.depth,
                          vk::to_string(image.info.pixel_format));
                 return; // CPU hasn't written yet — defer, Dirty stays set, retry next bind
             }
-            LOG_DEBUG(Render_Vulkan,
-                      "RefreshImage: LUT first upload (no prior CPU writes, "
-                      "pattern scan passed) addr={:#x}", image.info.guest_address);
+            // Data passes the pattern scan (has real content) — upload now even though
+            // no CPU page-fault was observed.  Some games write LUTs early in boot via
+            // DMA or with page tracking disabled; without this path those LUTs would
+            // stay black forever because cpu_write_count never increments.
+            LOG_INFO(Render_Vulkan,
+                     "RefreshImage: LUT force-upload (cpu_writes=0 but data looks real) "
+                     "addr={:#x} size={:#x} {}x{}x{} fmt={}",
+                     image.info.guest_address, image.info.guest_size,
+                     image.info.size.width, image.info.size.height, image.info.size.depth,
+                     vk::to_string(image.info.pixel_format));
         } else {
             LOG_DEBUG(Render_Vulkan,
                       "RefreshImage: LUT upload after {} CPU write(s) addr={:#x}",
