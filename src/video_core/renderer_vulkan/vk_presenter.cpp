@@ -167,6 +167,10 @@ bool Presenter::IsVideoOutSurface(const AmdGpu::ColorBuffer& color_buffer) const
 }
 
 void Presenter::RecreateFrame(Frame* frame, u32 width, u32 height) {
+    LOG_INFO(Render_Vulkan, "RecreateFrame: id={} {}x{} imgui_was={} image_was={}",
+             frame->id, width, height,
+             frame->imgui_texture ? "valid" : "null",
+             (VkImage)frame->image != VK_NULL_HANDLE ? "valid" : "null");
     const vk::Device device = instance.GetDevice();
     if (frame->imgui_texture) {
         ImGui::Vulkan::RemoveTexture(frame->imgui_texture);
@@ -231,6 +235,10 @@ void Presenter::RecreateFrame(Frame* frame, u32 width, u32 height) {
     frame->height = height;
 
     frame->imgui_texture = ImGui::Vulkan::AddTexture(view, vk::ImageLayout::eShaderReadOnlyOptimal);
+    LOG_INFO(Render_Vulkan, "RecreateFrame: id={} imgui_texture={} image_view={}",
+             frame->id,
+             frame->imgui_texture ? "valid" : "NULL - descriptor alloc failed!",
+             (VkImageView)view != VK_NULL_HANDLE ? "valid" : "NULL");
     frame->is_hdr = swapchain.GetHDR();
 }
 
@@ -665,6 +673,11 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame) {
                 };
 
                 ImGui::SetCursorPos(ImGui::GetCursorStartPos() + offset);
+                LOG_INFO(Render_Vulkan,
+                         "Present: frame->imgui_texture={} game_texture={} size={}x{}",
+                         frame->imgui_texture ? "valid" : "NULL",
+                         game_texture ? "valid" : "NULL",
+                         (int)size.x, (int)size.y);
                 ImGui::Image(game_texture, size);
 
                 if (Config::nullGpu()) {
