@@ -5,6 +5,7 @@
 
 #include "common/assert.h"
 #include "common/config.h"
+#include "common/logging/log.h"
 #include "video_core/host_shaders/fs_tri_vert.h"
 #include "video_core/host_shaders/post_process_frag.h"
 #include "video_core/renderer_vulkan/vk_platform.h"
@@ -16,6 +17,8 @@
 namespace Vulkan::HostPasses {
 
 void PostProcessingPass::Create(vk::Device device, const vk::Format surface_format) {
+    fmt::print("[pp_pass::Create] pipeline compiled for surface_format={}\n",
+               vk::to_string(surface_format));
     static const std::array pp_shaders{
         HostShaders::FS_TRI_VERT,
         HostShaders::POST_PROCESS_FRAG,
