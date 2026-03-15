@@ -183,6 +183,9 @@ void Presenter::RecreateFrame(Frame* frame, u32 width, u32 height) {
     }
 
     const vk::Format format = swapchain.GetSurfaceFormat().format;
+    LOG_INFO(Render_Vulkan,
+             "RecreateFrame: id={} {}x{} frame_format={} (pp_pass was created for same format)",
+             frame->id, width, height, vk::to_string(format));
     const vk::ImageCreateInfo image_info = {
         .flags = vk::ImageCreateFlagBits::eMutableFormat,
         .imageType = vk::ImageType::e2D,
