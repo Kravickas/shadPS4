@@ -446,6 +446,18 @@ std::tuple<ImageId, int, int> TextureCache::ResolveOverlap(const ImageInfo& imag
             return {ExpandImage(image_info, cache_image_id), -1, -1};
         }
 
+        // New image has FEWER resources (mips/layers) but a LARGER guest_size: the game
+        // has re-allocated the same address for a different image layout (e.g. 8x8 with
+        // 3 mips → 8x8 single-mip with extra padding).  The cached image is stale — free
+        // it so FindImage will create a new one that matches the current request.
+        if (image_info.resources < cache_image.info.resources &&
+            image_info.guest_size > cache_image.info.guest_size) {
+            if (safe_to_delete) {
+                FreeImage(cache_image_id);
+            }
+            return {merged_image_id, -1, -1};
+        }
+
         // Size is greater but resources are not, because the tiling mode is different.
         // Likely the address is reused for a image with a different tiling mode.
         if (image_info.tile_mode != cache_image.info.tile_mode) {
