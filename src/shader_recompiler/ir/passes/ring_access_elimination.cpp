@@ -93,17 +93,33 @@ void RingAccessElimination(const IR::Program& program, const RuntimeInfo& runtim
         info.gs_copy_data = Shader::ParseCopyShader(gs_info.vs_copy);
 
         u32 output_vertices = gs_info.output_vertices;
+        u32 ring_scale = 16u;
         if (info.gs_copy_data.output_vertices &&
             info.gs_copy_data.output_vertices != output_vertices) {
             ASSERT_MSG(gs_info.mode == AmdGpu::GsScenario::ScenarioG,
                        "Invalid geometry shader vertex configuration scenario = {}, max_vert_out = "
                        "{}, output_vertices = {}",
                        u32(gs_info.mode), output_vertices, info.gs_copy_data.output_vertices);
-            LOG_WARNING(Render_Vulkan,
-                        "GS MAX_VERT_OUT {} differs from copy shader output vertices {}, using "
-                        "copy shader value",
-                        output_vertices, info.gs_copy_data.output_vertices);
-            output_vertices = info.gs_copy_data.output_vertices;
+            if (output_vertices > info.gs_copy_data.output_vertices) {
+                LOG_WARNING(Render_Vulkan,
+                            "MAX_VERT_OUT {} is larger than actual output vertices {}",
+                            output_vertices, info.gs_copy_data.output_vertices);
+                output_vertices = info.gs_copy_data.output_vertices;
+            } else {
+                // GS writes at max_vert_out * 4 byte stride, copy shader reads at
+                // copy_verts * 64 byte stride. copy_verts = max_vert_out * num_invocations
+                // so ring_scale = (copy_verts * 64) / (max_vert_out * 4) = num_invocations * 16.
+                const u32 copy_space = info.gs_copy_data.output_vertices * 64u;
+                const u32 gs_space = output_vertices * 4u;
+                ASSERT_MSG(gs_space > 0 && (copy_space % gs_space) == 0,
+                           "GSVS ring scale not exact: copy_verts={}, max_vert_out={}",
+                           info.gs_copy_data.output_vertices, output_vertices);
+                ring_scale = copy_space / gs_space;
+                LOG_WARNING(Render_Vulkan,
+                            "GS ScenarioG: MAX_VERT_OUT {} with copy shader output vertices {} "
+                            "(multi-invocation ring, scale={})",
+                            output_vertices, info.gs_copy_data.output_vertices, ring_scale);
+            }
         }
 
         ForEachInstruction([&](IR::IREmitter& ir, IR::Inst& inst) {
@@ -142,7 +158,7 @@ void RingAccessElimination(const IR::Program& program, const RuntimeInfo& runtim
                 const auto comp_ofs = output_vertices * 4u;
                 const auto output_size = comp_ofs * gs_info.out_vertex_data_size;
 
-                const auto vc_read_ofs = (((offset / comp_ofs) * comp_ofs) % output_size) * 16u;
+                const auto vc_read_ofs = (((offset / comp_ofs) * comp_ofs) % output_size) * ring_scale;
                 const auto& it = info.gs_copy_data.attr_map.find(vc_read_ofs);
                 ASSERT(it != info.gs_copy_data.attr_map.cend());
                 const auto& [attr, comp] = it->second;
