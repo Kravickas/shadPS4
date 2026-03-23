@@ -4,6 +4,9 @@
 #include "common/assert.h"
 #include "common/elf_info.h"
 #include "common/logging/log.h"
+
+#include <atomic>
+
 #include "core/emulator_settings.h"
 #include "core/libraries/libs.h"
 #include "core/libraries/system/userservice.h"
@@ -342,19 +345,26 @@ s32 PS4_SYSV_ABI sceVideoOutGetBufferLabelAddress(s32 handle, uintptr_t* label_a
     return 16;
 }
 
-s32 sceVideoOutSubmitEopFlip(s32 handle, u32 buf_id, u32 mode, s64 flip_arg, void** unk) {
+static std::atomic<u32> s_next_flip_tag{1};
+
+s32 sceVideoOutSubmitEopFlip(s32 handle, u32 buf_id, u32 mode, s64 flip_arg, void** unk,
+                             u32& out_flip_tag) {
     auto* port = driver->GetPort(handle);
     if (!port) {
         return ORBIS_VIDEO_OUT_ERROR_INVALID_HANDLE;
     }
 
+    out_flip_tag = s_next_flip_tag++;
+
     Platform::IrqC::Instance()->RegisterOnce(
-        Platform::InterruptId::GfxFlip, [=](Platform::InterruptId irq) {
-            ASSERT_MSG(irq == Platform::InterruptId::GfxFlip, "An unexpected IRQ occured");
-            ASSERT_MSG(port->buffer_labels[buf_id] == 1, "Out of order flip IRQ");
+        Platform::InterruptId::GfxFlip,
+        [port, buf_id, flip_arg](Platform::InterruptId irq) {
             const auto result = driver->SubmitFlip(port, buf_id, flip_arg, true);
-            ASSERT_MSG(result, "EOP flip submission failed");
-        });
+            if (!result) {
+                LOG_ERROR(Lib_VideoOut, "EOP flip submission failed for buf {}", buf_id);
+            }
+        },
+        out_flip_tag);
 
     return ORBIS_OK;
 }

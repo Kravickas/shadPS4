@@ -2089,8 +2089,9 @@ static inline s32 PatchFlipRequest(u32* cmdbuf, u32 size, u32 vo_handle, u32 buf
                "Invalid flip packet");
     ASSERT_MSG(buf_idx != 0xffff'ffffu, "Invalid VO buffer index");
 
+    u32 flip_tag = 0;
     const s32 flip_result = VideoOut::sceVideoOutSubmitEopFlip(vo_handle, buf_idx, flip_mode,
-                                                               flip_arg, nullptr /*unk*/);
+                                                               flip_arg, nullptr /*unk*/, flip_tag);
     if (flip_result != 0) {
         if (flip_result == 0x80290012) {
             LOG_ERROR(Lib_GnmDriver, "Flip queue is full");
@@ -2118,10 +2119,12 @@ static inline s32 PatchFlipRequest(u32* cmdbuf, u32 size, u32 vo_handle, u32 buf
     if (backup[1] == PM4CmdNop::PayloadType::PrepareFlip) {
         nop->header = PM4Type3Header{PM4ItOpcode::Nop, 0x39};
         nop->data_block[0] = PM4CmdNop::PayloadType::PatchedFlip;
+        nop->data_block[1] = flip_tag;
     } else {
         if (backup[1] == PM4CmdNop::PayloadType::PrepareFlipLabel) {
             nop->header = PM4Type3Header{PM4ItOpcode::Nop, 0x34};
             nop->data_block[0] = PM4CmdNop::PayloadType::PatchedFlip;
+            nop->data_block[1] = flip_tag;
 
             // Write event to update label
             auto* write_label = reinterpret_cast<PM4CmdWriteData*>(cmdbuf + 0x3b);
@@ -2134,6 +2137,7 @@ static inline s32 PatchFlipRequest(u32* cmdbuf, u32 size, u32 vo_handle, u32 buf
         if (backup[1] == PM4CmdNop::PayloadType::PrepareFlipInterruptLabel) {
             nop->header = PM4Type3Header{PM4ItOpcode::Nop, 0x33};
             nop->data_block[0] = PM4CmdNop::PayloadType::PatchedFlip;
+            nop->data_block[1] = flip_tag;
 
             auto* write_eop = reinterpret_cast<PM4CmdEventWriteEop*>(cmdbuf + 0x3a);
             write_eop->header = PM4Type3Header{PM4ItOpcode::EventWriteEop, 4};
@@ -2146,6 +2150,7 @@ static inline s32 PatchFlipRequest(u32* cmdbuf, u32 size, u32 vo_handle, u32 buf
         if (backup[1] == PM4CmdNop::PayloadType::PrepareFlipInterrupt) {
             nop->header = PM4Type3Header{PM4ItOpcode::Nop, 0x33};
             nop->data_block[0] = PM4CmdNop::PayloadType::PatchedFlip;
+            nop->data_block[1] = flip_tag;
 
             auto* write_eop = reinterpret_cast<PM4CmdEventWriteEop*>(cmdbuf + 0x3a);
             write_eop->header = PM4Type3Header{PM4ItOpcode::EventWriteEop, 4};
