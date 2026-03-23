@@ -35,12 +35,16 @@ enum class InterruptId : u32 {
 using IrqHandler = std::function<void(InterruptId)>;
 
 struct IrqController {
-    void RegisterOnce(InterruptId irq, IrqHandler handler) {
+    void RegisterOnce(InterruptId irq, IrqHandler handler, u32 tag = 0) {
         ASSERT_MSG(static_cast<u32>(irq) <= static_cast<u32>(InterruptId::InterruptIdMax),
                    "Invalid IRQ number");
         auto& ctx = irq_contexts.try_emplace(irq).first->second;
         std::unique_lock lock{ctx.m_lock};
-        ctx.one_time_subscribers.emplace(handler);
+        if (tag != 0) {
+            ctx.tagged_subscribers[tag] = handler;
+        } else {
+            ctx.one_time_subscribers.emplace(handler);
+        }
     }
 
     void Register(InterruptId irq, IrqHandler handler, void* uid) {
@@ -62,23 +66,37 @@ struct IrqController {
         ctx.persistent_handlers.erase(uid);
     }
 
-    void Signal(InterruptId irq) {
+    void Signal(InterruptId irq, u32 tag = 0) {
         ASSERT_MSG(static_cast<u32>(irq) <= static_cast<u32>(InterruptId::InterruptIdMax),
                    "Unexpected IRQ signaled");
         auto& ctx = irq_contexts.try_emplace(irq).first->second;
-        std::unique_lock lock{ctx.m_lock};
 
-        LOG_TRACE(Core, "IRQ signaled: {}", magic_enum::enum_name(irq));
+        IrqHandler one_time_handler;
 
-        for (auto& [uid, h] : ctx.persistent_handlers) {
-            h(irq);
+        {
+            std::unique_lock lock{ctx.m_lock};
+
+            LOG_TRACE(Core, "IRQ signaled: {}", magic_enum::enum_name(irq));
+
+            for (auto& [uid, h] : ctx.persistent_handlers) {
+                h(irq);
+            }
+
+            // Look up by tag first, fall back to FIFO queue.
+            if (tag != 0) {
+                auto it = ctx.tagged_subscribers.find(tag);
+                if (it != ctx.tagged_subscribers.end()) {
+                    one_time_handler = std::move(it->second);
+                    ctx.tagged_subscribers.erase(it);
+                }
+            } else if (!ctx.one_time_subscribers.empty()) {
+                one_time_handler = std::move(ctx.one_time_subscribers.front());
+                ctx.one_time_subscribers.pop();
+            }
         }
 
-        if (!ctx.one_time_subscribers.empty()) {
-            const auto& h = ctx.one_time_subscribers.front();
-            h(irq);
-
-            ctx.one_time_subscribers.pop();
+        if (one_time_handler) {
+            one_time_handler(irq);
         }
     }
 
@@ -86,6 +104,7 @@ private:
     struct IrqContext {
         std::unordered_map<void*, IrqHandler> persistent_handlers{};
         std::queue<IrqHandler> one_time_subscribers{};
+        std::unordered_map<u32, IrqHandler> tagged_subscribers{};
         std::mutex m_lock{};
     };
     std::unordered_map<InterruptId, IrqContext> irq_contexts{};
