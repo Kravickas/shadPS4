@@ -359,6 +359,7 @@ s32 sceVideoOutSubmitEopFlip(s32 handle, u32 buf_id, u32 mode, s64 flip_arg, voi
     Platform::IrqC::Instance()->RegisterOnce(
         Platform::InterruptId::GfxFlip,
         [port, buf_id, flip_arg](Platform::InterruptId irq) {
+            ASSERT_MSG(port->buffer_labels[buf_id] == 1, "Out of order flip IRQ");
             const auto result = driver->SubmitFlip(port, buf_id, flip_arg, true);
             if (!result) {
                 LOG_ERROR(Lib_VideoOut, "EOP flip submission failed for buf {}", buf_id);
