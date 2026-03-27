@@ -152,8 +152,7 @@ void Liverpool::Process(std::stop_token stoken) {
                                "Buffer label not set at flip time for buf_id {}", flip->buf_id);
                     drv->EnqueueFlip(port, flip->buf_id, flip->flip_arg, true);
                 } else if (flip) {
-                    LOG_WARNING(Lib_GnmDriver,
-                                "EOP flip dropped — VideoOut port is not available");
+                    LOG_WARNING(Lib_GnmDriver, "EOP flip dropped — VideoOut port is not available");
                 }
             }
         }
