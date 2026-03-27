@@ -62,6 +62,11 @@ int VideoOutDriver::Open(const ServiceThreadParams* params) {
 }
 
 void VideoOutDriver::Close(s32 handle) {
+    // Drain all pending GPU submissions before closing.
+    // Must be done before taking mutex since the GPU thread needs it to
+    // enqueue flip requests.
+    liverpool->WaitGpuIdle();
+
     std::scoped_lock lock{mutex};
 
     main_port.is_open = false;
