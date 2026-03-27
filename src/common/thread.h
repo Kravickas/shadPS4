@@ -31,9 +31,7 @@ bool AccurateSleep(std::chrono::nanoseconds duration, std::chrono::nanoseconds* 
 
 class AccurateTimer {
     std::chrono::nanoseconds target_interval{};
-    std::chrono::nanoseconds total_wait{};
-
-    std::chrono::high_resolution_clock::time_point start_time;
+    std::chrono::high_resolution_clock::time_point next_tick;
 
 public:
     explicit AccurateTimer(std::chrono::nanoseconds target_interval);
@@ -43,7 +41,8 @@ public:
     void End();
 
     std::chrono::nanoseconds GetTotalWait() const {
-        return total_wait;
+        const auto now = std::chrono::high_resolution_clock::now();
+        return std::chrono::duration_cast<std::chrono::nanoseconds>(next_tick - now);
     }
 };
 
