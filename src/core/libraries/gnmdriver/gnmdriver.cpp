@@ -2081,7 +2081,7 @@ static inline s32 PatchFlipRequest(u32* cmdbuf, u32 size, u32 vo_handle, u32 buf
     // check for `prepareFlip` packet
     cmdbuf += size - 64;
     ASSERT_MSG(cmdbuf[0] == 0xc03e1000, "Can't find `prepareFlip` packet");
-    // PS4 accurate: returns error instead of crashing
+    // PS4 returns 0x80d11080 instead of crashing
     // if (cmdbuf[0] != 0xc03e1000) {
     //     LOG_ERROR(Lib_GnmDriver, "Can't find `prepareFlip` packet");
     //     return 0x80d11080; // SCE_GNM_ERROR_SUBMISSION_AND_FLIP_FAILED_INVALID_COMMAND_BUFFER
@@ -2174,8 +2174,8 @@ s32 PS4_SYSV_ABI sceGnmSubmitAndFlipCommandBuffers(u32 count, u32* dcb_gpu_addrs
 }
 
 // Shared submission loop. When flip has a value, it is associated with the
-// last command buffer in the batch — matching how the PS4 kernel ties a flip
-// to the submission that contains it.
+// last command buffer in the batch so the flip triggers after the final
+// command buffer completes.
 static s32 SubmitCommandBuffersInternal(u32 count, const u32* dcb_gpu_addrs[],
                                         u32* dcb_sizes_in_bytes, const u32* ccb_gpu_addrs[],
                                         u32* ccb_sizes_in_bytes,
