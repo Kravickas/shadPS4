@@ -28,7 +28,7 @@ class Rasterizer;
 namespace Libraries::VideoOut {
 struct VideoOutPort;
 class VideoOutDriver;
-}
+} // namespace Libraries::VideoOut
 
 namespace AmdGpu {
 
