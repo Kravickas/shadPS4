@@ -896,14 +896,18 @@ RenderState Rasterizer::BeginRendering(const GraphicsPipeline* pipeline) {
                           desc.view_info.range);
             attachment_feedback_loop = true;
         } else {
+            // PS4 controls depth and stencil writes independently. Pick the
+            // layout that matches the exact combination the game requests.
+            const bool depth_write = desc.view_info.is_storage;
             const bool stencil_write = has_stencil && regs.depth_control.stencil_enable;
             const auto new_layout =
-                desc.view_info.is_storage ? has_stencil
-                                                ? vk::ImageLayout::eDepthStencilAttachmentOptimal
-                                                : vk::ImageLayout::eDepthAttachmentOptimal
-                : stencil_write           ? vk::ImageLayout::eDepthReadOnlyStencilAttachmentOptimal
-                : has_stencil             ? vk::ImageLayout::eDepthStencilReadOnlyOptimal
-                                          : vk::ImageLayout::eDepthReadOnlyOptimal;
+                !has_stencil    ? depth_write ? vk::ImageLayout::eDepthAttachmentOptimal
+                                              : vk::ImageLayout::eDepthReadOnlyOptimal
+                : depth_write   ? stencil_write
+                                      ? vk::ImageLayout::eDepthStencilAttachmentOptimal
+                                      : vk::ImageLayout::eDepthAttachmentStencilReadOnlyOptimal
+                : stencil_write ? vk::ImageLayout::eDepthReadOnlyStencilAttachmentOptimal
+                                : vk::ImageLayout::eDepthStencilReadOnlyOptimal;
             image.Transit(new_layout,
                           vk::AccessFlagBits2::eDepthStencilAttachmentWrite |
                               vk::AccessFlagBits2::eDepthStencilAttachmentRead,
