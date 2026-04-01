@@ -887,8 +887,10 @@ RenderState Rasterizer::BeginRendering(const GraphicsPipeline* pipeline) {
         ASSERT(desc.view_info.range.extent.levels == 1 && !image.binding.needs_rebind);
 
         const bool has_stencil = image.info.props.has_stencil;
-        if (image.binding.is_bound && instance.IsAttachmentFeedbackLoopLayoutSupported()) {
-            image.Transit(vk::ImageLayout::eAttachmentFeedbackLoopOptimalEXT,
+        if (image.binding.is_bound) {
+            image.Transit(instance.IsAttachmentFeedbackLoopLayoutSupported()
+                              ? vk::ImageLayout::eAttachmentFeedbackLoopOptimalEXT
+                              : vk::ImageLayout::eGeneral,
                           vk::AccessFlagBits2::eDepthStencilAttachmentWrite |
                               vk::AccessFlagBits2::eDepthStencilAttachmentRead,
                           desc.view_info.range);
