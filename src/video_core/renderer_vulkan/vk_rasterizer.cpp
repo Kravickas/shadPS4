@@ -896,12 +896,14 @@ RenderState Rasterizer::BeginRendering(const GraphicsPipeline* pipeline) {
                           desc.view_info.range);
             attachment_feedback_loop = true;
         } else {
-            const auto new_layout = desc.view_info.is_storage
-                                        ? has_stencil
-                                              ? vk::ImageLayout::eDepthStencilAttachmentOptimal
-                                              : vk::ImageLayout::eDepthAttachmentOptimal
-                                    : has_stencil ? vk::ImageLayout::eDepthStencilReadOnlyOptimal
-                                                  : vk::ImageLayout::eDepthReadOnlyOptimal;
+            const bool stencil_write = has_stencil && regs.depth_control.stencil_enable;
+            const auto new_layout =
+                desc.view_info.is_storage ? has_stencil
+                                                ? vk::ImageLayout::eDepthStencilAttachmentOptimal
+                                                : vk::ImageLayout::eDepthAttachmentOptimal
+                : stencil_write           ? vk::ImageLayout::eDepthReadOnlyStencilAttachmentOptimal
+                : has_stencil             ? vk::ImageLayout::eDepthStencilReadOnlyOptimal
+                                          : vk::ImageLayout::eDepthReadOnlyOptimal;
             image.Transit(new_layout,
                           vk::AccessFlagBits2::eDepthStencilAttachmentWrite |
                               vk::AccessFlagBits2::eDepthStencilAttachmentRead,
