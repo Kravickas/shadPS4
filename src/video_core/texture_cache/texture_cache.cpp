@@ -545,7 +545,11 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_fmt) {
         if (cache_image.info.size != info.size) {
             continue;
         }
-        if (!IsVulkanFormatCompatible(cache_image.info.pixel_format, info.pixel_format) ||
+        const bool format_compatible =
+            IsVulkanFormatCompatible(cache_image.info.pixel_format, info.pixel_format) ||
+            (cache_image.info.props.is_depth && info.props.is_depth &&
+             cache_image.info.props.has_stencil && !info.props.has_stencil);
+        if (!format_compatible ||
             (cache_image.info.type != info.type && info.size != Extent3D{1, 1, 1})) {
             continue;
         }
@@ -699,6 +703,10 @@ ImageView& TextureCache::FindDepthTarget(ImageId image_id, const ImageDesc& desc
                                  }
                              });
         if (!stencil_id) {
+            LOG_WARNING(Render_Vulkan,
+                        "Creating stencil placeholder at addr={:#x} size={} for depth image "
+                        "at addr={:#x}",
+                        desc.info.stencil_addr, desc.info.stencil_size, desc.info.guest_address);
             ImageInfo info{};
             info.guest_address = desc.info.stencil_addr;
             info.guest_size = desc.info.stencil_size;
