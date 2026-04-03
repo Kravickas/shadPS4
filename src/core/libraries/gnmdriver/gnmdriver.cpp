@@ -19,7 +19,6 @@
 #include "core/libraries/libs.h"
 #include "core/libraries/videoout/video_out.h"
 #include "core/memory.h"
-#include "core/platform.h"
 #include "video_core/amdgpu/liverpool.h"
 #include "video_core/amdgpu/pm4_cmds.h"
 #include "video_core/renderer_vulkan/vk_presenter.h"
@@ -77,7 +76,7 @@ static u32 asc_next_offs_dw[Liverpool::NumComputeRings];
 static VAddr tessellation_factors_ring_addr = -1;
 static constexpr u32 tessellation_offchip_buffer_size = 0x800000u;
 
-static void ResetSubmissionLock(Platform::InterruptId irq) {
+static void ResetSubmissionLock(u32 irq_id) {
     std::unique_lock lock{m_submission};
     submission_lock = 0;
     cv_lock.notify_all();
@@ -117,10 +116,10 @@ static inline u32* ClearContextState(u32* cmdbuf) {
     return cmdbuf + ClearStateSequence.size();
 }
 
-static inline bool IsValidEventType(Platform::InterruptId id) {
-    return (static_cast<u32>(id) >= static_cast<u32>(Platform::InterruptId::Compute0RelMem) &&
-            static_cast<u32>(id) <= static_cast<u32>(Platform::InterruptId::Compute6RelMem)) ||
-           static_cast<u32>(id) == static_cast<u32>(Platform::InterruptId::GfxEop);
+static inline bool IsValidEventType(u32 id) {
+    return (id >= AmdGpu::Liverpool::IrqCompute0RelMem &&
+            id <= AmdGpu::Liverpool::IrqCompute6RelMem) ||
+           id == AmdGpu::Liverpool::IrqGfxEop;
 }
 
 s32 PS4_SYSV_ABI sceGnmAddEqEvent(OrbisKernelEqueue eq, u64 id, void* udata) {
@@ -141,10 +140,11 @@ s32 PS4_SYSV_ABI sceGnmAddEqEvent(OrbisKernelEqueue eq, u64 id, void* udata) {
 
     equeue->AddEvent(kernel_event);
 
-    Platform::IrqC::Instance()->Register(
-        static_cast<Platform::InterruptId>(id),
-        [=](Platform::InterruptId irq) {
-            ASSERT_MSG(irq == static_cast<Platform::InterruptId>(id), "An unexpected IRQ occured");
+    const u32 irq_id = static_cast<u32>(id);
+    liverpool->RegisterInterruptHandler(
+        irq_id,
+        [=](u32 irq) {
+            ASSERT_MSG(irq == irq_id, "An unexpected IRQ occured");
 
             // We need to convert IRQ# to event id
             if (!IsValidEventType(irq))
@@ -280,7 +280,7 @@ s32 PS4_SYSV_ABI sceGnmDeleteEqEvent(OrbisKernelEqueue eq, u64 id) {
 
     equeue->RemoveEvent(id, OrbisKernelEvent::Filter::GraphicsCore);
 
-    Platform::IrqC::Instance()->Unregister(static_cast<Platform::InterruptId>(id), equeue);
+    liverpool->UnregisterInterruptHandler(static_cast<u32>(id), equeue);
     return ORBIS_OK;
 }
 
@@ -2081,6 +2081,11 @@ static inline s32 PatchFlipRequest(u32* cmdbuf, u32 size, u32 vo_handle, u32 buf
     // check for `prepareFlip` packet
     cmdbuf += size - 64;
     ASSERT_MSG(cmdbuf[0] == 0xc03e1000, "Can't find `prepareFlip` packet");
+    // Per psdevwiki: real PS4 returns 0x80d11080 instead of crashing
+    // if (cmdbuf[0] != 0xc03e1000) {
+    //     LOG_ERROR(Lib_GnmDriver, "Can't find `prepareFlip` packet");
+    //     return 0x80d11080; // SCE_GNM_ERROR_SUBMISSION_AND_FLIP_FAILED_INVALID_COMMAND_BUFFER
+    // }
 
     std::array<u32, 7> backup{};
     std::memcpy(backup.data(), cmdbuf, backup.size() * sizeof(decltype(backup)::value_type));
@@ -2089,15 +2094,14 @@ static inline s32 PatchFlipRequest(u32* cmdbuf, u32 size, u32 vo_handle, u32 buf
                "Invalid flip packet");
     ASSERT_MSG(buf_idx != 0xffff'ffffu, "Invalid VO buffer index");
 
-    const s32 flip_result = VideoOut::sceVideoOutSubmitEopFlip(vo_handle, buf_idx, flip_mode,
-                                                               flip_arg, nullptr /*unk*/);
+    const s32 flip_result = liverpool->ReserveFlip();
     if (flip_result != 0) {
         if (flip_result == 0x80290012) {
             LOG_ERROR(Lib_GnmDriver, "Flip queue is full");
             return 0x80d11081;
         } else {
-            LOG_ERROR(Lib_GnmDriver, "Flip request failed");
-            return flip_result;
+            LOG_ERROR(Lib_GnmDriver, "Flip request failed with {:#x}", flip_result);
+            return 0x80d11082; // SCE_GNM_ERROR_SUBMISSION_AND_FLIP_FAILED_REQUEST_FAILED
         }
     }
 
@@ -2105,13 +2109,13 @@ static inline s32 PatchFlipRequest(u32* cmdbuf, u32 size, u32 vo_handle, u32 buf
     ASSERT_MSG(VideoOut::sceVideoOutGetBufferLabelAddress(vo_handle, &label_addr) == 16,
                "sceVideoOutGetBufferLabelAddress call failed");
 
-    // Write event to lock the VO surface
-    auto* write_lock = reinterpret_cast<PM4CmdWriteData*>(cmdbuf);
-    write_lock->header = PM4Type3Header{PM4ItOpcode::WriteData, 3};
-    write_lock->raw = 0x500u;
-    const auto addr = (label_addr + buf_idx * sizeof(label_addr)) & ~0x3ull;
-    write_lock->Address<uintptr_t>(addr);
-    write_lock->data[0] = 1;
+    // TEST: Skip WriteData for buffer label — Liverpool sets it at completion.
+    // If games break here, they poll buffer_labels during command buffer execution.
+    auto* nop_pad = reinterpret_cast<PM4CmdNop*>(cmdbuf);
+    nop_pad->header = PM4Type3Header{PM4ItOpcode::Nop, 3};
+    nop_pad->data_block[0] = 0;
+    nop_pad->data_block[1] = 0;
+    nop_pad->data_block[2] = 0;
 
     auto* nop = reinterpret_cast<PM4CmdNop*>(cmdbuf + 5);
 
@@ -2169,6 +2173,14 @@ s32 PS4_SYSV_ABI sceGnmSubmitAndFlipCommandBuffers(u32 count, u32* dcb_gpu_addrs
         vo_handle, buf_idx, flip_mode, flip_arg);
 }
 
+// Shared submission loop. When flip has a value, it is associated with the
+// last command buffer in the batch so the flip triggers after the final
+// command buffer completes.
+static s32 SubmitCommandBuffersInternal(u32 count, const u32* dcb_gpu_addrs[],
+                                        u32* dcb_sizes_in_bytes, const u32* ccb_gpu_addrs[],
+                                        u32* ccb_sizes_in_bytes,
+                                        std::optional<AmdGpu::Liverpool::FlipRequest> flip);
+
 s32 PS4_SYSV_ABI sceGnmSubmitAndFlipCommandBuffersForWorkload(
     u32 workload, u32 count, u32* dcb_gpu_addrs[], u32* dcb_sizes_in_bytes, u32* ccb_gpu_addrs[],
     u32* ccb_sizes_in_bytes, u32 vo_handle, u32 buf_idx, u32 flip_mode, s64 flip_arg) {
@@ -2183,9 +2195,10 @@ s32 PS4_SYSV_ABI sceGnmSubmitAndFlipCommandBuffersForWorkload(
         return patch_result;
     }
 
-    return sceGnmSubmitCommandBuffers(count, const_cast<const u32**>(dcb_gpu_addrs),
-                                      dcb_sizes_in_bytes, const_cast<const u32**>(ccb_gpu_addrs),
-                                      ccb_sizes_in_bytes);
+    return SubmitCommandBuffersInternal(count, const_cast<const u32**>(dcb_gpu_addrs),
+                                        dcb_sizes_in_bytes, const_cast<const u32**>(ccb_gpu_addrs),
+                                        ccb_sizes_in_bytes,
+                                        AmdGpu::Liverpool::FlipRequest{buf_idx, flip_arg});
 }
 
 int PS4_SYSV_ABI sceGnmSubmitCommandBuffersForWorkload(u32 workload, u32 count,
@@ -2193,6 +2206,14 @@ int PS4_SYSV_ABI sceGnmSubmitCommandBuffersForWorkload(u32 workload, u32 count,
                                                        u32* dcb_sizes_in_bytes,
                                                        const u32* ccb_gpu_addrs[],
                                                        u32* ccb_sizes_in_bytes) {
+    return SubmitCommandBuffersInternal(count, dcb_gpu_addrs, dcb_sizes_in_bytes, ccb_gpu_addrs,
+                                        ccb_sizes_in_bytes, std::nullopt);
+}
+
+static s32 SubmitCommandBuffersInternal(u32 count, const u32* dcb_gpu_addrs[],
+                                        u32* dcb_sizes_in_bytes, const u32* ccb_gpu_addrs[],
+                                        u32* ccb_sizes_in_bytes,
+                                        std::optional<AmdGpu::Liverpool::FlipRequest> flip) {
     HLE_TRACE;
     LOG_DEBUG(Lib_GnmDriver, "called");
 
@@ -2288,7 +2309,9 @@ int PS4_SYSV_ABI sceGnmSubmitCommandBuffersForWorkload(u32 workload, u32 count,
                 .base_addr = reinterpret_cast<uintptr_t>(ccb),
             });
         }
-        liverpool->SubmitGfx(dcb_span, ccb_span);
+        // Associate the flip with the last command buffer in the batch.
+        const bool is_last = (cbpair == count - 1);
+        liverpool->SubmitGfx(dcb_span, ccb_span, is_last ? flip : std::nullopt);
     }
 
     return ORBIS_OK;
@@ -2879,8 +2902,8 @@ void RegisterLib(Core::Loader::SymbolsResolver* sym) {
         liverpool->ReserveCopyBufferSpace();
     }
 
-    Platform::IrqC::Instance()->Register(Platform::InterruptId::GpuIdle, ResetSubmissionLock,
-                                         nullptr);
+    liverpool->RegisterInterruptHandler(AmdGpu::Liverpool::IrqGpuIdle, ResetSubmissionLock,
+                                        nullptr);
 
     LIB_FUNCTION("b0xyllnVY-I", "libSceGnmDriver", 1, "libSceGnmDriver", sceGnmAddEqEvent);
     LIB_FUNCTION("b08AgtPlHPg", "libSceGnmDriver", 1, "libSceGnmDriver", sceGnmAreSubmitsAllowed);
