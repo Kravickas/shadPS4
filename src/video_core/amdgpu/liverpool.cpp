@@ -10,9 +10,10 @@
 #include "core/debug_state.h"
 #include "core/emulator_settings.h"
 #include "core/libraries/kernel/process.h"
+#include "core/libraries/kernel/time.h"
 #include "core/libraries/videoout/driver.h"
+#include "core/libraries/videoout/videoout_error.h"
 #include "core/memory.h"
-#include "core/platform.h"
 #include "video_core/amdgpu/liverpool.h"
 #include "video_core/amdgpu/pm4_cmds.h"
 #include "video_core/renderdoc.h"
@@ -120,19 +121,37 @@ void Liverpool::Process(std::stop_token stoken) {
                 if (queue.submits.empty()) {
                     continue;
                 }
-                task = queue.submits.front();
+                task = queue.submits.front().task;
             }
             task.resume();
 
             if (task.done()) {
+                std::optional<FlipRequest> flip;
+                {
+                    std::scoped_lock lock{queue.m_access};
+                    flip = std::move(queue.submits.front().flip);
+                    queue.submits.pop();
+                }
+
                 task.destroy();
 
-                std::scoped_lock lock{queue.m_access};
-                queue.submits.pop();
-
                 --num_submits;
-                std::scoped_lock lock2{submit_mutex};
-                submit_cv.notify_all();
+                {
+                    std::scoped_lock lock2{submit_mutex};
+                    submit_cv.notify_all();
+                }
+
+                // Perform flip after the submission completes.
+                auto* port = vo_port.load(std::memory_order_acquire);
+                auto* drv = vo_driver.load(std::memory_order_acquire);
+                if (flip && port && drv) {
+                    ASSERT_MSG(flip->buf_id < Libraries::VideoOut::MaxDisplayBuffers,
+                               "Invalid flip buffer index {}", flip->buf_id);
+                    port->buffer_labels[flip->buf_id] = 1;
+                    drv->EnqueueFlip(port, flip->buf_id, flip->flip_arg, true);
+                } else if (flip) {
+                    LOG_WARNING(Lib_GnmDriver, "EOP flip dropped — VideoOut port is not available");
+                }
             }
         }
 
@@ -145,7 +164,7 @@ void Liverpool::Process(std::stop_token stoken) {
             submit_done = false;
         }
 
-        Platform::IrqC::Instance()->Signal(Platform::InterruptId::GpuIdle);
+        SignalInterrupt(IrqGpuIdle);
     }
 }
 
@@ -263,9 +282,7 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
 
                 switch (nop->data_block[0]) {
                 case PM4CmdNop::PayloadType::PatchedFlip: {
-                    // There is no evidence that GPU CP drives flip events by parsing
-                    // special NOP packets. For convenience lets assume that it does.
-                    Platform::IrqC::Instance()->Signal(Platform::InterruptId::GfxFlip);
+                    // Flip is performed when the submission completes, not here.
                     break;
                 }
                 case PM4CmdNop::PayloadType::DebugMarkerPush: {
@@ -716,7 +733,7 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                             memcpy(address, &data, num_bytes);
                         }
                     },
-                    [] { Platform::IrqC::Instance()->Signal(Platform::InterruptId::GfxEop); });
+                    [this] { SignalInterrupt(IrqGfxEop); });
                 break;
             }
             case PM4ItOpcode::DmaData: {
@@ -811,9 +828,10 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 // there are no other submits to yield to we can sleep the thread
                 // instead and allow other tasks to run.
                 const u64* wait_addr = wait_reg_mem->Address<u64*>();
-                if (vo_port->IsVoLabel(wait_addr) &&
+                auto* port = vo_port.load(std::memory_order_acquire);
+                if (port && port->IsVoLabel(wait_addr) &&
                     num_submits == mapped_queues[GfxQueueId].submits.size()) {
-                    vo_port->WaitVoLabel([&] { return wait_reg_mem->Test(regs.reg_array); });
+                    port->WaitVoLabel([&] { return wait_reg_mem->Test(regs.reg_array); });
                     break;
                 }
                 while (!wait_reg_mem->Test(regs.reg_array)) {
@@ -1137,13 +1155,11 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
         }
         case PM4ItOpcode::ReleaseMem: {
             const auto* release_mem = reinterpret_cast<const PM4CmdReleaseMem*>(header);
-            release_mem->SignalFence(
-                [pipe_id = queue.pipe_id] {
-                    Platform::IrqC::Instance()->Signal(static_cast<Platform::InterruptId>(pipe_id));
-                },
-                [this](VAddr dst, u16 gds_index, u16 num_dwords) {
-                    rasterizer->CopyBuffer(dst, gds_index, num_dwords * sizeof(u32), false, true);
-                });
+            release_mem->SignalFence([this, pipe_id = queue.pipe_id] { SignalInterrupt(pipe_id); },
+                                     [this](VAddr dst, u16 gds_index, u16 num_dwords) {
+                                         rasterizer->CopyBuffer(
+                                             dst, gds_index, num_dwords * sizeof(u32), false, true);
+                                     });
             break;
         }
         case PM4ItOpcode::EventWrite: {
@@ -1199,7 +1215,23 @@ Liverpool::CmdBuffer Liverpool::CopyCmdBuffers(std::span<const u32> dcb, std::sp
     return std::make_pair(dcb, ccb);
 }
 
-void Liverpool::SubmitGfx(std::span<const u32> dcb, std::span<const u32> ccb) {
+s32 Liverpool::ReserveFlip() {
+    auto* port = vo_port.load(std::memory_order_acquire);
+    if (!port) {
+        return ORBIS_VIDEO_OUT_ERROR_INVALID_HANDLE;
+    }
+    std::unique_lock lock{port->port_mutex};
+    if (port->flip_status.flip_pending_num > 16) {
+        return ORBIS_VIDEO_OUT_ERROR_FLIP_QUEUE_FULL;
+    }
+    ++port->flip_status.gc_queue_num;
+    ++port->flip_status.flip_pending_num;
+    port->flip_status.submit_tsc = Libraries::Kernel::sceKernelReadTsc();
+    return ORBIS_OK;
+}
+
+void Liverpool::SubmitGfx(std::span<const u32> dcb, std::span<const u32> ccb,
+                          std::optional<FlipRequest> flip) {
     auto& queue = mapped_queues[GfxQueueId];
 
     if (EmulatorSettings.IsCopyGpuBuffers()) {
@@ -1209,7 +1241,7 @@ void Liverpool::SubmitGfx(std::span<const u32> dcb, std::span<const u32> ccb) {
     auto task = ProcessGraphics(dcb, ccb);
     {
         std::scoped_lock lock{queue.m_access};
-        queue.submits.emplace(task.handle);
+        queue.submits.push({task.handle, std::move(flip)});
     }
 
     std::scoped_lock lk{submit_mutex};
@@ -1225,13 +1257,47 @@ void Liverpool::SubmitAsc(u32 gnm_vqid, std::span<const u32> acb) {
     const auto& task = ProcessCompute(acb, vqid);
     {
         std::scoped_lock lock{queue.m_access};
-        queue.submits.emplace(task.handle);
+        queue.submits.push({task.handle, std::nullopt});
     }
 
     std::scoped_lock lk{submit_mutex};
     num_mapped_queues = std::max(num_mapped_queues, gnm_vqid + 1);
     ++num_submits;
     submit_cv.notify_one();
+}
+
+void Liverpool::RegisterInterruptHandler(u32 irq_id, InterruptHandler handler, void* uid) {
+    std::scoped_lock lock{irq_mutex};
+    auto& handlers = irq_handlers[irq_id];
+    ASSERT_MSG(handlers.find(uid) == handlers.end(), "Interrupt handler already registered");
+    handlers.emplace(uid, std::move(handler));
+}
+
+void Liverpool::UnregisterInterruptHandler(u32 irq_id, void* uid) {
+    std::scoped_lock lock{irq_mutex};
+    auto it = irq_handlers.find(irq_id);
+    if (it != irq_handlers.end()) {
+        it->second.erase(uid);
+    }
+}
+
+void Liverpool::SignalInterrupt(u32 irq_id) {
+    // Copy handlers under lock, call outside — prevents deadlock if a
+    // handler calls Register/Unregister.
+    std::vector<InterruptHandler> to_call;
+    {
+        std::scoped_lock lock{irq_mutex};
+        auto it = irq_handlers.find(irq_id);
+        if (it != irq_handlers.end()) {
+            to_call.reserve(it->second.size());
+            for (auto& [uid, h] : it->second) {
+                to_call.push_back(h);
+            }
+        }
+    }
+    for (auto& h : to_call) {
+        h(irq_id);
+    }
 }
 
 } // namespace AmdGpu
