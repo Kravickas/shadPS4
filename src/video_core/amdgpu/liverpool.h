@@ -6,10 +6,13 @@
 #include <condition_variable>
 #include <coroutine>
 #include <exception>
+#include <functional>
 #include <mutex>
+#include <optional>
 #include <semaphore>
 #include <span>
 #include <thread>
+#include <unordered_map>
 #include <vector>
 #include <queue>
 
@@ -26,7 +29,8 @@ class Rasterizer;
 
 namespace Libraries::VideoOut {
 struct VideoOutPort;
-}
+class VideoOutDriver;
+} // namespace Libraries::VideoOut
 
 namespace AmdGpu {
 
@@ -67,7 +71,24 @@ public:
     explicit Liverpool();
     ~Liverpool();
 
-    void SubmitGfx(std::span<const u32> dcb, std::span<const u32> ccb);
+    struct FlipRequest {
+        u32 buf_id;
+        s64 flip_arg;
+    };
+
+    // Interrupt IDs used by the command processor.
+    static constexpr u32 IrqCompute0RelMem = 0x00;
+    static constexpr u32 IrqCompute6RelMem = 0x06;
+    static constexpr u32 IrqGfxEop = 0x40;
+    static constexpr u32 IrqGpuIdle = 0x09;
+
+    using InterruptHandler = std::function<void(u32 irq_id)>;
+
+    void RegisterInterruptHandler(u32 irq_id, InterruptHandler handler, void* uid);
+    void UnregisterInterruptHandler(u32 irq_id, void* uid);
+
+    void SubmitGfx(std::span<const u32> dcb, std::span<const u32> ccb,
+                   std::optional<FlipRequest> flip = std::nullopt);
     void SubmitAsc(u32 gnm_vqid, std::span<const u32> acb);
 
     void SubmitDone() noexcept {
@@ -87,9 +108,15 @@ public:
         return num_submits == 0;
     }
 
-    void SetVoPort(Libraries::VideoOut::VideoOutPort* port) {
-        vo_port = port;
+    void SetVideoOut(Libraries::VideoOut::VideoOutPort* port,
+                     Libraries::VideoOut::VideoOutDriver* drv) {
+        vo_port.store(port, std::memory_order_release);
+        vo_driver.store(drv, std::memory_order_release);
     }
+
+    // Reserve a flip slot — called at submission time (game thread).
+    // Returns ORBIS_OK or a VideoOut error code.
+    s32 ReserveFlip();
 
     void BindRasterizer(Vulkan::Rasterizer* rasterizer_) {
         rasterizer = rasterizer_;
@@ -187,12 +214,17 @@ private:
     void Process(std::stop_token stoken);
 
     struct GpuQueue {
+        struct Submission {
+            Task::Handle task;
+            std::optional<FlipRequest> flip{};
+        };
+
         std::mutex m_access{};
         std::atomic<u32> dcb_buffer_offset;
         std::atomic<u32> ccb_buffer_offset;
         std::vector<u32> dcb_buffer;
         std::vector<u32> ccb_buffer;
-        std::queue<Task::Handle> submits{};
+        std::queue<Submission> submits{};
         ComputeProgram cs_state{};
     };
     std::array<GpuQueue, NumTotalQueues> mapped_queues{};
@@ -221,7 +253,8 @@ private:
     } cblock{};
 
     Vulkan::Rasterizer* rasterizer{};
-    Libraries::VideoOut::VideoOutPort* vo_port{};
+    std::atomic<Libraries::VideoOut::VideoOutPort*> vo_port{};
+    std::atomic<Libraries::VideoOut::VideoOutDriver*> vo_driver{};
     std::jthread process_thread{};
     std::atomic<u32> num_submits{};
     std::atomic<u32> num_commands{};
@@ -231,6 +264,10 @@ private:
     std::queue<Common::UniqueFunction<void>> command_queue{};
     std::thread::id gpu_id;
     s32 curr_qid{-1};
+
+    void SignalInterrupt(u32 irq_id);
+    std::mutex irq_mutex;
+    std::unordered_map<u32, std::unordered_map<void*, InterruptHandler>> irq_handlers;
 };
 
 } // namespace AmdGpu
