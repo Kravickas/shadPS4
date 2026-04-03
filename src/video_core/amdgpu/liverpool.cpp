@@ -16,6 +16,8 @@
 #include "core/memory.h"
 #include "video_core/amdgpu/liverpool.h"
 #include "video_core/amdgpu/pm4_cmds.h"
+
+#include <magic_enum/magic_enum.hpp>
 #include "video_core/renderdoc.h"
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
 
