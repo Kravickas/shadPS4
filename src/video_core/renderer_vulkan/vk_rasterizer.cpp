@@ -402,6 +402,7 @@ bool Rasterizer::BindResources(const Pipeline* pipeline) {
         stage->PushUd(binding, push_data);
         BindBuffers(*stage, binding, push_data);
         BindTextures(*stage, binding);
+        BindBindlessTables(*stage, binding);
         uses_dma |= stage->uses_dma;
     }
 
@@ -813,6 +814,113 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
             .descriptorCount = 1,
             .descriptorType = vk::DescriptorType::eSampler,
             .pImageInfo = &image_infos.back(),
+        });
+    }
+}
+
+void Rasterizer::BindBindlessTables(const Shader::Info& stage, Shader::Backend::Bindings& binding) {
+    using BindlessResourceType = Shader::BindlessResourceType;
+
+    for (const auto& table : stage.bindless_tables) {
+        if (table.type != BindlessResourceType::Image) {
+            // Buffer/sampler bindless tables not yet supported.
+            binding.unified++;
+            continue;
+        }
+
+        // Read the descriptor table V# from the flat user-data buffer.
+        const auto table_vsharp = stage.ReadUdSharp<AmdGpu::Buffer>(table.table_sharp_idx);
+        const VAddr table_base = table_vsharp.base_address;
+        const u32 num_entries = table.num_entries;
+        const u32 first_image_info = static_cast<u32>(image_infos.size());
+
+        // Read each T# descriptor entry from PS4 GPU memory and bind it.
+        for (u32 i = 0; i < num_entries; i++) {
+            const VAddr entry_addr = table_base + VAddr(i) * 32; // T# = 8 dwords = 32 bytes
+            if (entry_addr == 0) {
+                // Null table — push null descriptor (PARTIALLY_BOUND allows this).
+                if (instance.IsNullDescriptorSupported()) {
+                    image_infos.emplace_back(VK_NULL_HANDLE, VK_NULL_HANDLE,
+                                             vk::ImageLayout::eGeneral);
+                } else {
+                    auto& null_view = texture_cache.FindTexture(VideoCore::NULL_IMAGE_ID, {});
+                    image_infos.emplace_back(VK_NULL_HANDLE, *null_view.image_view,
+                                             vk::ImageLayout::eGeneral);
+                }
+                continue;
+            }
+
+            // Read the T# from mapped PS4 GPU memory.
+            AmdGpu::Image tsharp{};
+            std::memcpy(&tsharp, reinterpret_cast<const void*>(entry_addr), sizeof(tsharp));
+
+            if (!tsharp.Valid() || tsharp.GetDataFmt() == AmdGpu::DataFormat::FormatInvalid) {
+                // Invalid entry — push null descriptor.
+                if (instance.IsNullDescriptorSupported()) {
+                    image_infos.emplace_back(VK_NULL_HANDLE, VK_NULL_HANDLE,
+                                             vk::ImageLayout::eGeneral);
+                } else {
+                    auto& null_view = texture_cache.FindTexture(VideoCore::NULL_IMAGE_ID, {});
+                    image_infos.emplace_back(VK_NULL_HANDLE, *null_view.image_view,
+                                             vk::ImageLayout::eGeneral);
+                }
+                continue;
+            }
+
+            // Create a minimal ImageResource for this table entry.
+            const Shader::ImageResource image_res = {
+                .sharp_idx = 0, // Not used — we have the sharp directly.
+                .is_depth = false,
+                .is_atomic = false,
+                .is_array = false,
+                .is_written = table.has_writes,
+                .is_r128 = false,
+            };
+
+            // Create ImageDesc and resolve through the texture cache.
+            auto desc = VideoCore::TextureCache::ImageDesc{tsharp, image_res};
+            const auto image_id = texture_cache.FindImage(desc);
+            if (!image_id) {
+                if (instance.IsNullDescriptorSupported()) {
+                    image_infos.emplace_back(VK_NULL_HANDLE, VK_NULL_HANDLE,
+                                             vk::ImageLayout::eGeneral);
+                } else {
+                    auto& null_view = texture_cache.FindTexture(VideoCore::NULL_IMAGE_ID, desc);
+                    image_infos.emplace_back(VK_NULL_HANDLE, *null_view.image_view,
+                                             vk::ImageLayout::eGeneral);
+                }
+                continue;
+            }
+
+            auto& image = texture_cache.GetImage(image_id);
+            auto& image_view = texture_cache.FindTexture(image_id, desc);
+            const bool is_storage = table.has_writes;
+
+            if (is_storage) {
+                image.Transit(vk::ImageLayout::eGeneral,
+                              vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eShaderWrite,
+                              desc.view_info.range);
+            } else {
+                image.Transit(vk::ImageLayout::eShaderReadOnlyOptimal,
+                              vk::AccessFlagBits2::eShaderRead, desc.view_info.range);
+            }
+            image.usage.texture |= !is_storage;
+            image.usage.storage |= is_storage;
+
+            image_infos.emplace_back(VK_NULL_HANDLE, *image_view.image_view,
+                                     image.backing->state.layout);
+        }
+
+        // Write descriptor array for this bindless table.
+        const bool is_storage = table.has_writes;
+        set_writes.push_back({
+            .dstSet = VK_NULL_HANDLE,
+            .dstBinding = binding.unified++,
+            .dstArrayElement = 0,
+            .descriptorCount = num_entries,
+            .descriptorType =
+                is_storage ? vk::DescriptorType::eStorageImage : vk::DescriptorType::eSampledImage,
+            .pImageInfo = &image_infos[first_image_info],
         });
     }
 }
