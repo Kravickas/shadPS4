@@ -762,4 +762,105 @@ void TessellationPreprocess(IR::Program& program, RuntimeInfo& runtime_info) {
     ConstantPropagationPass(program.post_order_blocks);
 }
 
+void LocalShaderTransform(IR::Program& program, const RuntimeInfo& runtime_info) {
+    const u32 ls_stride = runtime_info.ls_info.ls_stride;
+
+    if (ls_stride == 0) {
+        return;
+    }
+
+    bool has_lds_writes = false;
+    for (IR::Block* block : program.blocks) {
+        for (IR::Inst& inst : block->Instructions()) {
+            const auto opcode = inst.GetOpcode();
+            if ((opcode == IR::Opcode::WriteSharedU32 ||
+                 opcode == IR::Opcode::WriteSharedU64) &&
+                !inst.Flags<bool>()) {
+                has_lds_writes = true;
+                break;
+            }
+        }
+        if (has_lds_writes) {
+            break;
+        }
+    }
+
+    if (!has_lds_writes) {
+        // LS uses EXP instructions for output, no conversion needed
+        return;
+    }
+
+    for (IR::Block* block : program.blocks) {
+        for (IR::Inst& inst : block->Instructions()) {
+            const auto opcode = inst.GetOpcode();
+            switch (opcode) {
+            case IR::Opcode::WriteSharedU32:
+            case IR::Opcode::WriteSharedU64: {
+                // GDS writes are not tessellation output writes
+                if (inst.Flags<bool>()) {
+                    break;
+                }
+
+                IR::IREmitter ir{*block, IR::Block::InstructionList::s_iterator_to(inst)};
+                const u32 num_dwords = opcode == IR::Opcode::WriteSharedU32 ? 1 : 2;
+                const IR::U32 addr{inst.Arg(0)};
+                const IR::Value data =
+                    num_dwords == 2 ? ir.UnpackUint2x32(IR::U64{inst.Arg(1).Resolve()})
+                                   : inst.Arg(1).Resolve();
+
+                const auto SetOutput = [&](IR::U32 addr, IR::U32 value, u32 off_dw) {
+                    const IR::F32 data_component = ir.BitCast<IR::F32, IR::U32>(value);
+                    if (off_dw > 0) {
+                        addr = ir.IAdd(addr, ir.Imm32(off_dw));
+                    }
+                    const IR::U32 opt_addr = TryOptimizeAddressModulo(addr, ls_stride, ir);
+                    const IR::U32 offset = ir.IMod(opt_addr, ir.Imm32(ls_stride));
+                    const IR::U32 attr_index = ir.ShiftRightLogical(offset, ir.Imm32(4u));
+                    const IR::U32 comp_index = ir.ShiftRightLogical(
+                        ir.BitwiseAnd(offset, ir.Imm32(0xFU)), ir.Imm32(2u));
+                    ir.SetLsGenericAttribute(data_component, attr_index, comp_index);
+                };
+
+                if (num_dwords == 1) {
+                    SetOutput(addr, IR::U32{data}, 0);
+                } else {
+                    for (u32 i = 0; i < num_dwords; i++) {
+                        SetOutput(addr, IR::U32{ir.CompositeExtract(data, i)}, i);
+                    }
+                }
+                inst.Invalidate();
+                break;
+            }
+
+            case IR::Opcode::LoadSharedU32:
+            case IR::Opcode::LoadSharedU64: {
+                // GDS reads are not tessellation reads
+                if (inst.Flags<bool>()) {
+                    break;
+                }
+
+                // LS reading from LDS is uncommon but can occur when the shader
+                // reads back previously written data. Return zero for now since
+                // VS cannot read its own outputs in SPIR-V without additional
+                // variable declarations.
+                IR::IREmitter ir{*block, IR::Block::InstructionList::s_iterator_to(inst)};
+                const u32 num_dwords = opcode == IR::Opcode::LoadSharedU32 ? 1 : 2;
+                IR::Value attr_read;
+                if (num_dwords == 1) {
+                    attr_read = ir.Imm32(0u);
+                } else {
+                    attr_read = ir.PackUint2x32(
+                        ir.CompositeConstruct(ir.Imm32(0u), ir.Imm32(0u)));
+                }
+                inst.ReplaceUsesWithAndRemove(attr_read);
+                break;
+            }
+
+            default:
+                break;
+            }
+        }
+    }
+}
+
 } // namespace Shader::Optimization
