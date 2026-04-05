@@ -8,7 +8,6 @@
 #include "common/assert.h"
 #include "common/debug.h"
 #include "common/types.h"
-#include "imgui/renderer/imgui_core.h"
 #include "sdl_window.h"
 #include "video_core/renderer_vulkan/liverpool_to_vk.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
@@ -184,7 +183,6 @@ Instance::Instance(Frontend::WindowSDL& window, s32 physical_device_index,
 }
 
 Instance::~Instance() {
-    ImGui::Core::Shutdown(GetDevice());
     vmaDestroyAllocator(allocator);
 }
 
@@ -327,6 +325,20 @@ bool Instance::CreateDevice() {
             Render_Vulkan, "- workgroupMemoryExplicitLayout16BitAccess: {}",
             workgroup_memory_explicit_layout_features.workgroupMemoryExplicitLayout16BitAccess);
     }
+
+    // Log descriptor indexing support (Vulkan 1.2 core features).
+    LOG_INFO(Render_Vulkan, "- descriptorIndexing: {}", bool(vk12_features.descriptorIndexing));
+    LOG_INFO(Render_Vulkan, "- runtimeDescriptorArray: {}",
+             bool(vk12_features.runtimeDescriptorArray));
+    LOG_INFO(Render_Vulkan, "- descriptorBindingPartiallyBound: {}",
+             bool(vk12_features.descriptorBindingPartiallyBound));
+    LOG_INFO(Render_Vulkan, "- descriptorBindingVariableDescriptorCount: {}",
+             bool(vk12_features.descriptorBindingVariableDescriptorCount));
+    LOG_INFO(Render_Vulkan, "- shaderSampledImageArrayNonUniformIndexing: {}",
+             bool(vk12_features.shaderSampledImageArrayNonUniformIndexing));
+    LOG_INFO(Render_Vulkan, "- descriptorBindingSampledImageUpdateAfterBind: {}",
+             bool(vk12_features.descriptorBindingSampledImageUpdateAfterBind));
+
     const bool calibrated_timestamps =
         TRACY_GPU_ENABLED ? add_extension(VK_EXT_CALIBRATED_TIMESTAMPS_EXTENSION_NAME) : false;
 
@@ -422,6 +434,25 @@ bool Instance::CreateDevice() {
             .shaderSharedInt64Atomics = vk12_features.shaderSharedInt64Atomics,
             .shaderFloat16 = vk12_features.shaderFloat16,
             .shaderInt8 = vk12_features.shaderInt8,
+            .descriptorIndexing = vk12_features.descriptorIndexing,
+            .shaderSampledImageArrayNonUniformIndexing =
+                vk12_features.shaderSampledImageArrayNonUniformIndexing,
+            .shaderStorageBufferArrayNonUniformIndexing =
+                vk12_features.shaderStorageBufferArrayNonUniformIndexing,
+            .shaderStorageImageArrayNonUniformIndexing =
+                vk12_features.shaderStorageImageArrayNonUniformIndexing,
+            .descriptorBindingSampledImageUpdateAfterBind =
+                vk12_features.descriptorBindingSampledImageUpdateAfterBind,
+            .descriptorBindingStorageImageUpdateAfterBind =
+                vk12_features.descriptorBindingStorageImageUpdateAfterBind,
+            .descriptorBindingStorageBufferUpdateAfterBind =
+                vk12_features.descriptorBindingStorageBufferUpdateAfterBind,
+            .descriptorBindingUpdateUnusedWhilePending =
+                vk12_features.descriptorBindingUpdateUnusedWhilePending,
+            .descriptorBindingPartiallyBound = vk12_features.descriptorBindingPartiallyBound,
+            .descriptorBindingVariableDescriptorCount =
+                vk12_features.descriptorBindingVariableDescriptorCount,
+            .runtimeDescriptorArray = vk12_features.runtimeDescriptorArray,
             .scalarBlockLayout = vk12_features.scalarBlockLayout,
             .uniformBufferStandardLayout = vk12_features.uniformBufferStandardLayout,
             .separateDepthStencilLayouts = vk12_features.separateDepthStencilLayouts,
