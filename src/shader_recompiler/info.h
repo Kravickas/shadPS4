@@ -194,6 +194,10 @@ struct Info : InfoPersistent {
         ASSERT(user_data.size() <= NUM_USER_DATA_REGS);
         std::memcpy(flattened_ud_buf.data(), user_data.data(), user_data.size_bytes());
         if (srt_info.walker_func) {
+            // Restore pristine walker code before calling. The signal handler
+            // permanently patches faulting instructions to xor (zero), which
+            // prevents retrying reads that may now succeed with current memory.
+            RestoreWalkerCode(srt_info.walker_func, srt_info.walker_func_size);
             srt_info.walker_func(user_data.data(), flattened_ud_buf.data());
         }
     }
