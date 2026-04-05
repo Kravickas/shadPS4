@@ -16,6 +16,15 @@ namespace Shader {
 using PFN_SrtWalker = void PS4_SYSV_ABI (*)(const u32* /*user_data*/, u32* /*flat_dst*/);
 PFN_SrtWalker RegisterWalkerCode(const u8* ptr, size_t size);
 
+/// Save a pristine copy of a walker's JIT code so it can be restored after
+/// the signal handler destructively patches faulting instructions.
+void SaveWalkerBackup(PFN_SrtWalker func, size_t size);
+
+/// Restore a walker's JIT code to its original unpatched state. Must be
+/// called before every walker invocation so that pointer dereferences
+/// patched out by a previous fault are retried with current memory state.
+void RestoreWalkerCode(PFN_SrtWalker func, size_t size);
+
 struct PersistentSrtInfo {
     // Special case when fetch shader uses step rates.
     struct SrtSharpReservation {
