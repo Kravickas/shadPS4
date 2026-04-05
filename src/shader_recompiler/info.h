@@ -43,6 +43,7 @@ struct InfoPersistent {
     ImageResourceList images;
     SamplerResourceList samplers;
     FMaskResourceList fmasks;
+    BindlessTableList bindless_tables;
 
     struct UserDataMask {
         void Set(IR::ScalarReg reg) noexcept {
@@ -184,7 +185,7 @@ struct Info : InfoPersistent {
 
     void AddBindings(Backend::Bindings& bnd) const {
         bnd.buffer += buffers.size();
-        bnd.unified += buffers.size() + images.size() + samplers.size();
+        bnd.unified += buffers.size() + images.size() + samplers.size() + bindless_tables.size();
         bnd.user_data += ud_mask.NumRegs();
     }
 
