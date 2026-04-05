@@ -577,10 +577,10 @@ void PatchImageSharp(IR::Block& block, IR::Inst& inst, Info& info, Descriptors& 
     if (tsharp == kBindlessSentinel) {
         ASSERT_MSG(profile.supports_descriptor_indexing,
                    "Bindless image at pc={:#x} requires descriptor indexing (Vulkan 1.2)",
-                   inst_info.pc);
+                   u32(inst_info.pc));
 
         const IR::Inst* rcb = FindReadConstBuffer(image_handle);
-        ASSERT_MSG(rcb, "Bindless image at pc={:#x}: ReadConstBuffer not found", inst_info.pc);
+        ASSERT_MSG(rcb, "Bindless image at pc={:#x}: ReadConstBuffer not found", u32(inst_info.pc));
 
         // Resolve the table V# — its source IS in user data, so TrackSharp succeeds.
         const IR::Inst* table_composite = rcb->Arg(0).InstRecursive();
