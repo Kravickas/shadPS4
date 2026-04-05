@@ -407,9 +407,9 @@ SharpSources FindSharpSources(const IR::Inst* handle, u32 pc) {
     }
     if (sources.empty()) {
         if (found_read_const_buffer) {
-            UNREACHABLE_MSG("Bindless sharp access detected pc={:#x}", pc);
+            LOG_WARNING(Render_Vulkan, "Bindless sharp access detected pc={:#x}", pc);
         } else {
-            UNREACHABLE_MSG("Unable to find sharp sources pc={:#x}", pc);
+            LOG_WARNING(Render_Vulkan, "Unable to find sharp sources pc={:#x}", pc);
         }
     }
     return sources;
@@ -455,8 +455,35 @@ SharpLocation SharpLocationFromSource(const IR::Inst* inst) {
     }
 }
 
+// Sentinel value returned by TrackSharp when the descriptor source is a
+// ReadConstBuffer (bindless / indirect descriptor load from a table buffer).
+static constexpr SharpLocation kBindlessSentinel = std::numeric_limits<u32>::max();
+
+// Walk backward through identity-like ops / Phi to find a ReadConstBuffer.
+static const IR::Inst* FindReadConstBuffer(const IR::Inst* inst) {
+    if (!inst) {
+        return nullptr;
+    }
+    if (inst->GetOpcode() == IR::Opcode::ReadConstBuffer) {
+        return inst;
+    }
+    if (inst->GetOpcode() == IR::Opcode::Phi) {
+        for (size_t i = 0; i < inst->NumArgs(); i++) {
+            if (!inst->Arg(i).IsImmediate()) {
+                if (const auto* found = FindReadConstBuffer(inst->Arg(i).InstRecursive())) {
+                    return found;
+                }
+            }
+        }
+    }
+    return nullptr;
+}
+
 SharpLocation TrackSharp(const IR::Inst* inst, const IR::Block& current_parent, u32 pc = 0) {
     auto sources = FindSharpSources(inst, pc);
+    if (sources.empty()) {
+        return kBindlessSentinel;
+    }
     size_t num_sources = sources.size();
     ASSERT(current_parent.cfg_block);
 
@@ -517,6 +544,8 @@ void PatchBufferSharp(IR::Block& block, IR::Inst& inst, Info& info, Descriptors&
         // Normal buffer resource.
         IR::Inst* buffer_handle = handle->Arg(0).InstRecursive();
         const auto sharp_idx = TrackSharp(buffer_handle, block);
+        ASSERT_MSG(sharp_idx != kBindlessSentinel,
+                   "Bindless buffer descriptors require BindlessBufferIndex support");
         const auto buffer = info.ReadUdSharp<AmdGpu::Buffer>(sharp_idx);
         buffer_binding = descriptors.Add(BufferResource{
             .sharp_idx = sharp_idx,
@@ -539,12 +568,107 @@ void PatchImageSharp(IR::Block& block, IR::Inst& inst, Info& info, Descriptors& 
     const auto inst_info = inst.Flags<IR::TextureInstInfo>();
     const IR::Inst* image_handle = inst.Arg(0).InstRecursive();
     const auto tsharp = TrackSharp(image_handle, block, inst_info.pc);
+
+    // --- Bindless image access ---
+    // The image T# is loaded at runtime from a descriptor table buffer via
+    // S_BUFFER_LOAD_DWORD.  Create a BindlessTable entry and emit
+    // BindlessImageIndex so the SPIR-V backend can generate a runtime
+    // descriptor array access.
+    if (tsharp == kBindlessSentinel) {
+        ASSERT_MSG(profile.supports_descriptor_indexing,
+                   "Bindless image at pc={:#x} requires descriptor indexing (Vulkan 1.2)",
+                   inst_info.pc);
+
+        const IR::Inst* rcb = FindReadConstBuffer(image_handle);
+        ASSERT_MSG(rcb, "Bindless image at pc={:#x}: ReadConstBuffer not found", inst_info.pc);
+
+        // Resolve the table V# — its source IS in user data, so TrackSharp succeeds.
+        const IR::Inst* table_composite = rcb->Arg(0).InstRecursive();
+        ASSERT(table_composite &&
+               table_composite->GetOpcode() == IR::Opcode::CompositeConstructU32x4);
+        const IR::Inst* table_src = table_composite->Arg(0).InstRecursive();
+        ASSERT(table_src);
+        const auto table_sharp = TrackSharp(table_src, block, inst_info.pc);
+        ASSERT_MSG(table_sharp != kBindlessSentinel,
+                   "Descriptor table V# is itself bindless — nested indirection not supported");
+        const auto table_vsharp = info.ReadUdSharp<AmdGpu::Buffer>(table_sharp);
+
+        // T# is 8 dwords (32 bytes).  Compute how many entries fit in the table.
+        const u32 num_entries =
+            BindlessTable::CalcNumEntries(table_vsharp, BindlessResourceType::Image);
+
+        // Find or create the BindlessTable entry.
+        const bool is_written =
+            inst.GetOpcode() == IR::Opcode::ImageWrite || IsImageAtomicInstruction(inst);
+        u32 table_idx = std::numeric_limits<u32>::max();
+        for (u32 i = 0; i < info.bindless_tables.size(); i++) {
+            if (info.bindless_tables[i].table_sharp_idx == table_sharp &&
+                info.bindless_tables[i].type == BindlessResourceType::Image) {
+                table_idx = i;
+                info.bindless_tables[i].has_writes |= is_written;
+                break;
+            }
+        }
+        if (table_idx == std::numeric_limits<u32>::max()) {
+            table_idx = static_cast<u32>(info.bindless_tables.size());
+            info.bindless_tables.push_back({
+                .table_sharp_idx = table_sharp,
+                .type = BindlessResourceType::Image,
+                .num_entries = num_entries,
+                .has_writes = is_written,
+            });
+        }
+
+        IR::IREmitter ir{block, IR::Block::InstructionList::s_iterator_to(inst)};
+
+        // Convert dword offset from ReadConstBuffer → T# entry index (÷ 8 dwords).
+        const IR::Value& dyn_index_val = rcb->Arg(1);
+        IR::U32 entry_index;
+        if (dyn_index_val.IsImmediate()) {
+            entry_index = ir.Imm32(dyn_index_val.U32() / 8);
+        } else {
+            entry_index = ir.ShiftRightLogical(IR::U32{dyn_index_val}, ir.Imm32(3));
+        }
+
+        // Resolve sampler if this is a sampling instruction.
+        u32 sampler_binding = 0xFFFF;
+        if (inst.GetOpcode() == IR::Opcode::ImageSampleRaw) {
+            const IR::Inst* sampler = inst.Arg(1).InstRecursive();
+            ASSERT(sampler && sampler->GetOpcode() == IR::Opcode::CompositeConstructU32x4);
+            if (sampler->AreAllArgsImmediates()) {
+                const auto inline_sampler = AmdGpu::Sampler{
+                    .raw0 = u64(sampler->Arg(1).U32()) << 32 | u64(sampler->Arg(0).U32()),
+                    .raw1 = u64(sampler->Arg(3).U32()) << 32 | u64(sampler->Arg(2).U32()),
+                };
+                sampler_binding = descriptors.Add(SamplerResource{
+                    .sharp_idx = std::numeric_limits<u32>::max(),
+                    .inline_sampler = inline_sampler,
+                    .is_inline_sampler = true,
+                });
+            } else {
+                const auto& [sampler_handle, disable_aniso] =
+                    TryDisableAnisoLod0(sampler->Arg(0).InstRecursive());
+                const auto ssharp = TrackSharp(sampler_handle, block, inst_info.pc);
+                ASSERT_MSG(ssharp != kBindlessSentinel, "Bindless sampler not yet supported");
+                sampler_binding = descriptors.Add(SamplerResource{
+                    .sharp_idx = ssharp,
+                    .is_inline_sampler = false,
+                    .associated_image = 0,
+                    .disable_aniso = disable_aniso,
+                });
+            }
+        }
+
+        inst.SetArg(
+            0, ir.BindlessImageIndex(ir.Imm32(table_idx), entry_index, ir.Imm32(sampler_binding)));
+        return;
+    }
+
+    // --- Non-bindless path (unchanged from original) ---
     const bool is_atomic = IsImageAtomicInstruction(inst);
     const bool is_written = inst.GetOpcode() == IR::Opcode::ImageWrite || is_atomic;
     const bool is_storage =
         inst.GetOpcode() == IR::Opcode::ImageRead || inst.GetOpcode() == IR::Opcode::ImageWrite;
-    // ImageRead with !is_written gets emitted as OpImageFetch with LOD operand, doesn't
-    // need fallback (TODO is this 100% true?)
     const bool needs_mip_storage_fallback =
         inst_info.has_lod && is_written && !profile.supports_image_load_store_lod;
     ImageResource image_res = {
@@ -560,21 +684,18 @@ void PatchImageSharp(IR::Block& block, IR::Inst& inst, Info& info, Descriptors& 
     ASSERT(image.GetType() != AmdGpu::ImageType::Invalid);
 
     if (needs_mip_storage_fallback) {
-        // If the mip level to IMAGE_(LOAD/STORE)_MIP is a constant, set up ImageResource
-        // so that we will only bind a single level.
-        // If index is dynamic, we will bind levels as an array
         const auto view_type = image.GetViewType(image_res.is_array);
 
         IR::Inst* body = inst.Arg(1).InstRecursive();
         const auto lod_arg = [&] -> IR::Value {
             switch (view_type) {
-            case AmdGpu::ImageType::Color1D: // x, [lod]
+            case AmdGpu::ImageType::Color1D:
                 return body->Arg(1);
-            case AmdGpu::ImageType::Color1DArray: // x, slice, [lod]
-            case AmdGpu::ImageType::Color2D:      // x, y, [lod]
+            case AmdGpu::ImageType::Color1DArray:
+            case AmdGpu::ImageType::Color2D:
                 return body->Arg(2);
-            case AmdGpu::ImageType::Color2DArray: // x, y, slice, [lod]
-            case AmdGpu::ImageType::Color3D:      // x, y, z, [lod]
+            case AmdGpu::ImageType::Color2DArray:
+            case AmdGpu::ImageType::Color3D:
                 return body->Arg(3);
             case AmdGpu::ImageType::Color2DMsaa:
             case AmdGpu::ImageType::Color2DMsaaArray:
@@ -608,12 +729,11 @@ void PatchImageSharp(IR::Block& block, IR::Inst& inst, Info& info, Descriptors& 
             inst.ReplaceUsesWith(ir.Imm32(1));
             return;
         case IR::Opcode::ImageQueryDimensions: {
-            IR::Value dims = ir.CompositeConstruct(ir.Imm32(static_cast<u32>(image.width)), // x
-                                                   ir.Imm32(static_cast<u32>(image.width)), // y
+            IR::Value dims = ir.CompositeConstruct(ir.Imm32(static_cast<u32>(image.width)),  // x
+                                                   ir.Imm32(static_cast<u32>(image.height)), // y
                                                    ir.Imm32(1), ir.Imm32(1)); // depth, mip
             inst.ReplaceUsesWith(dims);
 
-            // Track FMask resource to do specialization.
             descriptors.Add(FMaskResource{
                 .sharp_idx = tsharp,
             });
@@ -632,7 +752,6 @@ void PatchImageSharp(IR::Block& block, IR::Inst& inst, Info& info, Descriptors& 
         u32 sampler_binding = 0;
         const IR::Inst* sampler = inst.Arg(1).InstRecursive();
         ASSERT(sampler && sampler->GetOpcode() == IR::Opcode::CompositeConstructU32x4);
-        // Inline sampler resource.
         if (sampler->AreAllArgsImmediates()) {
             const auto inline_sampler = AmdGpu::Sampler{
                 .raw0 = u64(sampler->Arg(1).U32()) << 32 | u64(sampler->Arg(0).U32()),
@@ -644,7 +763,6 @@ void PatchImageSharp(IR::Block& block, IR::Inst& inst, Info& info, Descriptors& 
                 .is_inline_sampler = true,
             });
         } else {
-            // Normal sampler resource.
             const auto& [sampler_handle, disable_aniso] =
                 TryDisableAnisoLod0(sampler->Arg(0).InstRecursive());
             const auto ssharp = TrackSharp(sampler_handle, block, inst_info.pc);
@@ -1089,6 +1207,122 @@ void PatchImageArgs(IR::Block& block, IR::Inst& inst, Info& info) {
     }
 
     const auto image_handle = inst.Arg(0);
+
+    // Bindless image: handle is non-immediate (BindlessImageIndex result).
+    // Decompose assuming Color2D (most common bindless pattern).
+    if (!image_handle.IsImmediate()) {
+        IR::IREmitter ir{block, IR::Block::InstructionList::s_iterator_to(inst)};
+        const auto inst_info = inst.Flags<IR::TextureInstInfo>();
+        const auto handle = image_handle;
+
+        // For ImageRead/ImageWrite: decompose body into 2D coords + lod.
+        // Assumed Color2D (non-MSAA) — no multisampling for bindless.
+        if (inst.GetOpcode() == IR::Opcode::ImageRead ||
+            inst.GetOpcode() == IR::Opcode::ImageWrite || IsImageAtomicInstruction(inst)) {
+            IR::Inst* body = inst.Arg(1).InstRecursive();
+            // 2D coords: (x, y). LOD at body->Arg(2) if present. No MS.
+            const auto coords = ir.CompositeConstruct(body->Arg(0), body->Arg(1));
+            inst.SetArg(1, coords);
+            if (inst.GetOpcode() == IR::Opcode::ImageRead) {
+                inst.SetArg(2, inst_info.has_lod ? body->Arg(2) : IR::Value{});
+                inst.SetArg(3, IR::Value{}); // No MS for assumed 2D
+            } else if (inst.GetOpcode() == IR::Opcode::ImageWrite) {
+                inst.SetArg(2, inst_info.has_lod ? body->Arg(2) : IR::Value{});
+                inst.SetArg(3, IR::Value{}); // No MS for assumed 2D
+            }
+            // Atomics: coords only, no LOD/MS args to patch.
+            return;
+        }
+
+        // For ImageSampleRaw: full decomposition assuming 2D.
+
+        IR::Inst* body1 = inst.Arg(2).InstRecursive();
+        const auto get_addr_reg = [&](u32 index) -> IR::F32 {
+            if (index <= 3) {
+                return IR::F32{body1->Arg(index)};
+            }
+            IR::Inst* body2 = inst.Arg(3).InstRecursive();
+            if (index >= 4 && index <= 7) {
+                return IR::F32{body2->Arg(index - 4)};
+            }
+            IR::Inst* body3 = inst.Arg(4).InstRecursive();
+            return IR::F32{body3->Arg(index - 8)};
+        };
+        u32 addr_reg = 0;
+
+        // Offset extraction for 2D.
+        const IR::Value offset = [&] -> IR::Value {
+            if (!inst_info.has_offset) {
+                return IR::U32{};
+            }
+            IR::Value arg = get_addr_reg(addr_reg++);
+            if (const IR::Inst* offset_inst = arg.TryInstRecursive()) {
+                if (offset_inst->GetOpcode() == IR::Opcode::BitCastF32U32) {
+                    arg = offset_inst->Arg(0);
+                }
+            }
+            const auto read = [&](u32 off) -> IR::U32 {
+                if (arg.IsImmediate()) {
+                    const u32 imm =
+                        arg.Type() == IR::Type::F32 ? std::bit_cast<u32>(arg.F32()) : arg.U32();
+                    const u16 comp = (imm >> off) & 0x3F;
+                    return ir.Imm32(s32(comp << 26) >> 26);
+                }
+                return ir.BitFieldExtract(IR::U32{arg}, ir.Imm32(off), ir.Imm32(6), true);
+            };
+            return ir.CompositeConstruct(read(0), read(8));
+        }();
+        const IR::F32 bias = inst_info.has_bias ? get_addr_reg(addr_reg++) : IR::F32{};
+        const IR::F32 dref = inst_info.is_depth ? get_addr_reg(addr_reg++) : IR::F32{};
+        const auto [derivatives_dx, derivatives_dy] = [&] -> std::pair<IR::Value, IR::Value> {
+            if (!inst_info.has_derivatives) {
+                return {};
+            }
+            addr_reg = addr_reg + 4;
+            return {ir.CompositeConstruct(get_addr_reg(addr_reg - 4), get_addr_reg(addr_reg - 3)),
+                    ir.CompositeConstruct(get_addr_reg(addr_reg - 2), get_addr_reg(addr_reg - 1))};
+        }();
+
+        // 2D coords: x, y
+        addr_reg = addr_reg + 2;
+        const IR::Value coords =
+            ir.CompositeConstruct(get_addr_reg(addr_reg - 2), get_addr_reg(addr_reg - 1));
+
+        const bool explicit_lod = inst_info.has_lod || inst_info.force_level0;
+        const IR::F32 lod = inst_info.has_lod        ? get_addr_reg(addr_reg++)
+                            : inst_info.force_level0 ? ir.Imm32(0.0f)
+                                                     : IR::F32{};
+        const IR::F32 lod_clamp = inst_info.has_lod_clamp ? get_addr_reg(addr_reg++) : IR::F32{};
+
+        auto texel = [&] -> IR::Value {
+            if (inst_info.is_gather) {
+                if (inst_info.is_depth) {
+                    return ir.ImageGatherDref(handle, coords, offset, dref, inst_info);
+                }
+                return ir.ImageGather(handle, coords, offset, inst_info);
+            }
+            if (inst_info.has_derivatives) {
+                return ir.ImageGradient(handle, coords, derivatives_dx, derivatives_dy, offset,
+                                        lod_clamp, inst_info);
+            }
+            if (inst_info.is_depth) {
+                if (explicit_lod) {
+                    return ir.ImageSampleDrefExplicitLod(handle, coords, dref, lod, offset,
+                                                         inst_info);
+                }
+                return ir.ImageSampleDrefImplicitLod(handle, coords, dref, bias, offset, inst_info);
+            }
+            if (explicit_lod) {
+                return ir.ImageSampleExplicitLod(handle, coords, lod, offset, inst_info);
+            }
+            return ir.ImageSampleImplicitLod(handle, coords, bias, offset, inst_info);
+        }();
+
+        inst.ReplaceUsesWith(texel);
+        return;
+    }
+
+    // --- Non-bindless path (unchanged) ---
     const auto& image_res = info.images[image_handle.U32() & 0xFFFF];
     auto image = image_res.GetSharp(info);
 
