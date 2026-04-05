@@ -261,6 +261,13 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
         .supports_amd_shader_explicit_vertex_parameter =
             instance_.IsAmdShaderExplicitVertexParameterSupported(),
         .supports_fragment_shader_barycentric = instance_.IsFragmentShaderBarycentricSupported(),
+        .supports_descriptor_indexing = instance_.IsDescriptorIndexingSupported(),
+        .max_bindless_sampled_images = instance_.IsDescriptorIndexingSupported()
+                                           ? instance_.MaxUpdateAfterBindSampledImages()
+                                           : 0u,
+        .max_bindless_storage_buffers = instance_.IsDescriptorIndexingSupported()
+                                            ? instance_.MaxUpdateAfterBindStorageBuffers()
+                                            : 0u,
         .has_incomplete_fragment_shader_barycentric =
             instance_.IsFragmentShaderBarycentricSupported() &&
             instance.GetDriverID() == vk::DriverId::eMoltenvk,
