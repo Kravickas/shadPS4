@@ -367,6 +367,10 @@ public:
                                            const Value& value, const Value& cmp_value,
                                            TextureInstInfo info);
 
+    // Bindless descriptor table access — produces opaque handle for image instructions.
+    [[nodiscard]] Value BindlessImageIndex(const U32& table_binding, const U32& index,
+                                           const U32& sampler_binding);
+
     [[nodiscard]] Value ImageSampleRaw(const Value& image_handle, const Value& sampler_handle,
                                        const Value& address1, const Value& address2,
                                        const Value& address3, const Value& address4,
