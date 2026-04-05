@@ -339,7 +339,13 @@ s32 PS4_SYSV_ABI sceKernelMprotect(const void* addr, u64 size, s32 prot) {
     Core::MemoryManager* memory_manager = Core::Memory::Instance();
     Core::MemoryProt protection_flags = static_cast<Core::MemoryProt>(prot);
 
-    return memory_manager->Protect(aligned_addr, aligned_size, protection_flags);
+    s32 result = memory_manager->Protect(aligned_addr, aligned_size, protection_flags);
+    if (result == ORBIS_OK) {
+        // Protection change may override page fault tracking set by the GPU
+        // buffer cache. Invalidate so the cache re-uploads and re-tracks.
+        memory_manager->InvalidateMemory(aligned_addr, aligned_size);
+    }
+    return result;
 }
 
 s32 PS4_SYSV_ABI posix_mprotect(const void* addr, u64 size, s32 prot) {
@@ -370,6 +376,9 @@ s32 PS4_SYSV_ABI sceKernelMtypeprotect(const void* addr, u64 size, s32 mtype, s3
     s32 result = memory_manager->Protect(aligned_addr, aligned_size, protection_flags);
     if (result == ORBIS_OK) {
         memory_manager->SetDirectMemoryType(aligned_addr, aligned_size, mtype);
+        // Protection change may override page fault tracking set by the GPU
+        // buffer cache. Invalidate so the cache re-uploads and re-tracks.
+        memory_manager->InvalidateMemory(aligned_addr, aligned_size);
     }
     return result;
 }
