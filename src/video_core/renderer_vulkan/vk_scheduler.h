@@ -367,6 +367,15 @@ public:
     /// Ends current rendering scope.
     void EndRendering();
 
+    /// Begins an occlusion query within the current render pass.
+    void BeginOcclusionQuery(vk::QueryPool pool, u32 index,
+                             vk::QueryControlFlags flags = {});
+
+    /// Returns true if an occlusion query is currently recording.
+    bool IsOcclusionQueryActive() const {
+        return occlusion_query_active;
+    }
+
     /// Returns the current render state.
     const RenderState& GetRenderState() const {
         return render_state;
@@ -444,6 +453,9 @@ private:
     std::jthread priority_pending_ops_thread;
     RenderState render_state;
     bool is_rendering = false;
+    bool occlusion_query_active = false;
+    vk::QueryPool occlusion_query_pool{};
+    u32 occlusion_query_index = 0;
     tracy::VkCtxScope* profiler_scope{};
 };
 

@@ -69,6 +69,9 @@ public:
     void Finish();
     void OnSubmit();
 
+    /// Returns accumulated Z-pass count from Vulkan occlusion queries.
+    u64 GetOcclusionResult();
+
     PipelineCache& GetPipelineCache() {
         return pipeline_cache;
     }
@@ -145,6 +148,12 @@ private:
     boost::container::static_vector<ImageBindingInfo, Shader::NUM_IMAGES> image_bindings;
     bool fault_process_pending{};
     bool attachment_feedback_loop{};
+
+    // Occlusion query state — maps PS4 DB_COUNT_CONTROL to Vulkan queries.
+    static constexpr u32 MaxOcclusionQueries = 256;
+    vk::UniqueQueryPool occlusion_query_pool{};
+    u32 occlusion_num_used{};
+    bool occlusion_tracking{};
 };
 
 } // namespace Vulkan

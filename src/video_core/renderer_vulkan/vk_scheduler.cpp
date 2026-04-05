@@ -58,8 +58,23 @@ void Scheduler::EndRendering() {
     if (!is_rendering) {
         return;
     }
+    if (occlusion_query_active) {
+        current_cmdbuf.endQuery(occlusion_query_pool, occlusion_query_index);
+        occlusion_query_active = false;
+    }
     is_rendering = false;
     current_cmdbuf.endRendering();
+}
+
+void Scheduler::BeginOcclusionQuery(vk::QueryPool pool, u32 index,
+                                    vk::QueryControlFlags flags) {
+    if (occlusion_query_active || !is_rendering) {
+        return;
+    }
+    occlusion_query_pool = pool;
+    occlusion_query_index = index;
+    occlusion_query_active = true;
+    current_cmdbuf.beginQuery(pool, index, flags);
 }
 
 void Scheduler::Flush(SubmitInfo& info) {

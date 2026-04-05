@@ -112,6 +112,23 @@ struct DepthRenderControl {
     u32 decompress_enable : 1;
 };
 
+// DB_COUNT_CONTROL (0xA001 / 0x28004)
+// Controls hardware Z-pass counting for occlusion queries.
+// Sea Islands (CIK) register layout from AMD register headers.
+struct DbCountControl {
+    u32 zpass_increment_disable : 1; // [0]    Disable zpass increment
+    u32 perfect_zpass_counts : 1;    // [1]    Use exact counting
+    u32 : 2;                         // [3:2]  Reserved
+    u32 sample_rate : 3;             // [6:4]  Log2 of sample count
+    u32 : 1;                         // [7]    Reserved
+    u32 zpass_enable : 4;            // [11:8] Per-backend enable mask
+    u32 : 20;                        // [31:12]
+
+    bool IsEnabled() const {
+        return zpass_enable != 0 && !zpass_increment_disable;
+    }
+};
+
 struct DepthView {
     u32 slice_start : 11;
     u32 : 2;

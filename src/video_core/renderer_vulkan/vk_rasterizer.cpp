@@ -42,6 +42,13 @@ Rasterizer::Rasterizer(const Instance& instance_, Scheduler& scheduler_,
         liverpool->BindRasterizer(this);
     }
     memory->SetRasterizer(this);
+
+    // Create occlusion query pool for DB_COUNT_CONTROL Z-pass counting.
+    const vk::QueryPoolCreateInfo query_pool_ci = {
+        .queryType = vk::QueryType::eOcclusion,
+        .queryCount = MaxOcclusionQueries,
+    };
+    occlusion_query_pool = instance.GetDevice().createQueryPoolUnique(query_pool_ci);
 }
 
 Rasterizer::~Rasterizer() = default;
@@ -215,6 +222,28 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset) {
     UpdateDynamicState(pipeline, is_indexed);
     scheduler.BeginRendering(state);
 
+    // Begin occlusion query if DB_COUNT_CONTROL enables Z-pass counting.
+    if (regs.db_count_control.IsEnabled() && !scheduler.IsOcclusionQueryActive() &&
+        occlusion_num_used < MaxOcclusionQueries) {
+        if (!occlusion_tracking) {
+            // Host-side reset (Vulkan 1.2+). vkCmdResetQueryPool cannot be
+            // used here because we are already inside a render pass.
+            instance.GetDevice().resetQueryPool(*occlusion_query_pool, 0,
+                                                MaxOcclusionQueries);
+            occlusion_tracking = true;
+        }
+        const auto flags = regs.db_count_control.perfect_zpass_counts
+                               ? vk::QueryControlFlagBits::ePrecise
+                               : vk::QueryControlFlags{};
+        scheduler.BeginOcclusionQuery(*occlusion_query_pool, occlusion_num_used,
+                                     flags);
+        occlusion_num_used++;
+    } else if (regs.db_count_control.IsEnabled() &&
+               occlusion_num_used >= MaxOcclusionQueries) {
+        LOG_WARNING(Render_Vulkan,
+                    "Occlusion query pool exhausted ({} queries)", MaxOcclusionQueries);
+    }
+
     const auto& vs_info = pipeline->GetStage(Shader::LogicalStage::Vertex);
     const auto& fetch_shader = pipeline->GetFetchShader();
     const auto [vertex_offset, instance_offset] = GetDrawOffsets(regs, vs_info, fetch_shader);
@@ -271,6 +300,27 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
     pipeline->BindResources(set_writes, buffer_barriers, push_data);
     UpdateDynamicState(pipeline, is_indexed);
     scheduler.BeginRendering(state);
+
+    // Begin occlusion query if DB_COUNT_CONTROL enables Z-pass counting.
+    const auto& regs = liverpool->regs;
+    if (regs.db_count_control.IsEnabled() && !scheduler.IsOcclusionQueryActive() &&
+        occlusion_num_used < MaxOcclusionQueries) {
+        if (!occlusion_tracking) {
+            instance.GetDevice().resetQueryPool(*occlusion_query_pool, 0,
+                                                MaxOcclusionQueries);
+            occlusion_tracking = true;
+        }
+        const auto flags = regs.db_count_control.perfect_zpass_counts
+                               ? vk::QueryControlFlagBits::ePrecise
+                               : vk::QueryControlFlags{};
+        scheduler.BeginOcclusionQuery(*occlusion_query_pool, occlusion_num_used,
+                                     flags);
+        occlusion_num_used++;
+    } else if (regs.db_count_control.IsEnabled() &&
+               occlusion_num_used >= MaxOcclusionQueries) {
+        LOG_WARNING(Render_Vulkan,
+                    "Occlusion query pool exhausted ({} queries)", MaxOcclusionQueries);
+    }
 
     // We can safely ignore both SGPR UD indices and results of fetch shader parsing, as vertex and
     // instance offsets will be automatically applied by Vulkan from indirect args buffer.
@@ -367,6 +417,41 @@ u64 Rasterizer::Flush() {
 
 void Rasterizer::Finish() {
     scheduler.Finish();
+}
+
+u64 Rasterizer::GetOcclusionResult() {
+    if (occlusion_num_used == 0) {
+        occlusion_tracking = false;
+        return 0;
+    }
+
+    // ZpassDone is a synchronization point on PS4 — game expects results
+    // immediately. End any active render pass and submit all pending work.
+    scheduler.EndRendering();
+    Finish();
+
+    // Batch read all query results in a single call. Avoids per-query
+    // overhead that RPCS3 documented as expensive on NVIDIA drivers.
+    std::array<u64, MaxOcclusionQueries> results{};
+    const auto device = instance.GetDevice();
+    const auto res = device.getQueryPoolResults(
+        *occlusion_query_pool, 0, occlusion_num_used,
+        occlusion_num_used * sizeof(u64), results.data(), sizeof(u64),
+        vk::QueryResultFlagBits::e64 | vk::QueryResultFlagBits::eWait);
+
+    u64 total = 0;
+    if (res == vk::Result::eSuccess) {
+        for (u32 i = 0; i < occlusion_num_used; i++) {
+            total += results[i];
+        }
+    } else {
+        LOG_WARNING(Render_Vulkan, "Occlusion query read returned {}",
+                    vk::to_string(res));
+    }
+
+    occlusion_num_used = 0;
+    occlusion_tracking = false;
+    return total;
 }
 
 void Rasterizer::OnSubmit() {
