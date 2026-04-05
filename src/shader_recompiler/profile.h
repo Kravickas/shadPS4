@@ -34,6 +34,9 @@ struct Profile {
     bool supports_workgroup_explicit_memory_layout{};
     bool supports_amd_shader_explicit_vertex_parameter{};
     bool supports_fragment_shader_barycentric{};
+    bool supports_descriptor_indexing{};
+    u32 max_bindless_sampled_images{};
+    u32 max_bindless_storage_buffers{};
     bool has_incomplete_fragment_shader_barycentric{};
     bool has_broken_spirv_clamp{};
     bool lower_left_origin_mode{};

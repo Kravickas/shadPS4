@@ -439,6 +439,9 @@ void GraphicsPipeline::BuildDescSetLayout(bool preloading) {
     boost::container::small_vector<vk::DescriptorSetLayoutBinding, 32> bindings;
     u32 binding{};
 
+    bool has_bindless = false;
+    u32 first_bindless_binding = 0;
+
     for (const auto* stage : stages) {
         if (!stage) {
             continue;
@@ -475,13 +478,67 @@ void GraphicsPipeline::BuildDescSetLayout(bool preloading) {
                 .stageFlags = stage_bit,
             });
         }
+
+        // Bindless descriptor tables for this stage.
+        if (!stage->bindless_tables.empty()) {
+            if (!has_bindless) {
+                first_bindless_binding = static_cast<u32>(bindings.size());
+                has_bindless = true;
+            }
+            for (const auto& table : stage->bindless_tables) {
+                vk::DescriptorType desc_type{};
+                switch (table.type) {
+                case Shader::BindlessResourceType::Image:
+                    desc_type = table.has_writes ? vk::DescriptorType::eStorageImage
+                                                 : vk::DescriptorType::eSampledImage;
+                    break;
+                case Shader::BindlessResourceType::Buffer:
+                    desc_type = vk::DescriptorType::eStorageBuffer;
+                    break;
+                case Shader::BindlessResourceType::Sampler:
+                    desc_type = vk::DescriptorType::eSampler;
+                    break;
+                }
+                bindings.push_back({
+                    .binding = binding++,
+                    .descriptorType = desc_type,
+                    .descriptorCount = table.num_entries,
+                    .stageFlags = stage_bit,
+                });
+            }
+        }
     }
-    uses_push_descriptors = binding < instance.MaxPushDescriptors();
-    const auto flags = uses_push_descriptors
-                           ? vk::DescriptorSetLayoutCreateFlagBits::ePushDescriptorKHR
-                           : vk::DescriptorSetLayoutCreateFlagBits{};
+
+    // Push descriptors cannot be used with update-after-bind (Vulkan spec).
+    uses_push_descriptors = !has_bindless && binding < instance.MaxPushDescriptors();
+
+    // Per-binding flags: bindless array bindings get PARTIALLY_BOUND and
+    // UPDATE_AFTER_BIND; regular bindings get no flags.
+    boost::container::small_vector<vk::DescriptorBindingFlags, 32> binding_flags(
+        bindings.size(), vk::DescriptorBindingFlags{});
+    if (has_bindless) {
+        for (u32 i = first_bindless_binding; i < bindings.size(); i++) {
+            if (bindings[i].descriptorCount > 1) {
+                binding_flags[i] = vk::DescriptorBindingFlagBits::ePartiallyBound |
+                                   vk::DescriptorBindingFlagBits::eUpdateAfterBind;
+            }
+        }
+    }
+
+    const vk::DescriptorSetLayoutBindingFlagsCreateInfo binding_flags_ci = {
+        .bindingCount = static_cast<u32>(binding_flags.size()),
+        .pBindingFlags = binding_flags.data(),
+    };
+
+    vk::DescriptorSetLayoutCreateFlags layout_flags =
+        uses_push_descriptors ? vk::DescriptorSetLayoutCreateFlagBits::ePushDescriptorKHR
+                              : vk::DescriptorSetLayoutCreateFlags{};
+    if (has_bindless) {
+        layout_flags |= vk::DescriptorSetLayoutCreateFlagBits::eUpdateAfterBindPool;
+    }
     const vk::DescriptorSetLayoutCreateInfo desc_layout_ci = {
-        .flags = flags,
+        .pNext = has_bindless ? &binding_flags_ci : nullptr,
+        .flags = layout_flags,
         .bindingCount = static_cast<u32>(bindings.size()),
         .pBindings = bindings.data(),
     };

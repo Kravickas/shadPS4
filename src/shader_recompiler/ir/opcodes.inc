@@ -411,6 +411,11 @@ OPCODE(ConvertS32S8,                                        U32,            U8, 
 OPCODE(ConvertS32S16,                                       U32,            U16,                                                                            )
 
 // Image operations
+// Bindless descriptor table index — produces an opaque handle for image instructions.
+// Arg(0) = table binding index in info.bindless_tables (immediate u32)
+// Arg(1) = dynamic dword index into the descriptor table (u32, may be non-immediate)
+// Arg(2) = sampler binding index in info.samplers (immediate u32, 0xFFFF if no sampler)
+OPCODE(BindlessImageIndex,                                  Opaque,         U32,            U32,            U32,                                            )
 OPCODE(ImageSampleRaw,                                      F32x4,          Opaque,         Opaque,         F32x4,          F32x4,          F32x4,          F32,           )
 OPCODE(ImageSampleImplicitLod,                              F32x4,          Opaque,         F32x4,          F32,            Opaque,                         )
 OPCODE(ImageSampleExplicitLod,                              F32x4,          Opaque,         Opaque,         F32,            Opaque,                         )

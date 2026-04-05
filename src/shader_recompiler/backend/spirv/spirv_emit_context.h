@@ -351,6 +351,37 @@ public:
     boost::container::small_vector<BufferDefinition, 16> buffers;
     boost::container::small_vector<TextureDefinition, 8> images;
     boost::container::small_vector<Id, 4> samplers;
+
+    // Bindless descriptor table definitions for runtime-indexed descriptor arrays.
+    struct BindlessTableSpv {
+        Id variable;         // OpVariable for the runtime array
+        Id image_type;       // Base OpTypeImage
+        Id sampled_type;     // OpTypeSampledImage(image_type) or image_type for storage
+        Id element_ptr_type; // OpTypePointer(UniformConstant, image/sampled type)
+        Id result_type;      // Return type for sampling (typically F32x4)
+        const VectorIds* data_types;
+        bool is_integer{};
+        bool is_storage{};
+    };
+    boost::container::small_vector<BindlessTableSpv, 4> bindless_image_tables;
+
+    // Resolved image/sampler from handle — works for both regular and bindless paths.
+    struct ResolvedImage {
+        Id id;           // Loaded image (OpLoad result)
+        Id var_id;       // Variable Id (for mip fallback OpAccessChain)
+        Id result_type;  // Return type for operations
+        Id sampled_type; // For OpSampledImage (sampling path only)
+        Id image_type;   // OpTypeImage
+        const VectorIds* data_types;
+        AmdGpu::ImageType view_type{AmdGpu::ImageType::Color2D};
+        MipStorageFallbackMode mip_fallback_mode{};
+        bool is_integer{};
+        bool is_storage{};
+    };
+
+    ResolvedImage GetImage(const IR::Value& handle);
+    Id GetSampler(const IR::Value& handle);
+
     std::unordered_map<u32, Id> first_to_last_label_map;
 
     size_t flatbuf_index{};

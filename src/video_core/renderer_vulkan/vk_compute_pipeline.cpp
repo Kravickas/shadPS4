@@ -67,18 +67,65 @@ ComputePipeline::ComputePipeline(const Instance& instance, Scheduler& scheduler,
         });
     }
 
+    // Bindless descriptor tables — each becomes an array binding.
+    const bool has_bindless = !info->bindless_tables.empty();
+    const u32 first_bindless_binding = static_cast<u32>(bindings.size());
+    for (const auto& table : info->bindless_tables) {
+        vk::DescriptorType desc_type{};
+        switch (table.type) {
+        case Shader::BindlessResourceType::Image:
+            desc_type = table.has_writes ? vk::DescriptorType::eStorageImage
+                                         : vk::DescriptorType::eSampledImage;
+            break;
+        case Shader::BindlessResourceType::Buffer:
+            desc_type = vk::DescriptorType::eStorageBuffer;
+            break;
+        case Shader::BindlessResourceType::Sampler:
+            desc_type = vk::DescriptorType::eSampler;
+            break;
+        }
+        bindings.push_back({
+            .binding = binding++,
+            .descriptorType = desc_type,
+            .descriptorCount = table.num_entries,
+            .stageFlags = vk::ShaderStageFlagBits::eCompute,
+        });
+    }
+
     const vk::PushConstantRange push_constants = {
         .stageFlags = vk::ShaderStageFlagBits::eCompute,
         .offset = 0,
         .size = sizeof(Shader::PushData),
     };
 
-    uses_push_descriptors = binding < instance.MaxPushDescriptors();
-    const auto flags = uses_push_descriptors
-                           ? vk::DescriptorSetLayoutCreateFlagBits::ePushDescriptorKHR
-                           : vk::DescriptorSetLayoutCreateFlagBits{};
+    // Push descriptors cannot be used with update-after-bind (Vulkan spec).
+    uses_push_descriptors = !has_bindless && binding < instance.MaxPushDescriptors();
+
+    // When bindless tables are present, per-binding flags enable partially-bound
+    // and update-after-bind on the array bindings.  Regular bindings get no flags.
+    boost::container::small_vector<vk::DescriptorBindingFlags, 32> binding_flags(
+        bindings.size(), vk::DescriptorBindingFlags{});
+    if (has_bindless) {
+        for (u32 i = first_bindless_binding; i < bindings.size(); i++) {
+            binding_flags[i] = vk::DescriptorBindingFlagBits::ePartiallyBound |
+                               vk::DescriptorBindingFlagBits::eUpdateAfterBind;
+        }
+    }
+
+    const vk::DescriptorSetLayoutBindingFlagsCreateInfo binding_flags_ci = {
+        .bindingCount = static_cast<u32>(binding_flags.size()),
+        .pBindingFlags = binding_flags.data(),
+    };
+
+    vk::DescriptorSetLayoutCreateFlags layout_flags =
+        uses_push_descriptors ? vk::DescriptorSetLayoutCreateFlagBits::ePushDescriptorKHR
+                              : vk::DescriptorSetLayoutCreateFlags{};
+    if (has_bindless) {
+        layout_flags |= vk::DescriptorSetLayoutCreateFlagBits::eUpdateAfterBindPool;
+    }
     const vk::DescriptorSetLayoutCreateInfo desc_layout_ci = {
-        .flags = flags,
+        .pNext = has_bindless ? &binding_flags_ci : nullptr,
+        .flags = layout_flags,
         .bindingCount = static_cast<u32>(bindings.size()),
         .pBindings = bindings.data(),
     };

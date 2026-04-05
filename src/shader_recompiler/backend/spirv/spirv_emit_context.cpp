@@ -995,23 +995,69 @@ void EmitContext::DefineImagesAndSamplers() {
         image_u32 = TypePointer(spv::StorageClass::Image, U32[1]);
         image_f32 = TypePointer(spv::StorageClass::Image, F32[1]);
     }
-    if (info.samplers.empty()) {
-        return;
+    if (!info.samplers.empty()) {
+        sampler_type = TypeSampler();
+        sampler_pointer_type = TypePointer(spv::StorageClass::UniformConstant, sampler_type);
+        for (const auto& samp_desc : info.samplers) {
+            const Id id{
+                AddGlobalVariable(sampler_pointer_type, spv::StorageClass::UniformConstant)};
+            Decorate(id, spv::Decoration::Binding, binding.unified++);
+            Decorate(id, spv::Decoration::DescriptorSet, 0U);
+            const auto sharp_desc =
+                samp_desc.is_inline_sampler
+                    ? fmt::format("inline:{:#x}:{:#x}", samp_desc.inline_sampler.raw0,
+                                  samp_desc.inline_sampler.raw1)
+                    : fmt::format("sgpr:{}", samp_desc.sharp_idx);
+            Name(id, fmt::format("{}_{}{}", stage, "samp", sharp_desc));
+            samplers.push_back(id);
+            interfaces.push_back(id);
+        }
     }
-    sampler_type = TypeSampler();
-    sampler_pointer_type = TypePointer(spv::StorageClass::UniformConstant, sampler_type);
-    for (const auto& samp_desc : info.samplers) {
-        const Id id{AddGlobalVariable(sampler_pointer_type, spv::StorageClass::UniformConstant)};
-        Decorate(id, spv::Decoration::Binding, binding.unified++);
-        Decorate(id, spv::Decoration::DescriptorSet, 0U);
-        const auto sharp_desc =
-            samp_desc.is_inline_sampler
-                ? fmt::format("inline:{:#x}:{:#x}", samp_desc.inline_sampler.raw0,
-                              samp_desc.inline_sampler.raw1)
-                : fmt::format("sgpr:{}", samp_desc.sharp_idx);
-        Name(id, fmt::format("{}_{}{}", stage, "samp", sharp_desc));
-        samplers.push_back(id);
-        interfaces.push_back(id);
+
+    // Bindless descriptor tables — each becomes a runtime-sized descriptor array.
+    // PS4 hardware loads descriptors from these tables via S_BUFFER_LOAD_DWORD;
+    // we replicate this with OpTypeRuntimeArray indexed by the dynamic offset.
+    for (u32 table_idx = 0; table_idx < info.bindless_tables.size(); table_idx++) {
+        const auto& table = info.bindless_tables[table_idx];
+        if (table.type != BindlessResourceType::Image) {
+            // Buffer and sampler bindless tables handled separately.
+            continue;
+        }
+
+        // Assume float sampled 2D for the table (most common PS4 bindless pattern).
+        // The actual image type per-entry may vary, but Vulkan descriptor arrays
+        // require a uniform type — this matches the common case.
+        const bool is_storage = table.has_writes;
+        const Id sampled_type = F32[1];
+        const u32 sampled = is_storage ? 2u : 1u;
+        const Id image_type =
+            TypeImage(sampled_type, spv::Dim::Dim2D, false, false, false, sampled,
+                      is_storage ? spv::ImageFormat::Unknown : spv::ImageFormat::Unknown);
+        const Id runtime_array = TypeRuntimeArray(image_type);
+        const Id ptr_type = TypePointer(spv::StorageClass::UniformConstant, runtime_array);
+        const Id element_ptr_type = TypePointer(spv::StorageClass::UniformConstant, image_type);
+        const Id variable = AddGlobalVariable(ptr_type, spv::StorageClass::UniformConstant);
+        Decorate(variable, spv::Decoration::Binding, binding.unified++);
+        Decorate(variable, spv::Decoration::DescriptorSet, 0U);
+        Name(variable, fmt::format("{}_{}{}", stage, "bindless_tex", table_idx));
+
+        // Enable required SPIR-V capabilities for runtime descriptor arrays.
+        AddCapability(spv::Capability::RuntimeDescriptorArray);
+        AddExtension("SPV_EXT_descriptor_indexing");
+
+        const Id result_type = F32[4];
+        const Id combined_sampled_type = is_storage ? image_type : TypeSampledImage(image_type);
+        bindless_image_tables.push_back({
+            .variable = variable,
+            .image_type = image_type,
+            .sampled_type = combined_sampled_type,
+            .element_ptr_type = element_ptr_type,
+            .result_type = result_type,
+            .data_types = &F32,
+            .is_integer = false,
+            .is_storage = is_storage,
+        });
+        interfaces.push_back(variable);
     }
 }
 
@@ -1267,6 +1313,63 @@ void EmitContext::DefineFunctions() {
         LOG_DEBUG(Render_Recompiler, "Shader {:#x} uses dynamic ReadConst", info.pgm_hash);
         read_const_dynamic = DefineReadConst(true);
     }
+}
+
+EmitContext::ResolvedImage EmitContext::GetImage(const IR::Value& handle) {
+    if (handle.IsImmediate()) {
+        // Non-bindless: handle is an immediate binding index.
+        const u32 idx = handle.U32() & 0xFFFF;
+        const auto& tex = images[idx];
+        const Id image = OpLoad(tex.image_type, tex.id);
+        return {
+            .id = image,
+            .var_id = tex.id,
+            .result_type = tex.data_types->Get(4),
+            .sampled_type = tex.sampled_type,
+            .image_type = tex.image_type,
+            .data_types = tex.data_types,
+            .view_type = tex.view_type,
+            .mip_fallback_mode = tex.mip_fallback_mode,
+            .is_integer = tex.is_integer,
+            .is_storage = tex.is_storage,
+        };
+    }
+    // Bindless: handle is the result of BindlessImageIndex.
+    const IR::Inst* handle_inst = handle.InstRecursive();
+    ASSERT(handle_inst->GetOpcode() == IR::Opcode::BindlessImageIndex);
+    const u32 table_idx = handle_inst->Arg(0).U32();
+    const Id dyn_index = Def(handle_inst->Arg(1));
+    const auto& table = bindless_image_tables[table_idx];
+    const Id ptr = OpAccessChain(table.element_ptr_type, table.variable, dyn_index);
+    const Id image = OpLoad(table.image_type, ptr);
+    return {
+        .id = image,
+        .var_id = ptr, // Access chain pointer — needed for OpImageTexelPointer (atomics)
+        .result_type = table.result_type,
+        .sampled_type = table.sampled_type,
+        .image_type = table.image_type,
+        .data_types = table.data_types,
+        .view_type = AmdGpu::ImageType::Color2D,
+        .is_integer = table.is_integer,
+        .is_storage = table.is_storage,
+    };
+}
+
+Id EmitContext::GetSampler(const IR::Value& handle) {
+    if (handle.IsImmediate()) {
+        const u32 sampler_idx = handle.U32() >> 16;
+        return OpLoad(sampler_type, samplers[sampler_idx]);
+    }
+    // Bindless: sampler binding is stored in BindlessImageIndex Arg(2).
+    const IR::Inst* handle_inst = handle.InstRecursive();
+    ASSERT(handle_inst->GetOpcode() == IR::Opcode::BindlessImageIndex);
+    const u32 sampler_idx = handle_inst->Arg(2).U32();
+    if (sampler_idx == 0xFFFF || samplers.empty()) {
+        // No sampler for this access (non-sampling instruction).
+        // Return an invalid Id — caller should not use it.
+        return {};
+    }
+    return OpLoad(sampler_type, samplers[sampler_idx]);
 }
 
 } // namespace Shader::Backend::SPIRV
