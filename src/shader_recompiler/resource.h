@@ -16,6 +16,7 @@ static constexpr u32 NUM_IMAGES = 64;
 static constexpr u32 NUM_BUFFERS = 40;
 static constexpr u32 NUM_SAMPLERS = 16;
 static constexpr u32 NUM_FMASKS = 8;
+static constexpr u32 NUM_BINDLESS_TABLES = 4;
 
 enum class BufferType : u32 {
     Guest,
@@ -138,6 +139,42 @@ struct FMaskResource {
     }
 };
 using FMaskResourceList = boost::container::static_vector<FMaskResource, NUM_FMASKS>;
+
+// Describes a descriptor table accessed via S_BUFFER_LOAD_DWORD (bindless).
+// On PS4 hardware, shaders load T#/V#/S# descriptors from a buffer pointed to
+// by a V# in user data SGPRs.  Each BindlessTable maps to a single Vulkan
+// descriptor array binding so the shader can index into it at runtime.
+enum class BindlessResourceType : u32 {
+    Image,   // Table contains T# (image descriptors, 8 dwords each)
+    Buffer,  // Table contains V# (buffer descriptors, 4 dwords each)
+    Sampler, // Table contains S# (sampler descriptors, 4 dwords each)
+};
+
+struct BindlessTable {
+    u32 table_sharp_idx;       // Location of the table V# in flattened_ud_buf
+    BindlessResourceType type; // What kind of descriptors this table holds
+    u32 num_entries;           // Number of descriptor slots in the table
+    bool has_writes{};         // Whether any descriptor in the table is written
+
+    u32 DwordsPerEntry() const noexcept {
+        switch (type) {
+        case BindlessResourceType::Image:
+            return 8; // T# is 256 bits
+        case BindlessResourceType::Buffer:
+        case BindlessResourceType::Sampler:
+            return 4; // V# and S# are 128 bits
+        }
+        return 4;
+    }
+
+    // Compute table entry count from the table V# size.
+    static u32 CalcNumEntries(const AmdGpu::Buffer& table_vsharp, BindlessResourceType res_type) {
+        const u32 dwords_per_entry = (res_type == BindlessResourceType::Image) ? 8u : 4u;
+        const u32 table_dwords = table_vsharp.NumDwords();
+        return table_dwords / dwords_per_entry;
+    }
+};
+using BindlessTableList = boost::container::static_vector<BindlessTable, NUM_BINDLESS_TABLES>;
 
 struct PushData {
     static constexpr u32 XOffsetIndex = 0;
