@@ -232,21 +232,23 @@ void SetThreadName(void* thread, const char* name) {
 #endif
 
 AccurateTimer::AccurateTimer(std::chrono::nanoseconds target_interval)
-    : target_interval(target_interval) {}
+    : target_interval(target_interval), next_tick(std::chrono::high_resolution_clock::now()) {}
 
 void AccurateTimer::Start() {
-    const auto begin_sleep = std::chrono::high_resolution_clock::now();
-    if (total_wait.count() > 0) {
-        AccurateSleep(total_wait, nullptr, false);
+    const auto now = std::chrono::high_resolution_clock::now();
+    if (next_tick > now) {
+        AccurateSleep(std::chrono::duration_cast<std::chrono::nanoseconds>(next_tick - now),
+                      nullptr, false);
     }
-    start_time = std::chrono::high_resolution_clock::now();
-    total_wait -= std::chrono::duration_cast<std::chrono::nanoseconds>(start_time - begin_sleep);
 }
 
 void AccurateTimer::End() {
-    auto now = std::chrono::high_resolution_clock::now();
-    total_wait +=
-        target_interval - std::chrono::duration_cast<std::chrono::nanoseconds>(now - start_time);
+    next_tick += target_interval;
+    // If more than one full period behind, snap forward to prevent catch-up busy-spin.
+    const auto now = std::chrono::high_resolution_clock::now();
+    if (next_tick + target_interval < now) {
+        next_tick = now;
+    }
 }
 
 std::string GetCurrentThreadName() {
