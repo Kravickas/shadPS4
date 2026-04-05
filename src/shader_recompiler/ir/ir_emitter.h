@@ -88,6 +88,7 @@ public:
     [[nodiscard]] F32 GetTessGenericAttribute(const U32& vertex_index, const U32& attr_index,
                                               const U32& comp_index);
     void SetTcsGenericAttribute(const F32& value, const U32& attr_index, const U32& comp_index);
+    void SetLsGenericAttribute(const F32& value, const U32& attr_index, const U32& comp_index);
 
     [[nodiscard]] F32 ReadTcsGenericOuputAttribute(const U32& vertex_index, const U32& attr_index,
                                                    const U32& comp_index);

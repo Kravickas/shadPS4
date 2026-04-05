@@ -76,6 +76,8 @@ IR::Program TranslateProgram(const std::span<const u32>& code, Pools& pools, Inf
     } else if (info.l_stage == LogicalStage::TessellationEval) {
         Shader::Optimization::TessellationPreprocess(program, runtime_info);
         Shader::Optimization::DomainShaderTransform(program, runtime_info);
+    } else if (info.stage == Stage::Local && info.l_stage == LogicalStage::Vertex) {
+        Shader::Optimization::LocalShaderTransform(program, runtime_info);
     }
     Shader::Optimization::RingAccessElimination(program, runtime_info);
     Shader::Optimization::ReadLaneEliminationPass(program);

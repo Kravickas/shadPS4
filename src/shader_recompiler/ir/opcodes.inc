@@ -78,6 +78,7 @@ OPCODE(GetPatch,                                            F32,            Patc
 OPCODE(SetPatch,                                            Void,           Patch,          F32,                                                            )
 OPCODE(GetTessGenericAttribute,                             F32,            U32,            U32,            U32,                                            )
 OPCODE(SetTcsGenericAttribute,                              Void,           F32,            U32,            U32,                                            )
+OPCODE(SetLsGenericAttribute,                               Void,           F32,            U32,            U32,                                            )
 OPCODE(ReadTcsGenericOuputAttribute,                        F32,            U32,            U32,            U32,                                            )
 
 
@@ -454,3 +455,4 @@ OPCODE(BallotFindLsb,                                       U32,            U32x
 OPCODE(DataAppend,                                          U32,            U32,            U32                                                             )
 OPCODE(DataConsume,                                         U32,            U32,            U32                                                             )
 OPCODE(GroupAny,                                            U1,             U1,                                                                             )
+

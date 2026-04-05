@@ -826,10 +826,8 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
             auto& image_view = texture_cache.FindTexture(image_id, desc);
 
             // The image is either bound as storage in a separate descriptor or bound as render
-            // target in feedback loop. Depth images are excluded because they can't be bound as
-            // storage and feedback loop doesn't make sense for them
-            if ((image.binding.force_general || image.binding.is_target) &&
-                !image.info.props.is_depth) {
+            // target in feedback loop.
+            if (image.binding.force_general || image.binding.is_target) {
                 image.Transit(instance.IsAttachmentFeedbackLoopLayoutSupported() &&
                                       image.binding.is_target
                                   ? vk::ImageLayout::eAttachmentFeedbackLoopOptimalEXT
@@ -974,20 +972,32 @@ RenderState Rasterizer::BeginRendering(const GraphicsPipeline* pipeline) {
         ASSERT(desc.view_info.range.extent.levels == 1 && !image.binding.needs_rebind);
 
         const bool has_stencil = image.info.props.has_stencil;
-        // Stencil writes can be enabled while depth writes are off.
-        const bool stencil_write =
-            has_stencil && regs.depth_control.stencil_enable && !desc.view_info.is_storage;
-        const auto new_layout = desc.view_info.is_storage
-                                    ? has_stencil ? vk::ImageLayout::eDepthStencilAttachmentOptimal
-                                                  : vk::ImageLayout::eDepthAttachmentOptimal
-                                : stencil_write
-                                    ? vk::ImageLayout::eDepthReadOnlyStencilAttachmentOptimal
-                                : has_stencil ? vk::ImageLayout::eDepthStencilReadOnlyOptimal
-                                              : vk::ImageLayout::eDepthReadOnlyOptimal;
-        image.Transit(new_layout,
-                      vk::AccessFlagBits2::eDepthStencilAttachmentWrite |
-                          vk::AccessFlagBits2::eDepthStencilAttachmentRead,
-                      desc.view_info.range);
+        if (image.binding.is_bound) {
+            image.Transit(instance.IsAttachmentFeedbackLoopLayoutSupported()
+                              ? vk::ImageLayout::eAttachmentFeedbackLoopOptimalEXT
+                              : vk::ImageLayout::eGeneral,
+                          vk::AccessFlagBits2::eDepthStencilAttachmentWrite |
+                              vk::AccessFlagBits2::eDepthStencilAttachmentRead,
+                          desc.view_info.range);
+            attachment_feedback_loop = true;
+        } else {
+            // PS4 controls depth and stencil writes independently. Pick the
+            // layout that matches the exact combination the game requests.
+            const bool depth_write = desc.view_info.is_storage;
+            const bool stencil_write = has_stencil && regs.depth_control.stencil_enable;
+            const auto new_layout =
+                !has_stencil    ? depth_write ? vk::ImageLayout::eDepthAttachmentOptimal
+                                              : vk::ImageLayout::eDepthReadOnlyOptimal
+                : depth_write   ? stencil_write
+                                      ? vk::ImageLayout::eDepthStencilAttachmentOptimal
+                                      : vk::ImageLayout::eDepthAttachmentStencilReadOnlyOptimal
+                : stencil_write ? vk::ImageLayout::eDepthReadOnlyStencilAttachmentOptimal
+                                : vk::ImageLayout::eDepthStencilReadOnlyOptimal;
+            image.Transit(new_layout,
+                          vk::AccessFlagBits2::eDepthStencilAttachmentWrite |
+                              vk::AccessFlagBits2::eDepthStencilAttachmentRead,
+                          desc.view_info.range);
+        }
 
         state.width = std::min<u32>(state.width, image.info.size.width);
         state.height = std::min<u32>(state.height, image.info.size.height);

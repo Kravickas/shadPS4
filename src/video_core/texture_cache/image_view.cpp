@@ -81,7 +81,9 @@ ImageViewInfo::ImageViewInfo(const AmdGpu::ColorBuffer& col_buffer) noexcept {
 ImageViewInfo::ImageViewInfo(const AmdGpu::DepthBuffer& depth_buffer, AmdGpu::DepthView view,
                              AmdGpu::DepthControl ctl) {
     format = Vulkan::LiverpoolToVK::DepthFormat(depth_buffer.z_info.format,
-                                                depth_buffer.stencil_info.format);
+                                                depth_buffer.StencilValid()
+                                                    ? depth_buffer.stencil_info.format
+                                                    : AmdGpu::DepthBuffer::StencilFormat::Invalid);
     is_storage = ctl.depth_write_enable;
     range.base.layer = view.slice_start;
     range.extent.layers = view.NumSlices() - range.base.layer;

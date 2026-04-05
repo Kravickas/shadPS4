@@ -87,11 +87,13 @@ ImageInfo::ImageInfo(const AmdGpu::DepthBuffer& buffer, u32 num_slices, VAddr ht
                      AmdGpu::CbDbExtent hint, bool write_buffer) noexcept {
     tile_mode = buffer.GetTileMode();
     array_mode = AmdGpu::GetArrayMode(tile_mode);
-    pixel_format = LiverpoolToVK::DepthFormat(buffer.z_info.format, buffer.stencil_info.format);
+    pixel_format = LiverpoolToVK::DepthFormat(
+        buffer.z_info.format, buffer.StencilValid() ? buffer.stencil_info.format
+                                                    : AmdGpu::DepthBuffer::StencilFormat::Invalid);
     type = AmdGpu::ImageType::Color2D;
     props.is_tiled = buffer.IsTiled();
     props.is_depth = true;
-    props.has_stencil = buffer.stencil_info.format != AmdGpu::DepthBuffer::StencilFormat::Invalid;
+    props.has_stencil = buffer.StencilValid();
     num_samples = buffer.NumSamples();
     num_bits = buffer.NumBits();
     size.width = hint.Valid() ? hint.width : buffer.Pitch();
