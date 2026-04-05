@@ -281,6 +281,13 @@ void EmitSetTcsGenericAttribute(EmitContext& ctx, Id value, Id attr_index, Id co
     ctx.OpStore(pointer, value);
 }
 
+void EmitSetLsGenericAttribute(EmitContext& ctx, Id value, Id attr_index, Id comp_index) {
+    // LS output array is flat (no per-vertex outer dimension like TCS)
+    const auto component_ptr = ctx.TypePointer(spv::StorageClass::Output, ctx.F32[1]);
+    Id pointer = ctx.OpAccessChain(component_ptr, ctx.output_attr_array, attr_index, comp_index);
+    ctx.OpStore(pointer, value);
+}
+
 Id EmitGetPatch(EmitContext& ctx, IR::Patch patch) {
     const u32 index{IR::GenericPatchIndex(patch)};
     const Id element{ctx.ConstU32(IR::GenericPatchElement(patch))};
