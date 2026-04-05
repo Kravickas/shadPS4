@@ -117,9 +117,9 @@ ComputePipeline::ComputePipeline(const Instance& instance, Scheduler& scheduler,
         .pBindingFlags = binding_flags.data(),
     };
 
-    auto layout_flags = uses_push_descriptors
-                            ? vk::DescriptorSetLayoutCreateFlagBits::ePushDescriptorKHR
-                            : vk::DescriptorSetLayoutCreateFlagBits{};
+    vk::DescriptorSetLayoutCreateFlags layout_flags =
+        uses_push_descriptors ? vk::DescriptorSetLayoutCreateFlagBits::ePushDescriptorKHR
+                              : vk::DescriptorSetLayoutCreateFlags{};
     if (has_bindless) {
         layout_flags |= vk::DescriptorSetLayoutCreateFlagBits::eUpdateAfterBindPool;
     }
