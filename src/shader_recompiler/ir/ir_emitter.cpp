@@ -2065,6 +2065,11 @@ Value IREmitter::ImageAtomicCmpSwap(const Value& handle, const Value& coords, co
     return Inst(Opcode::ImageAtomicCmpSwap32, Flags{info}, handle, coords, value, cmp_value);
 }
 
+Value IREmitter::BindlessImageIndex(const U32& table_binding, const U32& index,
+                                    const U32& sampler_binding) {
+    return Inst(Opcode::BindlessImageIndex, table_binding, index, sampler_binding);
+}
+
 Value IREmitter::ImageSampleRaw(const Value& image_handle, const Value& sampler_handle,
                                 const Value& address1, const Value& address2, const Value& address3,
                                 const Value& address4, TextureInstInfo info) {
