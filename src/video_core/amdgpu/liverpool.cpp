@@ -679,12 +679,19 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 } else if (event->event_index.Value() == EventIndex::ZpassDone) {
                     if (event->event_type.Value() == EventType::PixelPipeStatDump) {
                         static constexpr u64 OcclusionCounterValidMask = 0x8000000000000000ULL;
-                        static constexpr u64 OcclusionCounterStep = 0x2FFFFFFULL;
+                        const u64 pixel_count =
+                            rasterizer ? rasterizer->GetOcclusionResult() : 0;
+                        // PS4 distributes fragment counts across shader backends.
+                        // Games sum all pairs to get the total. Divide evenly with
+                        // remainder to pipe 0 so the sum equals the real total.
+                        const u64 per_pipe = pixel_count / num_counter_pairs;
+                        const u64 remainder = pixel_count % num_counter_pairs;
                         u64* results = event->Address<u64*>();
                         for (s32 i = 0; i < num_counter_pairs; ++i, results += 2) {
-                            *results = pixel_counter | OcclusionCounterValidMask;
+                            const u64 pipe_count =
+                                (i == 0) ? per_pipe + remainder : per_pipe;
+                            *results = pipe_count | OcclusionCounterValidMask;
                         }
-                        pixel_counter += OcclusionCounterStep;
                     }
                 }
                 break;
