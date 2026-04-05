@@ -23,6 +23,9 @@ static vk::ImageUsageFlags ImageUsageFlags(const Vulkan::Instance* instance,
     if (!info.props.is_block) {
         if (info.props.is_depth) {
             usage |= vk::ImageUsageFlagBits::eDepthStencilAttachment;
+            if (instance->IsAttachmentFeedbackLoopLayoutSupported()) {
+                usage |= vk::ImageUsageFlagBits::eAttachmentFeedbackLoopEXT;
+            }
         } else {
             usage |= vk::ImageUsageFlagBits::eColorAttachment;
             if (instance->IsAttachmentFeedbackLoopLayoutSupported()) {
