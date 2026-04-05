@@ -119,6 +119,25 @@ public:
         return maintenance_8;
     }
 
+    /// Returns true when descriptor indexing features are available (Vulkan 1.2 core).
+    /// Required for PS4 bindless resource table access via S_BUFFER_LOAD_DWORD.
+    bool IsDescriptorIndexingSupported() const {
+        return vk12_features.descriptorIndexing && vk12_features.runtimeDescriptorArray &&
+               vk12_features.descriptorBindingPartiallyBound &&
+               vk12_features.shaderSampledImageArrayNonUniformIndexing &&
+               vk12_features.descriptorBindingSampledImageUpdateAfterBind;
+    }
+
+    /// Returns the max sampled image descriptors per stage for update-after-bind sets.
+    u32 MaxUpdateAfterBindSampledImages() const {
+        return vk12_props.maxPerStageDescriptorUpdateAfterBindSampledImages;
+    }
+
+    /// Returns the max storage buffer descriptors per stage for update-after-bind sets.
+    u32 MaxUpdateAfterBindStorageBuffers() const {
+        return vk12_props.maxPerStageDescriptorUpdateAfterBindStorageBuffers;
+    }
+
     /// Returns true if VK_EXT_attachment_feedback_loop_layout is supported
     bool IsAttachmentFeedbackLoopLayoutSupported() const {
         return attachment_feedback_loop;
