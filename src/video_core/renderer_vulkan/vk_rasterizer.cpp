@@ -48,7 +48,9 @@ Rasterizer::Rasterizer(const Instance& instance_, Scheduler& scheduler_,
         .queryType = vk::QueryType::eOcclusion,
         .queryCount = MaxOcclusionQueries,
     };
-    occlusion_query_pool = instance.GetDevice().createQueryPoolUnique(query_pool_ci);
+    auto [pool_result, pool] = instance.GetDevice().createQueryPoolUnique(query_pool_ci);
+	ASSERT(pool_result == vk::Result::eSuccess);
+	occlusion_query_pool = std::move(pool);
 }
 
 Rasterizer::~Rasterizer() = default;
