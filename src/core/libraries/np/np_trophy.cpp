@@ -211,6 +211,14 @@ s32 PS4_SYSV_ABI sceNpTrophyCreateContext(OrbisNpTrophyContext* context,
         return ORBIS_NP_TROPHY_ERROR_CONTEXT_ALREADY_EXISTS;
     }
 
+    const auto& np_comm_ids = Common::ElfInfo::Instance().GetNpCommIds();
+    if (service_label >= np_comm_ids.size()) {
+        LOG_ERROR(Lib_NpTrophy,
+                  "service_label {} out of range (npCommIds size = {}), missing npbind.dat?",
+                  service_label, np_comm_ids.size());
+        return ORBIS_NP_TROPHY_ERROR_INVALID_ARGUMENT;
+    }
+
     const auto ctx_id = trophy_contexts.insert(user_id, service_label);
 
     *context = ctx_id.index + 1;
@@ -219,7 +227,7 @@ s32 PS4_SYSV_ABI sceNpTrophyCreateContext(OrbisNpTrophyContext* context,
     ctx.context_id = *context;
 
     // Resolve and cache all paths once so callers never recompute them.
-    const std::string np_comm_id = Common::ElfInfo::Instance().GetNpCommIds()[service_label];
+    const std::string np_comm_id = np_comm_ids[service_label];
     const auto trophy_base =
         Common::FS::GetUserPath(Common::FS::PathType::UserDir) / "trophy" / np_comm_id;
     ctx.xml_save_file =
