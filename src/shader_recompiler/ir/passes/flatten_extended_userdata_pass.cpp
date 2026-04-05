@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <unordered_map>
+#include <vector>
 #include <boost/container/flat_map.hpp>
 #include <xbyak/xbyak.h>
 #include <xbyak/xbyak_util.h>
@@ -27,13 +28,39 @@ using namespace Xbyak::util;
 static Xbyak::CodeGenerator g_srt_codegen(32_MB);
 static const u8* g_srt_codegen_start = nullptr;
 
+// Pristine copies of walker JIT code, keyed by function pointer.
+// The signal handler permanently patches faulting instructions to xor (zero),
+// which means subsequent calls never retry the read even if the memory is now
+// available. Restoring from backup before each call lets the walker retry.
+static std::unordered_map<Shader::PFN_SrtWalker, std::vector<u8>> g_walker_backups;
+
 namespace Shader {
 
 PFN_SrtWalker RegisterWalkerCode(const u8* ptr, size_t size) {
     const auto func_addr = (PFN_SrtWalker)g_srt_codegen.getCurr();
     g_srt_codegen.db(ptr, size);
     g_srt_codegen.ready();
+    SaveWalkerBackup(func_addr, size);
     return func_addr;
+}
+
+void SaveWalkerBackup(PFN_SrtWalker func, size_t size) {
+    if (!func || size == 0) {
+        return;
+    }
+    auto& backup = g_walker_backups[func];
+    backup.resize(size);
+    std::memcpy(backup.data(), reinterpret_cast<const u8*>(func), size);
+}
+
+void RestoreWalkerCode(PFN_SrtWalker func, size_t size) {
+    if (!func || size == 0) {
+        return;
+    }
+    auto it = g_walker_backups.find(func);
+    if (it != g_walker_backups.end()) {
+        std::memcpy(reinterpret_cast<u8*>(func), it->second.data(), it->second.size());
+    }
 }
 
 } // namespace Shader
@@ -234,6 +261,9 @@ static void GenerateSrtProgram(Info& info, PassInfo& pass_info) {
     }
 
     info.srt_info.flattened_bufsize_dw = pass_info.dst_off_dw;
+
+    // Save pristine copy of the walker code before any signal handler patching.
+    SaveWalkerBackup(info.srt_info.walker_func, info.srt_info.walker_func_size);
 }
 
 }; // namespace
