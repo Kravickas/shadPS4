@@ -49,6 +49,7 @@ bool Inst::MayHaveSideEffects() const noexcept {
     case Opcode::DiscardCond:
     case Opcode::SetAttribute:
     case Opcode::SetTcsGenericAttribute:
+    case Opcode::SetLsGenericAttribute:
     case Opcode::SetPatch:
     case Opcode::StoreBufferU8:
     case Opcode::StoreBufferU16:
