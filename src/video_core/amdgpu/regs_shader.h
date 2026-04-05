@@ -210,15 +210,20 @@ struct ComputeProgram {
 };
 
 static constexpr const BinaryInfo& SearchBinaryInfo(const u32* code) {
+    // Fast path: the PSSL compiler emits S_MOV_B32 VCC_HI (or VCC_LO) with an
+    // immediate that encodes the offset to BinaryInfo.
     constexpr u32 token_mov_vcchi = 0xBEEB03FF;
-    if (code[0] == token_mov_vcchi) {
+    constexpr u32 token_mov_vcclo = 0xBEEA03FF;
+    if (code[0] == token_mov_vcchi || code[0] == token_mov_vcclo) {
         const auto* info = std::bit_cast<const BinaryInfo*>(code + (code[1] + 1) * 2);
         if (info->Valid()) {
             return *info;
         }
     }
-    constexpr u32 signature_size = sizeof(BinaryInfo::signature_ref) / sizeof(u8);
-    constexpr u32 search_limit = 0x4000;
+    // Brute-force search for the "OrbShdr" signature within the shader binary.
+    // The limit must cover the largest possible PS4 shader (compute shaders can
+    // exceed 64 KB).  256 K dwords (1 MB) is sufficient for any known title.
+    constexpr u32 search_limit = 0x40000;
     const u32* end = code + search_limit;
     for (const u32* it = code; it < end; ++it) {
         if (const BinaryInfo* info = std::bit_cast<const BinaryInfo*>(it); info->Valid()) {
