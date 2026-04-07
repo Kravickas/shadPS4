@@ -296,6 +296,15 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
     const auto image_id = texture_cache.FindImage(desc);
     texture_cache.UpdateImage(image_id);
 
+    {
+        auto& img = texture_cache.GetImage(image_id);
+        LOG_INFO(Render_Vulkan,
+                 "PrepareFrame: addr={:#x} fmt={} size={}x{} vo={} dirty={} flags={:#x}",
+                 cpu_address, vk::to_string(img.info.pixel_format), img.info.size.width,
+                 img.info.size.height, u32(img.usage.vo_surface),
+                 u32(bool(img.flags & VideoCore::ImageFlagBits::Dirty)), u32(img.flags));
+    }
+
     Frame* frame = GetRenderFrame();
 
     const auto frame_subresources = vk::ImageSubresourceRange{
