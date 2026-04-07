@@ -766,9 +766,11 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
         const auto tsharp = image_desc.GetSharp(stage);
         if (stage.pgm_hash == 0xdae98450u) {
             LOG_INFO(Render_Vulkan,
-                     "BindTexture: shader={:#x} sharp_idx={} addr={:#x} dfmt={}",
+                     "BindTexture: shader={:#x} sharp_idx={} addr={:#x} dfmt={} written={} "
+                     "type={} tile={}",
                      stage.pgm_hash, image_desc.sharp_idx, u64(tsharp.Address()),
-                     u32(tsharp.GetDataFmt()));
+                     u32(tsharp.GetDataFmt()), image_desc.is_written, u32(tsharp.GetType()),
+                     u32(tsharp.GetTileMode()));
         }
         if (texture_cache.IsMeta(tsharp.Address())) {
             LOG_WARNING(Render_Vulkan, "Unexpected metadata read by a shader (texture)");
