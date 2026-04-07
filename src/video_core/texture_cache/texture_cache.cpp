@@ -273,7 +273,13 @@ ImageId TextureCache::ResolveDepthOverlap(const ImageInfo& requested_info, Bindi
                 cache_image.info.pixel_format, new_info.pixel_format, cache_image.GetImage(),
                 new_image.GetImage());
         } else {
-            LOG_WARNING(Render_Vulkan, "Unimplemented depth overlap copy");
+            LOG_WARNING(Render_Vulkan,
+                        "Unimplemented depth overlap copy: src_samples={} dst_samples={} "
+                        "src_fmt={} dst_fmt={} src_depth={} dst_depth={} addr={:#x}",
+                        cache_image.info.num_samples, new_info.num_samples,
+                        vk::to_string(cache_image.info.pixel_format),
+                        vk::to_string(new_info.pixel_format), cache_image.info.props.is_depth,
+                        new_info.props.is_depth, new_info.guest_address);
         }
 
         // Free the cache image.
@@ -587,7 +593,12 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_fmt) {
             // The image was clearly picked up wrong.
             FreeImage(image_id);
             image_id = {};
-            LOG_WARNING(Render_Vulkan, "Image overlap resolve failed");
+            LOG_WARNING(Render_Vulkan,
+                        "Image overlap resolve failed: addr={:#x} fmt={} size={}x{} "
+                        "resolved_layers={} requested_layers={} is_depth={}",
+                        info.guest_address, vk::to_string(info.pixel_format), info.size.width,
+                        info.size.height, image_resolved.info.resources.layers,
+                        info.resources.layers, info.props.is_depth);
         }
     }
     // Create and register a new image
