@@ -253,13 +253,15 @@ ImageId TextureCache::ResolveDepthOverlap(const ImageInfo& requested_info, Bindi
         // When creating a depth buffer through overlap resolution don't clear it on first use.
         new_image.info.meta_info.htile_clear_mask = 0;
 
-        if (cache_image.info.num_samples == 1 && new_info.num_samples == 1) {
-            // Perform depth<->color copy using the intermediate copy buffer.
+        if (cache_image.info.num_samples == new_info.num_samples) {
+            // Perform depth<->color copy.
             if (instance.IsMaintenance8Supported()) {
                 new_image.CopyImage(cache_image);
-            } else {
+            } else if (cache_image.info.num_samples == 1) {
                 const auto& copy_buffer = buffer_cache.GetUtilityBuffer(MemoryUsage::DeviceLocal);
                 new_image.CopyImageWithBuffer(cache_image, copy_buffer.Handle(), 0);
+            } else {
+                LOG_WARNING(Render_Vulkan, "MSAA depth overlap copy requires VK_KHR_maintenance8");
             }
         } else if (cache_image.info.num_samples == 1 && new_info.props.is_depth &&
                    new_info.num_samples > 1) {
