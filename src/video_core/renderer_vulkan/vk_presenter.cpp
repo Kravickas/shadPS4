@@ -340,6 +340,9 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
 
     auto& image = texture_cache.GetImage(image_id);
     auto image_view = *image.FindView(view_info).image_view;
+    LOG_INFO(Render_Vulkan, "PrepareFrame view: view_valid={} view_fmt={} has_backing={}",
+             static_cast<bool>(image_view), vk::to_string(view_info.format),
+             image.backing != nullptr);
     image.Transit(vk::ImageLayout::eShaderReadOnlyOptimal, vk::AccessFlagBits2::eShaderRead, {});
 
     const vk::Extent2D image_size = {image.info.size.width, image.info.size.height};
