@@ -670,10 +670,6 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
 
     for (const auto& desc : stage.buffers) {
         const auto vsharp = desc.GetSharp(stage);
-        LOG_INFO(Render_Vulkan,
-                 "BindBuffer: shader={:#x} sharp_idx={} base_addr={:#x} size={:#x} special={}",
-                 stage.pgm_hash, desc.sharp_idx, u64(vsharp.base_address),
-                 u64(vsharp.GetSize()), desc.IsSpecial());
         if (!desc.IsSpecial() && vsharp.base_address != 0 && vsharp.GetSize() > 0) {
             const u64 size = memory->ClampRangeSize(vsharp.base_address, vsharp.GetSize());
             const auto buffer_id = buffer_cache.FindBuffer(vsharp.base_address, size);
