@@ -670,6 +670,10 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
 
     for (const auto& desc : stage.buffers) {
         const auto vsharp = desc.GetSharp(stage);
+        LOG_INFO(Render_Vulkan,
+                 "BindBuffer: shader={:#x} sharp_idx={} base_addr={:#x} size={:#x} special={}",
+                 stage.pgm_hash, desc.sharp_idx, u64(vsharp.base_address),
+                 u64(vsharp.GetSize()), desc.IsSpecial());
         if (!desc.IsSpecial() && vsharp.base_address != 0 && vsharp.GetSize() > 0) {
             const u64 size = memory->ClampRangeSize(vsharp.base_address, vsharp.GetSize());
             const auto buffer_id = buffer_cache.FindBuffer(vsharp.base_address, size);
@@ -751,6 +755,10 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
 void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindings& binding) {
     image_bindings.clear();
     const u32 first_image_idx = image_infos.size();
+    if (stage.pgm_hash == 0xdae98450u) {
+        LOG_INFO(Render_Vulkan, "BindTextures: shader={:#x} num_images={} num_buffers={}",
+                 stage.pgm_hash, stage.images.size(), stage.buffers.size());
+    }
     // For loading/storing to explicit mip levels, when no native instruction support, bind an array
     // of descriptors consecutively, 1 for each mip level. The shader can index this with LOD
     // operand.
@@ -760,6 +768,12 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
 
     for (const auto& image_desc : stage.images) {
         const auto tsharp = image_desc.GetSharp(stage);
+        if (stage.pgm_hash == 0xdae98450u) {
+            LOG_INFO(Render_Vulkan,
+                     "BindTexture: shader={:#x} sharp_idx={} addr={:#x} dfmt={}",
+                     stage.pgm_hash, image_desc.sharp_idx, u64(tsharp.Address()),
+                     u32(tsharp.GetDataFmt()));
+        }
         if (texture_cache.IsMeta(tsharp.Address())) {
             LOG_WARNING(Render_Vulkan, "Unexpected metadata read by a shader (texture)");
         }
