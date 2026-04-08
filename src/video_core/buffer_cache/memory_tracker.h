@@ -113,6 +113,11 @@ public:
                                            if (!manager->template IsRegionModified<Type::GPU>(
                                                    rel_offset, range_size)) {
                                                func(addr, range_size);
+                                           } else {
+                                               LOG_INFO(Render_Vulkan,
+                                                        "Skipped stale CPU upload: "
+                                                        "addr={:#x} size={:#x}",
+                                                        addr, range_size);
                                            }
                                        });
                                }
