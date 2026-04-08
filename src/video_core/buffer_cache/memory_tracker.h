@@ -51,6 +51,9 @@ public:
                                 std::scoped_lock lk{manager->lock};
                                 manager->template ChangeRegionState<Type::CPU, true>(
                                     manager->GetCpuAddr() + offset, size);
+                                // A real CPU write supersedes any prior GPU modification.
+                                manager->template ChangeRegionState<Type::GPU, false>(
+                                    manager->GetCpuAddr() + offset, size);
                             });
     }
 
@@ -80,6 +83,9 @@ public:
                     }
                     manager->template ChangeRegionState<Type::CPU, true>(
                         manager->GetCpuAddr() + offset, size);
+                    // A real CPU write supersedes any prior GPU modification.
+                    manager->template ChangeRegionState<Type::GPU, false>(
+                        manager->GetCpuAddr() + offset, size);
                     return false;
                 }();
                 if (should_flush) {
@@ -94,8 +100,22 @@ public:
         IteratePages<true>(query_cpu_range, query_size,
                            [&func, is_written](RegionManager* manager, u64 offset, size_t size) {
                                manager->lock.lock();
-                               manager->template ForEachModifiedRange<Type::CPU, true>(
-                                   manager->GetCpuAddr() + offset, size, func);
+                               if (is_written) {
+                                   manager->template ForEachModifiedRange<Type::CPU, true>(
+                                       manager->GetCpuAddr() + offset, size, func);
+                               } else {
+                                   // Skip upload for GPU-modified pages to preserve
+                                   // GPU-written data that has no newer CPU write.
+                                   manager->template ForEachModifiedRange<Type::CPU, true>(
+                                       manager->GetCpuAddr() + offset, size,
+                                       [&func, manager](VAddr addr, size_t range_size) {
+                                           const size_t rel_offset = addr - manager->GetCpuAddr();
+                                           if (!manager->template IsRegionModified<Type::GPU>(
+                                                   rel_offset, range_size)) {
+                                               func(addr, range_size);
+                                           }
+                                       });
+                               }
                                if (!is_written) {
                                    manager->lock.unlock();
                                }
