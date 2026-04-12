@@ -670,6 +670,12 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
 
     for (const auto& desc : stage.buffers) {
         const auto vsharp = desc.GetSharp(stage);
+        if (stage.pgm_hash == 0x37822225u || stage.pgm_hash == 0x731d6c78u) {
+            LOG_INFO(Render_Vulkan,
+                     "BindBuffer: shader={:#x} addr={:#x} size={:#x} special={} type={}",
+                     stage.pgm_hash, vsharp.base_address, u64(vsharp.GetSize()),
+                     desc.IsSpecial(), u32(desc.buffer_type));
+        }
         if (!desc.IsSpecial() && vsharp.base_address != 0 && vsharp.GetSize() > 0) {
             const u64 size = memory->ClampRangeSize(vsharp.base_address, vsharp.GetSize());
             const auto buffer_id = buffer_cache.FindBuffer(vsharp.base_address, size);
@@ -722,6 +728,13 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
             const u32 offset_aligned = Common::AlignDown(offset, alignment);
             const u32 adjust = offset - offset_aligned;
             ASSERT(adjust % 4 == 0);
+            if (stage.pgm_hash == 0x731d6c78u) {
+                LOG_INFO(Render_Vulkan,
+                         "BindBuffer: shader={:#x} vsharp_addr={:#x} size={:#x} "
+                         "cache_offset={:#x} aligned={:#x} adjust={:#x} binding={}",
+                         stage.pgm_hash, vsharp.base_address, size, offset,
+                         offset_aligned, adjust, binding.buffer);
+            }
             push_data.AddOffset(binding.buffer, adjust);
             buffer_infos.emplace_back(vk_buffer->Handle(), offset_aligned, size + adjust);
             if (auto barrier =
