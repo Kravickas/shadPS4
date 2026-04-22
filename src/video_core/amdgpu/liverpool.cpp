@@ -27,7 +27,8 @@ static const char* ccb_task_name{"CCB_TASK"};
 static_assert(Liverpool::NumComputeRings <= MAX_NAMES);
 
 #define NAME_NUM(z, n, name) BOOST_PP_STRINGIZE(name) BOOST_PP_STRINGIZE(n),
-#define NAME_ARRAY(name, num) {BOOST_PP_REPEAT(num, NAME_NUM, name)}
+#define NAME_ARRAY(name, num)                                                                      \
+    { BOOST_PP_REPEAT(num, NAME_NUM, name) }
 
 static const char* acb_task_name[] = NAME_ARRAY(ACB_TASK, MAX_NAMES);
 
@@ -243,10 +244,55 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
         default:
             UNREACHABLE_MSG("Wrong PM4 type {}", type);
             break;
-        case 0:
-            UNREACHABLE_MSG("Unimplemented PM4 type 0, base reg: {}, size: {}",
-                            header->type0.base.Value(), header->type0.NumWords());
-            break;
+        case 0: {
+            // DIAGNOSTIC: dump context around the PKT0 to determine whether this is a real
+            // PKT0 emission or a parser desync (e.g., walked into zero-padded body of a
+            // mis-sized prior packet). Compares actual position against the expected end of
+            // the most recent plausible PKT3 within the look-back window.
+            const auto* dcb_start = reinterpret_cast<const u32*>(base_addr);
+            const auto* here = reinterpret_cast<const u32*>(header);
+            const ptrdiff_t back_dwords = std::min<ptrdiff_t>(64, here - dcb_start);
+            const ptrdiff_t fwd_dwords = std::min<ptrdiff_t>(16, dcb.size());
+
+            LOG_CRITICAL(Render,
+                         "PKT0 hit at dcb_offset={:#x} (header raw={:#010x}, base={}, "
+                         "size={}). dcb_total={} dwords. Dumping context:",
+                         here - dcb_start, header->raw, header->type0.base.Value(),
+                         header->type0.NumWords(), dcb.size_bytes() / 4);
+
+            // Backward dump (8 DWORDs per line)
+            for (ptrdiff_t i = -back_dwords; i < fwd_dwords; i += 8) {
+                std::string line = fmt::format("  [{:+#06x}]", i);
+                for (ptrdiff_t j = 0; j < 8 && (i + j) < fwd_dwords; ++j) {
+                    line += fmt::format(" {:08x}", here[i + j]);
+                }
+                LOG_CRITICAL(Render, "{}", line);
+            }
+
+            // Walk backward looking for the most recent plausible PKT3 header.
+            // If its NumWords()+1 lands exactly on `here`, the parser math is consistent
+            // and the PKT0 is genuine. If it overshoots/undershoots, that PKT3 is the
+            // desync source.
+            for (ptrdiff_t i = 1; i <= back_dwords; ++i) {
+                const auto* candidate = reinterpret_cast<const PM4Header*>(here - i);
+                if (candidate->type != 3) {
+                    continue;
+                }
+                const auto cand_size = candidate->type3.NumWords() + 1;
+                const auto delta = static_cast<ptrdiff_t>(cand_size) - i;
+                LOG_CRITICAL(Render,
+                             "  prev PKT3 at -{:#x}: opcode={:#x} count={} NumWords()+1={} "
+                             "(delta vs here = {:+d})",
+                             i, static_cast<u32>(candidate->type3.opcode.Value()),
+                             candidate->type3.count.Value(), cand_size, delta);
+                break;
+            }
+
+            // Skip past this PKT0 per AMD spec so the game keeps running and we can
+            // collect more diagnostic hits (instead of one-shot UNREACHABLE).
+            dcb = NextPacket(dcb, header->type0.NumWords() + 1);
+            continue;
+        }
         case 2:
             // Type-2 packet are used for padding purposes
             dcb = NextPacket(dcb, 1);
