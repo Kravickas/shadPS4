@@ -227,7 +227,8 @@ Liverpool::Task Liverpool::ProcessCeUpdate(std::span<const u32> ccb) {
     FIBER_EXIT;
 }
 
-Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<const u32> ccb) {
+Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<const u32> ccb,
+                                           uintptr_t dcb_guest_base) {
     FIBER_ENTER(dcb_task_name);
 
     cblock.Reset();
@@ -244,7 +245,16 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
     const bool host_markers_enabled = rasterizer && EmulatorSettings.IsVkHostMarkersEnabled();
     const bool guest_markers_enabled = rasterizer && EmulatorSettings.IsVkGuestMarkersEnabled();
 
-    const auto base_addr = reinterpret_cast<uintptr_t>(dcb.data());
+    // base_addr is the GUEST virtual address of the dcb being parsed, used by the
+    // debugger to annotate packets with their original PS4 memory location. When the
+    // dcb has been snapshotted into host memory (which is the case for every guest
+    // submission and every IB recursion in this build), dcb.data() points to the host
+    // copy and is meaningless to the debugger; the caller passes the original guest
+    // address as dcb_guest_base. When zero (host-synthesized init sequences) we fall
+    // back to dcb.data() to preserve the prior debug behavior for those.
+    const uintptr_t base_addr = dcb_guest_base != 0
+                                    ? dcb_guest_base
+                                    : reinterpret_cast<uintptr_t>(dcb.data());
     while (!dcb.empty()) {
         ProcessCommands();
 
@@ -846,8 +856,9 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 const auto* ib_src = indirect_buffer->Address<const u32>();
                 ib_snap->dcb.assign(ib_src, ib_src + indirect_buffer->ib_size);
                 const std::span<const u32> ib_span{ib_snap->dcb};
+                const uintptr_t ib_guest_base = reinterpret_cast<uintptr_t>(ib_src);
 
-                auto task = ProcessGraphics(ib_span, {});
+                auto task = ProcessGraphics(ib_span, {}, ib_guest_base);
                 task.handle.promise().snapshot = std::move(ib_snap);
                 RESUME_GFX(task);
 
@@ -921,7 +932,8 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
 }
 
 template <bool is_indirect>
-Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
+Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid,
+                                          uintptr_t acb_guest_base) {
     FIBER_ENTER(acb_task_name[vqid]);
     auto& queue = asc_queues[{vqid}];
     const bool host_markers_enabled = rasterizer && EmulatorSettings.IsVkHostMarkersEnabled();
@@ -932,7 +944,18 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
     };
     boost::container::small_vector<IndirectPatch, 4> indirect_patches;
 
-    auto base_addr = reinterpret_cast<VAddr>(acb.data());
+    // base_addr is the GUEST virtual address of this acb. It is compared against the
+    // guest virtual addresses encoded in DmaData packets to detect the GNM
+    // "DMA-then-DispatchDirect" self-patch pattern (where a game DMAs group dimensions
+    // into its own ACB just before a DispatchDirect, effectively making the dispatch
+    // indirect). The comparison is only meaningful when base_addr is in the guest
+    // address space. SubmitAsc passes the acb span directly from guest memory, so the
+    // legacy reinterpret_cast<VAddr>(acb.data()) yielded the right value; with IB
+    // recursion the acb span may instead point into a host snapshot, in which case
+    // the caller passes the original guest IB address as acb_guest_base.
+    const VAddr base_addr = acb_guest_base != 0
+                                ? static_cast<VAddr>(acb_guest_base)
+                                : reinterpret_cast<VAddr>(acb.data());
     size_t acb_size = acb.size_bytes();
     while (!acb.empty()) {
         ProcessCommands();
@@ -988,13 +1011,18 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
             const auto* indirect_buffer = reinterpret_cast<const PM4CmdIndirectBuffer*>(header);
             // Same rationale as the graphics IB handler: snapshot the IB into
             // the nested coroutine's promise so the parser reads stable bytes
-            // even if the guest rewrites the IB memory concurrently.
+            // even if the guest rewrites the IB memory concurrently. We also
+            // pass the IB's original guest virtual address through so that the
+            // nested ProcessCompute can correctly recognize the GNM
+            // DMA-then-DispatchDirect self-patch pattern (whose detection
+            // compares packet destinations against the acb's guest base).
             auto ib_snap = std::make_unique<CmdSnapshot>();
             const auto* ib_src = indirect_buffer->Address<const u32>();
             ib_snap->dcb.assign(ib_src, ib_src + indirect_buffer->ib_size);
             const std::span<const u32> ib_span{ib_snap->dcb};
+            const uintptr_t ib_guest_base = reinterpret_cast<uintptr_t>(ib_src);
 
-            auto task = ProcessCompute<true>(ib_span, vqid);
+            auto task = ProcessCompute<true>(ib_span, vqid, ib_guest_base);
             task.handle.promise().snapshot = std::move(ib_snap);
             RESUME_ASC(task, vqid);
 
@@ -1200,7 +1228,8 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
     FIBER_EXIT;
 }
 
-void Liverpool::SubmitGfx(std::span<const u32> dcb, std::span<const u32> ccb) {
+void Liverpool::SubmitGfx(std::span<const u32> dcb, std::span<const u32> ccb,
+                          uintptr_t dcb_guest_base) {
     auto& queue = mapped_queues[GfxQueueId];
 
     // PS4-accurate: snapshot DCB and CCB synchronously on the submitting thread
@@ -1212,6 +1241,10 @@ void Liverpool::SubmitGfx(std::span<const u32> dcb, std::span<const u32> ccb) {
     //
     // The snapshot is owned by the coroutine's promise, so its lifetime is
     // tied to the coroutine frame and it is freed by handle.destroy().
+    //
+    // dcb_guest_base is forwarded so that downstream debugger annotations
+    // (DebugState.PushRegsDump) keep showing the original PS4 virtual address
+    // rather than the host snapshot pointer.
     auto snap = std::make_unique<CmdSnapshot>();
     snap->dcb.assign(dcb.begin(), dcb.end());
     snap->ccb.assign(ccb.begin(), ccb.end());
@@ -1219,7 +1252,7 @@ void Liverpool::SubmitGfx(std::span<const u32> dcb, std::span<const u32> ccb) {
     const std::span<const u32> dcb_span{snap->dcb};
     const std::span<const u32> ccb_span{snap->ccb};
 
-    auto task = ProcessGraphics(dcb_span, ccb_span);
+    auto task = ProcessGraphics(dcb_span, ccb_span, dcb_guest_base);
     task.handle.promise().snapshot = std::move(snap);
     {
         std::scoped_lock lock{queue.m_access};
