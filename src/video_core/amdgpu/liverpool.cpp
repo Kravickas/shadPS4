@@ -27,8 +27,7 @@ static const char* ccb_task_name{"CCB_TASK"};
 static_assert(Liverpool::NumComputeRings <= MAX_NAMES);
 
 #define NAME_NUM(z, n, name) BOOST_PP_STRINGIZE(name) BOOST_PP_STRINGIZE(n),
-#define NAME_ARRAY(name, num)                                                                      \
-    { BOOST_PP_REPEAT(num, NAME_NUM, name) }
+#define NAME_ARRAY(name, num) {BOOST_PP_REPEAT(num, NAME_NUM, name)}
 
 static const char* acb_task_name[] = NAME_ARRAY(ACB_TASK, MAX_NAMES);
 
@@ -195,14 +194,26 @@ Liverpool::Task Liverpool::ProcessCeUpdate(std::span<const u32> ccb) {
         }
         case PM4ItOpcode::IndirectBufferConst: {
             const auto* indirect_buffer = reinterpret_cast<const PM4CmdIndirectBuffer*>(header);
-            auto task =
-                ProcessCeUpdate({indirect_buffer->Address<const u32>(), indirect_buffer->ib_size});
+            // Snapshot the IB into the nested task's promise. On PS4 the CP
+            // reads an IB at the moment it reaches the IndirectBuffer packet;
+            // shadPS4 emulates that here, but because the emulated parser can
+            // be arbitrarily behind the guest timeline the game may be
+            // rewriting the IB memory already. Copy it under our control so
+            // the nested coroutine parses stable bytes.
+            auto ib_snap = std::make_unique<CmdSnapshot>();
+            const auto* ib_src = indirect_buffer->Address<const u32>();
+            ib_snap->ccb.assign(ib_src, ib_src + indirect_buffer->ib_size);
+            const std::span<const u32> ib_span{ib_snap->ccb};
+
+            auto task = ProcessCeUpdate(ib_span);
+            task.handle.promise().snapshot = std::move(ib_snap);
             RESUME_CE(task);
 
             while (!task.handle.done()) {
                 YIELD_CE();
                 RESUME_CE(task);
             }
+            task.handle.destroy();
             break;
         }
         default:
@@ -215,33 +226,6 @@ Liverpool::Task Liverpool::ProcessCeUpdate(std::span<const u32> ccb) {
 
     FIBER_EXIT;
 }
-
-// DIAGNOSTIC: ring buffer of last N PKT3 dispatches (header ptr, header.raw, opcode, count,
-// advance). Updated at every PKT3 advance site in ProcessGraphics; dumped when a PKT0 is
-// encountered so we can see exactly which earlier packet's advance landed the parser inside
-// a packet body. Stores absolute header pointers so it survives IB recursion.
-namespace {
-struct DiagPkt {
-    uintptr_t header_addr;
-    u32 header_raw;
-    u32 opcode;
-    u32 count;
-    u32 advance;
-};
-constexpr size_t kDiagTrailSize = 24;
-thread_local std::array<DiagPkt, kDiagTrailSize> g_diag_trail{};
-thread_local size_t g_diag_trail_idx = 0;
-
-inline void DiagRecord(const PM4Header* h, u32 advance) {
-    auto& slot = g_diag_trail[g_diag_trail_idx % kDiagTrailSize];
-    slot.header_addr = reinterpret_cast<uintptr_t>(h);
-    slot.header_raw = h->raw;
-    slot.opcode = static_cast<u32>(h->type3.opcode.Value());
-    slot.count = h->type3.count.Value();
-    slot.advance = advance;
-    ++g_diag_trail_idx;
-}
-} // namespace
 
 Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<const u32> ccb) {
     FIBER_ENTER(dcb_task_name);
@@ -271,77 +255,10 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
         default:
             UNREACHABLE_MSG("Wrong PM4 type {}", type);
             break;
-        case 0: {
-            // DIAGNOSTIC: dump context around the PKT0 to determine whether this is a real
-            // PKT0 emission or a parser desync (e.g., walked into zero-padded body of a
-            // mis-sized prior packet). Compares actual position against the expected end of
-            // the most recent plausible PKT3 within the look-back window.
-            const auto* dcb_start = reinterpret_cast<const u32*>(base_addr);
-            const auto* here = reinterpret_cast<const u32*>(header);
-            const ptrdiff_t back_dwords = std::min<ptrdiff_t>(64, here - dcb_start);
-            const ptrdiff_t fwd_dwords = std::min<ptrdiff_t>(16, dcb.size());
-
-            LOG_CRITICAL(Render,
-                         "PKT0 hit at dcb_offset={:#x} (header raw={:#010x}, base={}, "
-                         "size={}). dcb_total={} dwords. Dumping context:",
-                         here - dcb_start, header->raw, header->type0.base.Value(),
-                         header->type0.NumWords(), dcb.size_bytes() / 4);
-
-            // Backward dump (8 DWORDs per line)
-            for (ptrdiff_t i = -back_dwords; i < fwd_dwords; i += 8) {
-                std::string line = fmt::format("  [{:+#06x}]", i);
-                for (ptrdiff_t j = 0; j < 8 && (i + j) < fwd_dwords; ++j) {
-                    line += fmt::format(" {:08x}", here[i + j]);
-                }
-                LOG_CRITICAL(Render, "{}", line);
-            }
-
-            // Walk backward looking for the most recent plausible PKT3 header.
-            // If its NumWords()+1 lands exactly on `here`, the parser math is consistent
-            // and the PKT0 is genuine. If it overshoots/undershoots, that PKT3 is the
-            // desync source.
-            for (ptrdiff_t i = 1; i <= back_dwords; ++i) {
-                const auto* candidate = reinterpret_cast<const PM4Header*>(here - i);
-                if (candidate->type != 3) {
-                    continue;
-                }
-                const auto cand_size = candidate->type3.NumWords() + 1;
-                const auto delta = static_cast<ptrdiff_t>(cand_size) - i;
-                LOG_CRITICAL(Render,
-                             "  prev PKT3 at -{:#x}: opcode={:#x} count={} NumWords()+1={} "
-                             "(delta vs here = {:+d})",
-                             i, static_cast<u32>(candidate->type3.opcode.Value()),
-                             candidate->type3.count.Value(), cand_size, delta);
-                break;
-            }
-
-            // Dump the recent-PKT3 trail recorded by DiagRecord. Offsets shown relative to
-            // current dcb base (negative = entry was in a parent IB). The last entry should
-            // satisfy (offset + advance) == current dcb_offset. If not, that packet is the
-            // desync source — its advance landed the parser somewhere unexpected.
-            const auto cur_base = reinterpret_cast<uintptr_t>(dcb_start);
-            LOG_CRITICAL(Render, "  trail of last {} PKT3 dispatches (oldest first):",
-                         std::min<size_t>(g_diag_trail_idx, kDiagTrailSize));
-            const size_t shown = std::min<size_t>(g_diag_trail_idx, kDiagTrailSize);
-            for (size_t k = 0; k < shown; ++k) {
-                const size_t age = shown - 1 - k;
-                const size_t slot = (g_diag_trail_idx - 1 - age) % kDiagTrailSize;
-                const auto& e = g_diag_trail[slot];
-                const ptrdiff_t rel_off =
-                    (static_cast<ptrdiff_t>(e.header_addr) - static_cast<ptrdiff_t>(cur_base)) /
-                    static_cast<ptrdiff_t>(sizeof(u32));
-                const auto end = rel_off + static_cast<ptrdiff_t>(e.advance);
-                LOG_CRITICAL(Render,
-                             "    [{:>2}] off={:+#08x} hdr={:#010x} op={:#04x} count={} adv={} "
-                             "-> next={:+#08x}",
-                             age, rel_off, e.header_raw, e.opcode, e.count, e.advance, end);
-            }
-
-            // Skip past this PKT0 per AMD spec so the game keeps running and we can
-            // collect more diagnostic hits (instead of one-shot UNREACHABLE).
-            dcb = NextPacket(dcb, header->type0.NumWords() + 1);
-            continue;
-        }
+        case 0:
+            UNREACHABLE_MSG("Unimplemented PM4 type 0, base reg: {}, size: {}",
+                            header->type0.base.Value(), header->type0.NumWords());
+            break;
         case 2:
             // Type-2 packet are used for padding purposes
             dcb = NextPacket(dcb, 1);
@@ -918,14 +835,27 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
             }
             case PM4ItOpcode::IndirectBuffer: {
                 const auto* indirect_buffer = reinterpret_cast<const PM4CmdIndirectBuffer*>(header);
-                auto task = ProcessGraphics(
-                    {indirect_buffer->Address<const u32>(), indirect_buffer->ib_size}, {});
+                // See rationale in ProcessCeUpdate::IndirectBufferConst above:
+                // snapshot the IB contents into the nested coroutine's promise
+                // so the parser is insulated from the guest rewriting IB
+                // memory before (or while) the emulated CP reaches the
+                // packets. Many games (KNACK, Bloodborne, etc.) recycle IB
+                // memory across frames and the race here produces PKT0
+                // desync crashes.
+                auto ib_snap = std::make_unique<CmdSnapshot>();
+                const auto* ib_src = indirect_buffer->Address<const u32>();
+                ib_snap->dcb.assign(ib_src, ib_src + indirect_buffer->ib_size);
+                const std::span<const u32> ib_span{ib_snap->dcb};
+
+                auto task = ProcessGraphics(ib_span, {});
+                task.handle.promise().snapshot = std::move(ib_snap);
                 RESUME_GFX(task);
 
                 while (!task.handle.done()) {
                     YIELD_GFX();
                     RESUME_GFX(task);
                 }
+                task.handle.destroy();
                 break;
             }
             case PM4ItOpcode::IncrementDeCounter: {
@@ -965,9 +895,8 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 }
                 const auto skip = *cond_exec->Address() == false;
                 if (skip) {
-                    const u32 adv = header->type3.NumWords() + 1 + cond_exec->exec_count.Value();
-                    DiagRecord(header, adv);
-                    dcb = NextPacket(dcb, adv);
+                    dcb = NextPacket(dcb,
+                                     header->type3.NumWords() + 1 + cond_exec->exec_count.Value());
                     continue;
                 }
                 break;
@@ -976,11 +905,7 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 UNREACHABLE_MSG("Unknown PM4 type 3 opcode {:#x} with count {}",
                                 static_cast<u32>(opcode), count);
             }
-            {
-                const u32 adv = header->type3.NumWords() + 1;
-                DiagRecord(header, adv);
-                dcb = NextPacket(dcb, adv);
-            }
+            dcb = NextPacket(dcb, header->type3.NumWords() + 1);
             break;
         }
     }
@@ -1061,14 +986,23 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
         }
         case PM4ItOpcode::IndirectBuffer: {
             const auto* indirect_buffer = reinterpret_cast<const PM4CmdIndirectBuffer*>(header);
-            auto task = ProcessCompute<true>(
-                {indirect_buffer->Address<const u32>(), indirect_buffer->ib_size}, vqid);
+            // Same rationale as the graphics IB handler: snapshot the IB into
+            // the nested coroutine's promise so the parser reads stable bytes
+            // even if the guest rewrites the IB memory concurrently.
+            auto ib_snap = std::make_unique<CmdSnapshot>();
+            const auto* ib_src = indirect_buffer->Address<const u32>();
+            ib_snap->dcb.assign(ib_src, ib_src + indirect_buffer->ib_size);
+            const std::span<const u32> ib_span{ib_snap->dcb};
+
+            auto task = ProcessCompute<true>(ib_span, vqid);
+            task.handle.promise().snapshot = std::move(ib_snap);
             RESUME_ASC(task, vqid);
 
             while (!task.handle.done()) {
                 YIELD_ASC(vqid);
                 RESUME_ASC(task, vqid);
             }
+            task.handle.destroy();
             break;
         }
         case PM4ItOpcode::DmaData: {
@@ -1266,47 +1200,27 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
     FIBER_EXIT;
 }
 
-Liverpool::CmdBuffer Liverpool::CopyCmdBuffers(std::span<const u32> dcb, std::span<const u32> ccb) {
-    auto& queue = mapped_queues[GfxQueueId];
-    ASSERT_MSG(queue.dcb_buffer.capacity() >= queue.dcb_buffer_offset + dcb.size(),
-               "dcb copy buffer out of reserved space");
-    ASSERT_MSG(queue.ccb_buffer.capacity() >= queue.ccb_buffer_offset + ccb.size(),
-               "ccb copy buffer out of reserved space");
-
-    queue.dcb_buffer.resize(
-        std::max(queue.dcb_buffer.size(), queue.dcb_buffer_offset + dcb.size()));
-    queue.ccb_buffer.resize(
-        std::max(queue.ccb_buffer.size(), queue.ccb_buffer_offset + ccb.size()));
-
-    const u32 prev_dcb_buffer_offset = queue.dcb_buffer_offset;
-    const u32 prev_ccb_buffer_offset = queue.ccb_buffer_offset;
-    if (!dcb.empty()) {
-        std::memcpy(queue.dcb_buffer.data() + queue.dcb_buffer_offset, dcb.data(),
-                    dcb.size_bytes());
-        queue.dcb_buffer_offset += dcb.size();
-        dcb = std::span<const u32>{queue.dcb_buffer.begin() + prev_dcb_buffer_offset,
-                                   queue.dcb_buffer.begin() + queue.dcb_buffer_offset};
-    }
-
-    if (!ccb.empty()) {
-        std::memcpy(queue.ccb_buffer.data() + queue.ccb_buffer_offset, ccb.data(),
-                    ccb.size_bytes());
-        queue.ccb_buffer_offset += ccb.size();
-        ccb = std::span<const u32>{queue.ccb_buffer.begin() + prev_ccb_buffer_offset,
-                                   queue.ccb_buffer.begin() + queue.ccb_buffer_offset};
-    }
-
-    return std::make_pair(dcb, ccb);
-}
-
 void Liverpool::SubmitGfx(std::span<const u32> dcb, std::span<const u32> ccb) {
     auto& queue = mapped_queues[GfxQueueId];
 
-    if (EmulatorSettings.IsCopyGpuBuffers()) {
-        std::tie(dcb, ccb) = CopyCmdBuffers(dcb, ccb);
-    }
+    // PS4-accurate: snapshot DCB and CCB synchronously on the submitting thread
+    // before the coroutine is enqueued. On real hardware the CP latches command
+    // buffer memory via cache-coherent reads at submit time and the game must
+    // not touch it until the submission's fence completes; some games (KNACK,
+    // Bloodborne, etc.) rewrite the memory earlier than the emulator's parser
+    // reaches it, which without a snapshot yields torn reads and a PKT0 crash.
+    //
+    // The snapshot is owned by the coroutine's promise, so its lifetime is
+    // tied to the coroutine frame and it is freed by handle.destroy().
+    auto snap = std::make_unique<CmdSnapshot>();
+    snap->dcb.assign(dcb.begin(), dcb.end());
+    snap->ccb.assign(ccb.begin(), ccb.end());
 
-    auto task = ProcessGraphics(dcb, ccb);
+    const std::span<const u32> dcb_span{snap->dcb};
+    const std::span<const u32> ccb_span{snap->ccb};
+
+    auto task = ProcessGraphics(dcb_span, ccb_span);
+    task.handle.promise().snapshot = std::move(snap);
     {
         std::scoped_lock lock{queue.m_access};
         queue.submits.emplace(task.handle);
