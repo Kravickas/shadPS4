@@ -68,7 +68,11 @@ public:
     explicit Liverpool();
     ~Liverpool();
 
-    void SubmitGfx(std::span<const u32> dcb, std::span<const u32> ccb);
+    // dcb_guest_base is the guest virtual address of the dcb being submitted, used by
+    // the parser for in-CB self-patch detection (DMA-then-DispatchDirect) and for
+    // debugger annotation. Pass 0 for host-synthesized command buffers (init sequences).
+    void SubmitGfx(std::span<const u32> dcb, std::span<const u32> ccb,
+                   uintptr_t dcb_guest_base = 0);
     void SubmitAsc(u32 gnm_vqid, std::span<const u32> acb);
 
     void SubmitDone() noexcept {
@@ -179,10 +183,18 @@ private:
         Handle handle;
     };
 
-    Task ProcessGraphics(std::span<const u32> dcb, std::span<const u32> ccb);
+    // The guest base parameters carry the original guest virtual address of the dcb/acb
+    // being parsed. They exist because a CB or IB may have been snapshotted into host
+    // memory for race-safe parsing, and downstream semantic checks (in-CB DMA
+    // self-patch detection in compute, debugger annotation in graphics) need the
+    // original guest VAddr - the host snapshot pointer is in a different address space
+    // and would silently mis-compare against guest addresses encoded in PM4 packets.
+    // Pass 0 to retain the legacy behavior of using the span's data pointer.
+    Task ProcessGraphics(std::span<const u32> dcb, std::span<const u32> ccb,
+                         uintptr_t dcb_guest_base = 0);
     Task ProcessCeUpdate(std::span<const u32> ccb);
     template <bool is_indirect = false>
-    Task ProcessCompute(std::span<const u32> acb, u32 vqid);
+    Task ProcessCompute(std::span<const u32> acb, u32 vqid, uintptr_t acb_guest_base = 0);
 
     void ProcessCommands();
     void Process(std::stop_token stoken);
