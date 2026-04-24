@@ -6,6 +6,7 @@
 #include <condition_variable>
 #include <coroutine>
 #include <exception>
+#include <memory>
 #include <mutex>
 #include <semaphore>
 #include <span>
@@ -72,8 +73,6 @@ public:
 
     void SubmitDone() noexcept {
         std::scoped_lock lk{submit_mutex};
-        mapped_queues[GfxQueueId].ccb_buffer_offset = 0;
-        mapped_queues[GfxQueueId].dcb_buffer_offset = 0;
         submit_done = true;
         submit_cv.notify_one();
     }
@@ -120,14 +119,6 @@ public:
         }
     }
 
-    void ReserveCopyBufferSpace() {
-        GpuQueue& gfx_queue = mapped_queues[GfxQueueId];
-        std::scoped_lock lk(gfx_queue.m_access);
-        constexpr size_t GfxReservedSize = 2_MB >> 2;
-        gfx_queue.ccb_buffer.reserve(GfxReservedSize);
-        gfx_queue.dcb_buffer.reserve(GfxReservedSize);
-    }
-
     inline ComputeProgram& GetCsRegs() {
         return mapped_queues[curr_qid].cs_state;
     }
@@ -144,6 +135,16 @@ public:
     Common::SlotVector<AscQueueInfo> asc_queues{};
 
 private:
+    // Owns one submission's worth of PM4 data that the coroutine reads from. The
+    // pointer lives inside the Task's promise so its lifetime is tied to the
+    // coroutine frame: the memory is freed when Task::handle.destroy() runs.
+    // Used by SubmitGfx (top-level DCB/CCB) and by every IndirectBuffer site to
+    // isolate the parser from the guest rewriting packet memory concurrently.
+    struct CmdSnapshot {
+        std::vector<u32> dcb;
+        std::vector<u32> ccb;
+    };
+
     struct Task {
         struct promise_type {
             auto get_return_object() {
@@ -170,14 +171,14 @@ private:
             std::suspend_always yield_value(empty&&) {
                 return {};
             }
+
+            std::unique_ptr<CmdSnapshot> snapshot;
         };
 
         using Handle = std::coroutine_handle<promise_type>;
         Handle handle;
     };
 
-    using CmdBuffer = std::pair<std::span<const u32>, std::span<const u32>>;
-    CmdBuffer CopyCmdBuffers(std::span<const u32> dcb, std::span<const u32> ccb);
     Task ProcessGraphics(std::span<const u32> dcb, std::span<const u32> ccb);
     Task ProcessCeUpdate(std::span<const u32> ccb);
     template <bool is_indirect = false>
@@ -188,10 +189,6 @@ private:
 
     struct GpuQueue {
         std::mutex m_access{};
-        std::atomic<u32> dcb_buffer_offset;
-        std::atomic<u32> ccb_buffer_offset;
-        std::vector<u32> dcb_buffer;
-        std::vector<u32> ccb_buffer;
         std::queue<Task::Handle> submits{};
         ComputeProgram cs_state{};
     };
