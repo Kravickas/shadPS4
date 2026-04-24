@@ -216,6 +216,33 @@ Liverpool::Task Liverpool::ProcessCeUpdate(std::span<const u32> ccb) {
     FIBER_EXIT;
 }
 
+// DIAGNOSTIC: ring buffer of last N PKT3 dispatches (header ptr, header.raw, opcode, count,
+// advance). Updated at every PKT3 advance site in ProcessGraphics; dumped when a PKT0 is
+// encountered so we can see exactly which earlier packet's advance landed the parser inside
+// a packet body. Stores absolute header pointers so it survives IB recursion.
+namespace {
+struct DiagPkt {
+    uintptr_t header_addr;
+    u32 header_raw;
+    u32 opcode;
+    u32 count;
+    u32 advance;
+};
+constexpr size_t kDiagTrailSize = 24;
+thread_local std::array<DiagPkt, kDiagTrailSize> g_diag_trail{};
+thread_local size_t g_diag_trail_idx = 0;
+
+inline void DiagRecord(const PM4Header* h, u32 advance) {
+    auto& slot = g_diag_trail[g_diag_trail_idx % kDiagTrailSize];
+    slot.header_addr = reinterpret_cast<uintptr_t>(h);
+    slot.header_raw = h->raw;
+    slot.opcode = static_cast<u32>(h->type3.opcode.Value());
+    slot.count = h->type3.count.Value();
+    slot.advance = advance;
+    ++g_diag_trail_idx;
+}
+} // namespace
+
 Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<const u32> ccb) {
     FIBER_ENTER(dcb_task_name);
 
@@ -286,6 +313,28 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                              i, static_cast<u32>(candidate->type3.opcode.Value()),
                              candidate->type3.count.Value(), cand_size, delta);
                 break;
+            }
+
+            // Dump the recent-PKT3 trail recorded by DiagRecord. Offsets shown relative to
+            // current dcb base (negative = entry was in a parent IB). The last entry should
+            // satisfy (offset + advance) == current dcb_offset. If not, that packet is the
+            // desync source — its advance landed the parser somewhere unexpected.
+            const auto cur_base = reinterpret_cast<uintptr_t>(dcb_start);
+            LOG_CRITICAL(Render, "  trail of last {} PKT3 dispatches (oldest first):",
+                         std::min<size_t>(g_diag_trail_idx, kDiagTrailSize));
+            const size_t shown = std::min<size_t>(g_diag_trail_idx, kDiagTrailSize);
+            for (size_t k = 0; k < shown; ++k) {
+                const size_t age = shown - 1 - k;
+                const size_t slot = (g_diag_trail_idx - 1 - age) % kDiagTrailSize;
+                const auto& e = g_diag_trail[slot];
+                const ptrdiff_t rel_off =
+                    (static_cast<ptrdiff_t>(e.header_addr) - static_cast<ptrdiff_t>(cur_base)) /
+                    static_cast<ptrdiff_t>(sizeof(u32));
+                const auto end = rel_off + static_cast<ptrdiff_t>(e.advance);
+                LOG_CRITICAL(Render,
+                             "    [{:>2}] off={:+#08x} hdr={:#010x} op={:#04x} count={} adv={} "
+                             "-> next={:+#08x}",
+                             age, rel_off, e.header_raw, e.opcode, e.count, e.advance, end);
             }
 
             // Skip past this PKT0 per AMD spec so the game keeps running and we can
@@ -916,8 +965,9 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 }
                 const auto skip = *cond_exec->Address() == false;
                 if (skip) {
-                    dcb = NextPacket(dcb,
-                                     header->type3.NumWords() + 1 + cond_exec->exec_count.Value());
+                    const u32 adv = header->type3.NumWords() + 1 + cond_exec->exec_count.Value();
+                    DiagRecord(header, adv);
+                    dcb = NextPacket(dcb, adv);
                     continue;
                 }
                 break;
@@ -926,7 +976,11 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 UNREACHABLE_MSG("Unknown PM4 type 3 opcode {:#x} with count {}",
                                 static_cast<u32>(opcode), count);
             }
-            dcb = NextPacket(dcb, header->type3.NumWords() + 1);
+            {
+                const u32 adv = header->type3.NumWords() + 1;
+                DiagRecord(header, adv);
+                dcb = NextPacket(dcb, adv);
+            }
             break;
         }
     }
