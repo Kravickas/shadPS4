@@ -2288,7 +2288,8 @@ int PS4_SYSV_ABI sceGnmSubmitCommandBuffersForWorkload(u32 workload, u32 count,
                 .base_addr = reinterpret_cast<uintptr_t>(ccb),
             });
         }
-        liverpool->SubmitGfx(dcb_span, ccb_span);
+        liverpool->SubmitGfx(dcb_span, ccb_span,
+                             reinterpret_cast<uintptr_t>(dcb_gpu_addrs[cbpair]));
     }
 
     return ORBIS_OK;
