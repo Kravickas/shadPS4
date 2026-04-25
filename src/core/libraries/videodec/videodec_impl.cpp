@@ -30,7 +30,7 @@ static inline void CopyNV12Data(u8* dst, const AVFrame& src) {
         }
     }
     if (frame_h < height) {
-        std::memset(dst + frame_h * pitch, 0, (height - frame_h) * pitch);
+        std::memset(dst + frame_h * pitch, 16, (height - frame_h) * pitch);
     }
 
     u8* chroma_dst = dst + y_plane_size;
@@ -44,7 +44,7 @@ static inline void CopyNV12Data(u8* dst, const AVFrame& src) {
         }
     }
     if (uv_h < uv_h_aligned) {
-        std::memset(chroma_dst + uv_h * pitch, 0, (uv_h_aligned - uv_h) * pitch);
+        std::memset(chroma_dst + uv_h * pitch, 128, (uv_h_aligned - uv_h) * pitch);
     }
 }
 
