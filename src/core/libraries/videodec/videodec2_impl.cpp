@@ -3,6 +3,7 @@
 
 #include "videodec2_impl.h"
 
+#include "common/alignment.h"
 #include "common/assert.h"
 #include "common/logging/log.h"
 #include "core/libraries/videodec/videodec_error.h"
