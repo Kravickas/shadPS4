@@ -15,24 +15,36 @@ namespace Libraries::Videodec {
 static inline void CopyNV12Data(u8* dst, const AVFrame& src) {
     const u32 width = Common::AlignUp(u32(src.width), 16);
     const u32 height = Common::AlignUp(u32(src.height), 16);
+    // Match ImageSizeLinearAligned pitch (tile.h): max(8, 64/Bpp) = 64 for R8.
+    const u32 pitch = Common::AlignUp(width, 64);
+    const u32 src_stride_y = u32(src.linesize[0]);
+    const u32 src_stride_uv = u32(src.linesize[1]);
+    const u32 frame_h = u32(src.height);
+    const u32 y_plane_size = pitch * height;
 
-    // Copy Y plane: source stride is linesize[0], destination stride is width.
-    if (u32(src.linesize[0]) == width) {
-        std::memcpy(dst, src.data[0], width * src.height);
+    if (pitch == src_stride_y) {
+        std::memcpy(dst, src.data[0], pitch * frame_h);
     } else {
-        for (u32 y = 0; y < u32(src.height); ++y) {
-            std::memcpy(dst + y * width, src.data[0] + y * src.linesize[0], src.width);
+        for (u32 y = 0; y < frame_h; ++y) {
+            std::memcpy(dst + y * pitch, src.data[0] + y * src_stride_y, src.width);
         }
     }
+    if (frame_h < height) {
+        std::memset(dst + frame_h * pitch, 0, (height - frame_h) * pitch);
+    }
 
-    // Copy interleaved UV plane: source stride is linesize[1], destination stride is width.
-    const auto chroma_dst = dst + width * height;
-    if (u32(src.linesize[1]) == width) {
-        std::memcpy(chroma_dst, src.data[1], width * (src.height / 2));
+    u8* chroma_dst = dst + y_plane_size;
+    const u32 uv_h = frame_h / 2;
+    const u32 uv_h_aligned = height / 2;
+    if (pitch == src_stride_uv) {
+        std::memcpy(chroma_dst, src.data[1], pitch * uv_h);
     } else {
-        for (u32 y = 0; y < u32(src.height) / 2; ++y) {
-            std::memcpy(chroma_dst + y * width, src.data[1] + y * src.linesize[1], src.width);
+        for (u32 y = 0; y < uv_h; ++y) {
+            std::memcpy(chroma_dst + y * pitch, src.data[1] + y * src_stride_uv, src.width);
         }
+    }
+    if (uv_h < uv_h_aligned) {
+        std::memset(chroma_dst + uv_h * pitch, 0, (uv_h_aligned - uv_h) * pitch);
     }
 }
 
@@ -117,7 +129,7 @@ s32 VdecDecoder::Decode(const OrbisVideodecInputData& pInputDataIn,
         pPictureInfoOut.codecType = 0;
         pPictureInfoOut.frameWidth = Common::AlignUp((u32)frame->width, 16);
         pPictureInfoOut.frameHeight = Common::AlignUp((u32)frame->height, 16);
-        pPictureInfoOut.framePitch = Common::AlignUp((u32)frame->width, 16);
+        pPictureInfoOut.framePitch = Common::AlignUp(pPictureInfoOut.frameWidth, 64);
 
         pPictureInfoOut.isValid = true;
         pPictureInfoOut.isErrorPic = false;
@@ -167,7 +179,7 @@ s32 VdecDecoder::Flush(OrbisVideodecFrameBuffer& pFrameBufferInOut,
         pPictureInfoOut.codecType = 0;
         pPictureInfoOut.frameWidth = Common::AlignUp((u32)frame->width, 16);
         pPictureInfoOut.frameHeight = Common::AlignUp((u32)frame->height, 16);
-        pPictureInfoOut.framePitch = Common::AlignUp((u32)frame->width, 16);
+        pPictureInfoOut.framePitch = Common::AlignUp(pPictureInfoOut.frameWidth, 64);
 
         pPictureInfoOut.isValid = true;
         pPictureInfoOut.isErrorPic = false;
