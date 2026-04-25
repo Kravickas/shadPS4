@@ -291,7 +291,7 @@ int PS4_SYSV_ABI sceGnmDestroyWorkloadStream() {
 
 void PS4_SYSV_ABI sceGnmDingDong(u32 gnm_vqid, u32 next_offs_dw) {
     HLE_TRACE;
-    LOG_DEBUG(Lib_GnmDriver, "vqid {}, offset_dw {}", gnm_vqid, next_offs_dw);
+    LOG_INFO(Lib_GnmDriver, "DingDong vqid={}, next_offs_dw={}", gnm_vqid, next_offs_dw);
 
     if (gnm_vqid == 0) {
         return;
@@ -311,6 +311,9 @@ void PS4_SYSV_ABI sceGnmDingDong(u32 gnm_vqid, u32 next_offs_dw) {
     if (next_offs_dw < offs_dw && next_offs_dw != 0) {
         // For cases if a submission is split at the end of the ring buffer, we need to submit it in
         // two parts to handle the wrap
+        LOG_INFO(Lib_GnmDriver,
+                 "DingDong wraparound: submit head [offs_dw={}, ring_end={}) ({} dw)", offs_dw,
+                 asc_queue.ring_size_dw, asc_queue.ring_size_dw - offs_dw);
         liverpool->SubmitAsc(gnm_vqid, {reinterpret_cast<const u32*>(asc_queue.map_addr) + offs_dw,
                                         asc_queue.ring_size_dw - offs_dw});
         offs_dw = 0;
@@ -319,6 +322,12 @@ void PS4_SYSV_ABI sceGnmDingDong(u32 gnm_vqid, u32 next_offs_dw) {
     const auto* acb_ptr = reinterpret_cast<const u32*>(asc_queue.map_addr) + offs_dw;
     const auto acb_size_dw = (next_offs_dw ? next_offs_dw : asc_queue.ring_size_dw) - offs_dw;
     const std::span acb_span{acb_ptr, acb_size_dw};
+
+    LOG_INFO(Lib_GnmDriver,
+             "DingDong submit: vqid={} slice=[offs_dw={}, next_offs_dw={}) size_dw={} "
+             "first_word=0x{:08x}",
+             gnm_vqid, offs_dw, next_offs_dw, acb_size_dw,
+             acb_size_dw > 0 ? acb_ptr[0] : 0u);
 
     asc_next_offs_dw[vqid] = next_offs_dw;
 
