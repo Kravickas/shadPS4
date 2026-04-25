@@ -14,21 +14,28 @@ namespace Libraries::Videodec2 {
 std::vector<OrbisVideodec2AvcPictureInfo> gPictureInfos;
 
 static inline void CopyNV12Data(u8* dst, const AVFrame& src) {
-    if (src.width == src.linesize[0]) {
-        std::memcpy(dst, src.data[0], src.width * src.height);
-        std::memcpy(dst + (src.width * src.height), src.data[1], (src.width * src.height) / 2);
-        return;
+    // Match ImageSizeLinearAligned pitch (tile.h): max(8, 64/Bpp) = 64 for R8.
+    const u32 pitch = Common::AlignUp(u32(src.width), 64);
+    const u32 src_stride_y = u32(src.linesize[0]);
+    const u32 src_stride_uv = u32(src.linesize[1]);
+    const u32 frame_h = u32(src.height);
+
+    if (pitch == src_stride_y) {
+        std::memcpy(dst, src.data[0], pitch * frame_h);
+    } else {
+        for (u32 y = 0; y < frame_h; ++y) {
+            std::memcpy(dst + y * pitch, src.data[0] + y * src_stride_y, src.width);
+        }
     }
 
-    for (u16 row = 0; row < src.height; row++) {
-        u64 dst_offset = row * src.width;
-        std::memcpy(dst + dst_offset, src.data[0] + (row * src.linesize[0]), src.width);
-    }
-
-    u64 dst_base = src.width * src.height;
-    for (u16 row = 0; row < src.height / 2; row++) {
-        u64 dst_offset = row * src.width;
-        std::memcpy(dst + dst_base + dst_offset, src.data[1] + (row * src.linesize[1]), src.width);
+    u8* chroma_dst = dst + pitch * frame_h;
+    const u32 uv_h = frame_h / 2;
+    if (pitch == src_stride_uv) {
+        std::memcpy(chroma_dst, src.data[1], pitch * uv_h);
+    } else {
+        for (u32 y = 0; y < uv_h; ++y) {
+            std::memcpy(chroma_dst + y * pitch, src.data[1] + y * src_stride_uv, src.width);
+        }
     }
 }
 
@@ -62,7 +69,7 @@ s32 VdecDecoder::Decode(const OrbisVideodec2InputData& inputData,
     outputInfo.isErrorFrame = true;
     outputInfo.pictureCount = 0;
 
-    // Only set frameFormat if the game uses the newer struct version.
+    // Trailing fields (frameFormat, framePitchInBytes) absent in older struct versions.
     if (outputInfo.thisSize == sizeof(OrbisVideodec2OutputInfo)) {
         outputInfo.frameFormat = 0;
     }
@@ -123,7 +130,7 @@ s32 VdecDecoder::Decode(const OrbisVideodec2InputData& inputData,
         outputInfo.codecType = 1; // FIXME: Hardcoded to AVC
         outputInfo.frameWidth = frame->width;
         outputInfo.frameHeight = frame->height;
-        outputInfo.framePitch = frame->width;
+        outputInfo.framePitch = Common::AlignUp(u32(frame->width), 64);
         outputInfo.frameBufferSize = frameBuffer.frameBufferSize;
         outputInfo.frameBuffer = frameBuffer.frameBuffer;
 
@@ -131,9 +138,8 @@ s32 VdecDecoder::Decode(const OrbisVideodec2InputData& inputData,
         outputInfo.isErrorFrame = false;
         outputInfo.pictureCount = 1; // TODO: 2 pictures for interlaced video
 
-        // Only set framePitchInBytes if the game uses the newer struct version.
         if (outputInfo.thisSize == sizeof(OrbisVideodec2OutputInfo)) {
-            outputInfo.framePitchInBytes = frame->linesize[0];
+            outputInfo.framePitchInBytes = Common::AlignUp(u32(frame->width), 64);
         }
 
         if (outputInfo.isValid) {
@@ -167,7 +173,6 @@ s32 VdecDecoder::Flush(OrbisVideodec2FrameBuffer& frameBuffer,
     outputInfo.isErrorFrame = true;
     outputInfo.pictureCount = 0;
 
-    // Only set frameFormat if the game uses the newer struct version.
     if (outputInfo.thisSize == sizeof(OrbisVideodec2OutputInfo)) {
         outputInfo.frameFormat = 0;
     }
@@ -201,7 +206,7 @@ s32 VdecDecoder::Flush(OrbisVideodec2FrameBuffer& frameBuffer,
         outputInfo.codecType = 1; // FIXME: Hardcoded to AVC
         outputInfo.frameWidth = frame->width;
         outputInfo.frameHeight = frame->height;
-        outputInfo.framePitch = frame->linesize[0];
+        outputInfo.framePitch = Common::AlignUp(u32(frame->width), 64);
         outputInfo.frameBufferSize = frameBuffer.frameBufferSize;
         outputInfo.frameBuffer = frameBuffer.frameBuffer;
 
@@ -209,9 +214,8 @@ s32 VdecDecoder::Flush(OrbisVideodec2FrameBuffer& frameBuffer,
         outputInfo.isErrorFrame = false;
         outputInfo.pictureCount = 1; // TODO: 2 pictures for interlaced video
 
-        // Only set framePitchInBytes if the game uses the newer struct version.
         if (outputInfo.thisSize == sizeof(OrbisVideodec2OutputInfo)) {
-            outputInfo.framePitchInBytes = frame->linesize[0];
+            outputInfo.framePitchInBytes = Common::AlignUp(u32(frame->width), 64);
         }
 
         // FIXME: Should we add picture info here too?
