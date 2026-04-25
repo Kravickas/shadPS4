@@ -225,7 +225,9 @@ bool AvPlayerSource::Start() {
             width = Common::AlignUp(width, 16);
             height = Common::AlignUp(height, 16);
         }
-        const auto size = (width * height * 3) / 2;
+        // Match ImageSizeLinearAligned pitch (tile.h): max(8, 64/Bpp) = 64 for R8.
+        const auto pitch = Common::AlignUp(width, 64);
+        const auto size = (pitch * height * 3) / 2;
         for (u64 index = 0; index < m_max_num_video_framebuffers; ++index) {
             m_video_buffers.Push(GuestBuffer(m_memory_replacement, 0x100, size, true));
         }
@@ -551,23 +553,36 @@ static void CopyNV12Data(u8* dst, const AVFrame& src, bool use_vdec2) {
         height = Common::AlignUp(height, 16);
     }
 
-    // Copy Y plane: source stride is linesize[0], destination stride is width.
-    if (u32(src.linesize[0]) == width) {
-        std::memcpy(dst, src.data[0], width * src.height);
+    // Match ImageSizeLinearAligned pitch (tile.h): max(8, 64/Bpp) = 64 for R8.
+    const u32 pitch = Common::AlignUp(width, 64);
+    const u32 src_stride_y = u32(src.linesize[0]);
+    const u32 src_stride_uv = u32(src.linesize[1]);
+    const u32 frame_h = u32(src.height);
+    const u32 y_plane_size = pitch * height;
+
+    if (pitch == src_stride_y) {
+        std::memcpy(dst, src.data[0], pitch * frame_h);
     } else {
-        for (u32 y = 0; y < u32(src.height); ++y) {
-            std::memcpy(dst + y * width, src.data[0] + y * src.linesize[0], src.width);
+        for (u32 y = 0; y < frame_h; ++y) {
+            std::memcpy(dst + y * pitch, src.data[0] + y * src_stride_y, src.width);
         }
     }
+    if (frame_h < height) {
+        std::memset(dst + frame_h * pitch, 0, (height - frame_h) * pitch);
+    }
 
-    // Copy interleaved UV plane: source stride is linesize[1], destination stride is width.
-    const auto chroma_dst = dst + width * height;
-    if (u32(src.linesize[1]) == width) {
-        std::memcpy(chroma_dst, src.data[1], width * (src.height / 2));
+    u8* chroma_dst = dst + y_plane_size;
+    const u32 uv_h = frame_h / 2;
+    const u32 uv_h_aligned = height / 2;
+    if (pitch == src_stride_uv) {
+        std::memcpy(chroma_dst, src.data[1], pitch * uv_h);
     } else {
-        for (u32 y = 0; y < u32(src.height) / 2; ++y) {
-            std::memcpy(chroma_dst + y * width, src.data[1] + y * src.linesize[1], src.width);
+        for (u32 y = 0; y < uv_h; ++y) {
+            std::memcpy(chroma_dst + y * pitch, src.data[1] + y * src_stride_uv, src.width);
         }
+    }
+    if (uv_h < uv_h_aligned) {
+        std::memset(chroma_dst + uv_h * pitch, 0, (uv_h_aligned - uv_h) * pitch);
     }
 }
 
@@ -609,7 +624,7 @@ Frame AvPlayerSource::PrepareVideoFrame(GuestBuffer buffer, const AVFrame& frame
                                 .crop_top_offset = u32(frame.crop_top),
                                 .crop_bottom_offset =
                                     u32(frame.crop_bottom + (height - frame.height)),
-                                .pitch = width,
+                                .pitch = Common::AlignUp(width, 64u),
                                 .luma_bit_depth = 8,
                                 .chroma_bit_depth = 8,
                             },
@@ -700,7 +715,7 @@ AvPlayerSource::AVFramePtr AvPlayerSource::ConvertAudioFrame(const AVFrame& fram
     }
     const auto res = swr_convert_frame(m_swr_context.get(), pcm16_frame.get(), &frame);
     if (res < 0) {
-        LOG_ERROR(Lib_AvPlayer, "Could not convert to NV12: {}", av_err2str(res));
+        LOG_ERROR(Lib_AvPlayer, "Could not convert audio to S16: {}", av_err2str(res));
         return AVFramePtr{nullptr, &ReleaseAVFrame};
     }
     return pcm16_frame;
