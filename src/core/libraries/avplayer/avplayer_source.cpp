@@ -213,14 +213,10 @@ bool AvPlayerSource::Start() {
                       m_video_stream_index.value());
             return false;
         }
-        auto width = u32(m_video_codec_context->width);
-        auto height = u32(m_video_codec_context->height);
-        if (!m_use_vdec2) {
-            width = Common::AlignUp(width, 16);
-            height = Common::AlignUp(height, 16);
-        }
+        const auto width = u32(m_video_codec_context->width);
+        const auto height = u32(m_video_codec_context->height);
         // Match ImageSizeLinearAligned pitch (tile.h): max(8, 64/Bpp) = 64 for R8.
-        const auto pitch = Common::AlignUp(width, 64);
+        const auto pitch = Common::AlignUp(width, 64u);
         const auto size = (pitch * height * 3) / 2;
         for (u64 index = 0; index < m_max_num_video_framebuffers; ++index) {
             m_video_buffers.Push(GuestBuffer(m_memory_replacement, 0x100, size, true));
@@ -540,19 +536,11 @@ AvPlayerSource::AVFramePtr AvPlayerSource::ConvertVideoFrame(const AVFrame& fram
 }
 
 static void CopyNV12Data(u8* dst, const AVFrame& src, bool use_vdec2) {
-    auto width = u32(src.width);
-    auto height = u32(src.height);
-    if (!use_vdec2) {
-        width = Common::AlignUp(width, 16);
-        height = Common::AlignUp(height, 16);
-    }
-
     // Match ImageSizeLinearAligned pitch (tile.h): max(8, 64/Bpp) = 64 for R8.
-    const u32 pitch = Common::AlignUp(width, 64);
+    const u32 pitch = Common::AlignUp(u32(src.width), 64u);
     const u32 src_stride_y = u32(src.linesize[0]);
     const u32 src_stride_uv = u32(src.linesize[1]);
     const u32 frame_h = u32(src.height);
-    const u32 y_plane_size = pitch * height;
 
     if (pitch == src_stride_y) {
         std::memcpy(dst, src.data[0], pitch * frame_h);
@@ -561,22 +549,15 @@ static void CopyNV12Data(u8* dst, const AVFrame& src, bool use_vdec2) {
             std::memcpy(dst + y * pitch, src.data[0] + y * src_stride_y, src.width);
         }
     }
-    if (frame_h < height) {
-        std::memset(dst + frame_h * pitch, 16, (height - frame_h) * pitch);
-    }
 
-    u8* chroma_dst = dst + y_plane_size;
+    u8* chroma_dst = dst + pitch * frame_h;
     const u32 uv_h = frame_h / 2;
-    const u32 uv_h_aligned = height / 2;
     if (pitch == src_stride_uv) {
         std::memcpy(chroma_dst, src.data[1], pitch * uv_h);
     } else {
         for (u32 y = 0; y < uv_h; ++y) {
             std::memcpy(chroma_dst + y * pitch, src.data[1] + y * src_stride_uv, src.width);
         }
-    }
-    if (uv_h < uv_h_aligned) {
-        std::memset(chroma_dst + uv_h * pitch, 128, (uv_h_aligned - uv_h) * pitch);
     }
 }
 
