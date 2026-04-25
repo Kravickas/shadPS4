@@ -116,14 +116,8 @@ bool AvPlayerSource::GetStreamInfo(u32 stream_index, AvPlayerStreamInfo& info) {
         LOG_INFO(Lib_AvPlayer, "Stream {} is a video stream.", stream_index);
         info.details.video.aspect_ratio =
             f32(p_stream->codecpar->width) / p_stream->codecpar->height;
-        auto width = u32(p_stream->codecpar->width);
-        auto height = u32(p_stream->codecpar->height);
-        if (!m_use_vdec2) {
-            width = Common::AlignUp(width, 16);
-            height = Common::AlignUp(height, 16);
-        }
-        info.details.video.width = width;
-        info.details.video.height = height;
+        info.details.video.width = u32(p_stream->codecpar->width);
+        info.details.video.height = u32(p_stream->codecpar->height);
         if (p_lang_node != nullptr) {
             std::memcpy(info.details.video.language_code, p_lang_node->value,
                         std::min(strlen(p_lang_node->value), size_t(3)));
@@ -318,8 +312,6 @@ bool AvPlayerSource::GetVideoData(AvPlayerFrameInfo& video_info) {
     if (!GetVideoData(info)) {
         return false;
     }
-    LOG_INFO(Lib_AvPlayer, "GetVideoData: old API (no pitch) {}x{}", info.details.video.width,
-             info.details.video.height);
     video_info = {};
     video_info.timestamp = u64(info.timestamp);
     video_info.p_data = reinterpret_cast<u8*>(info.p_data);
@@ -362,8 +354,6 @@ bool AvPlayerSource::GetVideoData(AvPlayerFrameInfoEx& video_info) {
     auto frame = m_video_frames.Pop();
     video_info = frame->info;
     m_current_video_frame = std::move(frame);
-    LOG_INFO(Lib_AvPlayer, "GetVideoData: Ex API pitch={} {}x{}", video_info.details.video.pitch,
-             video_info.details.video.width, video_info.details.video.height);
     return true;
 }
 
@@ -572,7 +562,7 @@ static void CopyNV12Data(u8* dst, const AVFrame& src, bool use_vdec2) {
         }
     }
     if (frame_h < height) {
-        std::memset(dst + frame_h * pitch, 0, (height - frame_h) * pitch);
+        std::memset(dst + frame_h * pitch, 16, (height - frame_h) * pitch);
     }
 
     u8* chroma_dst = dst + y_plane_size;
@@ -586,7 +576,7 @@ static void CopyNV12Data(u8* dst, const AVFrame& src, bool use_vdec2) {
         }
     }
     if (uv_h < uv_h_aligned) {
-        std::memset(chroma_dst + uv_h * pitch, 0, (uv_h_aligned - uv_h) * pitch);
+        std::memset(chroma_dst + uv_h * pitch, 128, (uv_h_aligned - uv_h) * pitch);
     }
 }
 
@@ -603,12 +593,8 @@ Frame AvPlayerSource::PrepareVideoFrame(GuestBuffer buffer, const AVFrame& frame
     const auto num = time_base.num;
     const auto timestamp = (num != 0 && den > 1) ? (pkt_dts * num) / den : pkt_dts;
 
-    auto width = u32(frame.width);
-    auto height = u32(frame.height);
-    if (!m_use_vdec2) {
-        width = Common::AlignUp(width, 16);
-        height = Common::AlignUp(height, 16);
-    }
+    const u32 width = u32(frame.width);
+    const u32 height = u32(frame.height);
 
     return Frame{
         .buffer = std::move(buffer),
@@ -624,10 +610,9 @@ Frame AvPlayerSource::PrepareVideoFrame(GuestBuffer buffer, const AVFrame& frame
                                 .height = height,
                                 .aspect_ratio = (float)av_q2d(frame.sample_aspect_ratio),
                                 .crop_left_offset = u32(frame.crop_left),
-                                .crop_right_offset = u32(frame.crop_right + (width - frame.width)),
+                                .crop_right_offset = u32(frame.crop_right),
                                 .crop_top_offset = u32(frame.crop_top),
-                                .crop_bottom_offset =
-                                    u32(frame.crop_bottom + (height - frame.height)),
+                                .crop_bottom_offset = u32(frame.crop_bottom),
                                 .pitch = Common::AlignUp(width, 64u),
                                 .luma_bit_depth = 8,
                                 .chroma_bit_depth = 8,
