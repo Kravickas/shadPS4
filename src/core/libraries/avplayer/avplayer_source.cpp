@@ -318,6 +318,8 @@ bool AvPlayerSource::GetVideoData(AvPlayerFrameInfo& video_info) {
     if (!GetVideoData(info)) {
         return false;
     }
+    LOG_INFO(Lib_AvPlayer, "GetVideoData: old API (no pitch) {}x{}", info.details.video.width,
+             info.details.video.height);
     video_info = {};
     video_info.timestamp = u64(info.timestamp);
     video_info.p_data = reinterpret_cast<u8*>(info.p_data);
@@ -360,6 +362,8 @@ bool AvPlayerSource::GetVideoData(AvPlayerFrameInfoEx& video_info) {
     auto frame = m_video_frames.Pop();
     video_info = frame->info;
     m_current_video_frame = std::move(frame);
+    LOG_INFO(Lib_AvPlayer, "GetVideoData: Ex API pitch={} {}x{}", video_info.details.video.pitch,
+             video_info.details.video.width, video_info.details.video.height);
     return true;
 }
 
