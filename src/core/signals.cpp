@@ -4,6 +4,7 @@
 #include "common/arch.h"
 #include "common/assert.h"
 #include "common/decoder.h"
+#include "common/logging/log.h"
 #include "common/signal_context.h"
 #include "core/libraries/kernel/threads/exception.h"
 #include "core/signals.h"
@@ -47,6 +48,22 @@ static LONG WINAPI SignalHandler(EXCEPTION_POINTERS* pExp) noexcept {
         return EXCEPTION_CONTINUE_EXECUTION;
     default:
         break;
+    }
+
+    if (!handled) {
+        const auto code = pExp->ExceptionRecord->ExceptionCode;
+        const auto* rec = pExp->ExceptionRecord;
+        void* fault_addr = nullptr;
+        const char* kind = "unknown";
+        if (code == EXCEPTION_ACCESS_VIOLATION && rec->NumberParameters >= 2) {
+            fault_addr = reinterpret_cast<void*>(rec->ExceptionInformation[1]);
+            kind = rec->ExceptionInformation[0] == 0 ? "read" : "write";
+        }
+        LOG_CRITICAL(Common,
+                     "Unhandled Windows exception {:#010x} at RIP {} ({} fault at {}). "
+                     "Process will terminate.",
+                     static_cast<u32>(code), fmt::ptr(rec->ExceptionAddress), kind,
+                     fmt::ptr(fault_addr));
     }
 
     return handled ? EXCEPTION_CONTINUE_EXECUTION : EXCEPTION_CONTINUE_SEARCH;
