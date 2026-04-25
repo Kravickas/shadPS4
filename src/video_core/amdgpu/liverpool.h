@@ -123,6 +123,14 @@ public:
         }
     }
 
+    // Kept for ABI compatibility with the gnmdriver init path. The previous
+    // implementation pre-reserved a per-queue ring buffer used by the old
+    // CopyCmdBuffers path; that path has been replaced with per-task snapshots
+    // owned by each coroutine's promise, so no up-front reservation is needed.
+    // The function is intentionally a no-op rather than removed because
+    // gnmdriver.cpp's existing call site is preserved.
+    void ReserveCopyBufferSpace() {}
+
     inline ComputeProgram& GetCsRegs() {
         return mapped_queues[curr_qid].cs_state;
     }
