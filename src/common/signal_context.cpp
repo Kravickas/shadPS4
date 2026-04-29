@@ -1,4 +1,4 @@
-// SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
+// SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include "common/arch.h"
@@ -74,6 +74,18 @@ void* GetRip(void* ctx) {
     return (void*)((ucontext_t*)ctx)->uc_mcontext.mc_rip;
 #else
     return (void*)((ucontext_t*)ctx)->uc_mcontext.gregs[REG_RIP];
+#endif
+}
+
+void* GetRsp(void* ctx) {
+#if defined(_WIN32)
+    return (void*)((EXCEPTION_POINTERS*)ctx)->ContextRecord->Rsp;
+#elif defined(__APPLE__)
+    return (void*)((ucontext_t*)ctx)->uc_mcontext->__ss.__rsp;
+#elif defined(__FreeBSD__)
+    return (void*)((ucontext_t*)ctx)->uc_mcontext.mc_rsp;
+#else
+    return (void*)((ucontext_t*)ctx)->uc_mcontext.gregs[REG_RSP];
 #endif
 }
 
