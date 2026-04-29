@@ -70,6 +70,9 @@ static std::string IdentifyModule(void* address) {
     return "<unmapped or unknown>";
 }
 
+// Reads sizeof(u64) from `addr` into `out`. Returns false on access fault.
+// Used by post-mortem stack/code dumpers, which must not double-fault if the
+// target address is corrupted or unmapped.
 static bool SafeReadU64(const void* addr, u64& out) noexcept {
     __try {
         out = *static_cast<const volatile u64*>(addr);
@@ -79,14 +82,24 @@ static bool SafeReadU64(const void* addr, u64& out) noexcept {
     }
 }
 
-static void DumpRedZone(const CONTEXT* ctx) {
-    const auto rsp = ctx->Rsp;
-    char hex[16 * 17 + 64] = {};
+static bool SafeReadU8(const void* addr, u8& out) noexcept {
+    __try {
+        out = *static_cast<const volatile u8*>(addr);
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+
+// Dumps an `n`-qword window of stack as hex on a single log line. `offset_first`
+// is the byte offset (negative or positive) from `rsp` of the FIRST qword printed.
+static void DumpStackRange(VAddr rsp, s64 offset_first, int count, const char* label) {
+    char hex[64 * 17 + 64] = {};
     char* p = hex;
     char* const end = hex + sizeof(hex);
 
-    for (int slot = -16; slot < 0; ++slot) {
-        const auto addr = rsp + static_cast<s64>(slot) * 8;
+    for (int i = 0; i < count; ++i) {
+        const auto addr = rsp + offset_first + static_cast<s64>(i) * 8;
         u64 value = 0;
         const bool ok = SafeReadU64(reinterpret_cast<const void*>(addr), value);
         const int n = std::snprintf(p, static_cast<size_t>(end - p), "%016llx ",
@@ -96,16 +109,56 @@ static void DumpRedZone(const CONTEXT* ctx) {
         }
         p += n;
     }
-    LOG_CRITICAL(Common, "RedZone[Rsp-128..Rsp) {:#018x}: {}", static_cast<unsigned long long>(rsp),
-                 hex);
+    LOG_CRITICAL(Common, "{} (rsp{:+#x}, {} qwords): {}", label, offset_first, count, hex);
+}
+
+// Dumps `n` bytes of code at `addr`, useful to verify that no in-memory patching
+// occurred between AOT decoding and execution. Bloodborne's crash function has
+// no instructions in shadPS4's JIT-patcher set (no SSE4a, no FS-segment), so
+// these bytes should match the eboot file exactly.
+static void DumpCodeBytes(VAddr addr, int count, const char* label) {
+    char hex[256 * 4 + 64] = {};
+    char* p = hex;
+    char* const end = hex + sizeof(hex);
+
+    for (int i = 0; i < count; ++i) {
+        u8 byte = 0;
+        const bool ok = SafeReadU8(reinterpret_cast<const void*>(addr + i), byte);
+        const int n = std::snprintf(p, static_cast<size_t>(end - p), "%02x ", ok ? byte : 0);
+        if (n <= 0 || n >= end - p) {
+            break;
+        }
+        p += n;
+    }
+    LOG_CRITICAL(Common, "{} ({:#x}, {} bytes): {}", label, static_cast<unsigned long long>(addr),
+                 count, hex);
+}
+
+static void DumpPostMortem(const CONTEXT* ctx) {
+    const auto rsp = ctx->Rsp;
+    const auto rip = ctx->Rip;
+
+    DumpStackRange(rsp, -256, 16, "RedZoneFar ");
+    DumpStackRange(rsp, -128, 16, "RedZoneNear");
+    DumpStackRange(rsp, 0, 12, "SavedRegs  ");
+    DumpCodeBytes(rip - 32, 48, "CodeBytes  ");
+
     LOG_CRITICAL(
         Common,
-        "Saved regs: Rax={:#018x} Rbp={:#018x} Rdi={:#018x} Rsi={:#018x} "
-        "Rdx={:#018x} R12={:#018x} R14={:#018x}",
-        static_cast<unsigned long long>(ctx->Rax), static_cast<unsigned long long>(ctx->Rbp),
-        static_cast<unsigned long long>(ctx->Rdi), static_cast<unsigned long long>(ctx->Rsi),
-        static_cast<unsigned long long>(ctx->Rdx), static_cast<unsigned long long>(ctx->R12),
-        static_cast<unsigned long long>(ctx->R14));
+        "Regs: Rax={:#018x} Rbx={:#018x} Rcx={:#018x} Rdx={:#018x} "
+        "Rsi={:#018x} Rdi={:#018x} Rbp={:#018x} Rsp={:#018x}",
+        static_cast<unsigned long long>(ctx->Rax), static_cast<unsigned long long>(ctx->Rbx),
+        static_cast<unsigned long long>(ctx->Rcx), static_cast<unsigned long long>(ctx->Rdx),
+        static_cast<unsigned long long>(ctx->Rsi), static_cast<unsigned long long>(ctx->Rdi),
+        static_cast<unsigned long long>(ctx->Rbp), static_cast<unsigned long long>(ctx->Rsp));
+    LOG_CRITICAL(
+        Common,
+        "Regs: R8 ={:#018x} R9 ={:#018x} R10={:#018x} R11={:#018x} "
+        "R12={:#018x} R13={:#018x} R14={:#018x} R15={:#018x}",
+        static_cast<unsigned long long>(ctx->R8), static_cast<unsigned long long>(ctx->R9),
+        static_cast<unsigned long long>(ctx->R10), static_cast<unsigned long long>(ctx->R11),
+        static_cast<unsigned long long>(ctx->R12), static_cast<unsigned long long>(ctx->R13),
+        static_cast<unsigned long long>(ctx->R14), static_cast<unsigned long long>(ctx->R15));
 }
 
 static LONG WINAPI SignalHandler(EXCEPTION_POINTERS* pExp) noexcept {
@@ -143,7 +196,7 @@ static LONG WINAPI SignalHandler(EXCEPTION_POINTERS* pExp) noexcept {
                      static_cast<u32>(code), fmt::ptr(rec->ExceptionAddress), kind,
                      fmt::ptr(fault_addr));
         LOG_CRITICAL(Common, "Module: {}", IdentifyModule(rec->ExceptionAddress));
-        DumpRedZone(pExp->ContextRecord);
+        DumpPostMortem(pExp->ContextRecord);
     }
 
     return handled ? EXCEPTION_CONTINUE_EXECUTION : EXCEPTION_CONTINUE_SEARCH;
