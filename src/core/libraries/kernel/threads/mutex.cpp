@@ -1,7 +1,9 @@
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <shared_mutex>
 #include <thread>
+#include <unordered_set>
 #include "common/assert.h"
 #include "common/logging/log.h"
 #include "common/types.h"
@@ -17,66 +19,77 @@
 
 namespace Libraries::Kernel {
 
-namespace {
+static constexpr u32 MUTEX_ADAPTIVE_SPINS = 2000;
+static std::mutex MutxStaticLock;
 
-constexpr uintptr_t kPlausibleHeapMin = 0x10000ULL;
+#define THR_MUTEX_INITIALIZER ((PthreadMutex*)NULL)
+#define THR_ADAPTIVE_MUTEX_INITIALIZER ((PthreadMutex*)1)
+#define THR_MUTEX_DESTROYED ((PthreadMutex*)2)
 
-// Validates whether the bytes at `addr` look like a fully-initialized
-// PthreadMutex — i.e. they are internally consistent with the layout produced
-// by MutexInit. Returns true if all sanity checks pass.
-bool LooksLikePthreadMutex(const PthreadMutex* candidate) {
-#ifdef _WIN64
-    if (candidate == nullptr) {
-        return false;
-    }
-    // Must be readable for sizeof(PthreadMutex) = ~72 bytes.
-    MEMORY_BASIC_INFORMATION mbi{};
-    if (VirtualQuery(candidate, &mbi, sizeof(mbi)) == 0) {
-        return false;
-    }
-    if (!(mbi.State & MEM_COMMIT) || (mbi.Protect & PAGE_NOACCESS) ||
-        (mbi.Protect & PAGE_GUARD)) {
-        return false;
-    }
-    const uintptr_t base = reinterpret_cast<uintptr_t>(mbi.BaseAddress);
-    const uintptr_t end = base + mbi.RegionSize;
-    if (reinterpret_cast<uintptr_t>(candidate) + sizeof(PthreadMutex) > end) {
-        return false;
-    }
+#define CPU_SPINWAIT __asm__ volatile("pause")
 
-    // Field-by-field consistency checks. We DO NOT touch the std::string
-    // because that could contain heap pointers we'd fault on.
-    const u32 flags_bits = static_cast<u32>(candidate->m_flags);
-    const u32 type_bits = flags_bits & 0xff; // PthreadMutexFlags::TypeMask
-    const u32 nontype_bits = flags_bits & ~0xff;
-    if (type_bits == 0 || type_bits >= static_cast<u32>(PthreadMutexType::Max)) {
-        return false;
-    }
-    // Only Deferred(0x200) is currently valid in the high bits.
-    if (nontype_bits != 0 && nontype_bits != 0x200) {
-        return false;
-    }
-    const u32 protocol = static_cast<u32>(candidate->m_protocol);
-    if (protocol > static_cast<u32>(PthreadMutexProt::Protect)) {
-        return false;
-    }
-    if (candidate->m_count < 0 || candidate->m_spinloops < 0 ||
-        candidate->m_yieldloops < 0) {
-        return false;
-    }
-    return true;
-#else
-    (void)candidate;
-    return false;
-#endif
+static std::shared_mutex g_diag_lock;
+static std::unordered_set<const void*> g_seen_slots;
+static std::unordered_set<const void*> g_alloc_pmutexes;
+
+static void DiagRecordSlot(const void* slot) {
+    std::unique_lock lk{g_diag_lock};
+    g_seen_slots.insert(slot);
 }
 
-void DumpMemSafe(const char* label, const void* addr, size_t bytes) {
+static void DiagRecordAlloc(const void* pmutex) {
+    std::unique_lock lk{g_diag_lock};
+    g_alloc_pmutexes.insert(pmutex);
+}
+
+static void DiagForgetAlloc(const void* pmutex) {
+    std::unique_lock lk{g_diag_lock};
+    g_alloc_pmutexes.erase(pmutex);
+}
+
+enum class MutexClass {
+    Unknown,
+    Slot,
+    HeapPmutex,
+    Both,
+};
+
+static MutexClass DiagClassify(const void* p) {
+    std::shared_lock lk{g_diag_lock};
+    const bool is_slot = g_seen_slots.find(p) != g_seen_slots.end();
+    const bool is_alloc = g_alloc_pmutexes.find(p) != g_alloc_pmutexes.end();
+    if (is_slot && is_alloc) {
+        return MutexClass::Both;
+    }
+    if (is_slot) {
+        return MutexClass::Slot;
+    }
+    if (is_alloc) {
+        return MutexClass::HeapPmutex;
+    }
+    return MutexClass::Unknown;
+}
+
+static const char* DiagClassName(MutexClass c) {
+    switch (c) {
+    case MutexClass::Slot:
+        return "SLOT (game uses FreeBSD ABI; *mutex corrupted post-init)";
+    case MutexClass::HeapPmutex:
+        return "ALLOC (game passes heap pmutex* directly, v3 theory)";
+    case MutexClass::Both:
+        return "BOTH (impossible without heap aliasing — investigate)";
+    case MutexClass::Unknown:
+    default:
+        return "UNKNOWN (mutex_param never passed through shadPS4)";
+    }
+}
+
+static void DiagDumpMem(const char* label, const void* addr, size_t bytes) {
 #ifdef _WIN64
     MEMORY_BASIC_INFORMATION mbi{};
     if (VirtualQuery(addr, &mbi, sizeof(mbi)) == 0 || !(mbi.State & MEM_COMMIT) ||
         (mbi.Protect & PAGE_NOACCESS) || (mbi.Protect & PAGE_GUARD)) {
-        LOG_CRITICAL(Kernel_Pthread, "[MTX-DIAG-V2]   {}: NOT readable", label);
+        LOG_CRITICAL(Kernel_Pthread, "[MTX-DIAG-V4]   {}: NOT readable", label);
         return;
     }
     const u8* base = reinterpret_cast<const u8*>(mbi.BaseAddress);
@@ -88,7 +101,7 @@ void DumpMemSafe(const char* label, const void* addr, size_t bytes) {
     for (size_t i = 0; i < to_dump; ++i) {
         line += fmt::format("{:02x} ", p[i]);
         if ((i & 0xf) == 0xf || i == to_dump - 1) {
-            LOG_CRITICAL(Kernel_Pthread, "[MTX-DIAG-V2]   {}+{:#04x}: {}", label,
+            LOG_CRITICAL(Kernel_Pthread, "[MTX-DIAG-V4]   {}+{:#04x}: {}", label,
                          i & ~size_t{0xf}, line);
             line.clear();
         }
@@ -100,72 +113,46 @@ void DumpMemSafe(const char* label, const void* addr, size_t bytes) {
 #endif
 }
 
-void DiagSuspiciousMutex(const char* fn, PthreadMutexT* mutex, const void* return_addr) {
+static void DiagSuspiciousLock(const char* fn, PthreadMutexT* mutex, const void* return_addr) {
     if (mutex == nullptr) {
-        LOG_CRITICAL(Kernel_Pthread, "[MTX-DIAG-V2] {}: mutex** is NULL caller={}", fn,
+        LOG_CRITICAL(Kernel_Pthread, "[MTX-DIAG-V4] {}: mutex** NULL caller={}", fn,
                      fmt::ptr(return_addr));
         return;
     }
     const uintptr_t m_val = reinterpret_cast<uintptr_t>(*mutex);
-    if (m_val <= 2 || m_val >= kPlausibleHeapMin) {
-        return; // valid magic or plausible heap pointer; not suspicious
+    if (m_val <= 2 || m_val >= 0x10000) {
+        return;
     }
 
-    LOG_CRITICAL(Kernel_Pthread, "[MTX-DIAG-V2] ============================");
-    LOG_CRITICAL(Kernel_Pthread, "[MTX-DIAG-V2] {} *mutex={:#x} (suspicious)", fn, m_val);
-    LOG_CRITICAL(Kernel_Pthread, "[MTX-DIAG-V2]   mutex** parameter = {}", fmt::ptr(mutex));
-    LOG_CRITICAL(Kernel_Pthread, "[MTX-DIAG-V2]   caller PC         = {}", fmt::ptr(return_addr));
-    LOG_CRITICAL(Kernel_Pthread, "[MTX-DIAG-V2]   g_curthread       = {} name='{}'",
-                 fmt::ptr(g_curthread),
-                 g_curthread ? g_curthread->name.c_str() : "<null>");
+    const MutexClass cls_param = DiagClassify(mutex);
+    const MutexClass cls_deref = DiagClassify(*mutex);
 
-    // CRITICAL TEST: does the buffer at `mutex` itself look like a valid
-    // PthreadMutex? If yes, the game is passing the heap PthreadMutex* directly
-    // (single-pointer ABI), and the FIX is to interpret `mutex` as PthreadMutex*
-    // rather than dereferencing it once more.
-    const PthreadMutex* as_pmutex = reinterpret_cast<const PthreadMutex*>(mutex);
-    const bool looks_valid_at_mutex = LooksLikePthreadMutex(as_pmutex);
-    LOG_CRITICAL(Kernel_Pthread, "[MTX-DIAG-V2]   `mutex` itself looks like PthreadMutex? {}",
-                 looks_valid_at_mutex ? "YES (game passes single-ptr)" : "no");
-    if (looks_valid_at_mutex) {
-        // Print the raw 8 bytes at +0x00 (the m_lock HANDLE, opaque to us)
-        u64 raw_lock = 0;
-        std::memcpy(&raw_lock, mutex, sizeof(raw_lock));
-        LOG_CRITICAL(Kernel_Pthread,
-                     "[MTX-DIAG-V2]   -> as PthreadMutex*: lock={:#x} flags={:#x}"
-                     " owner={} count={} prot={}",
-                     raw_lock, static_cast<u32>(as_pmutex->m_flags),
-                     fmt::ptr(as_pmutex->m_owner), as_pmutex->m_count,
-                     static_cast<u32>(as_pmutex->m_protocol));
+    LOG_CRITICAL(Kernel_Pthread, "[MTX-DIAG-V4] ============================");
+    LOG_CRITICAL(Kernel_Pthread, "[MTX-DIAG-V4] {} suspicious *mutex={:#x}", fn, m_val);
+    LOG_CRITICAL(Kernel_Pthread, "[MTX-DIAG-V4]   mutex_param  = {}  classify={}",
+                 fmt::ptr(mutex), DiagClassName(cls_param));
+    LOG_CRITICAL(Kernel_Pthread, "[MTX-DIAG-V4]   *mutex value = {:#x} classify={}", m_val,
+                 DiagClassName(cls_deref));
+    LOG_CRITICAL(Kernel_Pthread, "[MTX-DIAG-V4]   caller PC    = {}", fmt::ptr(return_addr));
+    size_t n_slots = 0;
+    size_t n_allocs = 0;
+    {
+        std::shared_lock lk{g_diag_lock};
+        n_slots = g_seen_slots.size();
+        n_allocs = g_alloc_pmutexes.size();
     }
-
-    // ALSO check if *mutex looks like a valid PthreadMutex (i.e. just because
-    // it's small doesn't necessarily mean it's invalid — but for 0x6eec, no).
-    const PthreadMutex* via_deref = reinterpret_cast<const PthreadMutex*>(*mutex);
-    const bool looks_valid_via_deref = LooksLikePthreadMutex(via_deref);
-    LOG_CRITICAL(Kernel_Pthread, "[MTX-DIAG-V2]   *mutex looks like PthreadMutex? {}",
-                 looks_valid_via_deref ? "YES (FreeBSD ABI)" : "no");
-
-    DumpMemSafe("buf_at_mutex", mutex, 80);
+    LOG_CRITICAL(Kernel_Pthread, "[MTX-DIAG-V4]   slots_recorded={} allocs_live={}", n_slots,
+                 n_allocs);
+    DiagDumpMem("mutex_param_bytes", mutex, 80);
 }
 
-} // namespace
-
 #ifdef _WIN64
-#define MTX_DIAG(fn_name, mutex_ptr) DiagSuspiciousMutex(fn_name, mutex_ptr, _ReturnAddress())
+#define MTX_DIAG_LOCK(fn_name, mutex_ptr)                                                          \
+    DiagSuspiciousLock(fn_name, mutex_ptr, _ReturnAddress())
 #else
-#define MTX_DIAG(fn_name, mutex_ptr)                                                               \
-    DiagSuspiciousMutex(fn_name, mutex_ptr, __builtin_return_address(0))
+#define MTX_DIAG_LOCK(fn_name, mutex_ptr)                                                          \
+    DiagSuspiciousLock(fn_name, mutex_ptr, __builtin_return_address(0))
 #endif
-
-static constexpr u32 MUTEX_ADAPTIVE_SPINS = 2000;
-static std::mutex MutxStaticLock;
-
-#define THR_MUTEX_INITIALIZER ((PthreadMutex*)NULL)
-#define THR_ADAPTIVE_MUTEX_INITIALIZER ((PthreadMutex*)1)
-#define THR_MUTEX_DESTROYED ((PthreadMutex*)2)
-
-#define CPU_SPINWAIT __asm__ volatile("pause")
 
 #define CHECK_AND_INIT_MUTEX                                                                       \
     if (PthreadMutex* m = *mutex; m <= THR_MUTEX_DESTROYED) [[unlikely]] {                         \
@@ -222,6 +209,19 @@ static s32 MutexInit(PthreadMutexT* mutex, const PthreadMutexAttr* mutex_attr, c
         // pmutex->m_yieldloops = _thr_yieldloops;
     }
 
+    // v4 diagnostic: record both the slot the user passed and the heap
+    // PthreadMutex we allocated. Log the value already at *mutex so we can
+    // see if the game uses a static-init magic shadPS4 doesn't recognise
+    // (PS4 has 0/1/0x10000000000; shadPS4 has 0/1).
+    const void* slot = mutex;
+    const uintptr_t prior = reinterpret_cast<uintptr_t>(*mutex);
+    if (prior != 0 && prior != 1 && prior != 2) {
+        LOG_INFO(Kernel_Pthread, "[MTX-DIAG-V4-INIT] slot={} prior_*mutex={:#x} alloc={} name='{}'",
+                 fmt::ptr(slot), prior, fmt::ptr(pmutex), pmutex->name.c_str());
+    }
+    DiagRecordSlot(slot);
+    DiagRecordAlloc(pmutex);
+
     *mutex = pmutex;
     return 0;
 }
@@ -259,6 +259,7 @@ s32 PS4_SYSV_ABI posix_pthread_mutex_destroy(PthreadMutexT* mutex) {
         return POSIX_EBUSY;
     }
     *mutex = THR_MUTEX_DESTROYED;
+    DiagForgetAlloc(m);
     delete m;
     return 0;
 }
@@ -396,26 +397,26 @@ s32 PthreadMutex::TryLock() {
 }
 
 s32 PS4_SYSV_ABI posix_pthread_mutex_trylock(PthreadMutexT* mutex) {
-    MTX_DIAG("posix_pthread_mutex_trylock", mutex);
+    MTX_DIAG_LOCK("posix_pthread_mutex_trylock", mutex);
     CHECK_AND_INIT_MUTEX
     return (*mutex)->TryLock();
 }
 
 s32 PS4_SYSV_ABI posix_pthread_mutex_lock(PthreadMutexT* mutex) {
-    MTX_DIAG("posix_pthread_mutex_lock", mutex);
+    MTX_DIAG_LOCK("posix_pthread_mutex_lock", mutex);
     CHECK_AND_INIT_MUTEX
     return (*mutex)->Lock(nullptr);
 }
 
 s32 PS4_SYSV_ABI posix_pthread_mutex_timedlock(PthreadMutexT* mutex,
                                                const OrbisKernelTimespec* abstime) {
-    MTX_DIAG("posix_pthread_mutex_timedlock", mutex);
+    MTX_DIAG_LOCK("posix_pthread_mutex_timedlock", mutex);
     CHECK_AND_INIT_MUTEX
     return (*mutex)->Lock(abstime);
 }
 
 s32 PS4_SYSV_ABI posix_pthread_mutex_reltimedlock_np(PthreadMutexT* mutex, u64 usec) {
-    MTX_DIAG("posix_pthread_mutex_reltimedlock_np", mutex);
+    MTX_DIAG_LOCK("posix_pthread_mutex_reltimedlock_np", mutex);
     CHECK_AND_INIT_MUTEX
     return (*mutex)->Lock(THR_RELTIME, usec);
 }
