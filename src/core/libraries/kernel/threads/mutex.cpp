@@ -3,13 +3,74 @@
 
 #include <thread>
 #include "common/assert.h"
+#include "common/logging/log.h"
 #include "common/types.h"
 #include "core/libraries/kernel/kernel.h"
 #include "core/libraries/kernel/posix_error.h"
 #include "core/libraries/kernel/threads/pthread.h"
 #include "core/libraries/libs.h"
 
+#ifdef _WIN64
+#include <intrin.h> // _ReturnAddress
+#include <windows.h>
+#endif
+
 namespace Libraries::Kernel {
+
+// Logged once per suspicious mutex; control flow is unchanged.
+static void DiagSuspiciousMutex(const char* fn, PthreadMutexT* mutex, const void* return_addr) {
+    if (mutex == nullptr) {
+        LOG_CRITICAL(Kernel_Pthread, "[MTX-DIAG] {}: mutex** is NULL (caller={})", fn,
+                     fmt::ptr(return_addr));
+        return;
+    }
+    const uintptr_t m_val = reinterpret_cast<uintptr_t>(*mutex);
+    // Magic values 0/1/2 are valid (handled by CHECK_AND_INIT_MUTEX).
+    // Real heap pointers are >= 0x10000 in practice on every supported host.
+    if (m_val <= 2 || m_val >= 0x10000) {
+        return;
+    }
+    LOG_CRITICAL(Kernel_Pthread, "[MTX-DIAG] {}: SUSPICIOUS *mutex = {:#x}", fn, m_val);
+    LOG_CRITICAL(Kernel_Pthread, "[MTX-DIAG]   mutex** ptr  = {}", fmt::ptr(mutex));
+    LOG_CRITICAL(Kernel_Pthread, "[MTX-DIAG]   caller PC    = {}", fmt::ptr(return_addr));
+    LOG_CRITICAL(Kernel_Pthread, "[MTX-DIAG]   g_curthread  = {} (name='{}')",
+                 fmt::ptr(g_curthread),
+                 g_curthread ? g_curthread->name.c_str() : "<null>");
+
+#ifdef _WIN64
+    // Dump 64 bytes at the mutex** storage so we can recognize what layout the
+    // game thinks pthread_mutex_t has (FreeBSD 8B pointer vs glibc 40B struct, etc).
+    MEMORY_BASIC_INFORMATION mbi{};
+    if (VirtualQuery(mutex, &mbi, sizeof(mbi)) != 0 && (mbi.State & MEM_COMMIT) &&
+        !(mbi.Protect & PAGE_NOACCESS) && !(mbi.Protect & PAGE_GUARD)) {
+        const u8* base = reinterpret_cast<const u8*>(mbi.BaseAddress);
+        const u8* p = reinterpret_cast<const u8*>(mutex);
+        const size_t avail = mbi.RegionSize - static_cast<size_t>(p - base);
+        const size_t to_dump = avail < 64 ? avail : 64;
+        std::string line;
+        line.reserve(80);
+        for (size_t i = 0; i < to_dump; ++i) {
+            line += fmt::format("{:02x} ", p[i]);
+            if ((i & 0xf) == 0xf || i == to_dump - 1) {
+                LOG_CRITICAL(Kernel_Pthread, "[MTX-DIAG]   mutex_buf+{:#04x}: {}",
+                             i & ~size_t{0xf}, line);
+                line.clear();
+            }
+        }
+    } else {
+        LOG_CRITICAL(Kernel_Pthread,
+                     "[MTX-DIAG]   mutex_buf NOT readable (VirtualQuery State={:#x} Prot={:#x})",
+                     mbi.State, mbi.Protect);
+    }
+#endif
+}
+
+#ifdef _WIN64
+#define MTX_DIAG(fn_name, mutex_ptr) DiagSuspiciousMutex(fn_name, mutex_ptr, _ReturnAddress())
+#else
+#define MTX_DIAG(fn_name, mutex_ptr)                                                               \
+    DiagSuspiciousMutex(fn_name, mutex_ptr, __builtin_return_address(0))
+#endif
 
 static constexpr u32 MUTEX_ADAPTIVE_SPINS = 2000;
 static std::mutex MutxStaticLock;
@@ -249,22 +310,26 @@ s32 PthreadMutex::TryLock() {
 }
 
 s32 PS4_SYSV_ABI posix_pthread_mutex_trylock(PthreadMutexT* mutex) {
+    MTX_DIAG("posix_pthread_mutex_trylock", mutex);
     CHECK_AND_INIT_MUTEX
     return (*mutex)->TryLock();
 }
 
 s32 PS4_SYSV_ABI posix_pthread_mutex_lock(PthreadMutexT* mutex) {
+    MTX_DIAG("posix_pthread_mutex_lock", mutex);
     CHECK_AND_INIT_MUTEX
     return (*mutex)->Lock(nullptr);
 }
 
 s32 PS4_SYSV_ABI posix_pthread_mutex_timedlock(PthreadMutexT* mutex,
                                                const OrbisKernelTimespec* abstime) {
+    MTX_DIAG("posix_pthread_mutex_timedlock", mutex);
     CHECK_AND_INIT_MUTEX
     return (*mutex)->Lock(abstime);
 }
 
 s32 PS4_SYSV_ABI posix_pthread_mutex_reltimedlock_np(PthreadMutexT* mutex, u64 usec) {
+    MTX_DIAG("posix_pthread_mutex_reltimedlock_np", mutex);
     CHECK_AND_INIT_MUTEX
     return (*mutex)->Lock(THR_RELTIME, usec);
 }
@@ -295,6 +360,7 @@ s32 PthreadMutex::Unlock() {
 }
 
 s32 PS4_SYSV_ABI posix_pthread_mutex_unlock(PthreadMutexT* mutex) {
+    MTX_DIAG("posix_pthread_mutex_unlock", mutex);
     PthreadMutex* mp = *mutex;
     if (mp <= THR_MUTEX_DESTROYED) [[unlikely]] {
         if (mp == THR_MUTEX_DESTROYED) {
