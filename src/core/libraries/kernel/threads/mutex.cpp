@@ -11,59 +11,145 @@
 #include "core/libraries/libs.h"
 
 #ifdef _WIN64
-#include <intrin.h> // _ReturnAddress
+#include <intrin.h>
 #include <windows.h>
 #endif
 
 namespace Libraries::Kernel {
 
-// Logged once per suspicious mutex; control flow is unchanged.
-static void DiagSuspiciousMutex(const char* fn, PthreadMutexT* mutex, const void* return_addr) {
+namespace {
+
+constexpr uintptr_t kPlausibleHeapMin = 0x10000ULL;
+
+// Validates whether the bytes at `addr` look like a fully-initialized
+// PthreadMutex — i.e. they are internally consistent with the layout produced
+// by MutexInit. Returns true if all sanity checks pass.
+bool LooksLikePthreadMutex(const PthreadMutex* candidate) {
+#ifdef _WIN64
+    if (candidate == nullptr) {
+        return false;
+    }
+    // Must be readable for sizeof(PthreadMutex) = ~72 bytes.
+    MEMORY_BASIC_INFORMATION mbi{};
+    if (VirtualQuery(candidate, &mbi, sizeof(mbi)) == 0) {
+        return false;
+    }
+    if (!(mbi.State & MEM_COMMIT) || (mbi.Protect & PAGE_NOACCESS) ||
+        (mbi.Protect & PAGE_GUARD)) {
+        return false;
+    }
+    const uintptr_t base = reinterpret_cast<uintptr_t>(mbi.BaseAddress);
+    const uintptr_t end = base + mbi.RegionSize;
+    if (reinterpret_cast<uintptr_t>(candidate) + sizeof(PthreadMutex) > end) {
+        return false;
+    }
+
+    // Field-by-field consistency checks. We DO NOT touch the std::string
+    // because that could contain heap pointers we'd fault on.
+    const u32 flags_bits = static_cast<u32>(candidate->m_flags);
+    const u32 type_bits = flags_bits & 0xff; // PthreadMutexFlags::TypeMask
+    const u32 nontype_bits = flags_bits & ~0xff;
+    if (type_bits == 0 || type_bits >= static_cast<u32>(PthreadMutexType::Max)) {
+        return false;
+    }
+    // Only Deferred(0x200) is currently valid in the high bits.
+    if (nontype_bits != 0 && nontype_bits != 0x200) {
+        return false;
+    }
+    const u32 protocol = static_cast<u32>(candidate->m_protocol);
+    if (protocol > static_cast<u32>(PthreadMutexProt::Protect)) {
+        return false;
+    }
+    if (candidate->m_count < 0 || candidate->m_spinloops < 0 ||
+        candidate->m_yieldloops < 0) {
+        return false;
+    }
+    return true;
+#else
+    (void)candidate;
+    return false;
+#endif
+}
+
+void DumpMemSafe(const char* label, const void* addr, size_t bytes) {
+#ifdef _WIN64
+    MEMORY_BASIC_INFORMATION mbi{};
+    if (VirtualQuery(addr, &mbi, sizeof(mbi)) == 0 || !(mbi.State & MEM_COMMIT) ||
+        (mbi.Protect & PAGE_NOACCESS) || (mbi.Protect & PAGE_GUARD)) {
+        LOG_CRITICAL(Kernel_Pthread, "[MTX-DIAG-V2]   {}: NOT readable", label);
+        return;
+    }
+    const u8* base = reinterpret_cast<const u8*>(mbi.BaseAddress);
+    const u8* p = reinterpret_cast<const u8*>(addr);
+    const size_t avail = mbi.RegionSize - static_cast<size_t>(p - base);
+    const size_t to_dump = avail < bytes ? avail : bytes;
+    std::string line;
+    line.reserve(80);
+    for (size_t i = 0; i < to_dump; ++i) {
+        line += fmt::format("{:02x} ", p[i]);
+        if ((i & 0xf) == 0xf || i == to_dump - 1) {
+            LOG_CRITICAL(Kernel_Pthread, "[MTX-DIAG-V2]   {}+{:#04x}: {}", label,
+                         i & ~size_t{0xf}, line);
+            line.clear();
+        }
+    }
+#else
+    (void)label;
+    (void)addr;
+    (void)bytes;
+#endif
+}
+
+void DiagSuspiciousMutex(const char* fn, PthreadMutexT* mutex, const void* return_addr) {
     if (mutex == nullptr) {
-        LOG_CRITICAL(Kernel_Pthread, "[MTX-DIAG] {}: mutex** is NULL (caller={})", fn,
+        LOG_CRITICAL(Kernel_Pthread, "[MTX-DIAG-V2] {}: mutex** is NULL caller={}", fn,
                      fmt::ptr(return_addr));
         return;
     }
     const uintptr_t m_val = reinterpret_cast<uintptr_t>(*mutex);
-    // Magic values 0/1/2 are valid (handled by CHECK_AND_INIT_MUTEX).
-    // Real heap pointers are >= 0x10000 in practice on every supported host.
-    if (m_val <= 2 || m_val >= 0x10000) {
-        return;
+    if (m_val <= 2 || m_val >= kPlausibleHeapMin) {
+        return; // valid magic or plausible heap pointer; not suspicious
     }
-    LOG_CRITICAL(Kernel_Pthread, "[MTX-DIAG] {}: SUSPICIOUS *mutex = {:#x}", fn, m_val);
-    LOG_CRITICAL(Kernel_Pthread, "[MTX-DIAG]   mutex** ptr  = {}", fmt::ptr(mutex));
-    LOG_CRITICAL(Kernel_Pthread, "[MTX-DIAG]   caller PC    = {}", fmt::ptr(return_addr));
-    LOG_CRITICAL(Kernel_Pthread, "[MTX-DIAG]   g_curthread  = {} (name='{}')",
+
+    LOG_CRITICAL(Kernel_Pthread, "[MTX-DIAG-V2] ============================");
+    LOG_CRITICAL(Kernel_Pthread, "[MTX-DIAG-V2] {} *mutex={:#x} (suspicious)", fn, m_val);
+    LOG_CRITICAL(Kernel_Pthread, "[MTX-DIAG-V2]   mutex** parameter = {}", fmt::ptr(mutex));
+    LOG_CRITICAL(Kernel_Pthread, "[MTX-DIAG-V2]   caller PC         = {}", fmt::ptr(return_addr));
+    LOG_CRITICAL(Kernel_Pthread, "[MTX-DIAG-V2]   g_curthread       = {} name='{}'",
                  fmt::ptr(g_curthread),
                  g_curthread ? g_curthread->name.c_str() : "<null>");
 
-#ifdef _WIN64
-    // Dump 64 bytes at the mutex** storage so we can recognize what layout the
-    // game thinks pthread_mutex_t has (FreeBSD 8B pointer vs glibc 40B struct, etc).
-    MEMORY_BASIC_INFORMATION mbi{};
-    if (VirtualQuery(mutex, &mbi, sizeof(mbi)) != 0 && (mbi.State & MEM_COMMIT) &&
-        !(mbi.Protect & PAGE_NOACCESS) && !(mbi.Protect & PAGE_GUARD)) {
-        const u8* base = reinterpret_cast<const u8*>(mbi.BaseAddress);
-        const u8* p = reinterpret_cast<const u8*>(mutex);
-        const size_t avail = mbi.RegionSize - static_cast<size_t>(p - base);
-        const size_t to_dump = avail < 64 ? avail : 64;
-        std::string line;
-        line.reserve(80);
-        for (size_t i = 0; i < to_dump; ++i) {
-            line += fmt::format("{:02x} ", p[i]);
-            if ((i & 0xf) == 0xf || i == to_dump - 1) {
-                LOG_CRITICAL(Kernel_Pthread, "[MTX-DIAG]   mutex_buf+{:#04x}: {}",
-                             i & ~size_t{0xf}, line);
-                line.clear();
-            }
-        }
-    } else {
+    // CRITICAL TEST: does the buffer at `mutex` itself look like a valid
+    // PthreadMutex? If yes, the game is passing the heap PthreadMutex* directly
+    // (single-pointer ABI), and the FIX is to interpret `mutex` as PthreadMutex*
+    // rather than dereferencing it once more.
+    const PthreadMutex* as_pmutex = reinterpret_cast<const PthreadMutex*>(mutex);
+    const bool looks_valid_at_mutex = LooksLikePthreadMutex(as_pmutex);
+    LOG_CRITICAL(Kernel_Pthread, "[MTX-DIAG-V2]   `mutex` itself looks like PthreadMutex? {}",
+                 looks_valid_at_mutex ? "YES (game passes single-ptr)" : "no");
+    if (looks_valid_at_mutex) {
+        // Print the raw 8 bytes at +0x00 (the m_lock HANDLE, opaque to us)
+        u64 raw_lock = 0;
+        std::memcpy(&raw_lock, mutex, sizeof(raw_lock));
         LOG_CRITICAL(Kernel_Pthread,
-                     "[MTX-DIAG]   mutex_buf NOT readable (VirtualQuery State={:#x} Prot={:#x})",
-                     mbi.State, mbi.Protect);
+                     "[MTX-DIAG-V2]   -> as PthreadMutex*: lock={:#x} flags={:#x}"
+                     " owner={} count={} prot={}",
+                     raw_lock, static_cast<u32>(as_pmutex->m_flags),
+                     fmt::ptr(as_pmutex->m_owner), as_pmutex->m_count,
+                     static_cast<u32>(as_pmutex->m_protocol));
     }
-#endif
+
+    // ALSO check if *mutex looks like a valid PthreadMutex (i.e. just because
+    // it's small doesn't necessarily mean it's invalid — but for 0x6eec, no).
+    const PthreadMutex* via_deref = reinterpret_cast<const PthreadMutex*>(*mutex);
+    const bool looks_valid_via_deref = LooksLikePthreadMutex(via_deref);
+    LOG_CRITICAL(Kernel_Pthread, "[MTX-DIAG-V2]   *mutex looks like PthreadMutex? {}",
+                 looks_valid_via_deref ? "YES (FreeBSD ABI)" : "no");
+
+    DumpMemSafe("buf_at_mutex", mutex, 80);
 }
+
+} // namespace
 
 #ifdef _WIN64
 #define MTX_DIAG(fn_name, mutex_ptr) DiagSuspiciousMutex(fn_name, mutex_ptr, _ReturnAddress())
@@ -360,7 +446,6 @@ s32 PthreadMutex::Unlock() {
 }
 
 s32 PS4_SYSV_ABI posix_pthread_mutex_unlock(PthreadMutexT* mutex) {
-    MTX_DIAG("posix_pthread_mutex_unlock", mutex);
     PthreadMutex* mp = *mutex;
     if (mp <= THR_MUTEX_DESTROYED) [[unlikely]] {
         if (mp == THR_MUTEX_DESTROYED) {
