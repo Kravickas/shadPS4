@@ -76,6 +76,42 @@ static std::string IdentifyModule(void* address) {
     return fmt::format("{} (base={:#018x}, +{:#x})", basename, base, offset);
 }
 
+static void DumpStackBacktrace() {
+    // RtlCaptureStackBackTrace uses RtlVirtualUnwind internally on x64 so it
+    // does not depend on frame-pointer omission settings. Skip the first two
+    // frames — DumpStackBacktrace itself and the SignalHandler that called it.
+    constexpr ULONG max_frames = 24;
+    constexpr ULONG skip_frames = 2;
+    PVOID frames[max_frames] = {};
+    const auto captured = CaptureStackBackTrace(skip_frames, max_frames, frames, nullptr);
+    LOG_CRITICAL(Common, "  Backtrace ({} frame{}):", captured, captured == 1 ? "" : "s");
+    for (ULONG i = 0; i < captured; ++i) {
+        LOG_CRITICAL(Common, "    [{:>2}] {} -> {}", i, fmt::ptr(frames[i]),
+                     IdentifyModule(frames[i]));
+    }
+}
+
+static void DumpMemorySafe(const char* tag, const void* addr, size_t bytes) {
+    // Probe page readability via VirtualQuery before reading; an unmapped or
+    // PAGE_NOACCESS page would otherwise reenter the signal handler.
+    MEMORY_BASIC_INFORMATION mbi{};
+    if (VirtualQuery(addr, &mbi, sizeof(mbi)) == 0 || mbi.State != MEM_COMMIT ||
+        (mbi.Protect & (PAGE_NOACCESS | PAGE_GUARD)) != 0) {
+        LOG_CRITICAL(Common, "  {} {} <unreadable>", tag, fmt::ptr(addr));
+        return;
+    }
+    const auto* p = static_cast<const u8*>(addr);
+    const size_t available = reinterpret_cast<uintptr_t>(mbi.BaseAddress) + mbi.RegionSize -
+                             reinterpret_cast<uintptr_t>(addr);
+    const size_t to_read = std::min(bytes, available);
+    std::string line;
+    line.reserve(to_read * 3);
+    for (size_t i = 0; i < to_read; ++i) {
+        fmt::format_to(std::back_inserter(line), "{:02x}{}", p[i], (i + 1) % 16 == 0 ? "  " : " ");
+    }
+    LOG_CRITICAL(Common, "  {} {} {}", tag, fmt::ptr(addr), line);
+}
+
 static LONG WINAPI SignalHandler(EXCEPTION_POINTERS* pExp) noexcept {
     const auto* signals = Signals::Instance();
 
@@ -123,6 +159,14 @@ static LONG WINAPI SignalHandler(EXCEPTION_POINTERS* pExp) noexcept {
         LOG_CRITICAL(Common, "  R12={:016x} R13={:016x} R14={:016x} R15={:016x}", ctx->R12,
                      ctx->R13, ctx->R14, ctx->R15);
         LOG_CRITICAL(Common, "  RFLAGS={:08x}", static_cast<u32>(ctx->EFlags));
+        // 32 bytes preceding the faulting instruction (often unreadable when the
+        // instruction sits at a function entry; DumpMemorySafe handles that).
+        DumpMemorySafe("Code-32:", reinterpret_cast<const u8*>(rec->ExceptionAddress) - 32, 32);
+        DumpMemorySafe("Code+0 :", rec->ExceptionAddress, 32);
+        // 64 bytes of stack memory at RSP (8 qwords). Recent return addresses
+        // and locals show up here.
+        DumpMemorySafe("Stack  :", reinterpret_cast<const void*>(ctx->Rsp), 64);
+        DumpStackBacktrace();
 #endif
     }
 
