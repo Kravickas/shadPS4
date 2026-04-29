@@ -1,19 +1,21 @@
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <filesystem>
+
 #include "common/arch.h"
 #include "common/assert.h"
 #include "common/decoder.h"
 #include "common/logging/log.h"
 #include "common/signal_context.h"
+#include "common/singleton.h"
 #include "core/libraries/kernel/threads/exception.h"
+#include "core/linker.h"
+#include "core/module.h"
 #include "core/signals.h"
 
 #ifdef _WIN32
 #include <windows.h>
-#ifdef ARCH_X86_64
-#include <Zydis/Formatter.h>
-#endif
 #else
 #include <csignal>
 #include <pthread.h>
@@ -30,6 +32,84 @@ extern std::array<OrbisKernelExceptionHandler, 32> Handlers;
 #endif
 
 namespace Core {
+
+#if defined(_WIN32)
+
+// Identifies which module a code address belongs to. PS4 modules (eboot.bin and
+// loaded PRX libraries) are mapped via VirtualAlloc rather than LoadLibrary, so they
+// are invisible to Win32 module enumeration APIs. We must consult shadPS4's own
+// Linker module list for those, then fall back to host Win32 modules for DLLs.
+static std::string IdentifyModule(void* address) {
+    const VAddr addr = reinterpret_cast<VAddr>(address);
+
+    // 1. Try shadPS4 PS4 module list first.
+    if (auto* linker = Common::Singleton<Core::Linker>::Instance()) {
+        if (auto* module = linker->FindByAddress(addr)) {
+            const VAddr base = module->GetBaseAddress();
+            const u64 offset = addr - base;
+            const std::string& name =
+                !module->name.empty() ? module->name : module->file.filename().string();
+            return fmt::format("{}+{:#x} (base {:#x})", name, offset, base);
+        }
+    }
+
+    // 2. Fall back to host Win32 modules (for shadPS4 itself, system DLLs).
+    HMODULE host_module = nullptr;
+    if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                               GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                           static_cast<LPCSTR>(address), &host_module)) {
+        char path[MAX_PATH] = {};
+        if (GetModuleFileNameA(host_module, path, sizeof(path)) > 0) {
+            const u64 offset = addr - reinterpret_cast<VAddr>(host_module);
+            const std::string filename = std::filesystem::path(path).filename().string();
+            return fmt::format("{}+{:#x} (base {})", filename, offset, fmt::ptr(host_module));
+        }
+    }
+
+    return "<unmapped or unknown>";
+}
+
+static LONG WINAPI SignalHandler(EXCEPTION_POINTERS* pExp) noexcept {
+    const auto* signals = Signals::Instance();
+
+    bool handled = false;
+    switch (pExp->ExceptionRecord->ExceptionCode) {
+    case EXCEPTION_ACCESS_VIOLATION:
+        handled = signals->DispatchAccessViolation(
+            pExp, reinterpret_cast<void*>(pExp->ExceptionRecord->ExceptionInformation[1]));
+        break;
+    case EXCEPTION_ILLEGAL_INSTRUCTION:
+        handled = signals->DispatchIllegalInstruction(pExp);
+        break;
+    case DBG_PRINTEXCEPTION_C:
+    case DBG_PRINTEXCEPTION_WIDE_C:
+        // Used by OutputDebugString functions. Always continuable.
+        return EXCEPTION_CONTINUE_EXECUTION;
+    default:
+        break;
+    }
+
+    if (!handled) {
+        const auto code = pExp->ExceptionRecord->ExceptionCode;
+        const auto* rec = pExp->ExceptionRecord;
+        void* fault_addr = nullptr;
+        const char* kind = "unknown";
+        if (code == EXCEPTION_ACCESS_VIOLATION && rec->NumberParameters >= 2) {
+            fault_addr = reinterpret_cast<void*>(rec->ExceptionInformation[1]);
+            kind = rec->ExceptionInformation[0] == 0 ? "read" : "write";
+        }
+        LOG_CRITICAL(Common,
+                     "Unhandled Windows exception {:#010x} at RIP {} ({} fault at {}). "
+                     "Process will terminate.",
+                     static_cast<u32>(code), fmt::ptr(rec->ExceptionAddress), kind,
+                     fmt::ptr(fault_addr));
+        LOG_CRITICAL(Common, "Module: {}", IdentifyModule(rec->ExceptionAddress));
+    }
+
+    return handled ? EXCEPTION_CONTINUE_EXECUTION : EXCEPTION_CONTINUE_SEARCH;
+}
+
+#else
 
 static std::string DisassembleInstruction(void* code_address) {
     char buffer[256] = "<unable to decode>";
@@ -50,130 +130,6 @@ static std::string DisassembleInstruction(void* code_address) {
 
     return buffer;
 }
-
-#if defined(_WIN32)
-
-static std::string IdentifyModule(void* address) {
-    HMODULE module_handle = nullptr;
-    if (!GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
-                                GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
-                            reinterpret_cast<LPCSTR>(address), &module_handle) ||
-        module_handle == nullptr) {
-        return "<no module - JIT or non-image memory>";
-    }
-    char path[MAX_PATH] = {};
-    if (GetModuleFileNameA(module_handle, path, MAX_PATH) == 0) {
-        return fmt::format("<unnamed module @ {}>", fmt::ptr(module_handle));
-    }
-    const auto base = reinterpret_cast<uintptr_t>(module_handle);
-    const auto offset = reinterpret_cast<uintptr_t>(address) - base;
-    const char* basename = path;
-    for (const char* p = path; *p; ++p) {
-        if (*p == '\\' || *p == '/') {
-            basename = p + 1;
-        }
-    }
-    return fmt::format("{} (base={:#018x}, +{:#x})", basename, base, offset);
-}
-
-static void DumpStackBacktrace() {
-    // RtlCaptureStackBackTrace uses RtlVirtualUnwind internally on x64 so it
-    // does not depend on frame-pointer omission settings. Skip the first two
-    // frames — DumpStackBacktrace itself and the SignalHandler that called it.
-    constexpr ULONG max_frames = 24;
-    constexpr ULONG skip_frames = 2;
-    PVOID frames[max_frames] = {};
-    const auto captured = CaptureStackBackTrace(skip_frames, max_frames, frames, nullptr);
-    LOG_CRITICAL(Common, "  Backtrace ({} frame{}):", captured, captured == 1 ? "" : "s");
-    for (ULONG i = 0; i < captured; ++i) {
-        LOG_CRITICAL(Common, "    [{:>2}] {} -> {}", i, fmt::ptr(frames[i]),
-                     IdentifyModule(frames[i]));
-    }
-}
-
-static void DumpMemorySafe(const char* tag, const void* addr, size_t bytes) {
-    // Probe page readability via VirtualQuery before reading; an unmapped or
-    // PAGE_NOACCESS page would otherwise reenter the signal handler.
-    MEMORY_BASIC_INFORMATION mbi{};
-    if (VirtualQuery(addr, &mbi, sizeof(mbi)) == 0 || mbi.State != MEM_COMMIT ||
-        (mbi.Protect & (PAGE_NOACCESS | PAGE_GUARD)) != 0) {
-        LOG_CRITICAL(Common, "  {} {} <unreadable>", tag, fmt::ptr(addr));
-        return;
-    }
-    const auto* p = static_cast<const u8*>(addr);
-    const size_t available = reinterpret_cast<uintptr_t>(mbi.BaseAddress) + mbi.RegionSize -
-                             reinterpret_cast<uintptr_t>(addr);
-    const size_t to_read = std::min(bytes, available);
-    std::string line;
-    line.reserve(to_read * 3);
-    for (size_t i = 0; i < to_read; ++i) {
-        fmt::format_to(std::back_inserter(line), "{:02x}{}", p[i], (i + 1) % 16 == 0 ? "  " : " ");
-    }
-    LOG_CRITICAL(Common, "  {} {} {}", tag, fmt::ptr(addr), line);
-}
-
-static LONG WINAPI SignalHandler(EXCEPTION_POINTERS* pExp) noexcept {
-    const auto* signals = Signals::Instance();
-
-    bool handled = false;
-    switch (pExp->ExceptionRecord->ExceptionCode) {
-    case EXCEPTION_ACCESS_VIOLATION:
-        handled = signals->DispatchAccessViolation(
-            pExp, reinterpret_cast<void*>(pExp->ExceptionRecord->ExceptionInformation[1]));
-        break;
-    case EXCEPTION_ILLEGAL_INSTRUCTION:
-        handled = signals->DispatchIllegalInstruction(pExp);
-        break;
-    case DBG_PRINTEXCEPTION_C:
-    case DBG_PRINTEXCEPTION_WIDE_C:
-        // Used by OutputDebugString functions.
-        return EXCEPTION_CONTINUE_EXECUTION;
-    default:
-        break;
-    }
-
-    if (!handled) {
-        const auto code = pExp->ExceptionRecord->ExceptionCode;
-        const auto* rec = pExp->ExceptionRecord;
-        void* fault_addr = nullptr;
-        const char* kind = "unknown";
-        if (code == EXCEPTION_ACCESS_VIOLATION && rec->NumberParameters >= 2) {
-            fault_addr = reinterpret_cast<void*>(rec->ExceptionInformation[1]);
-            kind = rec->ExceptionInformation[0] == 0 ? "read" : "write";
-        }
-        LOG_CRITICAL(Common,
-                     "Unhandled Windows exception {:#010x} at RIP {} ({} fault at {}). "
-                     "Process will terminate.",
-                     static_cast<u32>(code), fmt::ptr(rec->ExceptionAddress), kind,
-                     fmt::ptr(fault_addr));
-        LOG_CRITICAL(Common, "  Instruction: {}", DisassembleInstruction(rec->ExceptionAddress));
-        LOG_CRITICAL(Common, "  Module:      {}", IdentifyModule(rec->ExceptionAddress));
-#ifdef ARCH_X86_64
-        const auto* ctx = pExp->ContextRecord;
-        LOG_CRITICAL(Common, "  RAX={:016x} RBX={:016x} RCX={:016x} RDX={:016x}", ctx->Rax,
-                     ctx->Rbx, ctx->Rcx, ctx->Rdx);
-        LOG_CRITICAL(Common, "  RSI={:016x} RDI={:016x} RBP={:016x} RSP={:016x}", ctx->Rsi,
-                     ctx->Rdi, ctx->Rbp, ctx->Rsp);
-        LOG_CRITICAL(Common, "  R8 ={:016x} R9 ={:016x} R10={:016x} R11={:016x}", ctx->R8, ctx->R9,
-                     ctx->R10, ctx->R11);
-        LOG_CRITICAL(Common, "  R12={:016x} R13={:016x} R14={:016x} R15={:016x}", ctx->R12,
-                     ctx->R13, ctx->R14, ctx->R15);
-        LOG_CRITICAL(Common, "  RFLAGS={:08x}", static_cast<u32>(ctx->EFlags));
-        // 32 bytes preceding the faulting instruction (often unreadable when the
-        // instruction sits at a function entry; DumpMemorySafe handles that).
-        DumpMemorySafe("Code-32:", reinterpret_cast<const u8*>(rec->ExceptionAddress) - 32, 32);
-        DumpMemorySafe("Code+0 :", rec->ExceptionAddress, 32);
-        // 64 bytes of stack memory at RSP (8 qwords). Recent return addresses
-        // and locals show up here.
-        DumpMemorySafe("Stack  :", reinterpret_cast<const void*>(ctx->Rsp), 64);
-        DumpStackBacktrace();
-#endif
-    }
-
-    return handled ? EXCEPTION_CONTINUE_EXECUTION : EXCEPTION_CONTINUE_SEARCH;
-}
-
-#else
 
 void SignalHandler(int sig, siginfo_t* info, void* raw_context) {
     const auto* signals = Signals::Instance();
@@ -228,7 +184,7 @@ SignalDispatch::SignalDispatch() {
     ASSERT_MSG(handle = AddVectoredExceptionHandler(0, SignalHandler),
                "Failed to register exception handler.");
 #else
-    struct sigaction action{};
+    struct sigaction action {};
     action.sa_sigaction = SignalHandler;
     action.sa_flags = SA_SIGINFO | SA_ONSTACK;
     sigemptyset(&action.sa_mask);
@@ -247,7 +203,7 @@ SignalDispatch::~SignalDispatch() {
 #if defined(_WIN32)
     ASSERT_MSG(RemoveVectoredExceptionHandler(handle), "Failed to remove exception handler.");
 #else
-    struct sigaction action{};
+    struct sigaction action {};
     action.sa_handler = SIG_DFL;
     action.sa_flags = 0;
     sigemptyset(&action.sa_mask);
