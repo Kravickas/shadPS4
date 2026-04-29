@@ -11,6 +11,9 @@
 
 #ifdef _WIN32
 #include <windows.h>
+#ifdef ARCH_X86_64
+#include <Zydis/Formatter.h>
+#endif
 #else
 #include <csignal>
 #include <pthread.h>
@@ -28,7 +31,50 @@ extern std::array<OrbisKernelExceptionHandler, 32> Handlers;
 
 namespace Core {
 
+static std::string DisassembleInstruction(void* code_address) {
+    char buffer[256] = "<unable to decode>";
+
+#ifdef ARCH_X86_64
+    ZydisDecodedInstruction instruction;
+    ZydisDecodedOperand operands[ZYDIS_MAX_OPERAND_COUNT];
+    const auto status =
+        Common::Decoder::Instance()->decodeInstruction(instruction, operands, code_address);
+    if (ZYAN_SUCCESS(status)) {
+        ZydisFormatter formatter;
+        ZydisFormatterInit(&formatter, ZYDIS_FORMATTER_STYLE_INTEL);
+        ZydisFormatterFormatInstruction(&formatter, &instruction, operands,
+                                        instruction.operand_count_visible, buffer, sizeof(buffer),
+                                        reinterpret_cast<u64>(code_address), ZYAN_NULL);
+    }
+#endif
+
+    return buffer;
+}
+
 #if defined(_WIN32)
+
+static std::string IdentifyModule(void* address) {
+    HMODULE module_handle = nullptr;
+    if (!GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                                GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                            reinterpret_cast<LPCSTR>(address), &module_handle) ||
+        module_handle == nullptr) {
+        return "<no module - JIT or non-image memory>";
+    }
+    char path[MAX_PATH] = {};
+    if (GetModuleFileNameA(module_handle, path, MAX_PATH) == 0) {
+        return fmt::format("<unnamed module @ {}>", fmt::ptr(module_handle));
+    }
+    const auto base = reinterpret_cast<uintptr_t>(module_handle);
+    const auto offset = reinterpret_cast<uintptr_t>(address) - base;
+    const char* basename = path;
+    for (const char* p = path; *p; ++p) {
+        if (*p == '\\' || *p == '/') {
+            basename = p + 1;
+        }
+    }
+    return fmt::format("{} (base={:#018x}, +{:#x})", basename, base, offset);
+}
 
 static LONG WINAPI SignalHandler(EXCEPTION_POINTERS* pExp) noexcept {
     const auto* signals = Signals::Instance();
@@ -64,32 +110,26 @@ static LONG WINAPI SignalHandler(EXCEPTION_POINTERS* pExp) noexcept {
                      "Process will terminate.",
                      static_cast<u32>(code), fmt::ptr(rec->ExceptionAddress), kind,
                      fmt::ptr(fault_addr));
+        LOG_CRITICAL(Common, "  Instruction: {}", DisassembleInstruction(rec->ExceptionAddress));
+        LOG_CRITICAL(Common, "  Module:      {}", IdentifyModule(rec->ExceptionAddress));
+#ifdef ARCH_X86_64
+        const auto* ctx = pExp->ContextRecord;
+        LOG_CRITICAL(Common, "  RAX={:016x} RBX={:016x} RCX={:016x} RDX={:016x}", ctx->Rax,
+                     ctx->Rbx, ctx->Rcx, ctx->Rdx);
+        LOG_CRITICAL(Common, "  RSI={:016x} RDI={:016x} RBP={:016x} RSP={:016x}", ctx->Rsi,
+                     ctx->Rdi, ctx->Rbp, ctx->Rsp);
+        LOG_CRITICAL(Common, "  R8 ={:016x} R9 ={:016x} R10={:016x} R11={:016x}", ctx->R8, ctx->R9,
+                     ctx->R10, ctx->R11);
+        LOG_CRITICAL(Common, "  R12={:016x} R13={:016x} R14={:016x} R15={:016x}", ctx->R12,
+                     ctx->R13, ctx->R14, ctx->R15);
+        LOG_CRITICAL(Common, "  RFLAGS={:08x}", static_cast<u32>(ctx->EFlags));
+#endif
     }
 
     return handled ? EXCEPTION_CONTINUE_EXECUTION : EXCEPTION_CONTINUE_SEARCH;
 }
 
 #else
-
-static std::string DisassembleInstruction(void* code_address) {
-    char buffer[256] = "<unable to decode>";
-
-#ifdef ARCH_X86_64
-    ZydisDecodedInstruction instruction;
-    ZydisDecodedOperand operands[ZYDIS_MAX_OPERAND_COUNT];
-    const auto status =
-        Common::Decoder::Instance()->decodeInstruction(instruction, operands, code_address);
-    if (ZYAN_SUCCESS(status)) {
-        ZydisFormatter formatter;
-        ZydisFormatterInit(&formatter, ZYDIS_FORMATTER_STYLE_INTEL);
-        ZydisFormatterFormatInstruction(&formatter, &instruction, operands,
-                                        instruction.operand_count_visible, buffer, sizeof(buffer),
-                                        reinterpret_cast<u64>(code_address), ZYAN_NULL);
-    }
-#endif
-
-    return buffer;
-}
 
 void SignalHandler(int sig, siginfo_t* info, void* raw_context) {
     const auto* signals = Signals::Instance();
