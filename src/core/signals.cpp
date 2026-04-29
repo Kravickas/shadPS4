@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <cstdio>
 #include <filesystem>
 
 #include "common/arch.h"
@@ -69,6 +70,44 @@ static std::string IdentifyModule(void* address) {
     return "<unmapped or unknown>";
 }
 
+static bool SafeReadU64(const void* addr, u64& out) noexcept {
+    __try {
+        out = *static_cast<const volatile u64*>(addr);
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+
+static void DumpRedZone(const CONTEXT* ctx) {
+    const auto rsp = ctx->Rsp;
+    char hex[16 * 17 + 64] = {};
+    char* p = hex;
+    char* const end = hex + sizeof(hex);
+
+    for (int slot = -16; slot < 0; ++slot) {
+        const auto addr = rsp + static_cast<s64>(slot) * 8;
+        u64 value = 0;
+        const bool ok = SafeReadU64(reinterpret_cast<const void*>(addr), value);
+        const int n = std::snprintf(p, static_cast<size_t>(end - p), "%016llx ",
+                                    ok ? static_cast<unsigned long long>(value) : 0ULL);
+        if (n <= 0 || n >= end - p) {
+            break;
+        }
+        p += n;
+    }
+    LOG_CRITICAL(Common, "RedZone[Rsp-128..Rsp) {:#018x}: {}", static_cast<unsigned long long>(rsp),
+                 hex);
+    LOG_CRITICAL(
+        Common,
+        "Saved regs: Rax={:#018x} Rbp={:#018x} Rdi={:#018x} Rsi={:#018x} "
+        "Rdx={:#018x} R12={:#018x} R14={:#018x}",
+        static_cast<unsigned long long>(ctx->Rax), static_cast<unsigned long long>(ctx->Rbp),
+        static_cast<unsigned long long>(ctx->Rdi), static_cast<unsigned long long>(ctx->Rsi),
+        static_cast<unsigned long long>(ctx->Rdx), static_cast<unsigned long long>(ctx->R12),
+        static_cast<unsigned long long>(ctx->R14));
+}
+
 static LONG WINAPI SignalHandler(EXCEPTION_POINTERS* pExp) noexcept {
     const auto* signals = Signals::Instance();
 
@@ -104,6 +143,7 @@ static LONG WINAPI SignalHandler(EXCEPTION_POINTERS* pExp) noexcept {
                      static_cast<u32>(code), fmt::ptr(rec->ExceptionAddress), kind,
                      fmt::ptr(fault_addr));
         LOG_CRITICAL(Common, "Module: {}", IdentifyModule(rec->ExceptionAddress));
+        DumpRedZone(pExp->ContextRecord);
     }
 
     return handled ? EXCEPTION_CONTINUE_EXECUTION : EXCEPTION_CONTINUE_SEARCH;
