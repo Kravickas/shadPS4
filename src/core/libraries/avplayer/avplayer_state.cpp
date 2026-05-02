@@ -280,13 +280,16 @@ bool AvPlayerState::Stop() {
     if (m_up_source == nullptr || m_current_state == AvState::Stop) {
         return false;
     }
+    const bool was_eof = (m_current_state == AvState::EndOfFile);
     if (!m_up_source->Stop()) {
         return false;
     }
     if (!SetState(AvState::Stop)) {
         return false;
     }
-    OnPlaybackStateChanged(AvState::Stop);
+    if (!was_eof) {
+        OnPlaybackStateChanged(AvState::Stop);
+    }
     return true;
 }
 
@@ -358,7 +361,10 @@ void AvPlayerState::OnError() {
 }
 
 void AvPlayerState::OnEOF() {
-    SetState(AvState::EndOfFile);
+    if (!SetState(AvState::EndOfFile)) {
+        return;
+    }
+    EmitEvent(AvPlayerEvents::StateStop);
 }
 
 // Called inside CONTROLLER thread
