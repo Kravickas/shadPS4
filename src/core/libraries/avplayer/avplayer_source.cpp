@@ -329,39 +329,79 @@ bool AvPlayerSource::GetVideoData(AvPlayerFrameInfoEx& video_info) {
         m_video_buffers_cv.Notify();
     }
 
-    if (!IsActive() || m_is_paused) {
-        return false;
-    }
+    enum class Result { Released, NotActive, Paused, NoFrame, Early };
+    Result outcome = Result::Released;
+    s64 last_drift = 0;
+    u64 last_pts = 0;
+    u64 last_clock = 0;
+    u64 qsize = m_video_frames.Size();
 
-    if (m_video_frames.Size() == 0) {
-        return false;
-    }
-
-    // Sync gate per libSceAvPlayer: release when
-    // drift = elapsed_real_time - frame_pts >= +20ms; outside ±280ms/-690ms
-    if (m_state.GetSyncMode() == AvPlayerAvSyncMode::Default) {
+    if (!IsActive()) {
+        outcome = Result::NotActive;
+    } else if (m_is_paused) {
+        outcome = Result::Paused;
+    } else if (m_video_frames.Size() == 0) {
+        outcome = Result::NoFrame;
+    } else if (m_state.GetSyncMode() == AvPlayerAvSyncMode::Default) {
         const auto& new_frame = m_video_frames.Front();
         const auto current_time = CurrentTime();
         if (current_time != 0) {
-            const s64 frame_pts_ms = s64(new_frame.info.timestamp);
-            const s64 drift_ms = s64(current_time) - frame_pts_ms;
+            last_pts = new_frame.info.timestamp;
+            last_clock = current_time;
+            last_drift = s64(current_time) - s64(new_frame.info.timestamp);
 
             constexpr s64 kReleaseThresholdMs = 20;
             constexpr s64 kBehindLogThresholdMs = 280;
             constexpr s64 kAheadLogThresholdMs = -690;
 
-            if (drift_ms < kReleaseThresholdMs) {
-                if (drift_ms <= kAheadLogThresholdMs) {
+            if (last_drift < kReleaseThresholdMs) {
+                if (last_drift <= kAheadLogThresholdMs) {
                     LOG_INFO(Lib_AvPlayer, "VIDEO_AHEAD: drift={}ms vpts={}ms clock={}ms (waiting)",
-                             drift_ms, frame_pts_ms, current_time);
+                             last_drift, last_pts, last_clock);
                 }
-                return false;
-            }
-            if (drift_ms >= kBehindLogThresholdMs) {
+                outcome = Result::Early;
+            } else if (last_drift >= kBehindLogThresholdMs) {
                 LOG_INFO(Lib_AvPlayer, "VIDEO_BEHIND: drift={}ms vpts={}ms clock={}ms (releasing)",
-                         drift_ms, frame_pts_ms, current_time);
+                         last_drift, last_pts, last_clock);
             }
         }
+    }
+
+    // Throttled diagnostic: log aggregate stats once per second so we can see
+    // what the gate is doing across the whole playback without per-call spam.
+    {
+        using namespace std::chrono;
+        static std::atomic_uint64_t s_calls{0};
+        static std::atomic_uint64_t s_released{0};
+        static std::atomic_uint64_t s_early{0};
+        static std::atomic_uint64_t s_no_frame{0};
+        static std::atomic<int64_t> s_next_log_ms{0};
+
+        s_calls.fetch_add(1, std::memory_order_relaxed);
+        if (outcome == Result::Released)
+            s_released.fetch_add(1, std::memory_order_relaxed);
+        else if (outcome == Result::Early)
+            s_early.fetch_add(1, std::memory_order_relaxed);
+        else if (outcome == Result::NoFrame)
+            s_no_frame.fetch_add(1, std::memory_order_relaxed);
+
+        const auto now_ms =
+            duration_cast<milliseconds>(steady_clock::now().time_since_epoch()).count();
+        int64_t expected = s_next_log_ms.load(std::memory_order_relaxed);
+        if (now_ms >= expected && s_next_log_ms.compare_exchange_strong(expected, now_ms + 1000)) {
+            LOG_INFO(Lib_AvPlayer,
+                     "GetVideoData/sec: calls={} released={} early={} noframe={} qsize={} "
+                     "last_drift={}ms last_pts={}ms last_clock={}ms",
+                     s_calls.exchange(0, std::memory_order_relaxed),
+                     s_released.exchange(0, std::memory_order_relaxed),
+                     s_early.exchange(0, std::memory_order_relaxed),
+                     s_no_frame.exchange(0, std::memory_order_relaxed), qsize, last_drift, last_pts,
+                     last_clock);
+        }
+    }
+
+    if (outcome != Result::Released) {
+        return false;
     }
 
     auto frame = m_video_frames.Pop();
