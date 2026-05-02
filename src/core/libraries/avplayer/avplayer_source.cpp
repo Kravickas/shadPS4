@@ -259,15 +259,20 @@ bool AvPlayerSource::Start() {
 bool AvPlayerSource::Stop() {
     std::unique_lock lock(m_state_mutex);
 
-    if (!HasRunningThreads()) {
-        LOG_WARNING(Lib_AvPlayer, "Could not stop playback: already stopped.");
-        return false;
+    const bool post_eof_cleanup = !HasRunningThreads();
+    if (post_eof_cleanup) {
+        LOG_INFO(Lib_AvPlayer, "Stop: post-EOF cleanup (decoder + demuxer threads "
+                               "already exited on their own; flushing queues)");
+    } else {
+        LOG_INFO(Lib_AvPlayer, "Stop: game-initiated, signalling threads");
     }
 
     if (m_up_data_streamer) {
         m_up_data_streamer->Reset();
     }
 
+    // .Stop() is idempotent on a non-Joinable thread; both paths above end
+    // up here, and threads that have already exited are a no-op.
     m_video_decoder_thread.Stop();
     m_audio_decoder_thread.Stop();
     m_demuxer_thread.Stop();
@@ -498,18 +503,17 @@ void AvPlayerSource::DemuxerThread(std::stop_token stop) {
     m_audio_packets_cv.Notify();
     m_video_frames_cv.Notify();
     m_audio_frames_cv.Notify();
-
-    if (natural_eof) {
-        m_state.OnEOF();
-    }
-
-    // Wake the decoder buffer-wait loops one more time so they can observe
-    // stop_token if the game's Stop has cancelled them; harmless otherwise.
+    // Wake decoder buffer-wait loops so they can observe m_is_eof and bail
+    // out cleanly if the game has stopped recycling buffers.
     m_video_buffers_cv.Notify();
     m_audio_buffers_cv.Notify();
 
     m_video_decoder_thread.Join();
     m_audio_decoder_thread.Join();
+
+    if (natural_eof) {
+        m_state.OnEOF();
+    }
 
     LOG_INFO(Lib_AvPlayer, "Demuxer Thread exited normally");
 }
@@ -578,6 +582,13 @@ Frame AvPlayerSource::PrepareVideoFrame(GuestBuffer buffer, const AVFrame& frame
     auto p_buffer = buffer.GetBuffer();
     CopyNV12Data(p_buffer, frame, m_use_vdec2);
 
+    // Use PTS (presentation timestamp), not DTS (decode timestamp), for the
+    // game-visible frame timestamp. PS4 sync is PTS-based: verified via
+    // libSceAvPlayer. For B-frame video DTS != PTS, and
+    // using DTS produces visible frame-order jitter.
+    // best_effort_timestamp falls back through pts -> dts -> frame counter
+    // inside FFmpeg. Also explicitly handle AV_NOPTS_VALUE to avoid u64
+    // overflow when pts == INT64_MIN.
     s64 raw_ts = frame.best_effort_timestamp;
     if (raw_ts == AV_NOPTS_VALUE) {
         raw_ts = frame.pts != AV_NOPTS_VALUE ? frame.pts : frame.pkt_dts;
@@ -659,11 +670,17 @@ void AvPlayerSource::VideoDecoderThread(std::stop_token stop) {
             return;
         }
         while (res >= 0) {
-            if (!m_video_buffers_cv.Wait(stop, [this] { return m_video_buffers.Size() != 0; })) {
+            if (!m_video_buffers_cv.Wait(
+                    stop, [this] { return m_video_buffers.Size() != 0 || m_is_eof; })) {
                 break;
             }
             if (m_video_buffers.Size() == 0) {
-                continue;
+                // m_is_eof is true and the game has stopped recycling buffers
+                // (it's waiting for StateStop before its next loop
+                // iteration). We cannot drain further; abandon the trailing
+                // FFmpeg-internal B-frames and exit. Cleanup transitions state and
+                // the decoder threads simply stop.
+                return;
             }
             auto up_frame = AVFramePtr(av_frame_alloc(), &ReleaseAVFrame);
             res = avcodec_receive_frame(m_video_codec_context.get(), up_frame.get());
@@ -732,6 +749,8 @@ Frame AvPlayerSource::PrepareAudioFrame(GuestBuffer buffer, const AVFrame& frame
     const auto size = frame.ch_layout.nb_channels * frame.nb_samples * sizeof(u16);
     std::memcpy(p_buffer, frame.data[0], size);
 
+    // Use best_effort_timestamp for the same reasons as video (AV_NOPTS_VALUE
+    // safety, PTS-first ordering). For audio dts == pts in normal AAC streams.
     s64 raw_ts = frame.best_effort_timestamp;
     if (raw_ts == AV_NOPTS_VALUE) {
         raw_ts = frame.pts != AV_NOPTS_VALUE ? frame.pts : frame.pkt_dts;
@@ -796,11 +815,13 @@ void AvPlayerSource::AudioDecoderThread(std::stop_token stop) {
             return;
         }
         while (res >= 0) {
-            if (!m_audio_buffers_cv.Wait(stop, [this] { return m_audio_buffers.Size() != 0; })) {
+            if (!m_audio_buffers_cv.Wait(
+                    stop, [this] { return m_audio_buffers.Size() != 0 || m_is_eof; })) {
                 break;
             }
             if (m_audio_buffers.Size() == 0) {
-                continue;
+                // See comment on the equivalent path in VideoDecoderThread.
+                return;
             }
 
             auto up_frame = AVFramePtr(av_frame_alloc(), &ReleaseAVFrame);
