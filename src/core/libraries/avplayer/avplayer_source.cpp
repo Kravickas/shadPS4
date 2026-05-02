@@ -343,6 +343,8 @@ bool AvPlayerSource::GetVideoData(AvPlayerFrameInfoEx& video_info) {
     } else if (m_video_frames.Size() == 0) {
         outcome = Result::NoFrame;
     } else if (m_state.GetSyncMode() == AvPlayerAvSyncMode::Default) {
+        // Sync gate per libSceAvPlayer.sprx CheckTime (sub_33df0): release when
+        // drift = elapsed_real_time - frame_pts >= +20ms.
         const auto& new_frame = m_video_frames.Front();
         const auto current_time = CurrentTime();
         if (current_time != 0) {
@@ -412,31 +414,55 @@ bool AvPlayerSource::GetVideoData(AvPlayerFrameInfoEx& video_info) {
 
 bool AvPlayerSource::GetAudioData(AvPlayerFrameInfo& audio_info) {
     if (m_current_audio_frame.has_value()) {
-        // return the buffer to the queue
         m_audio_buffers.Push(std::move(m_current_audio_frame->buffer));
         m_current_audio_frame.reset();
         m_audio_buffers_cv.Notify();
     }
 
+    bool released = false;
+    bool inactive = false;
     if (!IsActive() || m_is_paused) {
-        return false;
+        inactive = true;
+    } else if (m_audio_frames.Size() != 0) {
+        auto frame = m_audio_frames.Pop();
+        m_last_audio_ts = frame->info.timestamp;
+
+        audio_info = {};
+        audio_info.timestamp = frame->info.timestamp;
+        audio_info.p_data = reinterpret_cast<u8*>(frame->info.p_data);
+        audio_info.details.audio.sample_rate = frame->info.details.audio.sample_rate;
+        audio_info.details.audio.size = frame->info.details.audio.size;
+        audio_info.details.audio.channel_count = frame->info.details.audio.channel_count;
+        m_current_audio_frame = std::move(frame);
+        released = true;
     }
 
-    if (m_audio_frames.Size() == 0) {
-        return false;
+    {
+        using namespace std::chrono;
+        static std::atomic_uint64_t s_calls{0};
+        static std::atomic_uint64_t s_released{0};
+        static std::atomic_uint64_t s_inactive{0};
+        static std::atomic<int64_t> s_next_log_ms{0};
+        s_calls.fetch_add(1, std::memory_order_relaxed);
+        if (released)
+            s_released.fetch_add(1, std::memory_order_relaxed);
+        if (inactive)
+            s_inactive.fetch_add(1, std::memory_order_relaxed);
+
+        const auto now_ms =
+            duration_cast<milliseconds>(steady_clock::now().time_since_epoch()).count();
+        int64_t expected = s_next_log_ms.load(std::memory_order_relaxed);
+        if (now_ms >= expected && s_next_log_ms.compare_exchange_strong(expected, now_ms + 1000)) {
+            LOG_INFO(Lib_AvPlayer,
+                     "GetAudioData/sec: calls={} released={} inactive={} qsize={} last_ts={}ms",
+                     s_calls.exchange(0, std::memory_order_relaxed),
+                     s_released.exchange(0, std::memory_order_relaxed),
+                     s_inactive.exchange(0, std::memory_order_relaxed), m_audio_frames.Size(),
+                     m_last_audio_ts.value_or(0));
+        }
     }
 
-    auto frame = m_audio_frames.Pop();
-    m_last_audio_ts = frame->info.timestamp;
-
-    audio_info = {};
-    audio_info.timestamp = frame->info.timestamp;
-    audio_info.p_data = reinterpret_cast<u8*>(frame->info.p_data);
-    audio_info.details.audio.sample_rate = frame->info.details.audio.sample_rate;
-    audio_info.details.audio.size = frame->info.details.audio.size;
-    audio_info.details.audio.channel_count = frame->info.details.audio.channel_count;
-    m_current_audio_frame = std::move(frame);
-    return true;
+    return released;
 }
 
 u64 AvPlayerSource::CurrentTime() {
@@ -450,8 +476,17 @@ u64 AvPlayerSource::CurrentTime() {
 }
 
 bool AvPlayerSource::IsActive() {
-    return !m_is_eof || m_audio_packets.Size() != 0 || m_video_packets.Size() != 0 ||
-           m_video_frames.Size() != 0 || m_audio_frames.Size() != 0;
+    const bool active = !m_is_eof || m_audio_packets.Size() != 0 || m_video_packets.Size() != 0 ||
+                        m_video_frames.Size() != 0 || m_audio_frames.Size() != 0;
+    static std::atomic_bool s_last{true};
+    bool prev = s_last.exchange(active, std::memory_order_relaxed);
+    if (prev != active) {
+        LOG_INFO(Lib_AvPlayer,
+                 "IsActive transition: {} -> {} (eof={} apkt={} vpkt={} vfr={} afr={})", prev,
+                 active, m_is_eof.load(), m_audio_packets.Size(), m_video_packets.Size(),
+                 m_video_frames.Size(), m_audio_frames.Size());
+    }
+    return active;
 }
 
 void AvPlayerSource::ReleaseAVPacket(AVPacket* packet) {
@@ -634,13 +669,7 @@ Frame AvPlayerSource::PrepareVideoFrame(GuestBuffer buffer, const AVFrame& frame
     auto p_buffer = buffer.GetBuffer();
     CopyNV12Data(p_buffer, frame, m_use_vdec2);
 
-    // Use PTS (presentation timestamp), not DTS (decode timestamp), for the
-    // game-visible frame timestamp. PS4 sync is PTS-based: verified via
-    // libSceAvPlayer. For B-frame video DTS != PTS, and
-    // using DTS produces visible frame-order jitter.
-    // best_effort_timestamp falls back through pts -> dts -> frame counter
-    // inside FFmpeg. Also explicitly handle AV_NOPTS_VALUE to avoid u64
-    // overflow when pts == INT64_MIN.
+    // PTS-based timestamp; AV_NOPTS_VALUE handled to avoid u64 overflow.
     s64 raw_ts = frame.best_effort_timestamp;
     if (raw_ts == AV_NOPTS_VALUE) {
         raw_ts = frame.pts != AV_NOPTS_VALUE ? frame.pts : frame.pkt_dts;
@@ -654,6 +683,23 @@ Frame AvPlayerSource::PrepareVideoFrame(GuestBuffer buffer, const AVFrame& frame
     const auto den = time_base.den;
     const auto num = time_base.num;
     const auto timestamp = (num != 0 && den > 1) ? (ts_units * num) / den : ts_units;
+
+    // Throttled diagnostic: log raw timestamp fields once per second so we can
+    // see whether the FFmpeg-decoded frame ordering is sane (out-of-order
+    // best_effort_timestamp would explain jitter).
+    {
+        using namespace std::chrono;
+        static std::atomic<int64_t> s_next_log_ms{0};
+        const auto now_ms =
+            duration_cast<milliseconds>(steady_clock::now().time_since_epoch()).count();
+        int64_t expected = s_next_log_ms.load(std::memory_order_relaxed);
+        if (now_ms >= expected && s_next_log_ms.compare_exchange_strong(expected, now_ms + 1000)) {
+            LOG_INFO(Lib_AvPlayer,
+                     "PrepareVideoFrame: pts={} dts={} best_effort={} -> ts={}ms tb={}/{}",
+                     s64(frame.pts), s64(frame.pkt_dts), s64(frame.best_effort_timestamp),
+                     timestamp, num, den);
+        }
+    }
 
     const u32 width = u32(frame.width);
     const u32 height = u32(frame.height);
