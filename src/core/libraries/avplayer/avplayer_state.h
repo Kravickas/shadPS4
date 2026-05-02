@@ -78,6 +78,7 @@ private:
 
     std::atomic<AvState> m_current_state;
     std::atomic<AvState> m_previous_state;
+    std::atomic_bool m_eof_state_stop_emitted{false};
     u32 m_thread_priority;
     u32 m_thread_affinity;
     std::atomic_uint32_t m_some_event_result{};
