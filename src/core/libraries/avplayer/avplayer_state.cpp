@@ -280,7 +280,7 @@ bool AvPlayerState::Stop() {
     if (m_up_source == nullptr || m_current_state == AvState::Stop) {
         return false;
     }
-    const bool was_eof = (m_current_state == AvState::EndOfFile);
+    const bool was_eof = m_eof_state_stop_emitted.load();
     if (!m_up_source->Stop()) {
         return false;
     }
@@ -361,10 +361,10 @@ void AvPlayerState::OnError() {
 }
 
 void AvPlayerState::OnEOF() {
-    if (!SetState(AvState::EndOfFile)) {
-        return;
-    }
-    EmitEvent(AvPlayerEvents::StateStop);
+    m_event_queue.Push(AvPlayerEvent{
+        .event = AvEventType::ChangeFlowState,
+        .payload = {.state = AvState::EndOfFile},
+    });
 }
 
 // Called inside CONTROLLER thread
@@ -451,12 +451,26 @@ void AvPlayerState::ProcessEvent() {
     }
     case AvEventType::AddSource: {
         std::shared_lock lock(m_source_mutex);
+        m_eof_state_stop_emitted.store(false);
         if (m_up_source->FindStreamInfo()) {
             SetState(AvState::Ready);
             OnPlaybackStateChanged(AvState::Ready);
         } else {
             OnWarning(ORBIS_AVPLAYER_ERROR_NOT_SUPPORTED);
             SetState(AvState::Error);
+        }
+        break;
+    }
+    case AvEventType::ChangeFlowState: {
+        const auto target = event->payload.state;
+        if (!SetState(target)) {
+            break;
+        }
+        if (target == AvState::EndOfFile) {
+            m_eof_state_stop_emitted.store(true);
+            EmitEvent(AvPlayerEvents::StateStop);
+        } else {
+            OnPlaybackStateChanged(target);
         }
         break;
     }
