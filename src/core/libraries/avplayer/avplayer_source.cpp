@@ -337,17 +337,29 @@ bool AvPlayerSource::GetVideoData(AvPlayerFrameInfoEx& video_info) {
         return false;
     }
 
-    const auto& new_frame = m_video_frames.Front();
+    // Sync gate per libSceAvPlayer: release when
+    // drift = elapsed_real_time - frame_pts >= +20ms; outside ±280ms/-690ms
     if (m_state.GetSyncMode() == AvPlayerAvSyncMode::Default) {
-        if (m_audio_stream_index) {
-            if (new_frame.info.timestamp > m_last_audio_ts.value_or(0)) {
+        const auto& new_frame = m_video_frames.Front();
+        const auto current_time = CurrentTime();
+        if (current_time != 0) {
+            const s64 frame_pts_ms = s64(new_frame.info.timestamp);
+            const s64 drift_ms = s64(current_time) - frame_pts_ms;
+
+            constexpr s64 kReleaseThresholdMs = 20;
+            constexpr s64 kBehindLogThresholdMs = 280;
+            constexpr s64 kAheadLogThresholdMs = -690;
+
+            if (drift_ms < kReleaseThresholdMs) {
+                if (drift_ms <= kAheadLogThresholdMs) {
+                    LOG_INFO(Lib_AvPlayer, "VIDEO_AHEAD: drift={}ms vpts={}ms clock={}ms (waiting)",
+                             drift_ms, frame_pts_ms, current_time);
+                }
                 return false;
             }
-        } else {
-            // Sync with the internal timer since audio is not available
-            const auto current_time = CurrentTime();
-            if (0 < current_time && current_time < new_frame.info.timestamp) {
-                return false;
+            if (drift_ms >= kBehindLogThresholdMs) {
+                LOG_INFO(Lib_AvPlayer, "VIDEO_BEHIND: drift={}ms vpts={}ms clock={}ms (releasing)",
+                         drift_ms, frame_pts_ms, current_time);
             }
         }
     }
