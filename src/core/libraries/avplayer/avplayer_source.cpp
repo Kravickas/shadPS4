@@ -215,9 +215,9 @@ bool AvPlayerSource::Start() {
         }
         const auto width = u32(m_video_codec_context->width);
         const auto height = u32(m_video_codec_context->height);
-        // Match ImageSizeLinearAligned pitch (tile.h): max(8, 64/Bpp) = 64 for R8.
-        const auto pitch = Common::AlignUp(width, 64u);
-        const auto size = (pitch * height * 3) / 2;
+        const auto pitch = Common::AlignUp(width, 256u);
+        const auto aligned_height = Common::AlignUp(height, 16u);
+        const auto size = (pitch * aligned_height * 3) / 2;
         for (u64 index = 0; index < m_max_num_video_framebuffers; ++index) {
             m_video_buffers.Push(GuestBuffer(m_memory_replacement, 0x100, size, true));
         }
@@ -443,6 +443,7 @@ void AvPlayerSource::DemuxerThread(std::stop_token stop) {
     }
     LOG_INFO(Lib_AvPlayer, "Demuxer Thread started");
 
+    bool natural_eof = false;
     while (!stop.stop_requested()) {
         if (m_video_packets.Size() > 30 &&
             (!m_audio_stream_index.has_value() || m_audio_packets.Size() > 8)) {
@@ -472,6 +473,7 @@ void AvPlayerSource::DemuxerThread(std::stop_token stop) {
                     continue;
                 } else {
                     LOG_INFO(Lib_AvPlayer, "EOF reached in demuxer. Exiting.");
+                    natural_eof = true;
                     break;
                 }
             } else {
@@ -499,7 +501,15 @@ void AvPlayerSource::DemuxerThread(std::stop_token stop) {
 
     m_video_decoder_thread.Join();
     m_audio_decoder_thread.Join();
-    m_state.OnEOF();
+
+    // Notify the state machine only on a natural end of stream. If the loop
+    // was cancelled by a game-issued Stop, the state has already advanced to
+    // Stop and the StateStop event has already been emitted from there;
+    // emitting EndOfFile here would regress the state and double-fire the
+    // event to the game.
+    if (natural_eof) {
+        m_state.OnEOF();
+    }
 
     LOG_INFO(Lib_AvPlayer, "Demuxer Thread exited normally");
 }
@@ -536,8 +546,7 @@ AvPlayerSource::AVFramePtr AvPlayerSource::ConvertVideoFrame(const AVFrame& fram
 }
 
 static void CopyNV12Data(u8* dst, const AVFrame& src, bool use_vdec2) {
-    // Match ImageSizeLinearAligned pitch (tile.h): max(8, 64/Bpp) = 64 for R8.
-    const u32 pitch = Common::AlignUp(u32(src.width), 64u);
+    const u32 pitch = Common::AlignUp(u32(src.width), 256u);
     const u32 src_stride_y = u32(src.linesize[0]);
     const u32 src_stride_uv = u32(src.linesize[1]);
     const u32 frame_h = u32(src.height);
@@ -576,6 +585,11 @@ Frame AvPlayerSource::PrepareVideoFrame(GuestBuffer buffer, const AVFrame& frame
 
     const u32 width = u32(frame.width);
     const u32 height = u32(frame.height);
+    const u32 pitch = Common::AlignUp(width, 256u);
+    // PS4's sceAvPlayerGetVideoDataEx adjusts crop_right by the row
+    // padding so the reported value is relative to the buffer pitch, not
+    // the codec's coded width.
+    const u32 crop_right_offset = u32(frame.crop_right) + (pitch - width);
 
     return Frame{
         .buffer = std::move(buffer),
@@ -591,10 +605,10 @@ Frame AvPlayerSource::PrepareVideoFrame(GuestBuffer buffer, const AVFrame& frame
                                 .height = height,
                                 .aspect_ratio = (float)av_q2d(frame.sample_aspect_ratio),
                                 .crop_left_offset = u32(frame.crop_left),
-                                .crop_right_offset = u32(frame.crop_right),
+                                .crop_right_offset = crop_right_offset,
                                 .crop_top_offset = u32(frame.crop_top),
                                 .crop_bottom_offset = u32(frame.crop_bottom),
-                                .pitch = Common::AlignUp(width, 64u),
+                                .pitch = pitch,
                                 .luma_bit_depth = 8,
                                 .chroma_bit_depth = 8,
                             },
@@ -608,17 +622,26 @@ void AvPlayerSource::VideoDecoderThread(std::stop_token stop) {
     Common::SetCurrentThreadName("shadPS4:AvVideoDecoder");
 
     LOG_INFO(Lib_AvPlayer, "Video Decoder Thread started");
-    while ((!m_is_eof || m_video_packets.Size() != 0) && !stop.stop_requested()) {
+    bool flush_sent = false;
+    while ((!m_is_eof || m_video_packets.Size() != 0 || !flush_sent) && !stop.stop_requested()) {
         if (!m_video_packets_cv.Wait(stop,
                                      [this] { return m_video_packets.Size() != 0 || m_is_eof; })) {
             continue;
         }
         const auto packet = m_video_packets.Pop();
-        if (!packet.has_value()) {
+        AVPacket* raw_packet = nullptr;
+        if (packet.has_value()) {
+            raw_packet = packet->get();
+        } else if (m_is_eof && !flush_sent) {
+            // Feed NULL once to enter drain mode and flush
+            // any frames buffered for B-frame reorder. Without this, the last
+            // few frames are silently dropped at end of stream.
+            flush_sent = true;
+        } else {
             continue;
         }
 
-        auto res = avcodec_send_packet(m_video_codec_context.get(), packet->get());
+        auto res = avcodec_send_packet(m_video_codec_context.get(), raw_packet);
         if (res < 0 && res != AVERROR(EAGAIN)) {
             m_state.OnError();
             LOG_ERROR(Lib_AvPlayer, "Could not send packet to the video codec. Error = {}",
@@ -730,16 +753,25 @@ void AvPlayerSource::AudioDecoderThread(std::stop_token stop) {
     Common::SetCurrentThreadName("shadPS4:AvAudioDecoder");
 
     LOG_INFO(Lib_AvPlayer, "Audio Decoder Thread started");
-    while ((!m_is_eof || m_audio_packets.Size() != 0) && !stop.stop_requested()) {
+    bool flush_sent = false;
+    while ((!m_is_eof || m_audio_packets.Size() != 0 || !flush_sent) && !stop.stop_requested()) {
         if (!m_audio_packets_cv.Wait(stop,
                                      [this] { return m_audio_packets.Size() != 0 || m_is_eof; })) {
             continue;
         }
         const auto packet = m_audio_packets.Pop();
-        if (!packet.has_value()) {
+        AVPacket* raw_packet = nullptr;
+        if (packet.has_value()) {
+            raw_packet = packet->get();
+        } else if (m_is_eof && !flush_sent) {
+            // Feed NULL once to enter drain mode and flush any
+            // frames buffered internally. Without this, the trailing audio
+            // samples are silently dropped at end of stream.
+            flush_sent = true;
+        } else {
             continue;
         }
-        auto res = avcodec_send_packet(m_audio_codec_context.get(), packet->get());
+        auto res = avcodec_send_packet(m_audio_codec_context.get(), raw_packet);
         if (res < 0 && res != AVERROR(EAGAIN)) {
             m_state.OnError();
             LOG_ERROR(Lib_AvPlayer, "Could not send packet to the audio codec. Error = {}",
