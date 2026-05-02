@@ -499,17 +499,17 @@ void AvPlayerSource::DemuxerThread(std::stop_token stop) {
     m_video_frames_cv.Notify();
     m_audio_frames_cv.Notify();
 
-    m_video_decoder_thread.Join();
-    m_audio_decoder_thread.Join();
-
-    // Notify the state machine only on a natural end of stream. If the loop
-    // was cancelled by a game-issued Stop, the state has already advanced to
-    // Stop and the StateStop event has already been emitted from there;
-    // emitting EndOfFile here would regress the state and double-fire the
-    // event to the game.
     if (natural_eof) {
         m_state.OnEOF();
     }
+
+    // Wake the decoder buffer-wait loops one more time so they can observe
+    // stop_token if the game's Stop has cancelled them; harmless otherwise.
+    m_video_buffers_cv.Notify();
+    m_audio_buffers_cv.Notify();
+
+    m_video_decoder_thread.Join();
+    m_audio_decoder_thread.Join();
 
     LOG_INFO(Lib_AvPlayer, "Demuxer Thread exited normally");
 }
@@ -518,6 +518,7 @@ AvPlayerSource::AVFramePtr AvPlayerSource::ConvertVideoFrame(const AVFrame& fram
     auto nv12_frame = AVFramePtr{av_frame_alloc(), &ReleaseAVFrame};
     nv12_frame->pts = frame.pts;
     nv12_frame->pkt_dts = frame.pkt_dts < 0 ? 0 : frame.pkt_dts;
+    nv12_frame->best_effort_timestamp = frame.best_effort_timestamp;
     nv12_frame->format = AV_PIX_FMT_NV12;
     nv12_frame->width = frame.width;
     nv12_frame->height = frame.height;
@@ -577,12 +578,19 @@ Frame AvPlayerSource::PrepareVideoFrame(GuestBuffer buffer, const AVFrame& frame
     auto p_buffer = buffer.GetBuffer();
     CopyNV12Data(p_buffer, frame, m_use_vdec2);
 
-    const auto pkt_dts = u64(frame.pkt_dts) * 1000;
+    s64 raw_ts = frame.best_effort_timestamp;
+    if (raw_ts == AV_NOPTS_VALUE) {
+        raw_ts = frame.pts != AV_NOPTS_VALUE ? frame.pts : frame.pkt_dts;
+    }
+    if (raw_ts == AV_NOPTS_VALUE || raw_ts < 0) {
+        raw_ts = 0;
+    }
+    const u64 ts_units = u64(raw_ts) * 1000;
     const auto stream = m_avformat_context->streams[m_video_stream_index.value()];
     const auto time_base = stream->time_base;
     const auto den = time_base.den;
     const auto num = time_base.num;
-    const auto timestamp = (num != 0 && den > 1) ? (pkt_dts * num) / den : pkt_dts;
+    const auto timestamp = (num != 0 && den > 1) ? (ts_units * num) / den : ts_units;
 
     const u32 width = u32(frame.width);
     const u32 height = u32(frame.height);
@@ -724,12 +732,19 @@ Frame AvPlayerSource::PrepareAudioFrame(GuestBuffer buffer, const AVFrame& frame
     const auto size = frame.ch_layout.nb_channels * frame.nb_samples * sizeof(u16);
     std::memcpy(p_buffer, frame.data[0], size);
 
-    const auto pkt_dts = u64(frame.pkt_dts) * 1000;
+    s64 raw_ts = frame.best_effort_timestamp;
+    if (raw_ts == AV_NOPTS_VALUE) {
+        raw_ts = frame.pts != AV_NOPTS_VALUE ? frame.pts : frame.pkt_dts;
+    }
+    if (raw_ts == AV_NOPTS_VALUE || raw_ts < 0) {
+        raw_ts = 0;
+    }
+    const u64 ts_units = u64(raw_ts) * 1000;
     const auto stream = m_avformat_context->streams[m_audio_stream_index.value()];
     const auto time_base = stream->time_base;
     const auto den = time_base.den;
     const auto num = time_base.num;
-    const auto timestamp = (num != 0 && den > 1) ? (pkt_dts * num) / den : pkt_dts;
+    const auto timestamp = (num != 0 && den > 1) ? (ts_units * num) / den : ts_units;
 
     return Frame{
         .buffer = std::move(buffer),
