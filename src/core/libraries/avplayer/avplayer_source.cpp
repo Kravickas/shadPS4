@@ -250,8 +250,14 @@ bool AvPlayerSource::Start() {
         }
     }
     m_demuxer_thread.Run([this](std::stop_token stop) { this->DemuxerThread(stop); });
-    m_video_decoder_thread.Run([this](std::stop_token stop) { this->VideoDecoderThread(stop); });
-    m_audio_decoder_thread.Run([this](std::stop_token stop) { this->AudioDecoderThread(stop); });
+    if (m_video_stream_index) {
+        m_video_decoder_thread.Run(
+            [this](std::stop_token stop) { this->VideoDecoderThread(stop); });
+    }
+    if (m_audio_stream_index) {
+        m_audio_decoder_thread.Run(
+            [this](std::stop_token stop) { this->AudioDecoderThread(stop); });
+    }
     m_start_time = std::chrono::high_resolution_clock::now();
     return true;
 }
@@ -343,29 +349,13 @@ bool AvPlayerSource::GetVideoData(AvPlayerFrameInfoEx& video_info) {
     } else if (m_video_frames.Size() == 0) {
         outcome = Result::NoFrame;
     } else if (m_state.GetSyncMode() == AvPlayerAvSyncMode::Default) {
-        // Sync gate per libSceAvPlayer.sprx CheckTime (sub_33df0): release when
-        // drift = elapsed_real_time - frame_pts >= +20ms.
         const auto& new_frame = m_video_frames.Front();
         const auto current_time = CurrentTime();
-        if (current_time != 0) {
-            last_pts = new_frame.info.timestamp;
-            last_clock = current_time;
-            last_drift = s64(current_time) - s64(new_frame.info.timestamp);
-
-            constexpr s64 kReleaseThresholdMs = 20;
-            constexpr s64 kBehindLogThresholdMs = 280;
-            constexpr s64 kAheadLogThresholdMs = -690;
-
-            if (last_drift < kReleaseThresholdMs) {
-                if (last_drift <= kAheadLogThresholdMs) {
-                    LOG_INFO(Lib_AvPlayer, "VIDEO_AHEAD: drift={}ms vpts={}ms clock={}ms (waiting)",
-                             last_drift, last_pts, last_clock);
-                }
-                outcome = Result::Early;
-            } else if (last_drift >= kBehindLogThresholdMs) {
-                LOG_INFO(Lib_AvPlayer, "VIDEO_BEHIND: drift={}ms vpts={}ms clock={}ms (releasing)",
-                         last_drift, last_pts, last_clock);
-            }
+        last_pts = new_frame.info.timestamp;
+        last_clock = current_time;
+        last_drift = s64(current_time) - s64(last_pts);
+        if (0 < current_time && current_time < new_frame.info.timestamp) {
+            outcome = Result::Early;
         }
     }
 
