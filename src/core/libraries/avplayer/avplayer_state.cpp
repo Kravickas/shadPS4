@@ -238,7 +238,7 @@ void AvPlayerState::AvControllerThread(std::stop_token stop) {
             ProcessEvent();
             continue;
         }
-        std::this_thread::sleep_for(milliseconds(5));
+        Common::AccurateSleep(std::chrono::milliseconds(5), nullptr, false);
         UpdateBufferingState();
     }
 }
@@ -289,12 +289,13 @@ bool AvPlayerState::Stop() {
         LOG_INFO(Lib_AvPlayer, "Stop not required from state: {}", magic_enum::enum_name(cur));
         return true;
     }
-    // EXPERIMENT: treat Stop from game as "skip permission" rather than
-    // immediate teardown. Don't tear down decoder threads or transition
-    // state; just acknowledge. Actual cleanup happens at natural EOF or
-    // sceAvPlayerClose.
-    LOG_INFO(Lib_AvPlayer, "Stop ignored (skip-permission experiment), state={}",
-             magic_enum::enum_name(cur));
+    if (!m_up_source->Stop()) {
+        return false;
+    }
+    if (!SetState(AvState::Stop)) {
+        return false;
+    }
+    OnPlaybackStateChanged(AvState::Stop);
     return true;
 }
 
