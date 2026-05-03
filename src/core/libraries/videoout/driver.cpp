@@ -284,8 +284,11 @@ void VideoOutDriver::SubmitFlipInternal(VideoOutPort* port, s32 index, s64 flip_
 }
 
 void VideoOutDriver::PresentThread(std::stop_token token) {
-    const std::chrono::nanoseconds vblank_period(1000000000 /
-                                                 EmulatorSettings.GetVblankFrequency());
+    const u32 nominal_freq = EmulatorSettings.GetVblankFrequency();
+    const bool is_ntsc_rate = nominal_freq == 24 || nominal_freq == 60 || nominal_freq == 90 ||
+                              nominal_freq == 120 || nominal_freq == 240;
+    const std::chrono::nanoseconds vblank_period(is_ntsc_rate ? (1'001'000'000ULL / nominal_freq)
+                                                              : (1'000'000'000ULL / nominal_freq));
 
     Common::SetCurrentThreadName("shadPS4:PresentThread");
     Common::SetCurrentThreadRealtime(vblank_period);
