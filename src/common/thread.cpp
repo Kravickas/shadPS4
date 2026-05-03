@@ -115,7 +115,14 @@ bool AccurateSleep(const std::chrono::nanoseconds duration, std::chrono::nanosec
     LARGE_INTEGER interval{
         .QuadPart = -1 * (duration.count() / 100u),
     };
-    HANDLE timer = ::CreateWaitableTimer(NULL, TRUE, NULL);
+#ifndef CREATE_WAITABLE_TIMER_HIGH_RESOLUTION
+#define CREATE_WAITABLE_TIMER_HIGH_RESOLUTION 0x00000002
+#endif
+    HANDLE timer = ::CreateWaitableTimerExW(NULL, NULL, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION,
+                                            TIMER_ALL_ACCESS);
+    if (timer == NULL) {
+        timer = ::CreateWaitableTimer(NULL, TRUE, NULL);
+    }
     SetWaitableTimer(timer, &interval, 0, NULL, NULL, 0);
     const auto ret = WaitForSingleObjectEx(timer, INFINITE, interruptible);
     ::CloseHandle(timer);
@@ -232,21 +239,22 @@ void SetThreadName(void* thread, const char* name) {
 #endif
 
 AccurateTimer::AccurateTimer(std::chrono::nanoseconds target_interval)
-    : target_interval(target_interval) {}
+    : target_interval(target_interval), next_tick(std::chrono::high_resolution_clock::now()) {}
 
 void AccurateTimer::Start() {
-    const auto begin_sleep = std::chrono::high_resolution_clock::now();
-    if (total_wait.count() > 0) {
-        AccurateSleep(total_wait, nullptr, false);
+    const auto now = std::chrono::high_resolution_clock::now();
+    if (next_tick > now) {
+        AccurateSleep(std::chrono::duration_cast<std::chrono::nanoseconds>(next_tick - now),
+                      nullptr, false);
     }
-    start_time = std::chrono::high_resolution_clock::now();
-    total_wait -= std::chrono::duration_cast<std::chrono::nanoseconds>(start_time - begin_sleep);
 }
 
 void AccurateTimer::End() {
-    auto now = std::chrono::high_resolution_clock::now();
-    total_wait +=
-        target_interval - std::chrono::duration_cast<std::chrono::nanoseconds>(now - start_time);
+    next_tick += target_interval;
+    const auto now = std::chrono::high_resolution_clock::now();
+    if (next_tick < now) {
+        next_tick = now;
+    }
 }
 
 std::string GetCurrentThreadName() {
