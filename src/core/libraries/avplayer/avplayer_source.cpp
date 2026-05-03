@@ -527,8 +527,11 @@ void AvPlayerSource::DemuxerThread(std::stop_token stop) {
 
     bool natural_eof = false;
     while (!stop.stop_requested()) {
-        if (m_video_packets.Size() > 30 &&
-            (!m_audio_stream_index.has_value() || m_audio_packets.Size() > 8)) {
+        if (m_video_packets.Size() > 30) {
+            std::this_thread::sleep_for(milliseconds(5));
+            continue;
+        }
+        if (m_audio_stream_index.has_value() && m_audio_packets.Size() > 8) {
             std::this_thread::sleep_for(milliseconds(5));
             continue;
         }
@@ -545,12 +548,18 @@ void AvPlayerSource::DemuxerThread(std::stop_token stop) {
                         const auto stream = m_avformat_context->streams[index];
                         avformat_seek_file(m_avformat_context.get(), index, 0, 0, stream->duration,
                                            0);
+                        if (m_video_codec_context) {
+                            avcodec_flush_buffers(m_video_codec_context.get());
+                        }
                     }
                     if (m_audio_stream_index.has_value()) {
                         const auto index = m_audio_stream_index.value();
                         const auto stream = m_avformat_context->streams[index];
                         avformat_seek_file(m_avformat_context.get(), index, 0, 0, stream->duration,
                                            0);
+                        if (m_audio_codec_context) {
+                            avcodec_flush_buffers(m_audio_codec_context.get());
+                        }
                     }
                     continue;
                 } else {
