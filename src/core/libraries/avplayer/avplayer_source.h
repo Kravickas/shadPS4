@@ -195,6 +195,8 @@ private:
     std::atomic_bool m_is_looping = false;
     std::atomic_bool m_is_paused = false;
     std::atomic_bool m_is_eof = false;
+    std::atomic_bool m_video_flush_pending = false;
+    std::atomic_bool m_audio_flush_pending = false;
 
     std::unique_ptr<IDataStreamer> m_up_data_streamer;
 
