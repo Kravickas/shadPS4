@@ -528,11 +528,11 @@ void AvPlayerSource::DemuxerThread(std::stop_token stop) {
     bool natural_eof = false;
     while (!stop.stop_requested()) {
         if (m_video_packets.Size() > 30) {
-            std::this_thread::sleep_for(milliseconds(5));
+            Common::AccurateSleep(milliseconds(5), nullptr, false);
             continue;
         }
         if (m_audio_stream_index.has_value() && m_audio_packets.Size() > 8) {
-            std::this_thread::sleep_for(milliseconds(5));
+            Common::AccurateSleep(milliseconds(5), nullptr, false);
             continue;
         }
         AVPacketPtr up_packet(av_packet_alloc(), &ReleaseAVPacket);
