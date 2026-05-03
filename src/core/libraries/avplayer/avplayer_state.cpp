@@ -281,6 +281,14 @@ bool AvPlayerState::Stop() {
     if (m_up_source == nullptr || m_current_state == AvState::Stop) {
         return false;
     }
+    // Stop is a silent no-op when player is in Unknown/Initial state.
+    // "Stop not required from state: %d" path returns
+    // success without invoking the cleanup that emits StateStop.
+    const AvState cur = m_current_state.load();
+    if (cur == AvState::Unknown || cur == AvState::Initial) {
+        LOG_INFO(Lib_AvPlayer, "Stop not required from state: {}", magic_enum::enum_name(cur));
+        return true;
+    }
     if (!m_up_source->Stop()) {
         return false;
     }
