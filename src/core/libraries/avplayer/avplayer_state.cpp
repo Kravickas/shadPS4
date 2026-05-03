@@ -148,6 +148,7 @@ bool AvPlayerState::AddSource(std::string_view path, AvPlayerSourceType source_t
             m_up_source.reset();
             return false;
         }
+        m_current_src_id.store(m_next_src_id.fetch_add(1));
     }
     AddSourceEvent();
     return true;
@@ -280,16 +281,13 @@ bool AvPlayerState::Stop() {
     if (m_up_source == nullptr || m_current_state == AvState::Stop) {
         return false;
     }
-    const bool was_eof = m_eof_state_stop_emitted.load();
     if (!m_up_source->Stop()) {
         return false;
     }
     if (!SetState(AvState::Stop)) {
         return false;
     }
-    if (!was_eof) {
-        OnPlaybackStateChanged(AvState::Stop);
-    }
+    OnPlaybackStateChanged(AvState::Stop);
     return true;
 }
 
@@ -420,11 +418,13 @@ std::optional<bool> AvPlayerState::OnBufferingCheckEvent(u32 num_frames) {
 
 // Called inside CONTROLLER thread
 void AvPlayerState::EmitEvent(AvPlayerEvents event_id, void* event_data) {
-    LOG_INFO(Lib_AvPlayer, "Sending event to the game: id = {}", magic_enum::enum_name(event_id));
+    const s32 src_id = m_current_src_id.load();
+    LOG_INFO(Lib_AvPlayer, "Sending event to the game: id = {} src_id = {}",
+             magic_enum::enum_name(event_id), src_id);
     const auto callback = m_init_data.event_replacement.event_callback;
     if (callback) {
         const auto ptr = m_init_data.event_replacement.object_ptr;
-        callback(ptr, event_id, 0, event_data);
+        callback(ptr, event_id, src_id, event_data);
     }
 }
 
@@ -467,8 +467,11 @@ void AvPlayerState::ProcessEvent() {
             break;
         }
         if (target == AvState::EndOfFile) {
-            m_eof_state_stop_emitted.store(true);
-            EmitEvent(AvPlayerEvents::StateStop);
+            // Only AvPlayerStop and AvPlayerClose
+            // emit StateStop. Natural EOF just transitions
+            // state internally; the game discovers completion via
+            // sceAvPlayerIsActive returning false and then calls Stop, which
+            // emits StateStop on its normal cleanup path.
         } else {
             OnPlaybackStateChanged(target);
         }
