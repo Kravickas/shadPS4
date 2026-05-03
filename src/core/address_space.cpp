@@ -45,6 +45,9 @@ constexpr VAddr USER_MIN = 0x1000000000ULL;
 #if defined(__linux__)
 // Linux maps the shadPS4 executable around here, so limit the user maximum
 constexpr VAddr USER_MAX = 0x54FFFFFFFFFFULL;
+#elif defined(__FreeBSD__)
+// FreeBSD address space is extremely volatile, keep this lower for safety.
+constexpr VAddr USER_MAX = 0xFFFFFFFFFFFULL;
 #else
 constexpr VAddr USER_MAX = 0x5FFFFFFFFFFFULL;
 #endif
@@ -55,7 +58,7 @@ static constexpr u64 SystemReservedSize = SYSTEM_RESERVED_MAX - SYSTEM_RESERVED_
 static constexpr u64 UserSize = USER_MAX - USER_MIN + 1;
 
 // Required backing file size for mapping physical address space.
-static u64 BackingSize = ORBIS_KERNEL_TOTAL_MEM_DEV_PRO;
+static u64 BackingSize = ORBIS_KERNEL_TOTAL_MEM_DEV_PRO + ORBIS_KERNEL_FLEXIBLE_MEMORY_SIZE;
 
 #ifdef _WIN32
 
@@ -613,7 +616,11 @@ struct AddressSpace::Impl {
         user_size = UserSize;
 
         constexpr int protection_flags = PROT_READ | PROT_WRITE;
-        constexpr int map_flags = MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE | MAP_FIXED;
+        int map_flags = MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED; // compiler knows its constexpr
+#if !defined(__FreeBSD__)
+        map_flags |= MAP_NORESERVE;
+#endif
+
 #if defined(__APPLE__) && defined(ARCH_X86_64)
         // On ARM64 Macs, we run into limitations due to the commpage from 0xFC0000000 - 0xFFFFFFFFF
         // and the GPU carveout region from 0x1000000000 - 0x6FFFFFFFFF. Because this creates gaps
@@ -628,7 +635,7 @@ struct AddressSpace::Impl {
             mmap(reinterpret_cast<void*>(USER_MIN), user_size, protection_flags, map_flags, -1, 0));
 #else
         const auto virtual_size = system_managed_size + system_reserved_size + user_size;
-#if defined(ARCH_X86_64)
+#if defined(ARCH_X86_64) && !defined(__FreeBSD__)
         const auto virtual_base =
             reinterpret_cast<u8*>(mmap(reinterpret_cast<void*>(SYSTEM_MANAGED_MIN), virtual_size,
                                        protection_flags, map_flags, -1, 0));
@@ -636,8 +643,10 @@ struct AddressSpace::Impl {
         system_reserved_base = reinterpret_cast<u8*>(SYSTEM_RESERVED_MIN);
         user_base = reinterpret_cast<u8*>(USER_MIN);
 #else
+        // FreeBSD can't stand MAP_FIXED or it may overwrite mmap() itself!
         // Map memory wherever possible and instruction translation can handle offsetting to the
         // base.
+        map_flags &= ~MAP_FIXED;
         const auto virtual_base =
             reinterpret_cast<u8*>(mmap(nullptr, virtual_size, protection_flags, map_flags, -1, 0));
         system_managed_base = virtual_base;
@@ -676,8 +685,13 @@ struct AddressSpace::Impl {
         }
         shm_unlink(shm_path.c_str());
 #else
+#ifndef __FreeBSD__
         madvise(virtual_base, virtual_size, MADV_HUGEPAGE);
-
+#endif
+        // NOTE: If you add MFD_HUGETLB or whatever, remember that FBSD will break (libc bug)
+        // so please, do not, add MFD_* whatever unless you ifdef it away (must be 0 for FBSD)
+        // using sized pages as well causes incessant vm_reclaim calls in kernel, do not use on FBSD
+        // under any circumstances.
         backing_fd = memfd_create("BackingDmem", 0);
         if (backing_fd < 0) {
             LOG_CRITICAL(Kernel_Vmm, "memfd_create failed: {}", strerror(errno));
@@ -705,6 +719,12 @@ struct AddressSpace::Impl {
     void* Map(VAddr virtual_addr, PAddr phys_addr, u64 size, PosixPageProtection prot,
               int fd = -1) {
         m_free_regions.subtract({virtual_addr, virtual_addr + size});
+#ifdef __APPLE__
+        if ((prot & PROT_EXEC) != 0) {
+            ASSERT_MSG(fd == -1, "Requested execute permissions for file mapping");
+            phys_addr = -1;
+        }
+#endif
         const int handle = phys_addr != -1 ? (fd == -1 ? backing_fd : fd) : -1;
         const off_t host_offset = phys_addr != -1 ? phys_addr : 0;
         const int flag = phys_addr != -1 ? MAP_SHARED : (MAP_ANONYMOUS | MAP_PRIVATE);

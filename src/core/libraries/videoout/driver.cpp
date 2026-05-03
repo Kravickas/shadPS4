@@ -62,10 +62,26 @@ int VideoOutDriver::Open(const ServiceThreadParams* params) {
 void VideoOutDriver::Close(s32 handle) {
     std::scoped_lock lock{mutex};
 
+    // Mark as closed
     main_port.is_open = false;
     main_port.flip_rate = 0;
     main_port.prev_index = -1;
+
+    // Clear port information
+    std::memset(main_port.buffer_labels.data(), 0, sizeof(main_port.buffer_labels));
+    std::memset(main_port.groups.data(), 0, sizeof(main_port.groups));
+    std::memset(&main_port.flip_status, 0, sizeof(main_port.flip_status));
+    std::memset(&main_port.vblank_status, 0, sizeof(main_port.vblank_status));
+
+    // Re-initialize buffers
+    std::memset(main_port.buffer_slots.data(), 0, sizeof(main_port.buffer_slots));
+    for (auto& buffer : main_port.buffer_slots) {
+        buffer.group_index = -1;
+    }
+
+    // TODO: Remove events?
     ASSERT(main_port.flip_events.empty());
+    ASSERT(main_port.vblank_events.empty());
 }
 
 VideoOutPort* VideoOutDriver::GetPort(int handle) {
@@ -268,8 +284,11 @@ void VideoOutDriver::SubmitFlipInternal(VideoOutPort* port, s32 index, s64 flip_
 }
 
 void VideoOutDriver::PresentThread(std::stop_token token) {
-    const std::chrono::nanoseconds vblank_period(1000000000 /
-                                                 EmulatorSettings.GetVblankFrequency());
+    const u32 nominal_freq = EmulatorSettings.GetVblankFrequency();
+    const bool is_ntsc_rate = nominal_freq == 24 || nominal_freq == 60 || nominal_freq == 90 ||
+                              nominal_freq == 120 || nominal_freq == 240;
+    const std::chrono::nanoseconds vblank_period(is_ntsc_rate ? (1'001'000'000ULL / nominal_freq)
+                                                              : (1'000'000'000ULL / nominal_freq));
 
     Common::SetCurrentThreadName("shadPS4:PresentThread");
     Common::SetCurrentThreadRealtime(vblank_period);

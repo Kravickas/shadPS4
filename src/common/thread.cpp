@@ -115,7 +115,14 @@ bool AccurateSleep(const std::chrono::nanoseconds duration, std::chrono::nanosec
     LARGE_INTEGER interval{
         .QuadPart = -1 * (duration.count() / 100u),
     };
-    HANDLE timer = ::CreateWaitableTimer(NULL, TRUE, NULL);
+#ifndef CREATE_WAITABLE_TIMER_HIGH_RESOLUTION
+#define CREATE_WAITABLE_TIMER_HIGH_RESOLUTION 0x00000002
+#endif
+    HANDLE timer = ::CreateWaitableTimerExW(NULL, NULL, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION,
+                                            TIMER_ALL_ACCESS);
+    if (timer == NULL) {
+        timer = ::CreateWaitableTimer(NULL, TRUE, NULL);
+    }
     SetWaitableTimer(timer, &interval, 0, NULL, NULL, 0);
     const auto ret = WaitForSingleObjectEx(timer, INFINITE, interruptible);
     ::CloseHandle(timer);

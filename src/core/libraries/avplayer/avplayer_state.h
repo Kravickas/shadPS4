@@ -78,9 +78,14 @@ private:
 
     std::atomic<AvState> m_current_state;
     std::atomic<AvState> m_previous_state;
+    std::atomic_bool m_eof_state_stop_emitted{false};
     u32 m_thread_priority;
     u32 m_thread_affinity;
     std::atomic_uint32_t m_some_event_result{};
+    // src_id counter: each AddSource increments and assigns.
+    // Counter is zeroed at player init. First source gets src_id=0.
+    std::atomic_int32_t m_next_src_id{0};
+    std::atomic_int32_t m_current_src_id{0};
 
     std::shared_mutex m_source_mutex{};
     std::mutex m_state_machine_mutex{};

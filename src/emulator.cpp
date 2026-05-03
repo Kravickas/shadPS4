@@ -11,7 +11,6 @@
 #include <hwinfo/hwinfo.h>
 
 #include "common/debug.h"
-#include "common/logging/backend.h"
 #include "common/logging/log.h"
 #include "common/thread.h"
 #include "core/emulator_settings.h"
@@ -109,7 +108,8 @@ void Emulator::Run(std::filesystem::path file, std::vector<std::string> args,
     } else {
         game_folder = file.parent_path();
         if (const auto game_folder_name = game_folder.filename().string();
-            game_folder_name.ends_with("-UPDATE") || game_folder_name.ends_with("-patch")) {
+            game_folder_name.ends_with("-UPDATE") || game_folder_name.ends_with("-patch") ||
+            game_folder_name.ends_with("-mods")) {
             // If an executable was launched from a separate update directory,
             // use the base game directory as the game folder.
             const std::string base_name = game_folder_name.substr(0, game_folder_name.rfind('-'));
@@ -200,6 +200,7 @@ void Emulator::Run(std::filesystem::path file, std::vector<std::string> args,
 
     game_info.game_folder = game_folder;
     std::filesystem::path npbindPath = game_folder / "sce_sys/npbind.dat";
+    std::filesystem::path trophyDir = game_folder / "sce_sys/trophy";
     NPBindFile npbind;
     if (!npbind.Load(npbindPath.string())) {
         LOG_WARNING(Common_Filesystem, "Failed to load npbind.dat file");
@@ -208,19 +209,45 @@ void Emulator::Run(std::filesystem::path file, std::vector<std::string> args,
         if (npCommIds.empty()) {
             LOG_WARNING(Common_Filesystem, "No NPComm IDs found in npbind.dat");
         } else {
+            std::vector<std::pair<int, std::string>> trophyFiles; // (trophy_index, filename)
+            std::string pattern = "trophy";
+            for (const auto& entry : std::filesystem::directory_iterator(trophyDir)) {
+                if (entry.is_regular_file() && entry.path().extension() == ".trp") {
+                    std::string filename =
+                        entry.path().stem().string(); // "trophy00", "trophy01", etc.
+
+                    // Check if filename starts with "trophy"
+                    if (filename.find(pattern) == 0) {
+                        // Extract the number part
+                        std::string numStr = filename.substr(pattern.length());
+                        int trophy_index = std::stoi(numStr);
+                        trophyFiles.emplace_back(trophy_index, filename);
+                    }
+                }
+            }
+            // Sort by trophy index
+            std::sort(trophyFiles.begin(), trophyFiles.end());
+            std::map<int, std::string> trophyIndexMap{};
+            // Map trophy indices to npCommIds (assuming npCommIds are in the same order as sorted
+            // trophy files)
+            for (size_t i = 0; i < trophyFiles.size() && i < npCommIds.size(); i++) {
+                int trophy_index = trophyFiles[i].first;
+                const std::string& npCommId = npCommIds[i];
+                trophyIndexMap[trophy_index] = npCommId;
+                LOG_DEBUG(Loader, "Mapped trophy index {} to npCommId: {}", trophy_index, npCommId);
+            }
+            game_info.trophyIndexMap = std::move(trophyIndexMap);
             game_info.npCommIds = std::move(npCommIds);
         }
     }
 
     EmulatorSettings.Load(id);
 
+    Common::Log::Shutdown();
     // Initialize logging as soon as possible
-    if (!id.empty() && EmulatorSettings.IsSeparateLoggingEnabled()) {
-        Common::Log::Initialize(id + ".log");
-    } else {
-        Common::Log::Initialize();
-    }
-    Common::Log::Start();
+    Common::Log::Setup((!id.empty() && EmulatorSettings.IsLogSeparate()) ? id + ".log"
+                                                                         : "shad_log.txt");
+
     if (!std::filesystem::exists(file)) {
         LOG_CRITICAL(Loader, "eboot.bin does not exist: {}",
                      std::filesystem::absolute(file).string());
@@ -236,12 +263,15 @@ void Emulator::Run(std::filesystem::path file, std::vector<std::string> args,
     LOG_INFO(Config, "Game-specific config used: {}",
              EmulatorState::GetInstance()->IsGameSpecifigConfigUsed());
 
-    LOG_INFO(Config, "General LogType: {}", EmulatorSettings.GetLogType());
-    LOG_INFO(Config, "General isIdenticalLogGrouped: {}", EmulatorSettings.IsIdenticalLogGrouped());
     LOG_INFO(Config, "General isNeo: {}", EmulatorSettings.IsNeo());
     LOG_INFO(Config, "General isDevKit: {}", EmulatorSettings.IsDevKit());
     LOG_INFO(Config, "General isConnectedToNetwork: {}", EmulatorSettings.IsConnectedToNetwork());
-    LOG_INFO(Config, "General isPsnSignedIn: {}", EmulatorSettings.IsPSNSignedIn());
+    LOG_INFO(Config, "General isShadNetEnabled: {}", EmulatorSettings.IsShadNetEnabled());
+    LOG_INFO(Config, "Log sync: {}", EmulatorSettings.IsLogSync());
+    LOG_INFO(Config, "Log skipDuplicate: {}", EmulatorSettings.IsLogSkipDuplicate());
+#ifdef _WIN32
+    LOG_INFO(Config, "Log type: {}", EmulatorSettings.GetLogType());
+#endif
     LOG_INFO(Config, "GPU isNullGpu: {}", EmulatorSettings.IsNullGPU());
     LOG_INFO(Config, "GPU readbacksMode: {}", EmulatorSettings.GetReadbacksMode());
     LOG_INFO(Config, "GPU readbackLinearImages: {}",
@@ -292,6 +322,13 @@ void Emulator::Run(std::filesystem::path file, std::vector<std::string> args,
         }
     }
 
+    std::filesystem::path mods_folder = game_folder;
+    mods_folder += "-mods";
+
+    if (std::filesystem::exists(mods_folder) && !std::filesystem::is_empty(mods_folder)) {
+        LOG_INFO(Loader, "Files found in game mods folder");
+    }
+
     // Create stdin/stdout/stderr
     Common::Singleton<FileSys::HandleTable>::Instance()->CreateStdHandles();
 
@@ -318,10 +355,12 @@ void Emulator::Run(std::filesystem::path file, std::vector<std::string> args,
                 }
             }
             for (User user : UserSettings.GetUserManager().GetValidUsers()) {
-                auto const user_trophy_file =
-                    Common::FS::GetUserPath(Common::FS::PathType::HomeDir) /
-                    std::to_string(user.user_id) / "trophy" / (npCommId + ".xml");
+                auto const user_trophy_file = EmulatorSettings.GetHomeDir() /
+                                              std::to_string(user.user_id) / "trophy" /
+                                              (npCommId + ".xml");
                 if (!std::filesystem::exists(user_trophy_file)) {
+                    auto temp = user_trophy_file.parent_path();
+                    std::filesystem::create_directories(temp);
                     std::error_code discard;
                     std::filesystem::copy_file(trophyDir / "Xml" / "TROPCONF.XML", user_trophy_file,
                                                discard);
@@ -435,13 +474,12 @@ void Emulator::Run(std::filesystem::path file, std::vector<std::string> args,
     if (!id.empty()) {
         start_time = std::chrono::steady_clock::now();
 
-        std::thread([this, id]() {
-            while (true) {
-                std::this_thread::sleep_for(std::chrono::seconds(60));
+        play_time_thread = std::jthread([this, id](std::stop_token stop) {
+            while (Common::StoppableTimedWait(stop, std::chrono::seconds(60))) {
                 UpdatePlayTime(id);
                 start_time = std::chrono::steady_clock::now();
             }
-        }).detach();
+        });
     }
 
     args.insert(args.begin(), eboot_name.generic_string());
@@ -497,7 +535,7 @@ void Emulator::Restart(std::filesystem::path eboot_path,
 
     LOG_INFO(Common, "Restarting the emulator with args: {}", fmt::join(args, " "));
     Libraries::SaveData::Backup::StopThread();
-    Common::Log::Denitializer();
+    Common::Log::Shutdown();
 
     auto& ipc = IPC::Instance();
 
@@ -533,7 +571,7 @@ void Emulator::Restart(std::filesystem::path eboot_path,
 
     CloseHandle(pi.hProcess);
     CloseHandle(pi.hThread);
-#elif defined(__APPLE__) || defined(__linux__)
+#elif defined(__APPLE__) || defined(__linux__) || defined(__FreeBSD__)
     std::vector<char*> argv;
 
     // Emulator executable

@@ -13,10 +13,39 @@
 namespace Libraries::Videodec {
 
 static inline void CopyNV12Data(u8* dst, const AVFrame& src) {
-    u32 width = Common::AlignUp((u32)src.width, 16);
-    u32 height = Common::AlignUp((u32)src.height, 16);
-    std::memcpy(dst, src.data[0], src.width * src.height);
-    std::memcpy(dst + src.width * height, src.data[1], (src.width * src.height) / 2);
+    const u32 width = Common::AlignUp(u32(src.width), 16);
+    const u32 height = Common::AlignUp(u32(src.height), 16);
+    // Match ImageSizeLinearAligned pitch (tile.h): max(8, 64/Bpp) = 64 for R8.
+    const u32 pitch = Common::AlignUp(width, 64);
+    const u32 src_stride_y = u32(src.linesize[0]);
+    const u32 src_stride_uv = u32(src.linesize[1]);
+    const u32 frame_h = u32(src.height);
+    const u32 y_plane_size = pitch * height;
+
+    if (pitch == src_stride_y) {
+        std::memcpy(dst, src.data[0], pitch * frame_h);
+    } else {
+        for (u32 y = 0; y < frame_h; ++y) {
+            std::memcpy(dst + y * pitch, src.data[0] + y * src_stride_y, src.width);
+        }
+    }
+    if (frame_h < height) {
+        std::memset(dst + frame_h * pitch, 16, (height - frame_h) * pitch);
+    }
+
+    u8* chroma_dst = dst + y_plane_size;
+    const u32 uv_h = frame_h / 2;
+    const u32 uv_h_aligned = height / 2;
+    if (pitch == src_stride_uv) {
+        std::memcpy(chroma_dst, src.data[1], pitch * uv_h);
+    } else {
+        for (u32 y = 0; y < uv_h; ++y) {
+            std::memcpy(chroma_dst + y * pitch, src.data[1] + y * src_stride_uv, src.width);
+        }
+    }
+    if (uv_h < uv_h_aligned) {
+        std::memset(chroma_dst + uv_h * pitch, 128, (uv_h_aligned - uv_h) * pitch);
+    }
 }
 
 VdecDecoder::VdecDecoder(const OrbisVideodecConfigInfo& pCfgInfoIn,
@@ -100,7 +129,7 @@ s32 VdecDecoder::Decode(const OrbisVideodecInputData& pInputDataIn,
         pPictureInfoOut.codecType = 0;
         pPictureInfoOut.frameWidth = Common::AlignUp((u32)frame->width, 16);
         pPictureInfoOut.frameHeight = Common::AlignUp((u32)frame->height, 16);
-        pPictureInfoOut.framePitch = frame->linesize[0];
+        pPictureInfoOut.framePitch = Common::AlignUp(pPictureInfoOut.frameWidth, 64);
 
         pPictureInfoOut.isValid = true;
         pPictureInfoOut.isErrorPic = false;
@@ -150,7 +179,7 @@ s32 VdecDecoder::Flush(OrbisVideodecFrameBuffer& pFrameBufferInOut,
         pPictureInfoOut.codecType = 0;
         pPictureInfoOut.frameWidth = Common::AlignUp((u32)frame->width, 16);
         pPictureInfoOut.frameHeight = Common::AlignUp((u32)frame->height, 16);
-        pPictureInfoOut.framePitch = frame->linesize[0];
+        pPictureInfoOut.framePitch = Common::AlignUp(pPictureInfoOut.frameWidth, 64);
 
         pPictureInfoOut.isValid = true;
         pPictureInfoOut.isErrorPic = false;

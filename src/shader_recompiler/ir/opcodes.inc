@@ -150,6 +150,7 @@ OPCODE(BufferAtomicOr32,                                    U32,            Opaq
 OPCODE(BufferAtomicXor32,                                   U32,            Opaque,         Opaque,         U32,                                            )
 OPCODE(BufferAtomicSwap32,                                  U32,            Opaque,         Opaque,         U32,                                            )
 OPCODE(BufferAtomicCmpSwap32,                               U32,            Opaque,         Opaque,         U32,            U32,                            )
+OPCODE(BufferAtomicFCmpSwap32,                              F32,            Opaque,         Opaque,         F32,            F32,                            )
 
 // Vector utility
 OPCODE(CompositeConstructU32x2,                             U32x2,          U32,            U32,                                                            )
@@ -235,9 +236,9 @@ OPCODE(FPAdd64,                                             F64,            F64,
 OPCODE(FPSub32,                                             F32,            F32,            F32,                                                            )
 OPCODE(FPFma32,                                             F32,            F32,            F32,            F32,                                            )
 OPCODE(FPFma64,                                             F64,            F64,            F64,            F64,                                            )
-OPCODE(FPMax32,                                             F32,            F32,            F32,            U1,                                             )
+OPCODE(FPMax32,                                             F32,            F32,            F32,                                                            )
 OPCODE(FPMax64,                                             F64,            F64,            F64,                                                            )
-OPCODE(FPMin32,                                             F32,            F32,            F32,            U1,                                             )
+OPCODE(FPMin32,                                             F32,            F32,            F32,                                                            )
 OPCODE(FPMin64,                                             F64,            F64,            F64,                                                            )
 OPCODE(FPMinTri32,                                          F32,            F32,            F32,            F32,                                            )
 OPCODE(FPMaxTri32,                                          F32,            F32,            F32,            F32,                                            )

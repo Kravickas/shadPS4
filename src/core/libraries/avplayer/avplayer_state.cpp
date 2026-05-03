@@ -148,6 +148,7 @@ bool AvPlayerState::AddSource(std::string_view path, AvPlayerSourceType source_t
             m_up_source.reset();
             return false;
         }
+        m_current_src_id.store(m_next_src_id.fetch_add(1));
     }
     AddSourceEvent();
     return true;
@@ -237,7 +238,7 @@ void AvPlayerState::AvControllerThread(std::stop_token stop) {
             ProcessEvent();
             continue;
         }
-        std::this_thread::sleep_for(milliseconds(5));
+        Common::AccurateSleep(std::chrono::milliseconds(5), nullptr, false);
         UpdateBufferingState();
     }
 }
@@ -279,6 +280,14 @@ bool AvPlayerState::Stop() {
     std::shared_lock lock(m_source_mutex);
     if (m_up_source == nullptr || m_current_state == AvState::Stop) {
         return false;
+    }
+    // Per .sprx 0xef20/0xea80: Stop is a silent no-op when player is in
+    // Unknown/Initial state. "Stop not required from state: %d" path returns
+    // success without invoking the cleanup that emits StateStop.
+    const AvState cur = m_current_state.load();
+    if (cur == AvState::Unknown || cur == AvState::Initial) {
+        LOG_INFO(Lib_AvPlayer, "Stop not required from state: {}", magic_enum::enum_name(cur));
+        return true;
     }
     if (!m_up_source->Stop()) {
         return false;
@@ -358,7 +367,10 @@ void AvPlayerState::OnError() {
 }
 
 void AvPlayerState::OnEOF() {
-    SetState(AvState::EndOfFile);
+    m_event_queue.Push(AvPlayerEvent{
+        .event = AvEventType::ChangeFlowState,
+        .payload = {.state = AvState::EndOfFile},
+    });
 }
 
 // Called inside CONTROLLER thread
@@ -414,11 +426,13 @@ std::optional<bool> AvPlayerState::OnBufferingCheckEvent(u32 num_frames) {
 
 // Called inside CONTROLLER thread
 void AvPlayerState::EmitEvent(AvPlayerEvents event_id, void* event_data) {
-    LOG_INFO(Lib_AvPlayer, "Sending event to the game: id = {}", magic_enum::enum_name(event_id));
+    const s32 src_id = m_current_src_id.load();
+    LOG_INFO(Lib_AvPlayer, "Sending event to the game: id = {} src_id = {}",
+             magic_enum::enum_name(event_id), src_id);
     const auto callback = m_init_data.event_replacement.event_callback;
     if (callback) {
         const auto ptr = m_init_data.event_replacement.object_ptr;
-        callback(ptr, event_id, 0, event_data);
+        callback(ptr, event_id, src_id, event_data);
     }
 }
 
@@ -445,12 +459,29 @@ void AvPlayerState::ProcessEvent() {
     }
     case AvEventType::AddSource: {
         std::shared_lock lock(m_source_mutex);
+        m_eof_state_stop_emitted.store(false);
         if (m_up_source->FindStreamInfo()) {
             SetState(AvState::Ready);
             OnPlaybackStateChanged(AvState::Ready);
         } else {
             OnWarning(ORBIS_AVPLAYER_ERROR_NOT_SUPPORTED);
             SetState(AvState::Error);
+        }
+        break;
+    }
+    case AvEventType::ChangeFlowState: {
+        const auto target = event->payload.state;
+        if (!SetState(target)) {
+            break;
+        }
+        if (target == AvState::EndOfFile) {
+            // Per .sprx 0xeb4a / 0xf320: only sceAvPlayerStop and
+            // sceAvPlayerClose emit StateStop. Natural EOF just transitions
+            // state internally; the game discovers completion via
+            // sceAvPlayerIsActive returning false and then calls Stop, which
+            // emits StateStop on its normal cleanup path.
+        } else {
+            OnPlaybackStateChanged(target);
         }
         break;
     }

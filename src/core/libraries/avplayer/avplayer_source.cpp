@@ -116,14 +116,8 @@ bool AvPlayerSource::GetStreamInfo(u32 stream_index, AvPlayerStreamInfo& info) {
         LOG_INFO(Lib_AvPlayer, "Stream {} is a video stream.", stream_index);
         info.details.video.aspect_ratio =
             f32(p_stream->codecpar->width) / p_stream->codecpar->height;
-        auto width = u32(p_stream->codecpar->width);
-        auto height = u32(p_stream->codecpar->height);
-        if (!m_use_vdec2) {
-            width = Common::AlignUp(width, 16);
-            height = Common::AlignUp(height, 16);
-        }
-        info.details.video.width = width;
-        info.details.video.height = height;
+        info.details.video.width = u32(p_stream->codecpar->width);
+        info.details.video.height = u32(p_stream->codecpar->height);
         if (p_lang_node != nullptr) {
             std::memcpy(info.details.video.language_code, p_lang_node->value,
                         std::min(strlen(p_lang_node->value), size_t(3)));
@@ -219,13 +213,11 @@ bool AvPlayerSource::Start() {
                       m_video_stream_index.value());
             return false;
         }
-        auto width = u32(m_video_codec_context->width);
-        auto height = u32(m_video_codec_context->height);
-        if (!m_use_vdec2) {
-            width = Common::AlignUp(width, 16);
-            height = Common::AlignUp(height, 16);
-        }
-        const auto size = (width * height * 3) / 2;
+        const auto width = u32(m_video_codec_context->width);
+        const auto height = u32(m_video_codec_context->height);
+        // Match ImageSizeLinearAligned pitch (tile.h): max(8, 64/Bpp) = 64 for R8.
+        const auto pitch = Common::AlignUp(width, 64u);
+        const auto size = (pitch * height * 3) / 2;
         for (u64 index = 0; index < m_max_num_video_framebuffers; ++index) {
             m_video_buffers.Push(GuestBuffer(m_memory_replacement, 0x100, size, true));
         }
@@ -258,8 +250,14 @@ bool AvPlayerSource::Start() {
         }
     }
     m_demuxer_thread.Run([this](std::stop_token stop) { this->DemuxerThread(stop); });
-    m_video_decoder_thread.Run([this](std::stop_token stop) { this->VideoDecoderThread(stop); });
-    m_audio_decoder_thread.Run([this](std::stop_token stop) { this->AudioDecoderThread(stop); });
+    if (m_video_stream_index) {
+        m_video_decoder_thread.Run(
+            [this](std::stop_token stop) { this->VideoDecoderThread(stop); });
+    }
+    if (m_audio_stream_index) {
+        m_audio_decoder_thread.Run(
+            [this](std::stop_token stop) { this->AudioDecoderThread(stop); });
+    }
     m_start_time = std::chrono::high_resolution_clock::now();
     return true;
 }
@@ -267,15 +265,20 @@ bool AvPlayerSource::Start() {
 bool AvPlayerSource::Stop() {
     std::unique_lock lock(m_state_mutex);
 
-    if (!HasRunningThreads()) {
-        LOG_WARNING(Lib_AvPlayer, "Could not stop playback: already stopped.");
-        return false;
+    const bool post_eof_cleanup = !HasRunningThreads();
+    if (post_eof_cleanup) {
+        LOG_INFO(Lib_AvPlayer, "Stop: post-EOF cleanup (decoder + demuxer threads "
+                               "already exited on their own; flushing queues)");
+    } else {
+        LOG_INFO(Lib_AvPlayer, "Stop: game-initiated, signalling threads");
     }
 
     if (m_up_data_streamer) {
         m_up_data_streamer->Reset();
     }
 
+    // .Stop() is idempotent on a non-Joinable thread; both paths above end
+    // up here, and threads that have already exited are a no-op.
     m_video_decoder_thread.Stop();
     m_audio_decoder_thread.Stop();
     m_demuxer_thread.Stop();
@@ -332,27 +335,65 @@ bool AvPlayerSource::GetVideoData(AvPlayerFrameInfoEx& video_info) {
         m_video_buffers_cv.Notify();
     }
 
-    if (!IsActive() || m_is_paused) {
-        return false;
-    }
+    enum class Result { Released, NotActive, Paused, NoFrame, Early };
+    Result outcome = Result::Released;
+    s64 last_drift = 0;
+    u64 last_pts = 0;
+    u64 last_clock = 0;
+    u64 qsize = m_video_frames.Size();
 
-    if (m_video_frames.Size() == 0) {
-        return false;
-    }
-
-    const auto& new_frame = m_video_frames.Front();
-    if (m_state.GetSyncMode() == AvPlayerAvSyncMode::Default) {
-        if (m_audio_stream_index) {
-            if (new_frame.info.timestamp > m_last_audio_ts.value_or(0)) {
-                return false;
-            }
-        } else {
-            // Sync with the internal timer since audio is not available
-            const auto current_time = CurrentTime();
-            if (0 < current_time && current_time < new_frame.info.timestamp) {
-                return false;
-            }
+    if (!IsActive()) {
+        outcome = Result::NotActive;
+    } else if (m_is_paused) {
+        outcome = Result::Paused;
+    } else if (m_video_frames.Size() == 0) {
+        outcome = Result::NoFrame;
+    } else if (m_state.GetSyncMode() == AvPlayerAvSyncMode::Default) {
+        const auto& new_frame = m_video_frames.Front();
+        const auto current_time = CurrentTime();
+        last_pts = new_frame.info.timestamp;
+        last_clock = current_time;
+        last_drift = s64(current_time) - s64(last_pts);
+        if (0 < current_time && current_time < new_frame.info.timestamp) {
+            outcome = Result::Early;
         }
+    }
+
+    // Throttled diagnostic: log aggregate stats once per second so we can see
+    // what the gate is doing across the whole playback without per-call spam.
+    {
+        using namespace std::chrono;
+        static std::atomic_uint64_t s_calls{0};
+        static std::atomic_uint64_t s_released{0};
+        static std::atomic_uint64_t s_early{0};
+        static std::atomic_uint64_t s_no_frame{0};
+        static std::atomic<int64_t> s_next_log_ms{0};
+
+        s_calls.fetch_add(1, std::memory_order_relaxed);
+        if (outcome == Result::Released)
+            s_released.fetch_add(1, std::memory_order_relaxed);
+        else if (outcome == Result::Early)
+            s_early.fetch_add(1, std::memory_order_relaxed);
+        else if (outcome == Result::NoFrame)
+            s_no_frame.fetch_add(1, std::memory_order_relaxed);
+
+        const auto now_ms =
+            duration_cast<milliseconds>(steady_clock::now().time_since_epoch()).count();
+        int64_t expected = s_next_log_ms.load(std::memory_order_relaxed);
+        if (now_ms >= expected && s_next_log_ms.compare_exchange_strong(expected, now_ms + 1000)) {
+            LOG_INFO(Lib_AvPlayer,
+                     "GetVideoData/sec: calls={} released={} early={} noframe={} qsize={} "
+                     "last_drift={}ms last_pts={}ms last_clock={}ms",
+                     s_calls.exchange(0, std::memory_order_relaxed),
+                     s_released.exchange(0, std::memory_order_relaxed),
+                     s_early.exchange(0, std::memory_order_relaxed),
+                     s_no_frame.exchange(0, std::memory_order_relaxed), qsize, last_drift, last_pts,
+                     last_clock);
+        }
+    }
+
+    if (outcome != Result::Released) {
+        return false;
     }
 
     auto frame = m_video_frames.Pop();
@@ -363,31 +404,55 @@ bool AvPlayerSource::GetVideoData(AvPlayerFrameInfoEx& video_info) {
 
 bool AvPlayerSource::GetAudioData(AvPlayerFrameInfo& audio_info) {
     if (m_current_audio_frame.has_value()) {
-        // return the buffer to the queue
         m_audio_buffers.Push(std::move(m_current_audio_frame->buffer));
         m_current_audio_frame.reset();
         m_audio_buffers_cv.Notify();
     }
 
+    bool released = false;
+    bool inactive = false;
     if (!IsActive() || m_is_paused) {
-        return false;
+        inactive = true;
+    } else if (m_audio_frames.Size() != 0) {
+        auto frame = m_audio_frames.Pop();
+        m_last_audio_ts = frame->info.timestamp;
+
+        audio_info = {};
+        audio_info.timestamp = frame->info.timestamp;
+        audio_info.p_data = reinterpret_cast<u8*>(frame->info.p_data);
+        audio_info.details.audio.sample_rate = frame->info.details.audio.sample_rate;
+        audio_info.details.audio.size = frame->info.details.audio.size;
+        audio_info.details.audio.channel_count = frame->info.details.audio.channel_count;
+        m_current_audio_frame = std::move(frame);
+        released = true;
     }
 
-    if (m_audio_frames.Size() == 0) {
-        return false;
+    {
+        using namespace std::chrono;
+        static std::atomic_uint64_t s_calls{0};
+        static std::atomic_uint64_t s_released{0};
+        static std::atomic_uint64_t s_inactive{0};
+        static std::atomic<int64_t> s_next_log_ms{0};
+        s_calls.fetch_add(1, std::memory_order_relaxed);
+        if (released)
+            s_released.fetch_add(1, std::memory_order_relaxed);
+        if (inactive)
+            s_inactive.fetch_add(1, std::memory_order_relaxed);
+
+        const auto now_ms =
+            duration_cast<milliseconds>(steady_clock::now().time_since_epoch()).count();
+        int64_t expected = s_next_log_ms.load(std::memory_order_relaxed);
+        if (now_ms >= expected && s_next_log_ms.compare_exchange_strong(expected, now_ms + 1000)) {
+            LOG_INFO(Lib_AvPlayer,
+                     "GetAudioData/sec: calls={} released={} inactive={} qsize={} last_ts={}ms",
+                     s_calls.exchange(0, std::memory_order_relaxed),
+                     s_released.exchange(0, std::memory_order_relaxed),
+                     s_inactive.exchange(0, std::memory_order_relaxed), m_audio_frames.Size(),
+                     m_last_audio_ts.value_or(0));
+        }
     }
 
-    auto frame = m_audio_frames.Pop();
-    m_last_audio_ts = frame->info.timestamp;
-
-    audio_info = {};
-    audio_info.timestamp = frame->info.timestamp;
-    audio_info.p_data = reinterpret_cast<u8*>(frame->info.p_data);
-    audio_info.details.audio.sample_rate = frame->info.details.audio.sample_rate;
-    audio_info.details.audio.size = frame->info.details.audio.size;
-    audio_info.details.audio.channel_count = frame->info.details.audio.channel_count;
-    m_current_audio_frame = std::move(frame);
-    return true;
+    return released;
 }
 
 u64 AvPlayerSource::CurrentTime() {
@@ -401,8 +466,17 @@ u64 AvPlayerSource::CurrentTime() {
 }
 
 bool AvPlayerSource::IsActive() {
-    return !m_is_eof || m_audio_packets.Size() != 0 || m_video_packets.Size() != 0 ||
-           m_video_frames.Size() != 0 || m_audio_frames.Size() != 0;
+    const bool active = !m_is_eof || m_audio_packets.Size() != 0 || m_video_packets.Size() != 0 ||
+                        m_video_frames.Size() != 0 || m_audio_frames.Size() != 0;
+    static std::atomic_bool s_last{true};
+    bool prev = s_last.exchange(active, std::memory_order_relaxed);
+    if (prev != active) {
+        LOG_INFO(Lib_AvPlayer,
+                 "IsActive transition: {} -> {} (eof={} apkt={} vpkt={} vfr={} afr={})", prev,
+                 active, m_is_eof.load(), m_audio_packets.Size(), m_video_packets.Size(),
+                 m_video_frames.Size(), m_audio_frames.Size());
+    }
+    return active;
 }
 
 void AvPlayerSource::ReleaseAVPacket(AVPacket* packet) {
@@ -451,10 +525,14 @@ void AvPlayerSource::DemuxerThread(std::stop_token stop) {
     }
     LOG_INFO(Lib_AvPlayer, "Demuxer Thread started");
 
+    bool natural_eof = false;
     while (!stop.stop_requested()) {
-        if (m_video_packets.Size() > 30 &&
-            (!m_audio_stream_index.has_value() || m_audio_packets.Size() > 8)) {
-            std::this_thread::sleep_for(milliseconds(5));
+        if (m_video_packets.Size() > 30) {
+            Common::AccurateSleep(milliseconds(5), nullptr, false);
+            continue;
+        }
+        if (m_audio_stream_index.has_value() && m_audio_packets.Size() > 8) {
+            Common::AccurateSleep(milliseconds(5), nullptr, false);
             continue;
         }
         AVPacketPtr up_packet(av_packet_alloc(), &ReleaseAVPacket);
@@ -470,16 +548,21 @@ void AvPlayerSource::DemuxerThread(std::stop_token stop) {
                         const auto stream = m_avformat_context->streams[index];
                         avformat_seek_file(m_avformat_context.get(), index, 0, 0, stream->duration,
                                            0);
+                        m_video_flush_pending.store(true);
+                        m_video_packets_cv.Notify();
                     }
                     if (m_audio_stream_index.has_value()) {
                         const auto index = m_audio_stream_index.value();
                         const auto stream = m_avformat_context->streams[index];
                         avformat_seek_file(m_avformat_context.get(), index, 0, 0, stream->duration,
                                            0);
+                        m_audio_flush_pending.store(true);
+                        m_audio_packets_cv.Notify();
                     }
                     continue;
                 } else {
                     LOG_INFO(Lib_AvPlayer, "EOF reached in demuxer. Exiting.");
+                    natural_eof = true;
                     break;
                 }
             } else {
@@ -504,10 +587,17 @@ void AvPlayerSource::DemuxerThread(std::stop_token stop) {
     m_audio_packets_cv.Notify();
     m_video_frames_cv.Notify();
     m_audio_frames_cv.Notify();
+    // Wake decoder buffer-wait loops so they can observe m_is_eof and bail
+    // out cleanly if the game has stopped recycling buffers.
+    m_video_buffers_cv.Notify();
+    m_audio_buffers_cv.Notify();
 
     m_video_decoder_thread.Join();
     m_audio_decoder_thread.Join();
-    m_state.OnEOF();
+
+    if (natural_eof) {
+        m_state.OnEOF();
+    }
 
     LOG_INFO(Lib_AvPlayer, "Demuxer Thread exited normally");
 }
@@ -516,6 +606,7 @@ AvPlayerSource::AVFramePtr AvPlayerSource::ConvertVideoFrame(const AVFrame& fram
     auto nv12_frame = AVFramePtr{av_frame_alloc(), &ReleaseAVFrame};
     nv12_frame->pts = frame.pts;
     nv12_frame->pkt_dts = frame.pkt_dts < 0 ? 0 : frame.pkt_dts;
+    nv12_frame->best_effort_timestamp = frame.best_effort_timestamp;
     nv12_frame->format = AV_PIX_FMT_NV12;
     nv12_frame->width = frame.width;
     nv12_frame->height = frame.height;
@@ -544,25 +635,27 @@ AvPlayerSource::AVFramePtr AvPlayerSource::ConvertVideoFrame(const AVFrame& fram
 }
 
 static void CopyNV12Data(u8* dst, const AVFrame& src, bool use_vdec2) {
-    auto width = u32(src.width);
-    auto height = u32(src.height);
-    if (!use_vdec2) {
-        width = Common::AlignUp(width, 16);
-        height = Common::AlignUp(height, 16);
+    // Match ImageSizeLinearAligned pitch (tile.h): max(8, 64/Bpp) = 64 for R8.
+    const u32 pitch = Common::AlignUp(u32(src.width), 64u);
+    const u32 src_stride_y = u32(src.linesize[0]);
+    const u32 src_stride_uv = u32(src.linesize[1]);
+    const u32 frame_h = u32(src.height);
+
+    if (pitch == src_stride_y) {
+        std::memcpy(dst, src.data[0], pitch * frame_h);
+    } else {
+        for (u32 y = 0; y < frame_h; ++y) {
+            std::memcpy(dst + y * pitch, src.data[0] + y * src_stride_y, src.width);
+        }
     }
 
-    if (src.width == width) {
-        std::memcpy(dst, src.data[0], src.width * src.height);
-        std::memcpy(dst + src.width * height, src.data[1], (src.width * src.height) / 2);
+    u8* chroma_dst = dst + pitch * frame_h;
+    const u32 uv_h = frame_h / 2;
+    if (pitch == src_stride_uv) {
+        std::memcpy(chroma_dst, src.data[1], pitch * uv_h);
     } else {
-        const auto luma_dst = dst;
-        for (u32 y = 0; y < src.height; ++y) {
-            std::memcpy(luma_dst + y * width, src.data[0] + y * src.width, src.width);
-        }
-        const auto chroma_dst = dst + width * height;
-        for (u32 y = 0; y < src.height / 2; ++y) {
-            std::memcpy(chroma_dst + y * (width / 2), src.data[0] + y * (src.width / 2),
-                        src.width / 2);
+        for (u32 y = 0; y < uv_h; ++y) {
+            std::memcpy(chroma_dst + y * pitch, src.data[1] + y * src_stride_uv, src.width);
         }
     }
 }
@@ -573,19 +666,46 @@ Frame AvPlayerSource::PrepareVideoFrame(GuestBuffer buffer, const AVFrame& frame
     auto p_buffer = buffer.GetBuffer();
     CopyNV12Data(p_buffer, frame, m_use_vdec2);
 
-    const auto pkt_dts = u64(frame.pkt_dts) * 1000;
+    // PTS-based timestamp; AV_NOPTS_VALUE handled to avoid u64 overflow.
+    s64 raw_ts = frame.best_effort_timestamp;
+    if (raw_ts == AV_NOPTS_VALUE) {
+        raw_ts = frame.pts != AV_NOPTS_VALUE ? frame.pts : frame.pkt_dts;
+    }
+    if (raw_ts == AV_NOPTS_VALUE || raw_ts < 0) {
+        raw_ts = 0;
+    }
+    const u64 ts_units = u64(raw_ts) * 1000;
     const auto stream = m_avformat_context->streams[m_video_stream_index.value()];
     const auto time_base = stream->time_base;
     const auto den = time_base.den;
     const auto num = time_base.num;
-    const auto timestamp = (num != 0 && den > 1) ? (pkt_dts * num) / den : pkt_dts;
+    const auto timestamp = (num != 0 && den > 1) ? (ts_units * num) / den : ts_units;
 
-    auto width = u32(frame.width);
-    auto height = u32(frame.height);
-    if (!m_use_vdec2) {
-        width = Common::AlignUp(width, 16);
-        height = Common::AlignUp(height, 16);
+    // Throttled diagnostic: log raw timestamp fields once per second so we can
+    // see whether the FFmpeg-decoded frame ordering is sane (out-of-order
+    // best_effort_timestamp would explain jitter).
+    {
+        using namespace std::chrono;
+        static std::atomic<int64_t> s_next_log_ms{0};
+        const auto now_ms =
+            duration_cast<milliseconds>(steady_clock::now().time_since_epoch()).count();
+        int64_t expected = s_next_log_ms.load(std::memory_order_relaxed);
+        if (now_ms >= expected && s_next_log_ms.compare_exchange_strong(expected, now_ms + 1000)) {
+            LOG_INFO(Lib_AvPlayer,
+                     "PrepareVideoFrame: pts={} dts={} best_effort={} -> ts={}ms tb={}/{}",
+                     s64(frame.pts), s64(frame.pkt_dts), s64(frame.best_effort_timestamp),
+                     timestamp, num, den);
+        }
     }
+
+    const u32 width = u32(frame.width);
+    const u32 height = u32(frame.height);
+    // Match ImageSizeLinearAligned pitch (tile.h): max(8, 64/Bpp) = 64 for R8.
+    const u32 pitch = Common::AlignUp(width, 64u);
+    // PS4's sceAvPlayerGetVideoDataEx adjusts crop_right by the row
+    // padding so the reported value is relative to the buffer pitch, not
+    // the codec's coded width.
+    const u32 crop_right_offset = u32(frame.crop_right) + (pitch - width);
 
     return Frame{
         .buffer = std::move(buffer),
@@ -601,11 +721,10 @@ Frame AvPlayerSource::PrepareVideoFrame(GuestBuffer buffer, const AVFrame& frame
                                 .height = height,
                                 .aspect_ratio = (float)av_q2d(frame.sample_aspect_ratio),
                                 .crop_left_offset = u32(frame.crop_left),
-                                .crop_right_offset = u32(frame.crop_right + (width - frame.width)),
+                                .crop_right_offset = crop_right_offset,
                                 .crop_top_offset = u32(frame.crop_top),
-                                .crop_bottom_offset =
-                                    u32(frame.crop_bottom + (height - frame.height)),
-                                .pitch = u32(frame.linesize[0]),
+                                .crop_bottom_offset = u32(frame.crop_bottom),
+                                .pitch = pitch,
                                 .luma_bit_depth = 8,
                                 .chroma_bit_depth = 8,
                             },
@@ -619,17 +738,30 @@ void AvPlayerSource::VideoDecoderThread(std::stop_token stop) {
     Common::SetCurrentThreadName("shadPS4:AvVideoDecoder");
 
     LOG_INFO(Lib_AvPlayer, "Video Decoder Thread started");
-    while ((!m_is_eof || m_video_packets.Size() != 0) && !stop.stop_requested()) {
+    bool flush_sent = false;
+    while ((!m_is_eof || m_video_packets.Size() != 0 || !flush_sent) && !stop.stop_requested()) {
+        if (m_video_flush_pending.exchange(false)) {
+            avcodec_flush_buffers(m_video_codec_context.get());
+            flush_sent = false;
+        }
         if (!m_video_packets_cv.Wait(stop,
                                      [this] { return m_video_packets.Size() != 0 || m_is_eof; })) {
             continue;
         }
         const auto packet = m_video_packets.Pop();
-        if (!packet.has_value()) {
+        AVPacket* raw_packet = nullptr;
+        if (packet.has_value()) {
+            raw_packet = packet->get();
+        } else if (m_is_eof && !flush_sent) {
+            // Feed NULL once to enter drain mode and flush
+            // any frames buffered for B-frame reorder. Without this, the last
+            // few frames are silently dropped at end of stream.
+            flush_sent = true;
+        } else {
             continue;
         }
 
-        auto res = avcodec_send_packet(m_video_codec_context.get(), packet->get());
+        auto res = avcodec_send_packet(m_video_codec_context.get(), raw_packet);
         if (res < 0 && res != AVERROR(EAGAIN)) {
             m_state.OnError();
             LOG_ERROR(Lib_AvPlayer, "Could not send packet to the video codec. Error = {}",
@@ -637,11 +769,17 @@ void AvPlayerSource::VideoDecoderThread(std::stop_token stop) {
             return;
         }
         while (res >= 0) {
-            if (!m_video_buffers_cv.Wait(stop, [this] { return m_video_buffers.Size() != 0; })) {
+            if (!m_video_buffers_cv.Wait(
+                    stop, [this] { return m_video_buffers.Size() != 0 || m_is_eof; })) {
                 break;
             }
             if (m_video_buffers.Size() == 0) {
-                continue;
+                // m_is_eof is true and the game has stopped recycling buffers
+                // (it's waiting for StateStop before its next loop
+                // iteration). We cannot drain further; abandon the trailing
+                // FFmpeg-internal B-frames and exit. Cleanup transitions state and
+                // the decoder threads simply stop.
+                return;
             }
             auto up_frame = AVFramePtr(av_frame_alloc(), &ReleaseAVFrame);
             res = avcodec_receive_frame(m_video_codec_context.get(), up_frame.get());
@@ -696,7 +834,7 @@ AvPlayerSource::AVFramePtr AvPlayerSource::ConvertAudioFrame(const AVFrame& fram
     }
     const auto res = swr_convert_frame(m_swr_context.get(), pcm16_frame.get(), &frame);
     if (res < 0) {
-        LOG_ERROR(Lib_AvPlayer, "Could not convert to NV12: {}", av_err2str(res));
+        LOG_ERROR(Lib_AvPlayer, "Could not convert audio to S16: {}", av_err2str(res));
         return AVFramePtr{nullptr, &ReleaseAVFrame};
     }
     return pcm16_frame;
@@ -710,12 +848,21 @@ Frame AvPlayerSource::PrepareAudioFrame(GuestBuffer buffer, const AVFrame& frame
     const auto size = frame.ch_layout.nb_channels * frame.nb_samples * sizeof(u16);
     std::memcpy(p_buffer, frame.data[0], size);
 
-    const auto pkt_dts = u64(frame.pkt_dts) * 1000;
+    // Use best_effort_timestamp for the same reasons as video (AV_NOPTS_VALUE
+    // safety, PTS-first ordering). For audio dts == pts in normal AAC streams.
+    s64 raw_ts = frame.best_effort_timestamp;
+    if (raw_ts == AV_NOPTS_VALUE) {
+        raw_ts = frame.pts != AV_NOPTS_VALUE ? frame.pts : frame.pkt_dts;
+    }
+    if (raw_ts == AV_NOPTS_VALUE || raw_ts < 0) {
+        raw_ts = 0;
+    }
+    const u64 ts_units = u64(raw_ts) * 1000;
     const auto stream = m_avformat_context->streams[m_audio_stream_index.value()];
     const auto time_base = stream->time_base;
     const auto den = time_base.den;
     const auto num = time_base.num;
-    const auto timestamp = (num != 0 && den > 1) ? (pkt_dts * num) / den : pkt_dts;
+    const auto timestamp = (num != 0 && den > 1) ? (ts_units * num) / den : ts_units;
 
     return Frame{
         .buffer = std::move(buffer),
@@ -741,16 +888,29 @@ void AvPlayerSource::AudioDecoderThread(std::stop_token stop) {
     Common::SetCurrentThreadName("shadPS4:AvAudioDecoder");
 
     LOG_INFO(Lib_AvPlayer, "Audio Decoder Thread started");
-    while ((!m_is_eof || m_audio_packets.Size() != 0) && !stop.stop_requested()) {
+    bool flush_sent = false;
+    while ((!m_is_eof || m_audio_packets.Size() != 0 || !flush_sent) && !stop.stop_requested()) {
+        if (m_audio_flush_pending.exchange(false)) {
+            avcodec_flush_buffers(m_audio_codec_context.get());
+            flush_sent = false;
+        }
         if (!m_audio_packets_cv.Wait(stop,
                                      [this] { return m_audio_packets.Size() != 0 || m_is_eof; })) {
             continue;
         }
         const auto packet = m_audio_packets.Pop();
-        if (!packet.has_value()) {
+        AVPacket* raw_packet = nullptr;
+        if (packet.has_value()) {
+            raw_packet = packet->get();
+        } else if (m_is_eof && !flush_sent) {
+            // Feed NULL once to enter drain mode and flush any
+            // frames buffered internally. Without this, the trailing audio
+            // samples are silently dropped at end of stream.
+            flush_sent = true;
+        } else {
             continue;
         }
-        auto res = avcodec_send_packet(m_audio_codec_context.get(), packet->get());
+        auto res = avcodec_send_packet(m_audio_codec_context.get(), raw_packet);
         if (res < 0 && res != AVERROR(EAGAIN)) {
             m_state.OnError();
             LOG_ERROR(Lib_AvPlayer, "Could not send packet to the audio codec. Error = {}",
@@ -758,11 +918,13 @@ void AvPlayerSource::AudioDecoderThread(std::stop_token stop) {
             return;
         }
         while (res >= 0) {
-            if (!m_audio_buffers_cv.Wait(stop, [this] { return m_audio_buffers.Size() != 0; })) {
+            if (!m_audio_buffers_cv.Wait(
+                    stop, [this] { return m_audio_buffers.Size() != 0 || m_is_eof; })) {
                 break;
             }
             if (m_audio_buffers.Size() == 0) {
-                continue;
+                // See comment on the equivalent path in VideoDecoderThread.
+                return;
             }
 
             auto up_frame = AVFramePtr(av_frame_alloc(), &ReleaseAVFrame);
