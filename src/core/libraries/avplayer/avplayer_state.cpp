@@ -281,21 +281,20 @@ bool AvPlayerState::Stop() {
     if (m_up_source == nullptr || m_current_state == AvState::Stop) {
         return false;
     }
-    // Stop is a silent no-op when player is in Unknown/Initial state.
-    // "Stop not required from state: %d" path returns
+    // Per .sprx 0xef20/0xea80: Stop is a silent no-op when player is in
+    // Unknown/Initial state. "Stop not required from state: %d" path returns
     // success without invoking the cleanup that emits StateStop.
     const AvState cur = m_current_state.load();
     if (cur == AvState::Unknown || cur == AvState::Initial) {
         LOG_INFO(Lib_AvPlayer, "Stop not required from state: {}", magic_enum::enum_name(cur));
         return true;
     }
-    if (!m_up_source->Stop()) {
-        return false;
-    }
-    if (!SetState(AvState::Stop)) {
-        return false;
-    }
-    OnPlaybackStateChanged(AvState::Stop);
+    // EXPERIMENT: treat Stop from game as "skip permission" rather than
+    // immediate teardown. Don't tear down decoder threads or transition
+    // state; just acknowledge. Actual cleanup happens at natural EOF or
+    // sceAvPlayerClose.
+    LOG_INFO(Lib_AvPlayer, "Stop ignored (skip-permission experiment), state={}",
+             magic_enum::enum_name(cur));
     return true;
 }
 
@@ -475,8 +474,8 @@ void AvPlayerState::ProcessEvent() {
             break;
         }
         if (target == AvState::EndOfFile) {
-            // Only AvPlayerStop and AvPlayerClose
-            // emit StateStop. Natural EOF just transitions
+            // Per .sprx 0xeb4a / 0xf320: only sceAvPlayerStop and
+            // sceAvPlayerClose emit StateStop. Natural EOF just transitions
             // state internally; the game discovers completion via
             // sceAvPlayerIsActive returning false and then calls Stop, which
             // emits StateStop on its normal cleanup path.
