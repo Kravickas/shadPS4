@@ -548,18 +548,16 @@ void AvPlayerSource::DemuxerThread(std::stop_token stop) {
                         const auto stream = m_avformat_context->streams[index];
                         avformat_seek_file(m_avformat_context.get(), index, 0, 0, stream->duration,
                                            0);
-                        if (m_video_codec_context) {
-                            avcodec_flush_buffers(m_video_codec_context.get());
-                        }
+                        m_video_flush_pending.store(true);
+                        m_video_packets_cv.Notify();
                     }
                     if (m_audio_stream_index.has_value()) {
                         const auto index = m_audio_stream_index.value();
                         const auto stream = m_avformat_context->streams[index];
                         avformat_seek_file(m_avformat_context.get(), index, 0, 0, stream->duration,
                                            0);
-                        if (m_audio_codec_context) {
-                            avcodec_flush_buffers(m_audio_codec_context.get());
-                        }
+                        m_audio_flush_pending.store(true);
+                        m_audio_packets_cv.Notify();
                     }
                     continue;
                 } else {
@@ -742,6 +740,10 @@ void AvPlayerSource::VideoDecoderThread(std::stop_token stop) {
     LOG_INFO(Lib_AvPlayer, "Video Decoder Thread started");
     bool flush_sent = false;
     while ((!m_is_eof || m_video_packets.Size() != 0 || !flush_sent) && !stop.stop_requested()) {
+        if (m_video_flush_pending.exchange(false)) {
+            avcodec_flush_buffers(m_video_codec_context.get());
+            flush_sent = false;
+        }
         if (!m_video_packets_cv.Wait(stop,
                                      [this] { return m_video_packets.Size() != 0 || m_is_eof; })) {
             continue;
@@ -888,6 +890,10 @@ void AvPlayerSource::AudioDecoderThread(std::stop_token stop) {
     LOG_INFO(Lib_AvPlayer, "Audio Decoder Thread started");
     bool flush_sent = false;
     while ((!m_is_eof || m_audio_packets.Size() != 0 || !flush_sent) && !stop.stop_requested()) {
+        if (m_audio_flush_pending.exchange(false)) {
+            avcodec_flush_buffers(m_audio_codec_context.get());
+            flush_sent = false;
+        }
         if (!m_audio_packets_cv.Wait(stop,
                                      [this] { return m_audio_packets.Size() != 0 || m_is_eof; })) {
             continue;
