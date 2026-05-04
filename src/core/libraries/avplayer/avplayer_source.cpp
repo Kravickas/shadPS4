@@ -277,8 +277,7 @@ bool AvPlayerSource::Stop() {
         m_up_data_streamer->Reset();
     }
 
-    // .Stop() is idempotent on a non-Joinable thread; both paths above end
-    // up here, and threads that have already exited are a no-op.
+    // Stop() blocks until the thread exits; safe on already-exited threads.
     m_video_decoder_thread.Stop();
     m_audio_decoder_thread.Stop();
     m_demuxer_thread.Stop();
