@@ -210,6 +210,7 @@ private:
     AvPlayerQueue<Frame> m_video_frames;
 
     std::optional<Frame> m_current_video_frame;
+    std::optional<Frame> m_previous_video_frame;
     std::optional<Frame> m_current_audio_frame;
 
     std::optional<s32> m_video_stream_index{};
