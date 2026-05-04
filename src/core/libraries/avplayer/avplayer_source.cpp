@@ -285,6 +285,7 @@ bool AvPlayerSource::Stop() {
 
     m_current_audio_frame.reset();
     m_current_video_frame.reset();
+    m_previous_video_frame.reset();
 
     m_video_buffers.Clear();
     m_audio_buffers.Clear();
@@ -329,10 +330,16 @@ bool AvPlayerSource::GetVideoData(AvPlayerFrameInfo& video_info) {
 }
 
 bool AvPlayerSource::GetVideoData(AvPlayerFrameInfoEx& video_info) {
-    if (m_current_video_frame.has_value()) {
-        m_video_buffers.Push(std::move(m_current_video_frame->buffer));
-        m_current_video_frame.reset();
+    // Stage one frame back. This guards against the GPU still
+    // reading the data of frame N when the game asks for frame N+1.
+    if (m_previous_video_frame.has_value()) {
+        m_video_buffers.Push(std::move(m_previous_video_frame->buffer));
+        m_previous_video_frame.reset();
         m_video_buffers_cv.Notify();
+    }
+    if (m_current_video_frame.has_value()) {
+        m_previous_video_frame = std::move(m_current_video_frame);
+        m_current_video_frame.reset();
     }
 
     enum class Result { Released, NotActive, Paused, NoFrame, Early };
