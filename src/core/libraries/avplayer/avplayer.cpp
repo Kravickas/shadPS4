@@ -37,6 +37,11 @@ s32 PS4_SYSV_ABI sceAvPlayerClose(AvPlayerHandle handle) {
     if (handle == nullptr) {
         return ORBIS_AVPLAYER_ERROR_INVALID_PARAMS;
     }
+    // Close emits StateStop on the way out. Run Stop through the state
+    // path before tearing down so the event reaches the game;
+    // ignore the return value (already-Stop / no-source returns
+    // false but isn't an error here).
+    handle->Stop();
     delete handle;
     return ORBIS_OK;
 }
