@@ -1,13 +1,21 @@
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <shared_mutex>
 #include <thread>
+#include <unordered_set>
 #include "common/assert.h"
+#include "common/logging/log.h"
 #include "common/types.h"
 #include "core/libraries/kernel/kernel.h"
 #include "core/libraries/kernel/posix_error.h"
 #include "core/libraries/kernel/threads/pthread.h"
 #include "core/libraries/libs.h"
+
+#ifdef _WIN64
+#include <intrin.h>
+#include <windows.h>
+#endif
 
 namespace Libraries::Kernel {
 
@@ -19,6 +27,132 @@ static std::mutex MutxStaticLock;
 #define THR_MUTEX_DESTROYED ((PthreadMutex*)2)
 
 #define CPU_SPINWAIT __asm__ volatile("pause")
+
+static std::shared_mutex g_diag_lock;
+static std::unordered_set<const void*> g_seen_slots;
+static std::unordered_set<const void*> g_alloc_pmutexes;
+
+static void DiagRecordSlot(const void* slot) {
+    std::unique_lock lk{g_diag_lock};
+    g_seen_slots.insert(slot);
+}
+
+static void DiagRecordAlloc(const void* pmutex) {
+    std::unique_lock lk{g_diag_lock};
+    g_alloc_pmutexes.insert(pmutex);
+}
+
+static void DiagForgetAlloc(const void* pmutex) {
+    std::unique_lock lk{g_diag_lock};
+    g_alloc_pmutexes.erase(pmutex);
+}
+
+enum class MutexClass {
+    Unknown,
+    Slot,
+    HeapPmutex,
+    Both,
+};
+
+static MutexClass DiagClassify(const void* p) {
+    std::shared_lock lk{g_diag_lock};
+    const bool is_slot = g_seen_slots.find(p) != g_seen_slots.end();
+    const bool is_alloc = g_alloc_pmutexes.find(p) != g_alloc_pmutexes.end();
+    if (is_slot && is_alloc) {
+        return MutexClass::Both;
+    }
+    if (is_slot) {
+        return MutexClass::Slot;
+    }
+    if (is_alloc) {
+        return MutexClass::HeapPmutex;
+    }
+    return MutexClass::Unknown;
+}
+
+static const char* DiagClassName(MutexClass c) {
+    switch (c) {
+    case MutexClass::Slot:
+        return "SLOT (game uses FreeBSD ABI; *mutex corrupted post-init)";
+    case MutexClass::HeapPmutex:
+        return "ALLOC (game passes heap pmutex* directly, v3 theory)";
+    case MutexClass::Both:
+        return "BOTH (impossible without heap aliasing — investigate)";
+    case MutexClass::Unknown:
+    default:
+        return "UNKNOWN (mutex_param never passed through shadPS4)";
+    }
+}
+
+static void DiagDumpMem(const char* label, const void* addr, size_t bytes) {
+#ifdef _WIN64
+    MEMORY_BASIC_INFORMATION mbi{};
+    if (VirtualQuery(addr, &mbi, sizeof(mbi)) == 0 || !(mbi.State & MEM_COMMIT) ||
+        (mbi.Protect & PAGE_NOACCESS) || (mbi.Protect & PAGE_GUARD)) {
+        LOG_CRITICAL(Kernel_Pthread, "[MTX-DIAG-V4]   {}: NOT readable", label);
+        return;
+    }
+    const u8* base = reinterpret_cast<const u8*>(mbi.BaseAddress);
+    const u8* p = reinterpret_cast<const u8*>(addr);
+    const size_t avail = mbi.RegionSize - static_cast<size_t>(p - base);
+    const size_t to_dump = avail < bytes ? avail : bytes;
+    std::string line;
+    line.reserve(80);
+    for (size_t i = 0; i < to_dump; ++i) {
+        line += fmt::format("{:02x} ", p[i]);
+        if ((i & 0xf) == 0xf || i == to_dump - 1) {
+            LOG_CRITICAL(Kernel_Pthread, "[MTX-DIAG-V4]   {}+{:#04x}: {}", label,
+                         i & ~size_t{0xf}, line);
+            line.clear();
+        }
+    }
+#else
+    (void)label;
+    (void)addr;
+    (void)bytes;
+#endif
+}
+
+static void DiagSuspiciousLock(const char* fn, PthreadMutexT* mutex, const void* return_addr) {
+    if (mutex == nullptr) {
+        LOG_CRITICAL(Kernel_Pthread, "[MTX-DIAG-V4] {}: mutex** NULL caller={}", fn,
+                     fmt::ptr(return_addr));
+        return;
+    }
+    const uintptr_t m_val = reinterpret_cast<uintptr_t>(*mutex);
+    if (m_val <= 2 || m_val >= 0x10000) {
+        return;
+    }
+
+    const MutexClass cls_param = DiagClassify(mutex);
+    const MutexClass cls_deref = DiagClassify(*mutex);
+
+    LOG_CRITICAL(Kernel_Pthread, "[MTX-DIAG-V4] ============================");
+    LOG_CRITICAL(Kernel_Pthread, "[MTX-DIAG-V4] {} suspicious *mutex={:#x}", fn, m_val);
+    LOG_CRITICAL(Kernel_Pthread, "[MTX-DIAG-V4]   mutex_param  = {}  classify={}",
+                 fmt::ptr(mutex), DiagClassName(cls_param));
+    LOG_CRITICAL(Kernel_Pthread, "[MTX-DIAG-V4]   *mutex value = {:#x} classify={}", m_val,
+                 DiagClassName(cls_deref));
+    LOG_CRITICAL(Kernel_Pthread, "[MTX-DIAG-V4]   caller PC    = {}", fmt::ptr(return_addr));
+    size_t n_slots = 0;
+    size_t n_allocs = 0;
+    {
+        std::shared_lock lk{g_diag_lock};
+        n_slots = g_seen_slots.size();
+        n_allocs = g_alloc_pmutexes.size();
+    }
+    LOG_CRITICAL(Kernel_Pthread, "[MTX-DIAG-V4]   slots_recorded={} allocs_live={}", n_slots,
+                 n_allocs);
+    DiagDumpMem("mutex_param_bytes", mutex, 80);
+}
+
+#ifdef _WIN64
+#define MTX_DIAG_LOCK(fn_name, mutex_ptr)                                                          \
+    DiagSuspiciousLock(fn_name, mutex_ptr, _ReturnAddress())
+#else
+#define MTX_DIAG_LOCK(fn_name, mutex_ptr)                                                          \
+    DiagSuspiciousLock(fn_name, mutex_ptr, __builtin_return_address(0))
+#endif
 
 #define CHECK_AND_INIT_MUTEX                                                                       \
     if (PthreadMutex* m = *mutex; m <= THR_MUTEX_DESTROYED) [[unlikely]] {                         \
@@ -75,6 +209,19 @@ static s32 MutexInit(PthreadMutexT* mutex, const PthreadMutexAttr* mutex_attr, c
         // pmutex->m_yieldloops = _thr_yieldloops;
     }
 
+    // v4 diagnostic: record both the slot the user passed and the heap
+    // PthreadMutex we allocated. Log the value already at *mutex so we can
+    // see if the game uses a static-init magic shadPS4 doesn't recognise
+    // (PS4 has 0/1/0x10000000000; shadPS4 has 0/1).
+    const void* slot = mutex;
+    const uintptr_t prior = reinterpret_cast<uintptr_t>(*mutex);
+    if (prior != 0 && prior != 1 && prior != 2) {
+        LOG_INFO(Kernel_Pthread, "[MTX-DIAG-V4-INIT] slot={} prior_*mutex={:#x} alloc={} name='{}'",
+                 fmt::ptr(slot), prior, fmt::ptr(pmutex), pmutex->name.c_str());
+    }
+    DiagRecordSlot(slot);
+    DiagRecordAlloc(pmutex);
+
     *mutex = pmutex;
     return 0;
 }
@@ -112,6 +259,7 @@ s32 PS4_SYSV_ABI posix_pthread_mutex_destroy(PthreadMutexT* mutex) {
         return POSIX_EBUSY;
     }
     *mutex = THR_MUTEX_DESTROYED;
+    DiagForgetAlloc(m);
     delete m;
     return 0;
 }
@@ -249,22 +397,26 @@ s32 PthreadMutex::TryLock() {
 }
 
 s32 PS4_SYSV_ABI posix_pthread_mutex_trylock(PthreadMutexT* mutex) {
+    MTX_DIAG_LOCK("posix_pthread_mutex_trylock", mutex);
     CHECK_AND_INIT_MUTEX
     return (*mutex)->TryLock();
 }
 
 s32 PS4_SYSV_ABI posix_pthread_mutex_lock(PthreadMutexT* mutex) {
+    MTX_DIAG_LOCK("posix_pthread_mutex_lock", mutex);
     CHECK_AND_INIT_MUTEX
     return (*mutex)->Lock(nullptr);
 }
 
 s32 PS4_SYSV_ABI posix_pthread_mutex_timedlock(PthreadMutexT* mutex,
                                                const OrbisKernelTimespec* abstime) {
+    MTX_DIAG_LOCK("posix_pthread_mutex_timedlock", mutex);
     CHECK_AND_INIT_MUTEX
     return (*mutex)->Lock(abstime);
 }
 
 s32 PS4_SYSV_ABI posix_pthread_mutex_reltimedlock_np(PthreadMutexT* mutex, u64 usec) {
+    MTX_DIAG_LOCK("posix_pthread_mutex_reltimedlock_np", mutex);
     CHECK_AND_INIT_MUTEX
     return (*mutex)->Lock(THR_RELTIME, usec);
 }
