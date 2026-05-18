@@ -163,9 +163,16 @@ static void DumpPostMortem(const CONTEXT* ctx) {
 
 static LONG WINAPI SignalHandler(EXCEPTION_POINTERS* pExp) noexcept {
     const auto* signals = Signals::Instance();
+    DWORD code = 0;
+    PVOID address = nullptr;
+
+    if (pExp != nullptr && pExp->ExceptionRecord != nullptr) {
+        code = pExp->ExceptionRecord->ExceptionCode;
+        address = pExp->ExceptionRecord->ExceptionAddress;
+    }
 
     bool handled = false;
-    switch (pExp->ExceptionRecord->ExceptionCode) {
+    switch (code) {
     case EXCEPTION_ACCESS_VIOLATION:
         handled = signals->DispatchAccessViolation(
             pExp, reinterpret_cast<void*>(pExp->ExceptionRecord->ExceptionInformation[1]));

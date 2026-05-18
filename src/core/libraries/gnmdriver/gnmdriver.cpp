@@ -308,47 +308,15 @@ void PS4_SYSV_ABI sceGnmDingDong(u32 gnm_vqid, u32 next_offs_dw) {
 
     auto& offs_dw = asc_next_offs_dw[vqid];
 
-    // PS4 ASC ring semantics. The host-emulated CP must only consume packets in
-    // the half-open dword range [offs_dw, next_offs_dw) of the ring, where
-    // offs_dw is the previously-recorded read pointer. Five cases:
-    //
-    //   1. next_offs_dw == offs_dw                      : no new work; return.
-    //   2. next_offs_dw == 0 && offs_dw == 0            : queue-arm / first
-    //                                                     DingDong before any
-    //                                                     packets are written;
-    //                                                     no work; return.
-    //   3. next_offs_dw  > offs_dw                      : submit [offs_dw, next).
-    //   4. next_offs_dw  < offs_dw && next_offs_dw > 0  : wrap; submit two
-    //                                                     slices [offs_dw, end)
-    //                                                     and [0, next_offs_dw).
-    //   5. next_offs_dw == 0 && offs_dw != 0            : wrap-to-zero; submit
-    //                                                     [offs_dw, end) only.
-    //
-    // The previous implementation collapsed (1), (2), (5) into a single fallback
-    // that submitted the entire remainder of the ring (`ring_size_dw - offs_dw`)
-    // whenever next_offs_dw was zero. For the queue-arm case (2) this caused the
-    // parser to walk over uninitialized ring memory, hit a zero header, and
-    // crash with "Invalid PM4 type 0" in ProcessCompute. RE Engine titles
-    // (DMC5, REmake, RE7, etc.) hit this on startup because they call
-    // DingDong(vqid, 0) once per ASC queue immediately after MapComputeQueue
-    // to arm the queues, then call DingDong(vqid, 4) when they actually have a
-    // first IB-jump packet to dispatch.
-
     if (next_offs_dw == offs_dw) {
-        // No new work since the last DingDong. Common after queue-arm or when
-        // the game polls without producing packets.
         return;
     }
 
-    const auto* ring_base = reinterpret_cast<const u32*>(asc_queue.map_addr);
-
-    if (next_offs_dw < offs_dw) {
-        // Wraparound case. Submit the [offs_dw, ring_end) tail first.
-        LOG_INFO(Lib_GnmDriver,
-                 "DingDong wraparound: submit head [offs_dw={}, ring_end={}) ({} dw)", offs_dw,
-                 asc_queue.ring_size_dw, asc_queue.ring_size_dw - offs_dw);
-        liverpool->SubmitAsc(gnm_vqid,
-                             {ring_base + offs_dw, asc_queue.ring_size_dw - offs_dw});
+    if (next_offs_dw < offs_dw && next_offs_dw != 0) {
+        // For cases if a submission is split at the end of the ring buffer, we need to submit it in
+        // two parts to handle the wrap
+        liverpool->SubmitAsc(gnm_vqid, {reinterpret_cast<const u32*>(asc_queue.map_addr) + offs_dw,
+                                        asc_queue.ring_size_dw - offs_dw});
         offs_dw = 0;
         if (next_offs_dw == 0) {
             // Wrap-to-zero: head was the entire remainder. No further slice.
@@ -2278,9 +2246,9 @@ int PS4_SYSV_ABI sceGnmSubmitCommandBuffersForWorkload(u32 workload, u32 count,
     }
 
     if (send_init_packet) {
-        if (sdk_version < Common::ElfInfo::FW_20) {
+        if (sdk_version < Common::ElfInfo::FW_200) {
             liverpool->SubmitGfx(InitSequence, {});
-        } else if (sdk_version < Common::ElfInfo::FW_40) {
+        } else if (sdk_version < Common::ElfInfo::FW_400) {
             if (sceKernelIsNeoMode()) {
                 if (!UseNeoCompatSequences) {
                     liverpool->SubmitGfx(InitSequence200Neo, {});
@@ -2862,7 +2830,7 @@ int PS4_SYSV_ABI Func_C4C328B7CF3B4171() {
 
 int PS4_SYSV_ABI sceGnmDrawInitToDefaultContextStateInternalCommand(u32* cmdbuf, u32 size) {
     LOG_TRACE(Lib_GnmDriver, "called");
-    if (sdk_version >= Common::ElfInfo::FW_40) {
+    if (sdk_version >= Common::ElfInfo::FW_400) {
         return sceGnmDrawInitToDefaultContextState400(cmdbuf, size);
     }
     return sceGnmDrawInitToDefaultContextState(cmdbuf, size);
@@ -2870,7 +2838,7 @@ int PS4_SYSV_ABI sceGnmDrawInitToDefaultContextStateInternalCommand(u32* cmdbuf,
 
 int PS4_SYSV_ABI sceGnmDrawInitToDefaultContextStateInternalSize() {
     LOG_TRACE(Lib_GnmDriver, "called");
-    if (sdk_version >= Common::ElfInfo::FW_40) {
+    if (sdk_version >= Common::ElfInfo::FW_400) {
         return 0x100;
     }
     return 0x20;
