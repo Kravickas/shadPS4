@@ -1,6 +1,8 @@
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <iterator>
+#include <string>
 #include <boost/preprocessor/stringize.hpp>
 
 #include "common/assert.h"
@@ -194,14 +196,34 @@ Liverpool::Task Liverpool::ProcessCeUpdate(std::span<const u32> ccb) {
         }
         case PM4ItOpcode::IndirectBufferConst: {
             const auto* indirect_buffer = reinterpret_cast<const PM4CmdIndirectBuffer*>(header);
-            auto task =
-                ProcessCeUpdate({indirect_buffer->Address<const u32>(), indirect_buffer->ib_size});
+            // When IsCopyGpuBuffers is enabled, snapshot the IB into the nested
+            // task's promise. On PS4 the CP reads an IB at the moment it
+            // reaches the IndirectBuffer packet; shadPS4 emulates that here,
+            // but because the emulated parser can be arbitrarily behind the
+            // guest timeline the game may be rewriting the IB memory already.
+            // The snapshot copy lets the nested coroutine parse stable bytes.
+            // When the user disables the setting we pass through the guest
+            // span unchanged, matching legacy (race-prone) behavior.
+            const auto* ib_src = indirect_buffer->Address<const u32>();
+            const std::span<const u32> ib_guest_span{ib_src, indirect_buffer->ib_size};
+
+            Task task{};
+            if (EmulatorSettings.IsCopyGpuBuffers()) {
+                auto ib_snap = std::make_unique<CmdSnapshot>();
+                ib_snap->ccb.assign(ib_src, ib_src + indirect_buffer->ib_size);
+                const std::span<const u32> ib_span{ib_snap->ccb};
+                task = ProcessCeUpdate(ib_span);
+                task.handle.promise().snapshot = std::move(ib_snap);
+            } else {
+                task = ProcessCeUpdate(ib_guest_span);
+            }
             RESUME_CE(task);
 
             while (!task.handle.done()) {
                 YIELD_CE();
                 RESUME_CE(task);
             }
+            task.handle.destroy();
             break;
         }
         default:
@@ -215,7 +237,8 @@ Liverpool::Task Liverpool::ProcessCeUpdate(std::span<const u32> ccb) {
     FIBER_EXIT;
 }
 
-Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<const u32> ccb) {
+Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<const u32> ccb,
+                                           uintptr_t dcb_guest_base) {
     FIBER_ENTER(dcb_task_name);
 
     cblock.Reset();
@@ -232,7 +255,16 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
     const bool host_markers_enabled = rasterizer && EmulatorSettings.IsVkHostMarkersEnabled();
     const bool guest_markers_enabled = rasterizer && EmulatorSettings.IsVkGuestMarkersEnabled();
 
-    const auto base_addr = reinterpret_cast<uintptr_t>(dcb.data());
+    // base_addr is the GUEST virtual address of the dcb being parsed, used by the
+    // debugger to annotate packets with their original PS4 memory location. When the
+    // dcb has been snapshotted into host memory (which is the case for every guest
+    // submission and every IB recursion in this build), dcb.data() points to the host
+    // copy and is meaningless to the debugger; the caller passes the original guest
+    // address as dcb_guest_base. When zero (host-synthesized init sequences) we fall
+    // back to dcb.data() to preserve the prior debug behavior for those.
+    const uintptr_t base_addr = dcb_guest_base != 0
+                                    ? dcb_guest_base
+                                    : reinterpret_cast<uintptr_t>(dcb.data());
     while (!dcb.empty()) {
         ProcessCommands();
 
@@ -823,14 +855,35 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
             }
             case PM4ItOpcode::IndirectBuffer: {
                 const auto* indirect_buffer = reinterpret_cast<const PM4CmdIndirectBuffer*>(header);
-                auto task = ProcessGraphics(
-                    {indirect_buffer->Address<const u32>(), indirect_buffer->ib_size}, {});
+                // See rationale in ProcessCeUpdate::IndirectBufferConst above:
+                // when the setting is on, snapshot the IB contents into the
+                // nested coroutine's promise so the parser is insulated from
+                // the guest rewriting IB memory before (or while) the emulated
+                // CP reaches the packets. Many games (KNACK, Bloodborne, etc.)
+                // recycle IB memory across frames and the race here produces
+                // PKT0 desync crashes. When the setting is off we pass through
+                // the guest span and accept the legacy behavior.
+                const auto* ib_src = indirect_buffer->Address<const u32>();
+                const std::span<const u32> ib_guest_span{ib_src, indirect_buffer->ib_size};
+                const uintptr_t ib_guest_base = reinterpret_cast<uintptr_t>(ib_src);
+
+                Task task{};
+                if (EmulatorSettings.IsCopyGpuBuffers()) {
+                    auto ib_snap = std::make_unique<CmdSnapshot>();
+                    ib_snap->dcb.assign(ib_src, ib_src + indirect_buffer->ib_size);
+                    const std::span<const u32> ib_span{ib_snap->dcb};
+                    task = ProcessGraphics(ib_span, {}, ib_guest_base);
+                    task.handle.promise().snapshot = std::move(ib_snap);
+                } else {
+                    task = ProcessGraphics(ib_guest_span, {}, ib_guest_base);
+                }
                 RESUME_GFX(task);
 
                 while (!task.handle.done()) {
                     YIELD_GFX();
                     RESUME_GFX(task);
                 }
+                task.handle.destroy();
                 break;
             }
             case PM4ItOpcode::IncrementDeCounter: {
@@ -896,7 +949,8 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
 }
 
 template <bool is_indirect>
-Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
+Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid,
+                                          uintptr_t acb_guest_base) {
     FIBER_ENTER(acb_task_name[vqid]);
     auto& queue = asc_queues[{vqid}];
     const bool host_markers_enabled = rasterizer && EmulatorSettings.IsVkHostMarkersEnabled();
@@ -907,7 +961,18 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
     };
     boost::container::small_vector<IndirectPatch, 4> indirect_patches;
 
-    auto base_addr = reinterpret_cast<VAddr>(acb.data());
+    // base_addr is the GUEST virtual address of this acb. It is compared against the
+    // guest virtual addresses encoded in DmaData packets to detect the GNM
+    // "DMA-then-DispatchDirect" self-patch pattern (where a game DMAs group dimensions
+    // into its own ACB just before a DispatchDirect, effectively making the dispatch
+    // indirect). The comparison is only meaningful when base_addr is in the guest
+    // address space. SubmitAsc passes the acb span directly from guest memory, so the
+    // legacy reinterpret_cast<VAddr>(acb.data()) yielded the right value; with IB
+    // recursion the acb span may instead point into a host snapshot, in which case
+    // the caller passes the original guest IB address as acb_guest_base.
+    const VAddr base_addr = acb_guest_base != 0
+                                ? static_cast<VAddr>(acb_guest_base)
+                                : reinterpret_cast<VAddr>(acb.data());
     size_t acb_size = acb.size_bytes();
     while (!acb.empty()) {
         ProcessCommands();
@@ -947,7 +1012,52 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
         }
 
         if (header->type != 3) {
-            // No other types of packets were spotted so far
+            // No other types of packets were spotted so far. When this fires it
+            // can mean (a) the parser drifted off-stream because a prior type-3
+            // opcode's NumWords() was wrong, (b) the ACB ring memory was
+            // rewritten by the guest while the parser was reading it, or
+            // (c) the game genuinely emitted a type-0 register-write packet
+            // that we don't implement. Dump enough surrounding context to
+            // distinguish those cases.
+            //
+            // offset_dw is the dword offset within the current acb span, NOT
+            // against the guest base; when this is a recursive (snapshotted)
+            // IB call, acb.data() is in host address space while base_addr is
+            // a guest VAddr, so subtracting them would be UB.
+            const u32 raw_header = *acb.data();
+            const u32 total_size_dw = static_cast<u32>(acb_size / sizeof(u32));
+            const u32 acb_remaining = static_cast<u32>(acb.size());
+            const u32 offset_dw = total_size_dw > acb_remaining
+                                      ? total_size_dw - acb_remaining
+                                      : 0u;
+            LOG_CRITICAL(
+                Render_Vulkan,
+                "ProcessCompute<is_indirect={}> non-type-3 PM4 header: vqid={}, header=0x{:08x} "
+                "(type={}, predicate={}, shader_type={}), guest_base=0x{:x}, host_acb=0x{:x}, "
+                "offset_dw={}, remaining_dw={}, total_dw={}, tmp_dwords={}",
+                static_cast<int>(is_indirect), vqid, raw_header,
+                static_cast<u32>(raw_header >> 30), static_cast<u32>((raw_header >> 0) & 1),
+                static_cast<u32>((raw_header >> 1) & 1), static_cast<u64>(base_addr),
+                reinterpret_cast<uintptr_t>(acb.data()), offset_dw, acb_remaining,
+                total_size_dw, queue.tmp_dwords);
+            // Surrounding dwords for stream-state visibility. Up to 16 dwords back
+            // (clamped to what we've consumed in this span) and 16 forward (clamped
+            // to what's left). All reads are within the current acb span only —
+            // never crossing into memory we don't own.
+            const u32 n_back = std::min<u32>(16u, offset_dw);
+            const u32 n_fwd = std::min<u32>(16u, acb_remaining);
+            std::string dump;
+            dump.reserve(8 + static_cast<size_t>(n_back + n_fwd) * 11);
+            for (u32 i = n_back; i > 0; --i) {
+                fmt::format_to(std::back_inserter(dump), "{:08x} ", *(acb.data() - i));
+            }
+            dump += "[";
+            fmt::format_to(std::back_inserter(dump), "{:08x}", *acb.data());
+            dump += "] ";
+            for (u32 i = 1; i < n_fwd; ++i) {
+                fmt::format_to(std::back_inserter(dump), "{:08x} ", *(acb.data() + i));
+            }
+            LOG_CRITICAL(Render_Vulkan, "ACB context: {}", dump);
             UNREACHABLE_MSG("Invalid PM4 type {}", header->type.Value());
         }
 
@@ -961,14 +1071,36 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
         }
         case PM4ItOpcode::IndirectBuffer: {
             const auto* indirect_buffer = reinterpret_cast<const PM4CmdIndirectBuffer*>(header);
-            auto task = ProcessCompute<true>(
-                {indirect_buffer->Address<const u32>(), indirect_buffer->ib_size}, vqid);
+            // Same rationale as the graphics IB handler: when the setting is
+            // on, snapshot the IB into the nested coroutine's promise so the
+            // parser reads stable bytes even if the guest rewrites the IB
+            // memory concurrently. We also pass the IB's original guest
+            // virtual address through so that the nested ProcessCompute can
+            // correctly recognize the GNM DMA-then-DispatchDirect self-patch
+            // pattern (whose detection compares packet destinations against
+            // the acb's guest base) regardless of whether the snapshot path
+            // or the legacy passthrough path is taken.
+            const auto* ib_src = indirect_buffer->Address<const u32>();
+            const std::span<const u32> ib_guest_span{ib_src, indirect_buffer->ib_size};
+            const uintptr_t ib_guest_base = reinterpret_cast<uintptr_t>(ib_src);
+
+            Task task{};
+            if (EmulatorSettings.IsCopyGpuBuffers()) {
+                auto ib_snap = std::make_unique<CmdSnapshot>();
+                ib_snap->dcb.assign(ib_src, ib_src + indirect_buffer->ib_size);
+                const std::span<const u32> ib_span{ib_snap->dcb};
+                task = ProcessCompute<true>(ib_span, vqid, ib_guest_base);
+                task.handle.promise().snapshot = std::move(ib_snap);
+            } else {
+                task = ProcessCompute<true>(ib_guest_span, vqid, ib_guest_base);
+            }
             RESUME_ASC(task, vqid);
 
             while (!task.handle.done()) {
                 YIELD_ASC(vqid);
                 RESUME_ASC(task, vqid);
             }
+            task.handle.destroy();
             break;
         }
         case PM4ItOpcode::DmaData: {
@@ -1166,47 +1298,44 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
     FIBER_EXIT;
 }
 
-Liverpool::CmdBuffer Liverpool::CopyCmdBuffers(std::span<const u32> dcb, std::span<const u32> ccb) {
-    auto& queue = mapped_queues[GfxQueueId];
-    ASSERT_MSG(queue.dcb_buffer.capacity() >= queue.dcb_buffer_offset + dcb.size(),
-               "dcb copy buffer out of reserved space");
-    ASSERT_MSG(queue.ccb_buffer.capacity() >= queue.ccb_buffer_offset + ccb.size(),
-               "ccb copy buffer out of reserved space");
-
-    queue.dcb_buffer.resize(
-        std::max(queue.dcb_buffer.size(), queue.dcb_buffer_offset + dcb.size()));
-    queue.ccb_buffer.resize(
-        std::max(queue.ccb_buffer.size(), queue.ccb_buffer_offset + ccb.size()));
-
-    const u32 prev_dcb_buffer_offset = queue.dcb_buffer_offset;
-    const u32 prev_ccb_buffer_offset = queue.ccb_buffer_offset;
-    if (!dcb.empty()) {
-        std::memcpy(queue.dcb_buffer.data() + queue.dcb_buffer_offset, dcb.data(),
-                    dcb.size_bytes());
-        queue.dcb_buffer_offset += dcb.size();
-        dcb = std::span<const u32>{queue.dcb_buffer.begin() + prev_dcb_buffer_offset,
-                                   queue.dcb_buffer.begin() + queue.dcb_buffer_offset};
-    }
-
-    if (!ccb.empty()) {
-        std::memcpy(queue.ccb_buffer.data() + queue.ccb_buffer_offset, ccb.data(),
-                    ccb.size_bytes());
-        queue.ccb_buffer_offset += ccb.size();
-        ccb = std::span<const u32>{queue.ccb_buffer.begin() + prev_ccb_buffer_offset,
-                                   queue.ccb_buffer.begin() + queue.ccb_buffer_offset};
-    }
-
-    return std::make_pair(dcb, ccb);
-}
-
-void Liverpool::SubmitGfx(std::span<const u32> dcb, std::span<const u32> ccb) {
+void Liverpool::SubmitGfx(std::span<const u32> dcb, std::span<const u32> ccb,
+                          uintptr_t dcb_guest_base) {
     auto& queue = mapped_queues[GfxQueueId];
 
+    // When IsCopyGpuBuffers is enabled (default), snapshot DCB and CCB
+    // synchronously on the submitting thread before the coroutine is enqueued.
+    // On real hardware the CP latches command buffer memory via cache-coherent
+    // reads at submit time and the game must not touch it until the
+    // submission's fence completes; some games (KNACK, Bloodborne, etc.)
+    // rewrite the memory earlier than the emulator's parser reaches it, which
+    // without a snapshot yields torn reads and a PKT0 crash.
+    //
+    // The snapshot is owned by the coroutine's promise, so its lifetime is
+    // tied to the coroutine frame and it is freed by handle.destroy().
+    //
+    // dcb_guest_base is forwarded so that downstream debugger annotations
+    // (DebugState.PushRegsDump) keep showing the original PS4 virtual address
+    // rather than the host snapshot pointer.
+    //
+    // When the user disables the setting (diagnostic / perf testing) we pass
+    // the guest spans through unchanged, matching legacy behavior. The CB
+    // memory is then read directly from guest VRAM and is subject to the
+    // race described above.
+    Task task{};
     if (EmulatorSettings.IsCopyGpuBuffers()) {
-        std::tie(dcb, ccb) = CopyCmdBuffers(dcb, ccb);
+        auto snap = std::make_unique<CmdSnapshot>();
+        snap->dcb.assign(dcb.begin(), dcb.end());
+        snap->ccb.assign(ccb.begin(), ccb.end());
+
+        const std::span<const u32> dcb_span{snap->dcb};
+        const std::span<const u32> ccb_span{snap->ccb};
+
+        task = ProcessGraphics(dcb_span, ccb_span, dcb_guest_base);
+        task.handle.promise().snapshot = std::move(snap);
+    } else {
+        task = ProcessGraphics(dcb, ccb, dcb_guest_base);
     }
 
-    auto task = ProcessGraphics(dcb, ccb);
     {
         std::scoped_lock lock{queue.m_access};
         queue.submits.emplace(task.handle);

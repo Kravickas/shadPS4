@@ -6,6 +6,7 @@
 #include <condition_variable>
 #include <coroutine>
 #include <exception>
+#include <memory>
 #include <mutex>
 #include <semaphore>
 #include <span>
@@ -67,13 +68,15 @@ public:
     explicit Liverpool();
     ~Liverpool();
 
-    void SubmitGfx(std::span<const u32> dcb, std::span<const u32> ccb);
+    // dcb_guest_base is the guest virtual address of the dcb being submitted, used by
+    // the parser for in-CB self-patch detection (DMA-then-DispatchDirect) and for
+    // debugger annotation. Pass 0 for host-synthesized command buffers (init sequences).
+    void SubmitGfx(std::span<const u32> dcb, std::span<const u32> ccb,
+                   uintptr_t dcb_guest_base = 0);
     void SubmitAsc(u32 gnm_vqid, std::span<const u32> acb);
 
     void SubmitDone() noexcept {
         std::scoped_lock lk{submit_mutex};
-        mapped_queues[GfxQueueId].ccb_buffer_offset = 0;
-        mapped_queues[GfxQueueId].dcb_buffer_offset = 0;
         submit_done = true;
         submit_cv.notify_one();
     }
@@ -120,13 +123,13 @@ public:
         }
     }
 
-    void ReserveCopyBufferSpace() {
-        GpuQueue& gfx_queue = mapped_queues[GfxQueueId];
-        std::scoped_lock lk(gfx_queue.m_access);
-        constexpr size_t GfxReservedSize = 2_MB >> 2;
-        gfx_queue.ccb_buffer.reserve(GfxReservedSize);
-        gfx_queue.dcb_buffer.reserve(GfxReservedSize);
-    }
+    // Kept for ABI compatibility with the gnmdriver init path. The previous
+    // implementation pre-reserved a per-queue ring buffer used by the old
+    // CopyCmdBuffers path; that path has been replaced with per-task snapshots
+    // owned by each coroutine's promise, so no up-front reservation is needed.
+    // The function is intentionally a no-op rather than removed because
+    // gnmdriver.cpp's existing call site is preserved.
+    void ReserveCopyBufferSpace() {}
 
     inline ComputeProgram& GetCsRegs() {
         return mapped_queues[curr_qid].cs_state;
@@ -144,6 +147,16 @@ public:
     Common::SlotVector<AscQueueInfo> asc_queues{};
 
 private:
+    // Owns one submission's worth of PM4 data that the coroutine reads from. The
+    // pointer lives inside the Task's promise so its lifetime is tied to the
+    // coroutine frame: the memory is freed when Task::handle.destroy() runs.
+    // Used by SubmitGfx (top-level DCB/CCB) and by every IndirectBuffer site to
+    // isolate the parser from the guest rewriting packet memory concurrently.
+    struct CmdSnapshot {
+        std::vector<u32> dcb;
+        std::vector<u32> ccb;
+    };
+
     struct Task {
         struct promise_type {
             auto get_return_object() {
@@ -170,28 +183,32 @@ private:
             std::suspend_always yield_value(empty&&) {
                 return {};
             }
+
+            std::unique_ptr<CmdSnapshot> snapshot;
         };
 
         using Handle = std::coroutine_handle<promise_type>;
         Handle handle;
     };
 
-    using CmdBuffer = std::pair<std::span<const u32>, std::span<const u32>>;
-    CmdBuffer CopyCmdBuffers(std::span<const u32> dcb, std::span<const u32> ccb);
-    Task ProcessGraphics(std::span<const u32> dcb, std::span<const u32> ccb);
+    // The guest base parameters carry the original guest virtual address of the dcb/acb
+    // being parsed. They exist because a CB or IB may have been snapshotted into host
+    // memory for race-safe parsing, and downstream semantic checks (in-CB DMA
+    // self-patch detection in compute, debugger annotation in graphics) need the
+    // original guest VAddr - the host snapshot pointer is in a different address space
+    // and would silently mis-compare against guest addresses encoded in PM4 packets.
+    // Pass 0 to retain the legacy behavior of using the span's data pointer.
+    Task ProcessGraphics(std::span<const u32> dcb, std::span<const u32> ccb,
+                         uintptr_t dcb_guest_base = 0);
     Task ProcessCeUpdate(std::span<const u32> ccb);
     template <bool is_indirect = false>
-    Task ProcessCompute(std::span<const u32> acb, u32 vqid);
+    Task ProcessCompute(std::span<const u32> acb, u32 vqid, uintptr_t acb_guest_base = 0);
 
     void ProcessCommands();
     void Process(std::stop_token stoken);
 
     struct GpuQueue {
         std::mutex m_access{};
-        std::atomic<u32> dcb_buffer_offset;
-        std::atomic<u32> ccb_buffer_offset;
-        std::vector<u32> dcb_buffer;
-        std::vector<u32> ccb_buffer;
         std::queue<Task::Handle> submits{};
         ComputeProgram cs_state{};
     };
