@@ -5,6 +5,7 @@
 
 #include "common/assert.h"
 #include "common/debug.h"
+#include "common/div_ceil.h"
 #include "common/scope_exit.h"
 #include "core/emulator_settings.h"
 #include "core/memory.h"
@@ -26,7 +27,8 @@ TextureCache::TextureCache(const Vulkan::Instance& instance_, Vulkan::Scheduler&
                            PageManager& tracker_)
     : instance{instance_}, scheduler{scheduler_}, liverpool{liverpool_},
       buffer_cache{buffer_cache_}, tracker{tracker_}, blit_helper{instance, scheduler},
-      tile_manager{instance, scheduler, buffer_cache.GetUtilityBuffer(MemoryUsage::Stream)} {
+      tile_manager{instance, scheduler, buffer_cache.GetUtilityBuffer(MemoryUsage::Stream)},
+      readback_linear_images{EmulatorSettings.IsReadbackLinearImagesEnabled()} {
     // Create basic null image at fixed image ID.
     const auto null_id = GetNullImage(vk::Format::eR8G8B8A8Unorm);
     ASSERT(null_id.index == NULL_IMAGE_ID.index);
@@ -415,7 +417,7 @@ std::tuple<ImageId, int, int> TextureCache::ResolveOverlap(const ImageInfo& imag
                   cache_image.info.size.height, cache_image.info.size.depth, cache_image.info.pitch,
                   cache_image.info.resources.levels, cache_image.info.resources.layers,
                   cache_image.info.num_samples, static_cast<u32>(cache_image.info.tile_mode),
-                  cache_image.info.num_bits, cache_image.info.props.is_block,
+                  cache_image.info.num_bits, +cache_image.info.props.is_block,
                   cache_image.info.guest_size, cache_image.tick_accessed_last, safe_to_delete,
 
                   // New image details
@@ -641,8 +643,7 @@ ImageView& TextureCache::FindTexture(ImageId image_id, const ImageDesc& desc) {
     Image& image = slot_images[image_id];
     if (desc.type == BindingType::Storage) {
         image.flags |= ImageFlagBits::GpuModified;
-        if (EmulatorSettings.IsReadbackLinearImagesEnabled() && !image.info.props.is_tiled &&
-            image.info.guest_address != 0) {
+        if (readback_linear_images && !image.info.props.is_tiled && image.info.guest_address != 0) {
             download_images.emplace(image_id);
         }
     }
@@ -653,7 +654,7 @@ ImageView& TextureCache::FindTexture(ImageId image_id, const ImageDesc& desc) {
 ImageView& TextureCache::FindRenderTarget(ImageId image_id, const ImageDesc& desc) {
     Image& image = slot_images[image_id];
     image.flags |= ImageFlagBits::GpuModified;
-    if (EmulatorSettings.IsReadbackLinearImagesEnabled() && !image.info.props.is_tiled) {
+    if (readback_linear_images && !image.info.props.is_tiled) {
         download_images.emplace(image_id);
     }
     image.usage.render_target = 1u;
@@ -731,7 +732,10 @@ void TextureCache::RefreshImage(Image& image) {
         const auto addr = std::bit_cast<u8*>(image.info.guest_address);
         const u32 w = std::min(image.info.size.width, u32(8));
         const u32 h = std::min(image.info.size.height, u32(8));
-        const u32 size = w * h * image.info.num_bits >> (3 + image.info.props.is_block ? 4 : 0);
+
+        const u32 s_w = image.info.props.is_block ? Common::DivCeil(w, 4u) : w;
+        const u32 s_h = image.info.props.is_block ? Common::DivCeil(h, 4u) : h;
+        const u32 size = s_w * s_h * (image.info.num_bits / 8);
         const u64 hash = XXH3_64bits(addr, size);
         if (image.hash == hash) {
             image.flags &= ~ImageFlagBits::MaybeCpuDirty;

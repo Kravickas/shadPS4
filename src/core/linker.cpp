@@ -5,6 +5,7 @@
 #include "common/arch.h"
 #include "common/assert.h"
 #include "common/elf_info.h"
+#include "common/logging/formatter.h"
 #include "common/logging/log.h"
 #include "common/path_util.h"
 #include "common/string_util.h"
@@ -75,7 +76,7 @@ void Linker::Execute(const std::vector<std::string>& args) {
     }
 
     // Configure the direct and flexible memory regions.
-    u64 fmem_size = ORBIS_FLEXIBLE_MEMORY_SIZE;
+    u64 fmem_size = ORBIS_KERNEL_FLEXIBLE_MEMORY_SIZE;
     bool use_extended_mem1 = true, use_extended_mem2 = true;
 
     const auto* proc_param = GetProcParam();
@@ -88,7 +89,7 @@ void Linker::Execute(const std::vector<std::string>& args) {
             if (mem_param.size >=
                 offsetof(OrbisKernelMemParam, flexible_memory_size) + sizeof(u64*)) {
                 if (const auto* flexible_size = mem_param.flexible_memory_size) {
-                    fmem_size = *flexible_size + ORBIS_FLEXIBLE_MEMORY_BASE;
+                    fmem_size = *flexible_size + ORBIS_KERNEL_FLEXIBLE_MEMORY_BASE;
                 }
             }
         }
@@ -102,7 +103,7 @@ void Linker::Execute(const std::vector<std::string>& args) {
     }
 
     const u64 sdk_ver = proc_param->sdk_version;
-    if (sdk_ver < Common::ElfInfo::FW_50) {
+    if (sdk_ver < Common::ElfInfo::FW_500) {
         use_extended_mem1 = mem_param.extended_memory_1 ? *mem_param.extended_memory_1 : false;
         use_extended_mem2 = mem_param.extended_memory_2 ? *mem_param.extended_memory_2 : false;
     }
@@ -111,6 +112,8 @@ void Linker::Execute(const std::vector<std::string>& args) {
 
     main_thread.Run([this, module, &args](std::stop_token) {
         Common::SetCurrentThreadName("Game:Main");
+        std::set_terminate(Common::Log::Terminate);
+
 #ifndef _WIN32 // Clear any existing signal mask for game threads.
         sigset_t emptyset;
         sigemptyset(&emptyset);
@@ -122,6 +125,24 @@ void Linker::Execute(const std::vector<std::string>& args) {
 
         // Have libSceSysmodule preload our libraries.
         Libraries::SysModule::sceSysmodulePreloadModuleForLibkernel();
+
+        // Load and start custom modules from the user directory.
+        std::string_view id = Common::ElfInfo::Instance().GameSerial();
+        const auto& custom_mod_directory =
+            Common::FS::GetUserPath(Common::FS::PathType::CustomModulesDir) / id;
+        if (!std::filesystem::exists(custom_mod_directory)) {
+            std::filesystem::create_directory(custom_mod_directory);
+        }
+        for (const auto& entry : std::filesystem::directory_iterator(custom_mod_directory)) {
+            if (entry.is_regular_file()) {
+                LOG_INFO(Core_Linker, "Loading custom module: {}",
+                         fmt::UTF(entry.path().u8string()));
+                if (LoadAndStartModule(entry.path(), 0, nullptr, nullptr) == -1) {
+                    LOG_ERROR(Core_Linker, "Failed to load custom module: {}",
+                              fmt::UTF(entry.path().u8string()));
+                }
+            }
+        }
 
         // Simulate libSceGnmDriver initialization, which maps a chunk of direct memory.
         // Some games fail without accurately emulating this behavior.
@@ -135,19 +156,16 @@ void Linker::Execute(const std::vector<std::string>& args) {
         }
         ASSERT_MSG(result == 0, "Unable to emulate libSceGnmDriver initialization");
 
-        // Start main module.
+        // Add all guest arguments, we will always have the executable path in argv[0]
         EntryParams& params = Libraries::Kernel::entry_params;
-        params.argc = 1;
-        params.argv[0] = "eboot.bin";
-        if (!args.empty()) {
-            constexpr int MaxArgs = sizeof(params.argv) / sizeof(params.argv[0]);
-            params.argc = std::min<int>(args.size(), MaxArgs);
-            for (int i = 0; i < params.argc; i++) {
-                params.argv[i] = args[i].c_str();
-            }
+        constexpr int MaxArgs = sizeof(params.argv) / sizeof(params.argv[0]);
+        params.argc = std::min<int>(args.size(), MaxArgs);
+        for (int i = 0; i < params.argc; i++) {
+            params.argv[i] = args[i].c_str();
         }
+
+        // Run the game's entry function
         params.entry_addr = module->GetEntryAddress();
-        Libraries::Kernel::ClearStack();
         RunMainEntry(&params);
     });
 }
@@ -308,14 +326,6 @@ void Linker::Relocate(Module* module) {
     });
 }
 
-const Module* Linker::FindExportedModule(const ModuleInfo& module, const LibraryInfo& library) {
-    const auto it = std::ranges::find_if(m_modules, [&](const auto& m) {
-        return std::ranges::contains(m->GetExportLibs(), library) &&
-               std::ranges::contains(m->GetExportModules(), module);
-    });
-    return it == m_modules.end() ? nullptr : it->get();
-}
-
 bool Linker::Resolve(const std::string& name, Loader::SymbolType sym_type, Module* m,
                      Loader::SymbolRecord* return_info) {
     const auto ids = Common::SplitString(name, '#');
@@ -344,10 +354,16 @@ bool Linker::Resolve(const std::string& name, Loader::SymbolType sym_type, Modul
         return true;
     }
 
-    // Check if it an export function
-    const auto* p = FindExportedModule(*module, *library);
-    if (p && p->export_sym.GetSize() > 0) {
-        record = p->export_sym.FindSymbol(sr);
+    // Check if it an exported function from one of our loaded libraries
+    for (const auto& mod : m_modules) {
+        if (!std::ranges::contains(mod->GetExportLibs(), *library) ||
+            !std::ranges::contains(mod->GetExportModules(), *module)) {
+            continue;
+        }
+        if (mod->export_sym.GetSize() == 0) {
+            continue;
+        }
+        record = mod->export_sym.FindSymbol(sr);
         if (record) {
             *return_info = *record;
             return true;

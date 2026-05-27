@@ -25,6 +25,7 @@
 #include "core/devtools/layer.h"
 #include "core/emulator_settings.h"
 #include "core/emulator_state.h"
+#include "imgui/big_picture/settings_dialog_layer.h"
 #include "input/controller.h"
 #include "input/input_mouse.h"
 
@@ -166,7 +167,8 @@ std::filesystem::path GetInputConfigFile(const std::string& game_id) {
     }
     if (game_id == "global") {
         std::map<std::string, std::string> default_bindings_to_add = {
-            {"hotkey_renderdoc_capture", "f12"},
+            {"hotkey_capture_frame", "f12"},
+            {"hotkey_screenshot_with_overlays", "lalt, f12"},
             {"hotkey_fullscreen", "f11"},
             {"hotkey_show_fps", "f10"},
             {"hotkey_pause", "f9"},
@@ -179,7 +181,10 @@ std::filesystem::path GetInputConfigFile(const std::string& game_id) {
             {"hotkey_quit", "lctrl, lshift, end"},
             {"hotkey_volume_up", "kpplus"},
             {"hotkey_volume_down", "kpminus"},
+            {"hotkey_emulator_settings", "f3"},
         };
+        std::string legacy_capture_binding;
+        bool legacy_capture_binding_found = false;
         std::ifstream global_in(config_file);
         std::string line;
         while (std::getline(global_in, line)) {
@@ -191,9 +196,19 @@ std::filesystem::path GetInputConfigFile(const std::string& game_id) {
                 continue;
             }
             std::string output_string = line.substr(0, equal_pos);
+            if (output_string == "hotkey_renderdoc_capture") {
+                legacy_capture_binding = line.substr(equal_pos + 1);
+                legacy_capture_binding_found = true;
+            }
             default_bindings_to_add.erase(output_string);
         }
         global_in.close();
+        if (legacy_capture_binding_found) {
+            if (auto it = default_bindings_to_add.find("hotkey_capture_frame");
+                it != default_bindings_to_add.end()) {
+                it->second = legacy_capture_binding;
+            }
+        }
         std::ofstream global_out(config_file, std::ios::app);
         for (auto const& b : default_bindings_to_add) {
             global_out << b.first << " = " << b.second << "\n";
@@ -529,7 +544,8 @@ void ParseInputConfig(const std::string game_id = "") {
             }
             output_gamepad_id = output_gamepad_id == -1 ? 1 : output_gamepad_id;
             if (enable == "true") {
-                GameControllers::SetControllerCustomColor(output_gamepad_id - 1, *r, *g, *b);
+                ControllerOutput::controllers.SetControllerCustomColor(output_gamepad_id - 1, *r,
+                                                                       *g, *b);
             }
             LOG_DEBUG(Input, "Parsed color settings: {} {} - {} {} {}",
                       enable == "true" ? "override" : "no override", output_gamepad_id, *r, *b, *g);
@@ -699,6 +715,7 @@ void ControllerOutput::AddUpdate(InputEvent event) {
         *new_param = (event.active ? event.axis_value : 0) + *new_param;
     }
 }
+
 void ControllerOutput::FinalizeUpdate(u8 gamepad_index) {
     auto PushSDLEvent = [&](u32 event_type) {
         if (new_button_state) {
@@ -763,6 +780,9 @@ void ControllerOutput::FinalizeUpdate(u8 gamepad_index) {
         case HOTKEY_RENDERDOC:
             PushSDLEvent(SDL_EVENT_RDOC_CAPTURE);
             break;
+        case HOTKEY_SCREENSHOT_WITH_OVERLAYS:
+            PushSDLEvent(SDL_EVENT_SCREENSHOT_WITH_OVERLAYS);
+            break;
         case HOTKEY_ADD_VIRTUAL_USER:
             PushSDLEvent(SDL_EVENT_ADD_VIRTUAL_USER);
             break;
@@ -781,6 +801,9 @@ void ControllerOutput::FinalizeUpdate(u8 gamepad_index) {
             break;
         case HOTKEY_QUIT:
             PushSDLEvent(SDL_EVENT_QUIT_DIALOG);
+            break;
+        case HOTKEY_OPEN_EMULATOR_SETTINGS:
+            ImGuiEmuSettings::OpenInGameSettingsDialog();
             break;
         case KEY_TOGGLE:
             // noop
