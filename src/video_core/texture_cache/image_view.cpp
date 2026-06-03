@@ -23,6 +23,8 @@ vk::ImageViewType ConvertImageViewType(AmdGpu::ImageType type) {
         return vk::ImageViewType::e2D;
     case AmdGpu::ImageType::Color2DArray:
         return vk::ImageViewType::e2DArray;
+    case AmdGpu::ImageType::Cube:
+        return vk::ImageViewType::eCube;
     case AmdGpu::ImageType::Color3D:
         return vk::ImageViewType::e3D;
     default:
@@ -42,6 +44,8 @@ bool IsViewTypeCompatible(AmdGpu::ImageType view_type, AmdGpu::ImageType image_t
         return image_type == AmdGpu::ImageType::Color2D || image_type == AmdGpu::ImageType::Color3D;
     case AmdGpu::ImageType::Color3D:
         return image_type == AmdGpu::ImageType::Color3D;
+    case AmdGpu::ImageType::Cube:
+        return image_type == AmdGpu::ImageType::Color2D;
     default:
         UNREACHABLE();
     }
@@ -64,6 +68,11 @@ ImageViewInfo::ImageViewInfo(const AmdGpu::Image& image, const Shader::ImageReso
     range.extent.levels = image.NumViewLevels(desc.is_array);
     range.extent.layers = image.NumViewLayers(desc.is_array);
     type = image.GetViewType(desc.is_array);
+    // A cube T# is stored as a 6-layer 2D array. Sample it through a real cube view so edge
+    // filtering is seamless. Storage views must stay 2D array as Vulkan has no cube storage images.
+    if (image.IsCube() && !is_storage && image.NumLayers() == 6) {
+        type = AmdGpu::ImageType::Cube;
+    }
 
     if (!is_storage) {
         mapping = Vulkan::LiverpoolToVK::ComponentMapping(image.DstSelect());
