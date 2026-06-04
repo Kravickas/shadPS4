@@ -49,7 +49,6 @@ struct ImageSpecialization {
     bool is_integer = false;
     bool is_storage = false;
     bool is_cube = false;
-    bool is_cube_array = false;
     bool is_srgb = false;
     AmdGpu::CompMapping dst_select{};
     AmdGpu::NumberConversion num_conversion{};
@@ -141,9 +140,6 @@ struct StageSpecialization {
                          spec.is_integer = AmdGpu::IsInteger(sharp.GetNumberFmt());
                          spec.is_storage = desc.is_written;
                          spec.is_cube = sharp.IsCube();
-                         // A single cube uses a cube view while cube arrays stay 2D array, so
-                         // they must specialize to distinct shaders.
-                         spec.is_cube_array = sharp.IsCube() && sharp.NumLayers() != 6;
                          if (spec.is_storage) {
                              spec.dst_select = sharp.DstSelect();
                          } else {
