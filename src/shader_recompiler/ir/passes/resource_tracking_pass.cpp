@@ -901,8 +901,8 @@ IR::Value FixCubeCoords(IR::IREmitter& ir, const AmdGpu::Image& image, const IR:
     const IR::F32 ntc{ir.FPNeg(tc)};
     const IR::F32 pos{ir.Imm32(1.f)};
     const IR::F32 neg{ir.Imm32(-1.f)};
-    const IR::F32 cube_index{ir.FPFloor(ir.FPDiv(IR::F32{face}, ir.Imm32(6.f)))};
-    const IR::F32 face_id{ir.FPSub(IR::F32{face}, ir.FPMul(cube_index, ir.Imm32(6.f)))};
+    const IR::F32 cube_index{ir.FPFloor(ir.FPDiv(IR::F32{face}, ir.Imm32(8.f)))};
+    const IR::F32 face_id{ir.FPSub(IR::F32{face}, ir.FPMul(cube_index, ir.Imm32(8.f)))};
     const auto on_face = [&](float f) -> IR::U1 { return ir.FPEqual(face_id, ir.Imm32(f)); };
     const IR::F32 dir_x{ir.Select(on_face(0.f), pos,
                                   ir.Select(on_face(1.f), neg, ir.Select(on_face(5.f), nsc, sc)))};
