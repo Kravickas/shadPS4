@@ -24,7 +24,7 @@ vk::ImageViewType ConvertImageViewType(AmdGpu::ImageType type) {
     case AmdGpu::ImageType::Color2DArray:
         return vk::ImageViewType::e2DArray;
     case AmdGpu::ImageType::Cube:
-        return vk::ImageViewType::eCube;
+        return vk::ImageViewType::eCubeArray;
     case AmdGpu::ImageType::Color3D:
         return vk::ImageViewType::e3D;
     default:
@@ -68,9 +68,9 @@ ImageViewInfo::ImageViewInfo(const AmdGpu::Image& image, const Shader::ImageReso
     range.extent.levels = image.NumViewLevels(desc.is_array);
     range.extent.layers = image.NumViewLayers(desc.is_array);
     type = image.GetViewType(desc.is_array);
-    // A cube T# is stored as a 6-layer 2D array. Sample it through a real cube view so edge
-    // filtering is seamless. Storage views must stay 2D array as Vulkan has no cube storage images.
-    if (image.IsCube() && !is_storage && image.NumLayers() == 6) {
+    // A cube T# is stored as 6 layers per cube. Storage views must stay 2D array as
+    // Vulkan has no cube storage images.
+    if (image.IsCube() && !is_storage) {
         type = AmdGpu::ImageType::Cube;
     }
 
