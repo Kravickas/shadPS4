@@ -914,9 +914,8 @@ Id ImageType(EmitContext& ctx, const ImageResource& desc, Id sampled_type) {
     const auto format = desc.is_atomic ? GetFormat(image) : spv::ImageFormat::Unknown;
     const auto type = image.GetViewType(desc.is_array);
     const u32 sampled = desc.is_written ? 2 : 1;
-    // Storage and integer-fetched cube T# stay 2D array, as Vulkan has no cube storage images
-    // and OpImageFetch is not allowed on a cube.
-    if (image.IsCube() && !desc.is_storage) {
+    if (image.IsCube() && !desc.is_storage && !desc.is_written) {
+        ctx.AddCapability(spv::Capability::SampledCubeArray);
         return ctx.TypeImage(sampled_type, spv::Dim::Cube, false, true, false, sampled, format);
     }
     switch (type) {
