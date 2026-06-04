@@ -893,20 +893,15 @@ IR::Value FixCubeCoords(IR::IREmitter& ir, const AmdGpu::Image& image, const IR:
     // to convert this to the range [0.0, 1.0] to get correct results.
     const IR::F32 s{ir.FPSub(IR::F32{x}, ir.Imm32(1.f))};
     const IR::F32 t{ir.FPSub(IR::F32{y}, ir.Imm32(1.f))};
-    if (image.NumLayers() != 6) {
-        // Cube arrays are still sampled as 2D arrays.
-        return ir.CompositeConstruct(s, t, face);
-    }
-    // A single cube is sampled through a real cube view, so reconstruct the direction by
-    // inverting the V_CUBESC/TC/MA/ID projection. The face-local coordinate in [-1.0, 1.0]
-    // is 2 * coord - 1.
     const IR::F32 sc{ir.FPSub(IR::F32{ir.FPMul(s, ir.Imm32(2.f))}, ir.Imm32(1.f))};
     const IR::F32 tc{ir.FPSub(IR::F32{ir.FPMul(t, ir.Imm32(2.f))}, ir.Imm32(1.f))};
     const IR::F32 nsc{ir.FPNeg(sc)};
     const IR::F32 ntc{ir.FPNeg(tc)};
     const IR::F32 pos{ir.Imm32(1.f)};
     const IR::F32 neg{ir.Imm32(-1.f)};
-    const auto on_face = [&](float f) -> IR::U1 { return ir.FPEqual(IR::F32{face}, ir.Imm32(f)); };
+    const IR::F32 cube_index{ir.FPFloor(ir.FPDiv(IR::F32{face}, ir.Imm32(6.f)))};
+    const IR::F32 face_id{ir.FPSub(IR::F32{face}, ir.FPMul(cube_index, ir.Imm32(6.f)))};
+    const auto on_face = [&](float f) -> IR::U1 { return ir.FPEqual(face_id, ir.Imm32(f)); };
     const IR::F32 dir_x{ir.Select(on_face(0.f), pos,
                                   ir.Select(on_face(1.f), neg, ir.Select(on_face(5.f), nsc, sc)))};
     const IR::F32 dir_y{ir.Select(on_face(2.f), pos, ir.Select(on_face(3.f), neg, ntc))};
@@ -915,7 +910,7 @@ IR::Value FixCubeCoords(IR::IREmitter& ir, const AmdGpu::Image& image, const IR:
         ir.Select(on_face(1.f), sc,
                   ir.Select(on_face(2.f), tc,
                             ir.Select(on_face(3.f), ntc, ir.Select(on_face(4.f), pos, neg)))))};
-    return ir.CompositeConstruct(dir_x, dir_y, dir_z);
+    return ir.CompositeConstruct(dir_x, dir_y, dir_z, cube_index);
 }
 
 void PatchImageSampleArgs(IR::Block& block, IR::Inst& inst, Info& info,
