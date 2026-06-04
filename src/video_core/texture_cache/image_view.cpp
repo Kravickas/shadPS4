@@ -68,9 +68,7 @@ ImageViewInfo::ImageViewInfo(const AmdGpu::Image& image, const Shader::ImageReso
     range.extent.levels = image.NumViewLevels(desc.is_array);
     range.extent.layers = image.NumViewLayers(desc.is_array);
     type = image.GetViewType(desc.is_array);
-    // A cube T# is stored as 6 layers per cube. Storage views must stay 2D array as
-    // Vulkan has no cube storage images.
-    if (image.IsCube() && !is_storage) {
+    if (image.IsCube() && !desc.is_written && !desc.is_storage) {
         type = AmdGpu::ImageType::Cube;
     }
 
