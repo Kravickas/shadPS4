@@ -891,12 +891,15 @@ IR::Value FixCubeCoords(IR::IREmitter& ir, const AmdGpu::Image& image, const IR:
     if (!image.IsCube()) {
         return ir.CompositeConstruct(x, y, face);
     }
-    // AMD cube math results in coordinates in the range [1.0, 2.0]. We need
-    // to convert this to the range [0.0, 1.0] to get correct results.
+    // x and y hold the selected face's 2D coordinates in the [1.0, 2.0] range, and face packs
+    // the array slice and face index as slice * 8 + face (GCN sampler cube stride). Vulkan
+    // samples a cube from a direction, so rebuild it here: map x and y to the signed
+    // [-1.0, 1.0] face coordinates and reconstruct the direction per the cube face table,
+    // returning it alongside the array index.
     const IR::F32 s{ir.FPSub(IR::F32{x}, ir.Imm32(1.f))};
     const IR::F32 t{ir.FPSub(IR::F32{y}, ir.Imm32(1.f))};
-    const IR::F32 sc{ir.FPSub(IR::F32{ir.FPMul(s, ir.Imm32(2.f))}, ir.Imm32(1.f))};
-    const IR::F32 tc{ir.FPSub(IR::F32{ir.FPMul(t, ir.Imm32(2.f))}, ir.Imm32(1.f))};
+    const IR::F32 sc{ir.FPSub(ir.FPMul(s, ir.Imm32(2.f)), ir.Imm32(1.f))};
+    const IR::F32 tc{ir.FPSub(ir.FPMul(t, ir.Imm32(2.f)), ir.Imm32(1.f))};
     const IR::F32 nsc{ir.FPNeg(sc)};
     const IR::F32 ntc{ir.FPNeg(tc)};
     const IR::F32 pos{ir.Imm32(1.f)};
