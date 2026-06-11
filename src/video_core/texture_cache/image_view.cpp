@@ -68,7 +68,7 @@ ImageViewInfo::ImageViewInfo(const AmdGpu::Image& image, const Shader::ImageReso
     range.extent.levels = image.NumViewLevels(desc.is_array);
     range.extent.layers = image.NumViewLayers(desc.is_array);
     type = image.GetViewType(desc.is_array);
-    if (image.IsCube() && !desc.is_written && !desc.is_storage) {
+    if (image.IsCube() && !desc.is_written && !desc.is_storage && !desc.is_depth) {
         type = AmdGpu::ImageType::Cube;
     }
 
