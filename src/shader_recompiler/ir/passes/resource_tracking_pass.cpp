@@ -891,11 +891,9 @@ IR::Value FixCubeCoords(IR::IREmitter& ir, const AmdGpu::Image& image, const IR:
     if (!image.IsCube()) {
         return ir.CompositeConstruct(x, y, face);
     }
-    // x and y hold the selected face's 2D coordinates in the [1.0, 2.0] range, and face packs
-    // the array slice and face index as slice * 8 + face (GCN sampler cube stride). Vulkan
-    // samples a cube from a direction, so rebuild it here: map x and y to the signed
-    // [-1.0, 1.0] face coordinates and reconstruct the direction per the cube face table,
-    // returning it alongside the array index.
+    // The cube ALU already projected the sample direction onto the selected face, so x and y are
+    // the face coordinates and face is slice * 8 + face_id. Invert that here to rebuild the
+    // direction Vulkan samples a cube with.
     const IR::F32 s{ir.FPSub(IR::F32{x}, ir.Imm32(1.f))};
     const IR::F32 t{ir.FPSub(IR::F32{y}, ir.Imm32(1.f))};
     const IR::F32 sc{ir.FPSub(ir.FPMul(s, ir.Imm32(2.f)), ir.Imm32(1.f))};
