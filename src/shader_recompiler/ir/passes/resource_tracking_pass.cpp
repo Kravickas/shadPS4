@@ -888,7 +888,7 @@ void PatchBufferArgs(IR::Block& block, IR::Inst& inst, Info& info) {
 
 IR::Value FixCubeCoords(IR::IREmitter& ir, const AmdGpu::Image& image, const IR::Value& x,
                         const IR::Value& y, const IR::Value& face) {
-    if (!image.IsCube()) {
+    if (!image.IsValidCube()) {
         return ir.CompositeConstruct(x, y, face);
     }
     // The cube ALU already projected the sample direction onto the selected face, so x and y are
