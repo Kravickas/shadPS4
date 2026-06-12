@@ -255,6 +255,10 @@ struct Image {
         return static_cast<ImageType>(type) == ImageType::Cube;
     }
 
+    bool IsValidCube() const noexcept {
+        return IsCube() && width == height && NumViewLayers(false) % 6 == 0;
+    }
+
     ImageType GetType() const noexcept {
         return IsCube() ? ImageType::Color2DArray : static_cast<ImageType>(type);
     }
