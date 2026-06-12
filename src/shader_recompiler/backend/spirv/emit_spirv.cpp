@@ -279,6 +279,9 @@ void SetupCapabilities(const Info& info, const Profile& profile, const RuntimeIn
     if (info.has_image_query) {
         ctx.AddCapability(spv::Capability::ImageQuery);
     }
+    if (ctx.uses_sampled_cube) {
+        ctx.AddCapability(spv::Capability::SampledCubeArray);
+    }
     if ((info.uses_image_atomic_float_min_max && profile.supports_image_fp32_atomic_min_max) ||
         (info.uses_buffer_atomic_float_min_max && profile.supports_buffer_fp32_atomic_min_max)) {
         ctx.AddExtension("SPV_EXT_shader_atomic_float_min_max");
