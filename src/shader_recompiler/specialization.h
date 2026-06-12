@@ -139,7 +139,7 @@ struct StageSpecialization {
                          spec.type = sharp.GetViewType(desc.is_array);
                          spec.is_integer = AmdGpu::IsInteger(sharp.GetNumberFmt());
                          spec.is_storage = desc.is_written;
-                         spec.is_cube = sharp.IsCube();
+                         spec.is_cube = sharp.IsValidCube();
                          if (spec.is_storage) {
                              spec.dst_select = sharp.DstSelect();
                          } else {
