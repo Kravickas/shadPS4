@@ -925,7 +925,7 @@ Id ImageType(EmitContext& ctx, const ImageResource& desc, Id sampled_type) {
     const auto type = image.GetViewType(desc.is_array);
     const u32 sampled = desc.is_written ? 2 : 1;
     if (image.IsValidCube() && !desc.is_written && !desc.is_storage && !desc.is_depth) {
-        ctx.AddCapability(spv::Capability::SampledCubeArray);
+        ctx.uses_sampled_cube = true;
         return ctx.TypeImage(sampled_type, spv::Dim::Cube, false, true, false, sampled, format);
     }
     switch (type) {
