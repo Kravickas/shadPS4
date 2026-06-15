@@ -712,6 +712,21 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
             }
             case PM4ItOpcode::EventWriteEop: {
                 const auto* event_eop = reinterpret_cast<const PM4CmdEventWriteEop*>(header);
+                auto signal = [eop = *event_eop] {
+                    eop.SignalFence(
+                        [](void* address, u64 data, u32 num_bytes) {
+                            auto* memory = Core::Memory::Instance();
+                            if (!memory->TryWriteBacking(address, &data, num_bytes)) {
+                                memcpy(address, &data, num_bytes);
+                            }
+                        },
+                        [] { Platform::IrqC::Instance()->Signal(Platform::InterruptId::GfxEop); });
+                };
+                if (rasterizer) {
+                    rasterizer->EnqueueEopFence(std::move(signal));
+                } else {
+                    signal();
+
                 if (rasterizer) {
                     rasterizer->ProcessDownloadImages();
                 }
