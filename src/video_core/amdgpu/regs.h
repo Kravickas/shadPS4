@@ -139,7 +139,8 @@ union Regs {
         LsHsConfig ls_hs_config;
         u32 vgt_gs_vert_itemsize[4];
         TessellationConfig tess_config;
-        INSERT_PADDING_WORDS(3);
+        DbAlphaToMask db_alpha_to_mask;
+        INSERT_PADDING_WORDS(2);
         PolygonOffset poly_offset;
         GsInstances vgt_gs_instance_cnt;
         StreamOutConfig vgt_strmout_config;
@@ -186,6 +187,9 @@ union Regs {
 
     void SetDefaults();
 };
+
+static_assert(offsetof(Regs, db_alpha_to_mask) == 0xA2DCu * 4u,
+              "DB_ALPHA_TO_MASK must map to context register 0x2DC");
 
 #undef DO_CONCAT2
 #undef CONCAT2
