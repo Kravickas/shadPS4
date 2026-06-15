@@ -115,18 +115,18 @@ SDL_Texture* LoadSdlTextureData(std::vector<u8> data) {
     unsigned char* image_data = stbi_load_from_memory(
         (const unsigned char*)data.data(), (int)data.size(), &image_width, &image_height, NULL, 4);
     if (image_data == nullptr) {
-        fmt::println("Failed to load image: {}", stbi_failure_reason());
+        LOG_ERROR(ImGui, "Failed to load image: {}", stbi_failure_reason());
     }
 
     SDL_Surface* surface = SDL_CreateSurfaceFrom(image_width, image_height, SDL_PIXELFORMAT_RGBA32,
                                                  (void*)image_data, channels * image_width);
     if (surface == nullptr) {
-        fmt::println("Unable to create SDL surface: {}", SDL_GetError());
+        LOG_ERROR(ImGui, "Unable to create SDL surface: {}", SDL_GetError());
     }
 
     SDL_Texture* texture = SDL_CreateTextureFromSurface(renderer, surface);
     if (texture == nullptr) {
-        fmt::println("Unable to create SDL texture: {}", SDL_GetError());
+        LOG_ERROR(ImGui, "Unable to create SDL texture: {}", SDL_GetError());
     }
 
     SDL_DestroySurface(surface);
@@ -190,21 +190,22 @@ void GetGameIconInfo(std::vector<IconInfo>& icons) {
 
 void Launch(char* executableName) {
     if (!SDL_Init(SDL_INIT_VIDEO)) {
-        fmt::println("SDL_INIT_VIDEO Error: {}", SDL_GetError());
+        LOG_ERROR(ImGui, "SDL_INIT_VIDEO Error: {}", SDL_GetError());
         SDL_Quit();
         return;
     }
 
     if (!SDL_Init(SDL_INIT_GAMEPAD)) {
-        fmt::println("SDL_INIT_GAMEPAD Error: {}", SDL_GetError());
+        LOG_ERROR(ImGui, "SDL_INIT_GAMEPAD Error: {}", SDL_GetError());
     }
 
     SDL_Window* window =
-        SDL_CreateWindow("shadPS4 Big Picture Mode", 1280, 720, SDL_WINDOW_FULLSCREEN);
+        SDL_CreateWindow("shadPS4 Big Picture Mode", 1280, 720,
+                         EmulatorSettings.IsFullScreen() ? SDL_WINDOW_FULLSCREEN : 0);
     renderer = SDL_CreateRenderer(window, nullptr);
 
     if (window == nullptr) {
-        fmt::println("SDL Window Creation Error: {}", SDL_GetError());
+        LOG_ERROR(ImGui, "SDL Window Creation Error: {}", SDL_GetError());
         SDL_DestroyRenderer(renderer);
         SDL_Quit();
         return;
@@ -229,10 +230,18 @@ void Launch(char* executableName) {
 
     ImGui_ImplSDL3_InitForSDLRenderer(window, renderer);
     ImGui_ImplSDLRenderer3_Init(renderer);
-    GetGameIconInfo(gameIcons);
 
-    uiScale = static_cast<float>(EmulatorSettings.GetBigPictureScale() / 1000.f);
     ImGuiEmuSettings::SettingsWindow settingsWindow(false);
+
+    float sliderScale = 1.0f;
+    auto applySettings = [&] {
+        uiScale = EmulatorSettings.GetBigPictureScale() / 1000.f;
+        sliderScale = uiScale;
+        GetGameIconInfo(gameIcons);
+        SDL_SetWindowFullscreen(window,
+                                EmulatorSettings.IsFullScreen() ? SDL_WINDOW_FULLSCREEN : 0);
+    };
+    applySettings();
 
     while (!done) {
         SDL_Event event;
@@ -297,7 +306,6 @@ void Launch(char* executableName) {
 
         ImGui::SetNextItemWidth(300.0f * uiScale);
 
-        static float sliderScale = 1.0f;
         if (ImGui::IsWindowAppearing()) {
             sliderScale = uiScale;
         }
@@ -317,6 +325,9 @@ void Launch(char* executableName) {
         ImGui::SetCursorPosX(ImGui::GetWindowContentRegionMax().x - buttonsWidth);
 
         if (ImGui::Button("Settings")) {
+            EmulatorSettings.SetBigPictureScale(static_cast<int>(uiScale * 1000));
+            EmulatorSettings.Save();
+            settingsWindow.Prepare();
             showSettings = true;
         }
 
@@ -350,16 +361,7 @@ void Launch(char* executableName) {
         }
 
         if (showSettings) {
-            EmulatorSettings.SetBigPictureScale(static_cast<int>(uiScale * 1000));
-            EmulatorSettings.Save();
-            settingsWindow.DrawSettings(&showSettings);
-
-            // update when settings dialog closed
-            if (!showSettings) {
-                uiScale = static_cast<float>(EmulatorSettings.GetBigPictureScale() / 1000.f);
-                sliderScale = uiScale;
-                GetGameIconInfo(gameIcons);
-            }
+            settingsWindow.DrawSettings(&showSettings, applySettings);
         }
 
         ImGui::PopStyleVar(8);
