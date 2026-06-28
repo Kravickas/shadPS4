@@ -2136,6 +2136,14 @@ void IREmitter::ImageWrite(const Value& handle, const Value& coords, const U32& 
     return Inst<F32>(Opcode::CubeFaceIndex, cube_coords);
 }
 
+[[nodiscard]] Value IREmitter::CubeFaceCoord(const Value& cube_coords) {
+    return Inst(Opcode::CubeFaceCoord, cube_coords);
+}
+
+[[nodiscard]] F32 IREmitter::CubeMajorAxis(const Value& cube_coords) {
+    return Inst<F32>(Opcode::CubeMajorAxis, cube_coords);
+}
+
 // Debug print maps to SPIRV's NonSemantic DebugPrintf instruction
 // Renderdoc will hook in its own implementation of the SPIRV instruction
 // Renderdoc accepts format specifiers, e.g. %u, listed here:
