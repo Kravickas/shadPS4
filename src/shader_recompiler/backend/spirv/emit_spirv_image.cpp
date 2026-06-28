@@ -185,9 +185,11 @@ Id EmitImageQueryDimensions(EmitContext& ctx, IR::Inst* inst, u32 handle, Id lod
     case AmdGpu::ImageType::Color1DArray:
     case AmdGpu::ImageType::Color2D:
     case AmdGpu::ImageType::Color2DMsaa:
+    case AmdGpu::ImageType::Cube:
         return ctx.OpCompositeConstruct(ctx.U32[4], query(ctx.U32[2]), zero, mips());
     case AmdGpu::ImageType::Color2DArray:
     case AmdGpu::ImageType::Color3D:
+    case AmdGpu::ImageType::CubeArray:
         return ctx.OpCompositeConstruct(ctx.U32[4], query(ctx.U32[3]), mips());
     default:
         UNREACHABLE_MSG("SPIR-V Instruction");
@@ -278,12 +280,63 @@ void EmitImageWrite(EmitContext& ctx, IR::Inst* inst, u32 handle, Id coords, Id 
     ctx.OpImageWrite(image, coords, texel, operands.mask, operands.operands);
 }
 
+Id SelectCubeResult(EmitContext& ctx, Id x, Id y, Id z, Id x_res, Id y_res, Id z_res) {
+    const Id abs_x{ctx.OpFAbs(ctx.F32[1], x)};
+    const Id abs_y{ctx.OpFAbs(ctx.F32[1], y)};
+    const Id abs_z{ctx.OpFAbs(ctx.F32[1], z)};
+    const Id z_face_cond{ctx.OpLogicalAnd(ctx.U1[1],
+                                          ctx.OpFOrdGreaterThanEqual(ctx.U1[1], abs_z, abs_x),
+                                          ctx.OpFOrdGreaterThanEqual(ctx.U1[1], abs_z, abs_y))};
+    const Id y_face_cond{ctx.OpFOrdGreaterThanEqual(ctx.U1[1], abs_y, abs_x)};
+    return ctx.OpSelect(ctx.F32[1], z_face_cond, z_res,
+                        ctx.OpSelect(ctx.F32[1], y_face_cond, y_res, x_res));
+}
+
 Id EmitCubeFaceIndex(EmitContext& ctx, IR::Inst* inst, Id cube_coords) {
     if (ctx.profile.supports_native_cube_calc) {
         return ctx.OpCubeFaceIndexAMD(ctx.F32[1], cube_coords);
-    } else {
-        UNREACHABLE_MSG("SPIR-V Instruction");
     }
+    const Id x{ctx.OpCompositeExtract(ctx.F32[1], cube_coords, 0)};
+    const Id y{ctx.OpCompositeExtract(ctx.F32[1], cube_coords, 1)};
+    const Id z{ctx.OpCompositeExtract(ctx.F32[1], cube_coords, 2)};
+    const Id zero{ctx.ConstF32(0.f)};
+    const Id x_face{ctx.OpSelect(ctx.F32[1], ctx.OpFOrdLessThan(ctx.U1[1], x, zero),
+                                 ctx.ConstF32(1.f), ctx.ConstF32(0.f))};
+    const Id y_face{ctx.OpSelect(ctx.F32[1], ctx.OpFOrdLessThan(ctx.U1[1], y, zero),
+                                 ctx.ConstF32(3.f), ctx.ConstF32(2.f))};
+    const Id z_face{ctx.OpSelect(ctx.F32[1], ctx.OpFOrdLessThan(ctx.U1[1], z, zero),
+                                 ctx.ConstF32(5.f), ctx.ConstF32(4.f))};
+    return SelectCubeResult(ctx, x, y, z, x_face, y_face, z_face);
+}
+
+Id EmitCubeFaceCoord(EmitContext& ctx, IR::Inst* inst, Id cube_coords) {
+    if (ctx.profile.supports_native_cube_calc) {
+        return ctx.OpCubeFaceCoordAMD(ctx.F32[2], cube_coords);
+    }
+    const Id x{ctx.OpCompositeExtract(ctx.F32[1], cube_coords, 0)};
+    const Id y{ctx.OpCompositeExtract(ctx.F32[1], cube_coords, 1)};
+    const Id z{ctx.OpCompositeExtract(ctx.F32[1], cube_coords, 2)};
+    const Id zero{ctx.ConstF32(0.f)};
+    const Id neg_x{ctx.OpFNegate(ctx.F32[1], x)};
+    const Id neg_y{ctx.OpFNegate(ctx.F32[1], y)};
+    const Id neg_z{ctx.OpFNegate(ctx.F32[1], z)};
+    const Id x_sc{ctx.OpSelect(ctx.F32[1], ctx.OpFOrdLessThan(ctx.U1[1], x, zero), z, neg_z)};
+    const Id z_sc{ctx.OpSelect(ctx.F32[1], ctx.OpFOrdLessThan(ctx.U1[1], z, zero), neg_x, x)};
+    const Id sc{SelectCubeResult(ctx, x, y, z, x_sc, x, z_sc)};
+    const Id y_tc{ctx.OpSelect(ctx.F32[1], ctx.OpFOrdLessThan(ctx.U1[1], y, zero), neg_z, z)};
+    const Id tc{SelectCubeResult(ctx, x, y, z, neg_y, y_tc, neg_y)};
+    return ctx.OpCompositeConstruct(ctx.F32[2], sc, tc);
+}
+
+Id EmitCubeMajorAxis(EmitContext& ctx, IR::Inst* inst, Id cube_coords) {
+    const Id x{ctx.OpCompositeExtract(ctx.F32[1], cube_coords, 0)};
+    const Id y{ctx.OpCompositeExtract(ctx.F32[1], cube_coords, 1)};
+    const Id z{ctx.OpCompositeExtract(ctx.F32[1], cube_coords, 2)};
+    const Id two{ctx.ConstF32(2.f)};
+    const Id x_ma{ctx.OpFMul(ctx.F32[1], x, two)};
+    const Id y_ma{ctx.OpFMul(ctx.F32[1], y, two)};
+    const Id z_ma{ctx.OpFMul(ctx.F32[1], z, two)};
+    return SelectCubeResult(ctx, x, y, z, x_ma, y_ma, z_ma);
 }
 
 } // namespace Shader::Backend::SPIRV
