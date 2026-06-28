@@ -568,7 +568,8 @@ void PatchImageSharp(IR::Block& block, IR::Inst& inst, Info& info, Descriptors& 
         // If the mip level to IMAGE_(LOAD/STORE)_MIP is a constant, set up ImageResource
         // so that we will only bind a single level.
         // If index is dynamic, we will bind levels as an array
-        const auto view_type = image.GetViewType(image_res.is_array);
+        const auto view_type = image.GetViewType(
+            image_res.is_array, image_res.is_storage || image_res.is_written || image_res.is_depth);
 
         IR::Inst* body = inst.Arg(1).InstRecursive();
         const auto lod_arg = [&] -> IR::Value {
@@ -886,33 +887,26 @@ void PatchBufferArgs(IR::Block& block, IR::Inst& inst, Info& info) {
                 CalculateBufferAddress(ir, inst, info, buffer, buffer.stride));
 }
 
-IR::Value FixCubeCoords(IR::IREmitter& ir, const AmdGpu::Image& image, const IR::Value& x,
-                        const IR::Value& y, const IR::Value& face) {
-    if (!image.IsValidCube()) {
-        return ir.CompositeConstruct(x, y, face);
+IR::Value FixCubeCoords(IR::IREmitter& ir, const bool is_array, const IR::Value& face) {
+    // Recover the original direction from the cube op's input instead of inverting the projection.
+    const auto pred = [](const IR::Inst* inst) -> std::optional<const IR::Inst*> {
+        if (inst->GetOpcode() == IR::Opcode::CubeFaceIndex) {
+            return inst;
+        }
+        return std::nullopt;
+    };
+    const auto cube_inst = IR::BreadthFirstSearch(face, pred);
+    ASSERT_MSG(cube_inst, "Unable to find cube face index source");
+    const IR::Value dir{cube_inst.value()->Arg(0)};
+    const IR::F32 dir_x{ir.CompositeExtract(dir, 0)};
+    const IR::F32 dir_y{ir.CompositeExtract(dir, 1)};
+    const IR::F32 dir_z{ir.CompositeExtract(dir, 2)};
+    if (!is_array) {
+        // Single cube, no array layer.
+        return ir.CompositeConstruct(dir_x, dir_y, dir_z);
     }
-    // The cube ALU already projected the sample direction onto the selected face, so x and y are
-    // the face coordinates and face is slice * 8 + face_id. Invert that here to rebuild the
-    // direction Vulkan samples a cube with.
-    const IR::F32 s{ir.FPSub(IR::F32{x}, ir.Imm32(1.f))};
-    const IR::F32 t{ir.FPSub(IR::F32{y}, ir.Imm32(1.f))};
-    const IR::F32 sc{ir.FPSub(ir.FPMul(s, ir.Imm32(2.f)), ir.Imm32(1.f))};
-    const IR::F32 tc{ir.FPSub(ir.FPMul(t, ir.Imm32(2.f)), ir.Imm32(1.f))};
-    const IR::F32 nsc{ir.FPNeg(sc)};
-    const IR::F32 ntc{ir.FPNeg(tc)};
-    const IR::F32 pos{ir.Imm32(1.f)};
-    const IR::F32 neg{ir.Imm32(-1.f)};
+    // GCN packs slice * 8 + face_id into the face register, so the array index is face / 8.
     const IR::F32 cube_index{ir.FPFloor(ir.FPDiv(IR::F32{face}, ir.Imm32(8.f)))};
-    const IR::F32 face_id{ir.FPSub(IR::F32{face}, ir.FPMul(cube_index, ir.Imm32(8.f)))};
-    const auto on_face = [&](float f) -> IR::U1 { return ir.FPEqual(face_id, ir.Imm32(f)); };
-    const IR::F32 dir_x{ir.Select(on_face(0.f), pos,
-                                  ir.Select(on_face(1.f), neg, ir.Select(on_face(5.f), nsc, sc)))};
-    const IR::F32 dir_y{ir.Select(on_face(2.f), pos, ir.Select(on_face(3.f), neg, ntc))};
-    const IR::F32 dir_z{ir.Select(
-        on_face(0.f), nsc,
-        ir.Select(on_face(1.f), sc,
-                  ir.Select(on_face(2.f), tc,
-                            ir.Select(on_face(3.f), ntc, ir.Select(on_face(4.f), pos, neg)))))};
     return ir.CompositeConstruct(dir_x, dir_y, dir_z, cube_index);
 }
 
@@ -924,7 +918,8 @@ void PatchImageSampleArgs(IR::Block& block, IR::Inst& inst, Info& info,
 
     IR::IREmitter ir{block, IR::Block::InstructionList::s_iterator_to(inst)};
     const auto inst_info = inst.Flags<IR::TextureInstInfo>();
-    const auto view_type = image.GetViewType(image_res.is_array);
+    const auto view_type = image.GetViewType(
+        image_res.is_array, image_res.is_storage || image_res.is_written || image_res.is_depth);
 
     IR::Inst* body1 = inst.Arg(2).InstRecursive();
     IR::Inst* body2 = inst.Arg(3).InstRecursive();
@@ -1057,9 +1052,12 @@ void PatchImageSampleArgs(IR::Block& block, IR::Inst& inst, Info& info,
             return ir.CompositeConstruct(get_coord(addr_reg - 2, 0), get_coord(addr_reg - 1, 1));
         case AmdGpu::ImageType::Color2DArray: // x, y, slice
             addr_reg = addr_reg + 3;
-            // Note we can use FixCubeCoords with fallthrough cases since it checks for image type.
-            return FixCubeCoords(ir, image, get_coord(addr_reg - 3, 0), get_coord(addr_reg - 2, 1),
-                                 get_addr_reg(addr_reg - 1));
+            return ir.CompositeConstruct(get_coord(addr_reg - 3, 0), get_coord(addr_reg - 2, 1),
+                                         get_addr_reg(addr_reg - 1));
+        case AmdGpu::ImageType::Cube:      // x, y, face
+        case AmdGpu::ImageType::CubeArray: // x, y, face
+            addr_reg = addr_reg + 3;
+            return FixCubeCoords(ir, image_res.is_array, get_addr_reg(addr_reg - 1));
         case AmdGpu::ImageType::Color3D: // x, y, z
             addr_reg = addr_reg + 3;
             return ir.CompositeConstruct(get_coord(addr_reg - 3, 0), get_coord(addr_reg - 2, 1),
@@ -1127,7 +1125,8 @@ void PatchImageArgs(IR::Block& block, IR::Inst& inst, Info& info) {
 
     IR::IREmitter ir{block, IR::Block::InstructionList::s_iterator_to(inst)};
     auto inst_info = inst.Flags<IR::TextureInstInfo>();
-    const auto view_type = image.GetViewType(image_res.is_array);
+    const auto view_type = image.GetViewType(
+        image_res.is_array, image_res.is_storage || image_res.is_written || image_res.is_depth);
 
     // Now that we know the image type, adjust texture coordinate vector.
     IR::Inst* body = inst.Arg(1).InstRecursive();
@@ -1161,6 +1160,8 @@ void PatchImageArgs(IR::Block& block, IR::Inst& inst, Info& info) {
         case AmdGpu::ImageType::Color2DMsaaArray: // x, y, slice. (sample is passed on different
                                                   // argument)
         case AmdGpu::ImageType::Color3D:          // x, y, z, [lod]
+        case AmdGpu::ImageType::Cube:             // x, y, face, [lod]
+        case AmdGpu::ImageType::CubeArray:        // x, y, face, [lod]
             return {ir.CompositeConstruct(body->Arg(0), body->Arg(1), body->Arg(2)), body->Arg(3)};
         default:
             UNREACHABLE_MSG("Unknown image type {}", view_type);
