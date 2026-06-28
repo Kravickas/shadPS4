@@ -922,12 +922,9 @@ spv::ImageFormat GetFormat(const AmdGpu::Image& image) {
 Id ImageType(EmitContext& ctx, const ImageResource& desc, Id sampled_type) {
     const auto image = desc.GetSharp(ctx.info);
     const auto format = desc.is_atomic ? GetFormat(image) : spv::ImageFormat::Unknown;
-    const auto type = image.GetViewType(desc.is_array);
+    const auto type =
+        image.GetViewType(desc.is_array, desc.is_storage || desc.is_written || desc.is_depth);
     const u32 sampled = desc.is_written ? 2 : 1;
-    if (image.IsValidCube() && !desc.is_written && !desc.is_storage && !desc.is_depth) {
-        ctx.uses_sampled_cube = true;
-        return ctx.TypeImage(sampled_type, spv::Dim::Cube, false, true, false, sampled, format);
-    }
     switch (type) {
     case AmdGpu::ImageType::Color1D:
         return ctx.TypeImage(sampled_type, spv::Dim::Dim1D, false, false, false, sampled, format);
@@ -941,6 +938,11 @@ Id ImageType(EmitContext& ctx, const ImageResource& desc, Id sampled_type) {
         return ctx.TypeImage(sampled_type, spv::Dim::Dim2D, false, false, true, sampled, format);
     case AmdGpu::ImageType::Color3D:
         return ctx.TypeImage(sampled_type, spv::Dim::Dim3D, false, false, false, sampled, format);
+    case AmdGpu::ImageType::Cube:
+        return ctx.TypeImage(sampled_type, spv::Dim::Cube, false, false, false, sampled, format);
+    case AmdGpu::ImageType::CubeArray:
+        ctx.uses_sampled_cube = true;
+        return ctx.TypeImage(sampled_type, spv::Dim::Cube, false, true, false, sampled, format);
     default:
         break;
     }
@@ -976,7 +978,9 @@ void EmitContext::DefineImagesAndSamplers() {
             .id = id,
             .sampled_type = is_storage ? sampled_type : TypeSampledImage(image_type),
             .image_type = image_type,
-            .view_type = sharp.GetViewType(image_desc.is_array),
+            .view_type = sharp.GetViewType(image_desc.is_array, image_desc.is_storage ||
+                                                                    image_desc.is_written ||
+                                                                    image_desc.is_depth),
             .is_integer = is_integer,
             .is_storage = is_storage,
             .mip_fallback_mode = mip_fallback_mode,
