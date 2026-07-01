@@ -889,7 +889,7 @@ void PatchBufferArgs(IR::Block& block, IR::Inst& inst, Info& info) {
 
 IR::Value FixCubeCoords(IR::IREmitter& ir, const bool is_array, const IR::Value& face) {
     // Recover the original direction from the cube op's input instead of inverting the projection.
-    const auto pred = [](const IR::Inst* inst) -> std::optional<const IR::Inst*> {
+    const auto pred = [](IR::Inst* inst) -> std::optional<IR::Inst*> {
         if (inst->GetOpcode() == IR::Opcode::CubeFaceIndex) {
             return inst;
         }
