@@ -887,7 +887,8 @@ void PatchBufferArgs(IR::Block& block, IR::Inst& inst, Info& info) {
                 CalculateBufferAddress(ir, inst, info, buffer, buffer.stride));
 }
 
-IR::Value FixCubeCoords(IR::IREmitter& ir, const bool is_array, const IR::Value& face) {
+IR::Value FixCubeCoords(IR::IREmitter& ir, const AmdGpu::Image& image, const bool is_array,
+                        const IR::Value& face) {
     // Recover the original direction from the cube op's input instead of inverting the projection.
     const auto pred = [](IR::Inst* inst) -> std::optional<IR::Inst*> {
         if (inst->GetOpcode() == IR::Opcode::CubeFaceIndex) {
@@ -902,12 +903,14 @@ IR::Value FixCubeCoords(IR::IREmitter& ir, const bool is_array, const IR::Value&
     const IR::F32 dir_y{ir.CompositeExtract(dir, 1)};
     const IR::F32 dir_z{ir.CompositeExtract(dir, 2)};
     if (!is_array) {
-        // Single cube, no array layer.
         return ir.CompositeConstruct(dir_x, dir_y, dir_z);
     }
     // GCN packs slice * 8 + face_id into the face register, so the array index is face / 8.
+    // Clamp the layer to a valid cube.
     const IR::F32 cube_index{ir.FPFloor(ir.FPDiv(IR::F32{face}, ir.Imm32(8.f)))};
-    return ir.CompositeConstruct(dir_x, dir_y, dir_z, cube_index);
+    const IR::F32 max_index{ir.Imm32(static_cast<f32>(image.NumLayers() / 6) - 1.f)};
+    const IR::F32 clamped{ir.FPMax(ir.FPMin(cube_index, max_index), ir.Imm32(0.f))};
+    return ir.CompositeConstruct(dir_x, dir_y, dir_z, clamped);
 }
 
 void PatchImageSampleArgs(IR::Block& block, IR::Inst& inst, Info& info,
@@ -1057,7 +1060,7 @@ void PatchImageSampleArgs(IR::Block& block, IR::Inst& inst, Info& info,
         case AmdGpu::ImageType::Cube:      // x, y, face
         case AmdGpu::ImageType::CubeArray: // x, y, face
             addr_reg = addr_reg + 3;
-            return FixCubeCoords(ir, image_res.is_array, get_addr_reg(addr_reg - 1));
+            return FixCubeCoords(ir, image, image_res.is_array, get_addr_reg(addr_reg - 1));
         case AmdGpu::ImageType::Color3D: // x, y, z
             addr_reg = addr_reg + 3;
             return ir.CompositeConstruct(get_coord(addr_reg - 3, 0), get_coord(addr_reg - 2, 1),
