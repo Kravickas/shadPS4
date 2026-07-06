@@ -998,7 +998,9 @@ void PatchImageSampleArgs(IR::Block& block, IR::Inst& inst, Info& info,
         case AmdGpu::ImageType::Color2D:
         case AmdGpu::ImageType::Color2DMsaa:
         case AmdGpu::ImageType::Color2DArray:
-            // (du/dx, dv/dx), (du/dy, dv/dy)
+        case AmdGpu::ImageType::Cube:
+        case AmdGpu::ImageType::CubeArray:
+            // (du/dx, dv/dx), (du/dy, dv/dy). The guest projects cube gradients to 2D face space.
             addr_reg = addr_reg + 4;
             return {ir.CompositeConstruct(get_addr_reg(addr_reg - 4), get_addr_reg(addr_reg - 3)),
                     ir.CompositeConstruct(get_addr_reg(addr_reg - 2), get_addr_reg(addr_reg - 1))};
@@ -1077,6 +1079,26 @@ void PatchImageSampleArgs(IR::Block& block, IR::Inst& inst, Info& info,
                                                  : IR::F32{};
     const IR::F32 lod_clamp = inst_info.has_lod_clamp ? get_addr_reg(addr_reg++) : IR::F32{};
 
+    // Cubes are sampled by direction on the host, but the guest supplies projected 2D face-space
+    // gradients that Vulkan cannot consume as cube gradients. Derive an explicit LOD from them so
+    // the sample stays seamless: rho = max(|d(u,v)/dx|, |d(u,v)/dy|) * face_size, lod = log2(rho).
+    const bool is_cube_grad =
+        inst_info.has_derivatives &&
+        (view_type == AmdGpu::ImageType::Cube || view_type == AmdGpu::ImageType::CubeArray);
+    const IR::F32 cube_lod = [&] -> IR::F32 {
+        if (!is_cube_grad) {
+            return IR::F32{};
+        }
+        const auto dim = ir.ImageQueryDimension(handle, ir.Imm32(0u), ir.Imm1(false), inst_info);
+        const IR::F32 face_size{ir.ConvertUToF(32, 32, IR::U32{ir.CompositeExtract(dim, 0)})};
+        const auto scaled_len = [&](const IR::Value& d) -> IR::F32 {
+            const auto du = ir.FPMul(IR::F32{ir.CompositeExtract(d, 0)}, face_size);
+            const auto dv = ir.FPMul(IR::F32{ir.CompositeExtract(d, 1)}, face_size);
+            return ir.FPSqrt(IR::F32{ir.FPFma(du, du, ir.FPMul(dv, dv))});
+        };
+        return ir.FPLog2(IR::F32{ir.FPMax(scaled_len(derivatives_dx), scaled_len(derivatives_dy))});
+    }();
+
     auto texel = [&] -> IR::Value {
         if (is_msaa) {
             return ir.ImageRead(handle, coords, {}, ir.Imm32(0U), inst_info);
@@ -1088,6 +1110,9 @@ void PatchImageSampleArgs(IR::Block& block, IR::Inst& inst, Info& info,
             return ir.ImageGather(handle, coords, offset, inst_info);
         }
         if (inst_info.has_derivatives) {
+            if (is_cube_grad) {
+                return ir.ImageSampleExplicitLod(handle, coords, cube_lod, offset, inst_info);
+            }
             return ir.ImageGradient(handle, coords, derivatives_dx, derivatives_dy, offset,
                                     lod_clamp, inst_info);
         }
