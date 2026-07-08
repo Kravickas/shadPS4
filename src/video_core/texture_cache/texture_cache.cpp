@@ -88,7 +88,7 @@ ImageId TextureCache::GetNullImage(const vk::Format format) {
 void TextureCache::ProcessDownloadImages() {
     const bool sync = EmulatorSettings.GetReadbacksMode() == GpuReadbacksMode::Precise;
     for (const ImageId image_id : download_images) {
-        DownloadImageMemory(image_id, sync);
+        DownloadImageMemory(image_id, true);
     }
     download_images.clear();
 }
@@ -125,16 +125,16 @@ void TextureCache::DownloadImageMemory(ImageId image_id, bool sync) {
     cmdbuf.copyImageToBuffer(image.GetImage(), vk::ImageLayout::eTransferSrcOptimal,
                              download_buffer.Handle(), image_download);
 
+    const auto write_data = [this, device_addr = image.info.guest_address, download,
+                             download_size] {
+        Core::Memory::Instance()->TryWriteBacking(std::bit_cast<u8*>(device_addr), download,
+                                                  download_size);
+    };
     if (sync) {
         scheduler.Finish();
-        Core::Memory::Instance()->TryWriteBacking(std::bit_cast<u8*>(image.info.guest_address),
-                                                  download, download_size);
+        write_data();
     } else {
-        scheduler.DeferPriorityOperation(
-            [this, device_addr = image.info.guest_address, download, download_size] {
-                Core::Memory::Instance()->TryWriteBacking(std::bit_cast<u8*>(device_addr), download,
-                                                          download_size);
-            });
+        scheduler.DeferPriorityOperation(write_data);
     }
 }
 
