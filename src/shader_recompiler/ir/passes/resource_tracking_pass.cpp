@@ -904,18 +904,16 @@ IR::Value FixCubeCoords(IR::IREmitter& ir, const AmdGpu::Image& image, const boo
         dir_y = IR::F32{ir.CompositeExtract(dir, 1)};
         dir_z = IR::F32{ir.CompositeExtract(dir, 2)};
     } else {
-        // Some shaders reach a cube sampler without a traceable cube projection (e.g. the direction
-        // is assembled across control flow). Fall back to the raw coordinates instead of crashing.
         LOG_WARNING(Render_Recompiler, "Cube face index source not found; using raw coordinates");
         dir_x = coord_x;
         dir_y = coord_y;
         dir_z = face;
     }
+    const IR::F32 mag2{ir.FPFma(dir_x, dir_x, ir.FPFma(dir_y, dir_y, ir.FPMul(dir_z, dir_z)))};
+    dir_z = IR::F32{ir.Select(ir.FPEqual(mag2, ir.Imm32(0.f)), ir.Imm32(1.f), dir_z)};
     if (!is_array) {
         return ir.CompositeConstruct(dir_x, dir_y, dir_z);
     }
-    // GCN packs slice * 8 + face_id into the face register, so the array index is face / 8.
-    // Clamp the layer to a valid cube.
     const IR::F32 cube_index{ir.FPFloor(ir.FPDiv(IR::F32{face}, ir.Imm32(8.f)))};
     const IR::F32 max_index{ir.Imm32(static_cast<f32>(image.NumLayers() / 6) - 1.f)};
     const IR::F32 clamped{ir.FPMax(ir.FPMin(cube_index, max_index), ir.Imm32(0.f))};
@@ -1089,6 +1087,7 @@ void PatchImageSampleArgs(IR::Block& block, IR::Inst& inst, Info& info,
                                                  : IR::F32{};
     const IR::F32 lod_clamp = inst_info.has_lod_clamp ? get_addr_reg(addr_reg++) : IR::F32{};
 
+    // Guest cube gradients are projected 2D face-space; sample with implicit LOD instead.
     const bool is_cube_grad =
         inst_info.has_derivatives &&
         (view_type == AmdGpu::ImageType::Cube || view_type == AmdGpu::ImageType::CubeArray);
