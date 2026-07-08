@@ -99,6 +99,7 @@ ImageInfo::ImageInfo(const AmdGpu::DepthBuffer& buffer, u32 num_slices, VAddr ht
     size.depth = 1;
     pitch = buffer.Pitch();
     resources.layers = num_slices;
+    props.is_cube = size.width == size.height && resources.layers >= 6;
     meta_info.htile_addr = buffer.z_info.tile_surface_enable ? htile_address : 0;
 
     stencil_addr = write_buffer ? buffer.StencilWriteAddress() : buffer.StencilAddress();
