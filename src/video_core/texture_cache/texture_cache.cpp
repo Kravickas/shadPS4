@@ -86,7 +86,6 @@ ImageId TextureCache::GetNullImage(const vk::Format format) {
 }
 
 void TextureCache::ProcessDownloadImages() {
-    const bool sync = EmulatorSettings.GetReadbacksMode() == GpuReadbacksMode::Precise;
     for (const ImageId image_id : download_images) {
         DownloadImageMemory(image_id, true);
     }
@@ -650,8 +649,7 @@ ImageView& TextureCache::FindTexture(ImageId image_id, const ImageDesc& desc) {
     Image& image = slot_images[image_id];
     if (desc.type == BindingType::Storage) {
         image.flags |= ImageFlagBits::GpuModified;
-        if (!image.info.props.is_tiled && image.info.guest_address != 0 &&
-            (readback_linear_images || image.info.props.is_volume)) {
+        if (readback_linear_images && !image.info.props.is_tiled && image.info.guest_address != 0) {
             download_images.emplace(image_id);
         }
     }
