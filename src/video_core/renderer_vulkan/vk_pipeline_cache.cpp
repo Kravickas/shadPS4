@@ -461,6 +461,11 @@ bool PipelineCache::RefreshGraphicsKey() {
         }
     }
 
+    key.alpha_to_mask_enable =
+        regs.db_alpha_to_mask.alpha_to_mask_enable &&
+        !regs.depth_shader_control.alpha_to_mask_disable &&
+        (key.cb_shader_mask.GetMask(0) & AmdGpu::ColorBufferMask::ComponentA) != 0;
+
     return true;
 }
 
