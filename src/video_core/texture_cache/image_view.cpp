@@ -70,16 +70,10 @@ ImageViewInfo::ImageViewInfo(const AmdGpu::Image& image, const Shader::ImageReso
     range.base.layer = image.base_array;
     range.extent.levels = image.NumViewLevels(desc.is_array);
     range.extent.layers = image.NumViewLayers(desc.is_array);
-    type = image.GetViewType(desc.is_array, desc.is_storage || desc.is_written || desc.is_depth);
+    type = image.GetViewType(desc.is_array, desc.is_storage || desc.is_written);
     if (type == AmdGpu::ImageType::Cube) {
         // Single cube view: exactly six faces.
         range.extent.layers = 6;
-    } else if (image.IsValidCube() && desc.is_depth && !desc.is_written && !desc.is_storage) {
-        // TODO: depth cubemaps need a CUBE_COMPATIBLE backing image; sample as 2D array for now.
-        LOG_WARNING(Render_Vulkan,
-                    "Depth cubemap (format {}) sampled as a 2D array; native depth cube sampling "
-                    "is not implemented",
-                    vk::to_string(format));
     }
 
     if (!is_storage) {
