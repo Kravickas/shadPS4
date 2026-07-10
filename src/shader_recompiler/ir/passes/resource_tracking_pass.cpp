@@ -915,7 +915,7 @@ IR::Value FixCubeCoords(IR::IREmitter& ir, const AmdGpu::Image& image, const boo
         return ir.CompositeConstruct(dir_x, dir_y, dir_z);
     }
     const IR::F32 cube_index{ir.FPFloor(ir.FPDiv(IR::F32{face}, ir.Imm32(8.f)))};
-    const IR::F32 max_index{ir.Imm32(static_cast<f32>(image.NumLayers() / 6) - 1.f)};
+    const IR::F32 max_index{ir.Imm32(static_cast<f32>(image.NumViewLayers(true) / 6) - 1.f)};
     const IR::F32 clamped{ir.FPMax(ir.FPMin(cube_index, max_index), ir.Imm32(0.f))};
     return ir.CompositeConstruct(dir_x, dir_y, dir_z, clamped);
 }
