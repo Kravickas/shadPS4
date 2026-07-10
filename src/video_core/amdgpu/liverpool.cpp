@@ -1197,11 +1197,9 @@ Liverpool::Task Liverpool::ProcessGraphicsCopy(CmdBuffer cmd_buffers) {
 void Liverpool::SubmitGfx(std::span<const u32> dcb, std::span<const u32> ccb) {
     auto& queue = mapped_queues[GfxQueueId];
 
-    if (EmulatorSettings.IsCopyGpuBuffers()) {
-        std::tie(dcb, ccb) = CopyCmdBuffers(dcb, ccb);
-    }
-
-    auto task = ProcessGraphics(dcb, ccb);
+    auto task = EmulatorSettings.IsCopyGpuBuffers()
+                    ? ProcessGraphicsCopy(CopyCmdBuffers(dcb, ccb))
+                    : ProcessGraphics(dcb, ccb);
     {
         std::scoped_lock lock{queue.m_access};
         queue.submits.emplace(task.handle);
