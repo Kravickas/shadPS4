@@ -215,7 +215,8 @@ Liverpool::Task Liverpool::ProcessCeUpdate(std::span<const u32> ccb) {
     FIBER_EXIT;
 }
 
-Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<const u32> ccb, u32 level) {
+Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<const u32> ccb,
+                                           u32 level) {
     FIBER_ENTER(dcb_task_name);
 
     cblock.Reset();
@@ -246,10 +247,11 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
             break;
         case 0:
             UNREACHABLE_MSG("Unimplemented PM4 type 0, base reg: {}, size: {} "
-                            "(level {}, buf 0x{:x} size {}dw, off +0x{:x}, header 0x{:08x})",
-                            header->type0.base.Value(), header->type0.NumWords(), level, base_addr,
-                            dcb_size_dw, reinterpret_cast<uintptr_t>(header) - base_addr,
-                            header->raw);
+                            "(level {}, copy_setting {}, buf 0x{:x} size {}dw, off +0x{:x}, "
+                            "header 0x{:08x})",
+                            header->type0.base.Value(), header->type0.NumWords(), level,
+                            EmulatorSettings.IsCopyGpuBuffers(), base_addr, dcb_size_dw,
+                            reinterpret_cast<uintptr_t>(header) - base_addr, header->raw);
             break;
         case 2:
             // Type-2 packet are used for padding purposes
@@ -1183,13 +1185,17 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
     FIBER_EXIT;
 }
 
-Liverpool::CmdBuffer Liverpool::CopyCmdBuffers(std::span<const u32> dcb, std::span<const u32> ccb) {
+Liverpool::CmdBuffer Liverpool::CopyCmdBuffers(std::span<const u32> dcb,
+                                               std::span<const u32> ccb) {
     return {std::vector<u32>(dcb.begin(), dcb.end()), std::vector<u32>(ccb.begin(), ccb.end())};
 }
 
 Liverpool::Task Liverpool::ProcessGraphicsCopy(CmdBuffer cmd_buffers) {
     FIBER_ENTER(dcb_task_name);
 
+    // Entry point used when the `copyGPUBuffers` setting is enabled. The copies live in this
+    // coroutine frame, which the submit queue keeps alive until the parse below has consumed
+    // them, so the guest cannot recycle a command buffer while it is still being read.
     auto task = ProcessGraphics(cmd_buffers.first, cmd_buffers.second);
     RESUME_GFX(task);
 
@@ -1205,9 +1211,11 @@ Liverpool::Task Liverpool::ProcessGraphicsCopy(CmdBuffer cmd_buffers) {
 void Liverpool::SubmitGfx(std::span<const u32> dcb, std::span<const u32> ccb) {
     auto& queue = mapped_queues[GfxQueueId];
 
-    auto task = EmulatorSettings.IsCopyGpuBuffers()
-                    ? ProcessGraphicsCopy(CopyCmdBuffers(dcb, ccb))
-                    : ProcessGraphics(dcb, ccb);
+    const bool copy = EmulatorSettings.IsCopyGpuBuffers();
+    LOG_DEBUG(Render, "SubmitGfx: copy={} guest_dcb=0x{:x} {}dw ccb={}dw", copy,
+              reinterpret_cast<uintptr_t>(dcb.data()), dcb.size(), ccb.size());
+
+    auto task = copy ? ProcessGraphicsCopy(CopyCmdBuffers(dcb, ccb)) : ProcessGraphics(dcb, ccb);
     {
         std::scoped_lock lock{queue.m_access};
         queue.submits.emplace(task.handle);
