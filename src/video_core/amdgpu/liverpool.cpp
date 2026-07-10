@@ -215,7 +215,7 @@ Liverpool::Task Liverpool::ProcessCeUpdate(std::span<const u32> ccb) {
     FIBER_EXIT;
 }
 
-Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<const u32> ccb) {
+Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<const u32> ccb, u32 level) {
     FIBER_ENTER(dcb_task_name);
 
     cblock.Reset();
@@ -233,6 +233,7 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
     const bool guest_markers_enabled = rasterizer && EmulatorSettings.IsVkGuestMarkersEnabled();
 
     const auto base_addr = reinterpret_cast<uintptr_t>(dcb.data());
+    const auto dcb_size_dw = dcb.size();
     while (!dcb.empty()) {
         ProcessCommands();
 
@@ -244,8 +245,11 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
             UNREACHABLE_MSG("Wrong PM4 type {}", type);
             break;
         case 0:
-            UNREACHABLE_MSG("Unimplemented PM4 type 0, base reg: {}, size: {}",
-                            header->type0.base.Value(), header->type0.NumWords());
+            UNREACHABLE_MSG("Unimplemented PM4 type 0, base reg: {}, size: {} "
+                            "(level {}, buf 0x{:x} size {}dw, off +0x{:x}, header 0x{:08x})",
+                            header->type0.base.Value(), header->type0.NumWords(), level, base_addr,
+                            dcb_size_dw, reinterpret_cast<uintptr_t>(header) - base_addr,
+                            header->raw);
             break;
         case 2:
             // Type-2 packet are used for padding purposes
@@ -829,8 +833,12 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
             }
             case PM4ItOpcode::IndirectBuffer: {
                 const auto* indirect_buffer = reinterpret_cast<const PM4CmdIndirectBuffer*>(header);
+                LOG_DEBUG(Render, "IB from level {}: guest 0x{:x} size {}dw", level,
+                          reinterpret_cast<uintptr_t>(indirect_buffer->Address<const u32>()),
+                          indirect_buffer->ib_size);
                 auto task = ProcessGraphics(
-                    {indirect_buffer->Address<const u32>(), indirect_buffer->ib_size}, {});
+                    {indirect_buffer->Address<const u32>(), indirect_buffer->ib_size}, {},
+                    level + 1);
                 RESUME_GFX(task);
 
                 while (!task.handle.done()) {
