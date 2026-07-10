@@ -835,7 +835,7 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 const auto* indirect_buffer = reinterpret_cast<const PM4CmdIndirectBuffer*>(header);
                 LOG_DEBUG(Render, "IB from level {}: guest 0x{:x} size {}dw", level,
                           reinterpret_cast<uintptr_t>(indirect_buffer->Address<const u32>()),
-                          indirect_buffer->ib_size);
+                          indirect_buffer->ib_size.Value());
                 auto task = ProcessGraphics(
                     {indirect_buffer->Address<const u32>(), indirect_buffer->ib_size}, {},
                     level + 1);
