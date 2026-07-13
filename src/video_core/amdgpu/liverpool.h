@@ -168,8 +168,9 @@ private:
 
     using CmdBuffer = std::pair<std::vector<u32>, std::vector<u32>>;
     static CmdBuffer CopyCmdBuffers(std::span<const u32> dcb, std::span<const u32> ccb);
-    Task ProcessGraphicsCopy(CmdBuffer cmd_buffers);
-    Task ProcessGraphics(std::span<const u32> dcb, std::span<const u32> ccb);
+    Task ProcessGraphicsCopy(CmdBuffer cmd_buffers, uintptr_t guest_dcb_base);
+    Task ProcessGraphics(std::span<const u32> dcb, std::span<const u32> ccb,
+                         uintptr_t guest_base = 0, u32 level = 0);
     Task ProcessCeUpdate(std::span<const u32> ccb);
     template <bool is_indirect = false>
     Task ProcessCompute(std::span<const u32> acb, u32 vqid);
