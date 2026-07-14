@@ -254,6 +254,21 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 dcb = {};
                 continue;
             }
+            {
+                const volatile u32* p = reinterpret_cast<const volatile u32*>(dcb.data());
+                const u32 r0 = p[0];
+                const u32 r1 = p[0];
+                const u32 r2 = p[0];
+                const auto off_dw = dcb.data() - reinterpret_cast<const u32*>(base_addr);
+                LOG_CRITICAL(Lib_GnmDriver,
+                             "type0 trace: base 0x{:x} off {}dw remaining {}dw hdr r0 0x{:08x} r1 "
+                             "0x{:08x} r2 0x{:08x} changed {}",
+                             base_addr, off_dw, dcb.size(), r0, r1, r2, (r0 != r1) || (r1 != r2));
+                const size_t dump_n = dcb.size() < 8 ? dcb.size() : 8;
+                for (size_t i = 0; i < dump_n; ++i) {
+                    LOG_CRITICAL(Lib_GnmDriver, "type0 trace: +{}dw 0x{:08x}", i, p[i]);
+                }
+            }
             UNREACHABLE_MSG("Unimplemented PM4 type 0, base reg: {}, size: {}",
                             header->type0.base.Value(), header->type0.NumWords());
             break;
@@ -839,6 +854,13 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
             }
             case PM4ItOpcode::IndirectBuffer: {
                 const auto* indirect_buffer = reinterpret_cast<const PM4CmdIndirectBuffer*>(header);
+                LOG_CRITICAL(Lib_GnmDriver,
+                             "ib descend: target 0x{:x} ib_size {}dw chain {} vmid {} from base "
+                             "0x{:x} off {}dw",
+                             reinterpret_cast<uintptr_t>(indirect_buffer->Address<const u32>()),
+                             indirect_buffer->ib_size.Value(), indirect_buffer->chain.Value(),
+                             indirect_buffer->vmid.Value(), base_addr,
+                             dcb.data() - reinterpret_cast<const u32*>(base_addr));
                 auto task = ProcessGraphics(
                     {indirect_buffer->Address<const u32>(), indirect_buffer->ib_size}, {});
                 RESUME_GFX(task);
