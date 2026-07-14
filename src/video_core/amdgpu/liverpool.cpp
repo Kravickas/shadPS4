@@ -295,6 +295,16 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                              at(off_dw - 6), at(off_dw - 5), at(off_dw - 4), at(off_dw - 3),
                              at(off_dw - 2), at(off_dw - 1), at(off_dw), at(off_dw + 1),
                              at(off_dw + 2));
+                // Full buffer dump from the start so the packet chain that reached this offset is
+                // visible. Eight dwords per line.
+                const u32 last = off_dw + 2 < dcb_size_dw ? off_dw + 2 : dcb_size_dw - 1;
+                for (u32 base = 0; base <= last; base += 8) {
+                    LOG_CRITICAL(Render,
+                                 "type-0 dump +0x{:x}: {:08x} {:08x} {:08x} {:08x} {:08x} {:08x} "
+                                 "{:08x} {:08x}",
+                                 base * 4, at(base), at(base + 1), at(base + 2), at(base + 3),
+                                 at(base + 4), at(base + 5), at(base + 6), at(base + 7));
+                }
             }
             UNREACHABLE_MSG("Unimplemented PM4 type 0, base reg: {}, size: {}",
                             header->type0.base.Value(), header->type0.NumWords());
@@ -881,10 +891,15 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
             }
             case PM4ItOpcode::IndirectBuffer: {
                 const auto* indirect_buffer = reinterpret_cast<const PM4CmdIndirectBuffer*>(header);
-                LOG_INFO(Render, "IB descend: level {} -> {} guest 0x{:x} size {}dw", level,
-                         level + 1,
+                LOG_INFO(Render,
+                         "IB descend: level {} -> {} guest 0x{:x} ib_size {}dw raw hdr 0x{:08x} "
+                         "dw1 0x{:08x} dw2 0x{:08x} dw3 0x{:08x}",
+                         level, level + 1,
                          reinterpret_cast<uintptr_t>(indirect_buffer->Address<const u32>()),
-                         indirect_buffer->ib_size.Value());
+                         indirect_buffer->ib_size.Value(), reinterpret_cast<const u32*>(header)[0],
+                         reinterpret_cast<const u32*>(header)[1],
+                         reinterpret_cast<const u32*>(header)[2],
+                         reinterpret_cast<const u32*>(header)[3]);
                 auto task = ProcessGraphics(
                     {indirect_buffer->Address<const u32>(), indirect_buffer->ib_size}, {}, 0,
                     level + 1);
