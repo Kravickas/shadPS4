@@ -215,8 +215,7 @@ Liverpool::Task Liverpool::ProcessCeUpdate(std::span<const u32> ccb) {
     FIBER_EXIT;
 }
 
-Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<const u32> ccb,
-                                           uintptr_t guest_base, u32 level) {
+Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<const u32> ccb) {
     FIBER_ENTER(dcb_task_name);
 
     cblock.Reset();
@@ -234,32 +233,11 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
     const bool guest_markers_enabled = rasterizer && EmulatorSettings.IsVkGuestMarkersEnabled();
 
     const auto base_addr = reinterpret_cast<uintptr_t>(dcb.data());
-    const auto dcb_begin = dcb.data();
-    const auto dcb_size_dw = dcb.size();
-    const auto dump_base = guest_base != 0 ? guest_base : base_addr;
-    // Diagnostic: remember the packet parsed on the previous iteration so a desync onto a bad
-    // header can be traced to the packet that under-advanced.
-    u32 prev_off_dw = 0, prev_header = 0, prev_type = 0, prev_opcode = 0, prev_advance_dw = 0;
     while (!dcb.empty()) {
         ProcessCommands();
 
         const auto* header = reinterpret_cast<const PM4Header*>(dcb.data());
         const u32 type = header->type;
-
-        if (type == 3 && header->type3.NumWords() + 1 > dcb.size()) {
-            LOG_WARNING(Render,
-                        "PM4 overrun: level {} buf 0x{:x} off +0x{:x} needs {}dw {}dw left "
-                        "header 0x{:08x} opcode 0x{:x}",
-                        level, dump_base, reinterpret_cast<uintptr_t>(header) - base_addr,
-                        header->type3.NumWords() + 1, dcb.size(), header->raw,
-                        static_cast<u32>(header->type3.opcode.Value()));
-        }
-
-        prev_off_dw = static_cast<u32>(reinterpret_cast<const u32*>(header) - dcb_begin);
-        prev_header = header->raw;
-        prev_type = type;
-        prev_opcode = type == 3 ? static_cast<u32>(header->type3.opcode.Value()) : 0;
-        prev_advance_dw = type == 3 ? header->type3.NumWords() + 1 : 1;
 
         switch (type) {
         default:
@@ -275,36 +253,6 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
             if (header->raw == 0) {
                 dcb = {};
                 continue;
-            }
-            {
-                const u32 off_dw =
-                    static_cast<u32>(reinterpret_cast<const u32*>(header) - dcb_begin);
-                const auto at = [&](u32 d) -> u32 { return d < dcb_size_dw ? dcb_begin[d] : 0u; };
-                LOG_CRITICAL(
-                    Render,
-                    "type-0 prev-packet: off +0x{:x} header 0x{:08x} type {} opcode 0x{:x} "
-                    "advanced {}dw",
-                    prev_off_dw * 4, prev_header, prev_type, prev_opcode, prev_advance_dw);
-                LOG_CRITICAL(
-                    Render,
-                    "type-0 crash: level {} buf 0x{:x} size {}dw off +0x{:x} header 0x{:08x}",
-                    level, dump_base, dcb_size_dw, off_dw * 4, header->raw);
-                LOG_CRITICAL(Render,
-                             "type-0 window: -6:0x{:08x} -5:0x{:08x} -4:0x{:08x} -3:0x{:08x} "
-                             "-2:0x{:08x} -1:0x{:08x} *0:0x{:08x} +1:0x{:08x} +2:0x{:08x}",
-                             at(off_dw - 6), at(off_dw - 5), at(off_dw - 4), at(off_dw - 3),
-                             at(off_dw - 2), at(off_dw - 1), at(off_dw), at(off_dw + 1),
-                             at(off_dw + 2));
-                // Full buffer dump from the start so the packet chain that reached this offset is
-                // visible. Eight dwords per line.
-                const u32 last = off_dw + 2 < dcb_size_dw ? off_dw + 2 : dcb_size_dw - 1;
-                for (u32 base = 0; base <= last; base += 8) {
-                    LOG_CRITICAL(Render,
-                                 "type-0 dump +0x{:x}: {:08x} {:08x} {:08x} {:08x} {:08x} {:08x} "
-                                 "{:08x} {:08x}",
-                                 base * 4, at(base), at(base + 1), at(base + 2), at(base + 3),
-                                 at(base + 4), at(base + 5), at(base + 6), at(base + 7));
-                }
             }
             UNREACHABLE_MSG("Unimplemented PM4 type 0, base reg: {}, size: {}",
                             header->type0.base.Value(), header->type0.NumWords());
@@ -891,23 +839,19 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
             }
             case PM4ItOpcode::IndirectBuffer: {
                 const auto* indirect_buffer = reinterpret_cast<const PM4CmdIndirectBuffer*>(header);
-                LOG_INFO(Render,
-                         "IB descend: level {} -> {} guest 0x{:x} ib_size {}dw raw hdr 0x{:08x} "
-                         "dw1 0x{:08x} dw2 0x{:08x} dw3 0x{:08x}",
-                         level, level + 1,
-                         reinterpret_cast<uintptr_t>(indirect_buffer->Address<const u32>()),
-                         indirect_buffer->ib_size.Value(), reinterpret_cast<const u32*>(header)[0],
-                         reinterpret_cast<const u32*>(header)[1],
-                         reinterpret_cast<const u32*>(header)[2],
-                         reinterpret_cast<const u32*>(header)[3]);
                 auto task = ProcessGraphics(
-                    {indirect_buffer->Address<const u32>(), indirect_buffer->ib_size}, {}, 0,
-                    level + 1);
+                    {indirect_buffer->Address<const u32>(), indirect_buffer->ib_size}, {});
                 RESUME_GFX(task);
 
                 while (!task.handle.done()) {
                     YIELD_GFX();
                     RESUME_GFX(task);
+                }
+                // A chained indirect buffer transfers execution rather than being called: the
+                // CP does not return to parse packets after this one, so stop the current buffer.
+                if (indirect_buffer->chain != 0) {
+                    dcb = {};
+                    continue;
                 }
                 break;
             }
@@ -1251,13 +1195,13 @@ Liverpool::CmdBuffer Liverpool::CopyCmdBuffers(std::span<const u32> dcb, std::sp
     return {std::vector<u32>(dcb.begin(), dcb.end()), std::vector<u32>(ccb.begin(), ccb.end())};
 }
 
-Liverpool::Task Liverpool::ProcessGraphicsCopy(CmdBuffer cmd_buffers, uintptr_t guest_dcb_base) {
+Liverpool::Task Liverpool::ProcessGraphicsCopy(CmdBuffer cmd_buffers) {
     FIBER_ENTER(dcb_task_name);
 
     // Entry point used when the `copyGPUBuffers` setting is enabled. The copies live in this
     // coroutine frame, which the submit queue keeps alive until the parse below has consumed
     // them, so the guest cannot recycle a command buffer while it is still being read.
-    auto task = ProcessGraphics(cmd_buffers.first, cmd_buffers.second, guest_dcb_base);
+    auto task = ProcessGraphics(cmd_buffers.first, cmd_buffers.second);
     RESUME_GFX(task);
 
     while (!task.handle.done()) {
@@ -1272,10 +1216,8 @@ Liverpool::Task Liverpool::ProcessGraphicsCopy(CmdBuffer cmd_buffers, uintptr_t 
 void Liverpool::SubmitGfx(std::span<const u32> dcb, std::span<const u32> ccb) {
     auto& queue = mapped_queues[GfxQueueId];
 
-    const auto guest_dcb_base = reinterpret_cast<uintptr_t>(dcb.data());
-    auto task = EmulatorSettings.IsCopyGpuBuffers()
-                    ? ProcessGraphicsCopy(CopyCmdBuffers(dcb, ccb), guest_dcb_base)
-                    : ProcessGraphics(dcb, ccb);
+    auto task = EmulatorSettings.IsCopyGpuBuffers() ? ProcessGraphicsCopy(CopyCmdBuffers(dcb, ccb))
+                                                    : ProcessGraphics(dcb, ccb);
     {
         std::scoped_lock lock{queue.m_access};
         queue.submits.emplace(task.handle);
