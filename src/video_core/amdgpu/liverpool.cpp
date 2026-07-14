@@ -236,6 +236,14 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
     const auto base_addr = reinterpret_cast<uintptr_t>(dcb.data());
     const auto dcb_size_dw = dcb.size();
     const auto dump_base = guest_base != 0 ? guest_base : base_addr;
+    const auto* dcb_begin = dcb.data();
+    // Diagnostic: remember the packet parsed on the previous iteration so that if the next
+    // header is a bogus type 0 we can see who advanced onto it.
+    u32 prev_off_dw = 0;
+    u32 prev_header = 0;
+    u32 prev_type = 0;
+    u32 prev_opcode = 0;
+    u32 prev_advance_dw = 0;
     while (!dcb.empty()) {
         ProcessCommands();
 
@@ -254,17 +262,39 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
             }
         }
 
+        prev_off_dw = static_cast<u32>(reinterpret_cast<const u32*>(header) - dcb_begin);
+        prev_header = header->raw;
+        prev_type = type;
+        prev_opcode = type == 3 ? static_cast<u32>(header->type3.opcode.Value()) : 0;
+        prev_advance_dw = type == 3 ? header->type3.NumWords() + 1 : 1;
+
         switch (type) {
         default:
             UNREACHABLE_MSG("Wrong PM4 type {}", type);
             break;
-        case 0:
+        case 0: {
+            const u32 off_dw = static_cast<u32>(reinterpret_cast<const u32*>(header) - dcb_begin);
+            // Dump the previous packet and a raw window [off-8, off+2] so the packet whose size
+            // advanced onto this bogus header is visible.
+            LOG_CRITICAL(Render,
+                         "type-0 prev-packet: off +0x{:x} header 0x{:08x} type {} opcode 0x{:x} "
+                         "advanced {}dw",
+                         prev_off_dw * 4, prev_header, prev_type, prev_opcode, prev_advance_dw);
+            const auto at = [&](u32 d) -> u32 { return d < dcb_size_dw ? dcb_begin[d] : 0u; };
+            LOG_CRITICAL(Render,
+                         "type-0 window (buf 0x{:x} off +0x{:x}): -6:0x{:08x} -5:0x{:08x} "
+                         "-4:0x{:08x} -3:0x{:08x} -2:0x{:08x} -1:0x{:08x} *0:0x{:08x} "
+                         "+1:0x{:08x} +2:0x{:08x}",
+                         dump_base, off_dw * 4, at(off_dw - 6), at(off_dw - 5), at(off_dw - 4),
+                         at(off_dw - 3), at(off_dw - 2), at(off_dw - 1), at(off_dw), at(off_dw + 1),
+                         at(off_dw + 2));
             UNREACHABLE_MSG("Unimplemented PM4 type 0, base reg: {}, size: {} "
                             "(level {}, buf 0x{:x}, size {}dw, off +0x{:x}, header 0x{:08x})",
                             header->type0.base.Value(), header->type0.NumWords(), level, dump_base,
                             dcb_size_dw, reinterpret_cast<uintptr_t>(header) - base_addr,
                             header->raw);
             break;
+        }
         case 2:
             // Type-2 packet are used for padding purposes
             dcb = NextPacket(dcb, 1);
