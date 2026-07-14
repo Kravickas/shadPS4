@@ -256,17 +256,18 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
             }
             {
                 const volatile u32* p = reinterpret_cast<const volatile u32*>(dcb.data());
-                const u32 r0 = p[0];
-                const u32 r1 = p[0];
-                const u32 r2 = p[0];
                 const auto off_dw = dcb.data() - reinterpret_cast<const u32*>(base_addr);
-                LOG_CRITICAL(Lib_GnmDriver,
-                             "type0 trace: base 0x{:x} off {}dw remaining {}dw hdr r0 0x{:08x} r1 "
-                             "0x{:08x} r2 0x{:08x} changed {}",
-                             base_addr, off_dw, dcb.size(), r0, r1, r2, (r0 != r1) || (r1 != r2));
                 const size_t dump_n = dcb.size() < 8 ? dcb.size() : 8;
+                LOG_CRITICAL(Lib_GnmDriver, "type0 trace: base 0x{:x} off {}dw remaining {}dw",
+                             base_addr, off_dw, dcb.size());
                 for (size_t i = 0; i < dump_n; ++i) {
-                    LOG_CRITICAL(Lib_GnmDriver, "type0 trace: +{}dw 0x{:08x}", i, p[i]);
+                    const u32 a = p[i];
+                    const u32 b = p[i];
+                    const u32 c = p[i];
+                    LOG_CRITICAL(Lib_GnmDriver,
+                                 "type0 trace: +{}dw a 0x{:08x} b 0x{:08x} c 0x{:08x} "
+                                 "changed {}",
+                                 i, a, b, c, (a != b) || (b != c));
                 }
             }
             UNREACHABLE_MSG("Unimplemented PM4 type 0, base reg: {}, size: {}",
@@ -854,13 +855,19 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
             }
             case PM4ItOpcode::IndirectBuffer: {
                 const auto* indirect_buffer = reinterpret_cast<const PM4CmdIndirectBuffer*>(header);
+                const volatile u32* ibp = reinterpret_cast<const volatile u32*>(dcb.data());
+                const u32 pre0 = ibp[0];
+                const u32 pre1 = ibp[1];
+                const u32 pre2 = ibp[2];
+                const u32 pre3 = ibp[3];
+                const auto ib_off = dcb.data() - reinterpret_cast<const u32*>(base_addr);
                 LOG_CRITICAL(Lib_GnmDriver,
                              "ib descend: target 0x{:x} ib_size {}dw chain {} vmid {} from base "
-                             "0x{:x} off {}dw",
+                             "0x{:x} off {}dw pre [{:08x} {:08x} {:08x} {:08x}]",
                              reinterpret_cast<uintptr_t>(indirect_buffer->Address<const u32>()),
                              indirect_buffer->ib_size.Value(), indirect_buffer->chain.Value(),
-                             indirect_buffer->vmid.Value(), base_addr,
-                             dcb.data() - reinterpret_cast<const u32*>(base_addr));
+                             indirect_buffer->vmid.Value(), base_addr, ib_off, pre0, pre1, pre2,
+                             pre3);
                 auto task = ProcessGraphics(
                     {indirect_buffer->Address<const u32>(), indirect_buffer->ib_size}, {});
                 RESUME_GFX(task);
@@ -869,6 +876,17 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                     YIELD_GFX();
                     RESUME_GFX(task);
                 }
+                const u32 post0 = ibp[0];
+                const u32 post1 = ibp[1];
+                const u32 post2 = ibp[2];
+                const u32 post3 = ibp[3];
+                const bool ib_changed =
+                    (pre0 != post0) || (pre1 != post1) || (pre2 != post2) || (pre3 != post3);
+                LOG_CRITICAL(Lib_GnmDriver,
+                             "ib return: base 0x{:x} off {}dw chain-now {} post [{:08x} {:08x} "
+                             "{:08x} {:08x}] changed {}",
+                             base_addr, ib_off, indirect_buffer->chain.Value(), post0, post1, post2,
+                             post3, ib_changed);
                 // A chained indirect buffer transfers execution rather than being called: the
                 // CP does not return to parse packets after this one, so stop the current buffer.
                 if (indirect_buffer->chain != 0) {
