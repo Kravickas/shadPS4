@@ -813,13 +813,25 @@ s32 MemoryManager::PoolDecommit(VAddr virtual_addr, u64 size) {
                 u64 size_in_dma =
                     std::min<u64>(size_to_free, phys_handle->second.size - dma_offset);
 
-                // Create a new dmem area reflecting the pooled region
-                const auto new_dmem_handle = CarvePhysArea(dmem_map, phys_addr, size_in_dma);
-                auto& new_dmem_area = new_dmem_handle->second;
-                new_dmem_area.dma_type = PhysicalMemoryType::Pooled;
+                // Create a new dmem area reflecting the pooled region. The range may span
+                // several dmem areas if another mapping carved part of it since this mapping
+                // was created, so walk each of them.
+                PAddr dma_addr = phys_addr;
+                u64 dma_remaining = size_in_dma;
+                while (dma_remaining > 0) {
+                    const PAddr dmem_end = FindDmemArea(dma_addr)->second.GetEnd();
+                    const u64 size_in_dmem = std::min<u64>(dma_remaining, dmem_end - dma_addr);
 
-                // Coalesce with nearby direct memory areas.
-                MergeAdjacent(dmem_map, new_dmem_handle);
+                    const auto new_dmem_handle = CarvePhysArea(dmem_map, dma_addr, size_in_dmem);
+                    auto& new_dmem_area = new_dmem_handle->second;
+                    new_dmem_area.dma_type = PhysicalMemoryType::Pooled;
+
+                    // Coalesce with nearby direct memory areas.
+                    MergeAdjacent(dmem_map, new_dmem_handle);
+
+                    dma_addr += size_in_dmem;
+                    dma_remaining -= size_in_dmem;
+                }
 
                 // Increment loop
                 size_to_free -= size_in_dma;
@@ -893,22 +905,44 @@ u64 MemoryManager::UnmapBytesFromEntry(VAddr virtual_addr, VirtualMemoryArea vma
             PAddr phys_addr = phys_handle->second.base + dma_offset;
             u64 size_in_dma = std::min<u64>(size_to_free, phys_handle->second.size - dma_offset);
 
-            // Create a new dmem area reflecting the pooled region
+            // Create a new dmem area reflecting the pooled region. The area tracked here was
+            // copied when this mapping was created, and another mapping may have carved part of
+            // the same physical range since, so walk each backing area the range covers.
             if (vma_type == VMAType::Direct) {
-                const auto new_dmem_handle = CarvePhysArea(dmem_map, phys_addr, size_in_dma);
-                auto& new_dmem_area = new_dmem_handle->second;
-                new_dmem_area.dma_type = PhysicalMemoryType::Allocated;
+                PAddr dma_addr = phys_addr;
+                u64 dma_remaining = size_in_dma;
+                while (dma_remaining > 0) {
+                    const PAddr dmem_end = FindDmemArea(dma_addr)->second.GetEnd();
+                    const u64 size_in_dmem = std::min<u64>(dma_remaining, dmem_end - dma_addr);
 
-                // Coalesce with nearby direct memory areas.
-                MergeAdjacent(dmem_map, new_dmem_handle);
+                    const auto new_dmem_handle = CarvePhysArea(dmem_map, dma_addr, size_in_dmem);
+                    auto& new_dmem_area = new_dmem_handle->second;
+                    new_dmem_area.dma_type = PhysicalMemoryType::Allocated;
+
+                    // Coalesce with nearby direct memory areas.
+                    MergeAdjacent(dmem_map, new_dmem_handle);
+
+                    dma_addr += size_in_dmem;
+                    dma_remaining -= size_in_dmem;
+                }
             } else if (vma_type == VMAType::Flexible) {
-                // Update fmem_map
-                const auto new_fmem_handle = CarvePhysArea(fmem_map, phys_addr, size_in_dma);
-                auto& new_fmem_area = new_fmem_handle->second;
-                new_fmem_area.dma_type = PhysicalMemoryType::Free;
+                PAddr dma_addr = phys_addr;
+                u64 dma_remaining = size_in_dma;
+                while (dma_remaining > 0) {
+                    const PAddr fmem_end = FindFmemArea(dma_addr)->second.GetEnd();
+                    const u64 size_in_fmem = std::min<u64>(dma_remaining, fmem_end - dma_addr);
 
-                // Coalesce with nearby flexible memory areas.
-                MergeAdjacent(fmem_map, new_fmem_handle);
+                    // Update fmem_map
+                    const auto new_fmem_handle = CarvePhysArea(fmem_map, dma_addr, size_in_fmem);
+                    auto& new_fmem_area = new_fmem_handle->second;
+                    new_fmem_area.dma_type = PhysicalMemoryType::Free;
+
+                    // Coalesce with nearby flexible memory areas.
+                    MergeAdjacent(fmem_map, new_fmem_handle);
+
+                    dma_addr += size_in_fmem;
+                    dma_remaining -= size_in_fmem;
+                }
 
                 // Zero out the old memory data
                 const auto unmap_hardware_address = impl.BackingBase() + phys_addr;
