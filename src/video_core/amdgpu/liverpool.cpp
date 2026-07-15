@@ -152,6 +152,9 @@ void Liverpool::Process(std::stop_token stoken) {
 Liverpool::Task Liverpool::ProcessCeUpdate(std::span<const u32> ccb) {
     FIBER_ENTER(ccb_task_name);
 
+    const bool copy_gpu_buffers = EmulatorSettings.IsCopyGpuBuffers();
+    // Backs `ccb` after a chained indirect buffer transfers execution; must outlive the loop.
+    std::vector<u32> chain_body;
     while (!ccb.empty()) {
         ProcessCommands();
 
@@ -194,8 +197,24 @@ Liverpool::Task Liverpool::ProcessCeUpdate(std::span<const u32> ccb) {
         }
         case PM4ItOpcode::IndirectBufferConst: {
             const auto* indirect_buffer = reinterpret_cast<const PM4CmdIndirectBuffer*>(header);
+            const std::span<const u32> ib_body{indirect_buffer->Address<const u32>(),
+                                               indirect_buffer->ib_size};
+            if (indirect_buffer->chain != 0) {
+                // Chain set: transfer execution to the target buffer, as on the graphics path.
+                if (copy_gpu_buffers) {
+                    chain_body.assign(ib_body.begin(), ib_body.end());
+                    ccb = chain_body;
+                } else {
+                    ccb = ib_body;
+                }
+                continue;
+            }
+            std::vector<u32> ib2_body;
+            if (copy_gpu_buffers) {
+                ib2_body.assign(ib_body.begin(), ib_body.end());
+            }
             auto task =
-                ProcessCeUpdate({indirect_buffer->Address<const u32>(), indirect_buffer->ib_size});
+                ProcessCeUpdate(copy_gpu_buffers ? std::span<const u32>{ib2_body} : ib_body);
             RESUME_CE(task);
 
             while (!task.handle.done()) {
@@ -231,8 +250,11 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
     }
     const bool host_markers_enabled = rasterizer && EmulatorSettings.IsVkHostMarkersEnabled();
     const bool guest_markers_enabled = rasterizer && EmulatorSettings.IsVkGuestMarkersEnabled();
+    const bool copy_gpu_buffers = EmulatorSettings.IsCopyGpuBuffers();
+    // Backs `dcb` after a chained indirect buffer transfers execution; must outlive the loop.
+    std::vector<u32> chain_body;
 
-    const auto base_addr = reinterpret_cast<uintptr_t>(dcb.data());
+    auto base_addr = reinterpret_cast<uintptr_t>(dcb.data());
     while (!dcb.empty()) {
         ProcessCommands();
 
@@ -253,22 +275,6 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
             if (header->raw == 0) {
                 dcb = {};
                 continue;
-            }
-            {
-                const volatile u32* p = reinterpret_cast<const volatile u32*>(dcb.data());
-                const auto off_dw = dcb.data() - reinterpret_cast<const u32*>(base_addr);
-                const size_t dump_n = dcb.size() < 8 ? dcb.size() : 8;
-                LOG_CRITICAL(Lib_GnmDriver, "type0 trace: base 0x{:x} off {}dw remaining {}dw",
-                             base_addr, off_dw, dcb.size());
-                for (size_t i = 0; i < dump_n; ++i) {
-                    const u32 a = p[i];
-                    const u32 b = p[i];
-                    const u32 c = p[i];
-                    LOG_CRITICAL(Lib_GnmDriver,
-                                 "type0 trace: +{}dw a 0x{:08x} b 0x{:08x} c 0x{:08x} "
-                                 "changed {}",
-                                 i, a, b, c, (a != b) || (b != c));
-                }
             }
             UNREACHABLE_MSG("Unimplemented PM4 type 0, base reg: {}, size: {}",
                             header->type0.base.Value(), header->type0.NumWords());
@@ -855,43 +861,32 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
             }
             case PM4ItOpcode::IndirectBuffer: {
                 const auto* indirect_buffer = reinterpret_cast<const PM4CmdIndirectBuffer*>(header);
-                const volatile u32* ibp = reinterpret_cast<const volatile u32*>(dcb.data());
-                const u32 pre0 = ibp[0];
-                const u32 pre1 = ibp[1];
-                const u32 pre2 = ibp[2];
-                const u32 pre3 = ibp[3];
-                const auto ib_off = dcb.data() - reinterpret_cast<const u32*>(base_addr);
-                LOG_CRITICAL(Lib_GnmDriver,
-                             "ib descend: target 0x{:x} ib_size {}dw chain {} vmid {} from base "
-                             "0x{:x} off {}dw pre [{:08x} {:08x} {:08x} {:08x}]",
-                             reinterpret_cast<uintptr_t>(indirect_buffer->Address<const u32>()),
-                             indirect_buffer->ib_size.Value(), indirect_buffer->chain.Value(),
-                             indirect_buffer->vmid.Value(), base_addr, ib_off, pre0, pre1, pre2,
-                             pre3);
+                const std::span<const u32> ib_body{indirect_buffer->Address<const u32>(),
+                                                   indirect_buffer->ib_size};
+                if (indirect_buffer->chain != 0) {
+                    // Chain set: the CP continues execution in the target buffer at the current
+                    // level and never returns here, so transfer instead of recursing.
+                    if (copy_gpu_buffers) {
+                        chain_body.assign(ib_body.begin(), ib_body.end());
+                        dcb = chain_body;
+                    } else {
+                        dcb = ib_body;
+                    }
+                    base_addr = reinterpret_cast<uintptr_t>(dcb.data());
+                    continue;
+                }
+                // Chain clear: the CP launches an IB2, which returns here once it completes.
+                std::vector<u32> ib2_body;
+                if (copy_gpu_buffers) {
+                    ib2_body.assign(ib_body.begin(), ib_body.end());
+                }
                 auto task = ProcessGraphics(
-                    {indirect_buffer->Address<const u32>(), indirect_buffer->ib_size}, {});
+                    copy_gpu_buffers ? std::span<const u32>{ib2_body} : ib_body, {});
                 RESUME_GFX(task);
 
                 while (!task.handle.done()) {
                     YIELD_GFX();
                     RESUME_GFX(task);
-                }
-                const u32 post0 = ibp[0];
-                const u32 post1 = ibp[1];
-                const u32 post2 = ibp[2];
-                const u32 post3 = ibp[3];
-                const bool ib_changed =
-                    (pre0 != post0) || (pre1 != post1) || (pre2 != post2) || (pre3 != post3);
-                LOG_CRITICAL(Lib_GnmDriver,
-                             "ib return: base 0x{:x} off {}dw chain-now {} post [{:08x} {:08x} "
-                             "{:08x} {:08x}] changed {}",
-                             base_addr, ib_off, indirect_buffer->chain.Value(), post0, post1, post2,
-                             post3, ib_changed);
-                // A chained indirect buffer transfers execution rather than being called: the
-                // CP does not return to parse packets after this one, so stop the current buffer.
-                if (indirect_buffer->chain != 0) {
-                    dcb = {};
-                    continue;
                 }
                 break;
             }
