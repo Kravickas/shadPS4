@@ -1242,11 +1242,23 @@ s32 MemoryManager::SetDirectMemoryType(VAddr addr, u64 size, s32 memory_type) {
                 // Update internal physical areas
                 phys_handle->second.memory_type = memory_type;
 
-                // Carve a new dmem area in dmem_map, update memory type there
-                auto dmem_handle =
-                    CarvePhysArea(dmem_map, phys_handle->second.base, phys_handle->second.size);
-                auto& dmem_area = dmem_handle->second;
-                dmem_area.memory_type = memory_type;
+                // The area tracked here was copied when this mapping was created. Another
+                // mapping may have carved part of the same physical range since, splitting it
+                // into several dmem areas, so walk them and update each in turn.
+                PAddr phys_addr = phys_handle->second.base;
+                u64 phys_remaining = phys_handle->second.size;
+                while (phys_remaining > 0) {
+                    const PAddr dmem_end = FindDmemArea(phys_addr)->second.GetEnd();
+                    const u64 size_in_dmem = std::min<u64>(phys_remaining, dmem_end - phys_addr);
+
+                    // Carve a new dmem area in dmem_map, update memory type there
+                    auto dmem_handle = CarvePhysArea(dmem_map, phys_addr, size_in_dmem);
+                    auto& dmem_area = dmem_handle->second;
+                    dmem_area.memory_type = memory_type;
+
+                    phys_addr += size_in_dmem;
+                    phys_remaining -= size_in_dmem;
+                }
 
                 // Increment phys_handle
                 phys_handle++;
