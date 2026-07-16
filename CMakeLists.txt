@@ -364,8 +364,7 @@ set(KERNEL_LIB src/core/libraries/kernel/coredump/coredump.cpp
 )
 
 if (ARCHITECTURE STREQUAL "x86_64" OR ARCHITECTURE STREQUAL "arm64")
-    list(APPEND KERNEL_LIB src/core/libraries/kernel/threads/stack.S)
-    set_source_files_properties(src/core/libraries/kernel/threads/stack.S PROPERTIES COMPILE_OPTIONS -Wno-unused-command-line-argument)
+    list(APPEND KERNEL_LIB src/core/libraries/kernel/threads/stack_asm.cpp)
 endif()
 
 set(NETWORK_LIBS src/core/libraries/network/http.cpp
@@ -421,8 +420,6 @@ set(SYSTEM_LIBS src/core/libraries/system/commondialog.cpp
                 src/core/libraries/system/msgdialog.cpp
                 src/core/libraries/system/msgdialog.h
                 src/core/libraries/system/msgdialog_ui.cpp
-                src/core/libraries/system/posix.cpp
-                src/core/libraries/system/posix.h
                 src/core/libraries/save_data/save_backup.cpp
                 src/core/libraries/save_data/save_backup.h
                 src/core/libraries/save_data/save_instance.cpp
@@ -609,13 +606,11 @@ set(USBD_LIB src/core/libraries/usbd/usbd.cpp
              src/core/libraries/usbd/emulated/skylander.h
 )
 
-set(FIBER_LIB src/core/libraries/fiber/fiber_context.s
+set(FIBER_LIB src/core/libraries/fiber/fiber_context.cpp
               src/core/libraries/fiber/fiber.cpp
               src/core/libraries/fiber/fiber.h
               src/core/libraries/fiber/fiber_error.h
 )
-
-set_source_files_properties(src/core/libraries/fiber/fiber_context.s PROPERTIES COMPILE_OPTIONS -Wno-unused-command-line-argument)
 
 set(VDEC_LIB src/core/libraries/videodec/videodec2_impl.cpp
              src/core/libraries/videodec/videodec2_impl.h
@@ -1213,6 +1208,8 @@ add_custom_command(
 
 set(SHADNET src/shadnet/client.cpp
             src/shadnet/client.h
+            src/shadnet/server_probe.cpp
+            src/shadnet/server_probe.h
             "${SHADNET_PROTO_OUT}/shadnet.pb.cc"
 )
 if (APPLE)
