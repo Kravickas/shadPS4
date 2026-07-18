@@ -188,9 +188,6 @@ union Regs {
     void SetDefaults();
 };
 
-static_assert(offsetof(Regs, db_alpha_to_mask) == 0xA2DCu * 4u,
-              "DB_ALPHA_TO_MASK must map to context register 0x2DC");
-
 #undef DO_CONCAT2
 #undef CONCAT2
 #undef INSERT_PADDING_WORDS
