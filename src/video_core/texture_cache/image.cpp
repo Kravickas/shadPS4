@@ -136,7 +136,7 @@ Image::Image(const Vulkan::Instance& instance_, Vulkan::Scheduler& scheduler_,
     if (info.props.is_block && instance->IsBlockTexelViewSupported()) {
         flags |= vk::ImageCreateFlagBits::eBlockTexelViewCompatible;
     }
-    if (info.props.is_cube && info.num_samples == 1) {
+    if (info.props.is_cube && info.num_samples == 1 && instance->IsNativeCubeSupported()) {
         flags |= vk::ImageCreateFlagBits::eCubeCompatible;
     }
 
