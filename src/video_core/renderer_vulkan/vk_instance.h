@@ -295,7 +295,7 @@ public:
             return true;
         }
         const u32 id = properties.deviceID;
-        return !((id >= 0x67C0 && id <= 0x67FF) || (id >= 0x6980 && id <= 0x699F));
+        return !((id >= 0x67C0 && id <= 0x67FF) || (id >= 0x6980 && id <= 0x699F) || id == 0x6FDF);
     }
 
     /// Returns the current driver version provided in Vulkan-formatted version numbers.
