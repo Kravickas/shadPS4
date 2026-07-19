@@ -569,7 +569,8 @@ void PatchImageSharp(IR::Block& block, IR::Inst& inst, Info& info, Descriptors& 
         // so that we will only bind a single level.
         // If index is dynamic, we will bind levels as an array
         const auto view_type =
-            image.GetViewType(image_res.is_array, image_res.is_storage || image_res.is_written);
+            image.GetViewType(image_res.is_array, image_res.is_storage || image_res.is_written,
+                              profile.supports_native_cube_map);
 
         IR::Inst* body = inst.Arg(1).InstRecursive();
         const auto lod_arg = [&] -> IR::Value {
@@ -929,7 +930,8 @@ void PatchImageSampleArgs(IR::Block& block, IR::Inst& inst, Info& info,
     IR::IREmitter ir{block, IR::Block::InstructionList::s_iterator_to(inst)};
     const auto inst_info = inst.Flags<IR::TextureInstInfo>();
     const auto view_type =
-        image.GetViewType(image_res.is_array, image_res.is_storage || image_res.is_written);
+        image.GetViewType(image_res.is_array, image_res.is_storage || image_res.is_written,
+                          profile.supports_native_cube_map);
 
     IR::Inst* body1 = inst.Arg(2).InstRecursive();
     IR::Inst* body2 = inst.Arg(3).InstRecursive();
@@ -1147,7 +1149,8 @@ void PatchImageArgs(IR::Block& block, IR::Inst& inst, Info& info) {
     IR::IREmitter ir{block, IR::Block::InstructionList::s_iterator_to(inst)};
     auto inst_info = inst.Flags<IR::TextureInstInfo>();
     const auto view_type =
-        image.GetViewType(image_res.is_array, image_res.is_storage || image_res.is_written);
+        image.GetViewType(image_res.is_array, image_res.is_storage || image_res.is_written,
+                          profile.supports_native_cube_map);
 
     // Now that we know the image type, adjust texture coordinate vector.
     IR::Inst* body = inst.Arg(1).InstRecursive();
