@@ -321,12 +321,11 @@ struct Image {
         return base_type;
     }
 
-    ImageType GetViewType(const bool is_array, const bool is_storage = false) const noexcept {
+    ImageType GetViewType(const bool is_array, const bool is_storage = false,
+                          const bool native_cube = true) const noexcept {
         const auto base_type = GetType();
         if (IsCube()) {
-            // Storage/written/depth cubes stay 2D arrays; a sampled cube picks cube vs cube array
-            // from the DA flag.
-            if (is_storage || !IsValidCube()) {
+            if (is_storage || !native_cube || !IsValidCube()) {
                 return base_type;
             }
             return is_array ? ImageType::CubeArray : ImageType::Cube;
