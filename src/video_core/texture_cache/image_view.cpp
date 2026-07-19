@@ -121,6 +121,10 @@ ImageView::ImageView(const Vulkan::Instance& instance, const ImageViewInfo& info
     }
 
     auto view_type = ConvertImageViewType(info.type);
+    if (!instance.IsNativeCubeSupported() &&
+        (info.type == AmdGpu::ImageType::Cube || info.type == AmdGpu::ImageType::CubeArray)) {
+        view_type = vk::ImageViewType::e2DArray;
+    }
 
     const vk::ImageViewCreateInfo image_view_ci = {
         .pNext = &usage_ci,
