@@ -934,7 +934,8 @@ IR::Value FixCubeCoords(IR::IREmitter& ir, const AmdGpu::Image& image, const boo
 }
 
 void PatchImageSampleArgs(IR::Block& block, IR::Inst& inst, Info& info,
-                          const ImageResource& image_res, const AmdGpu::Image& image) {
+                          const ImageResource& image_res, const AmdGpu::Image& image,
+                          const Profile& profile) {
     const auto handle = inst.Arg(0);
     const auto& sampler_res = info.samplers[(handle.U32() >> 16) & 0xFFFF];
     const auto sampler = sampler_res.GetSharp(info);
@@ -1081,9 +1082,10 @@ void PatchImageSampleArgs(IR::Block& block, IR::Inst& inst, Info& info,
             if (image.IsCube()) {
                 const IR::F32 face{get_addr_reg(addr_reg - 1)};
                 const IR::F32 idx{ir.FPFloor(IR::F32{ir.FPDiv(face, ir.Imm32(8.f))})};
-                return ir.CompositeConstruct(ir.FPSub(get_coord(addr_reg - 3, 0), ir.Imm32(1.f)),
-                                             ir.FPSub(get_coord(addr_reg - 2, 1), ir.Imm32(1.f)),
-                                             ir.FPFma(idx, ir.Imm32(-2.f), face));
+                return ir.CompositeConstruct(
+                    ir.FPSub(IR::F32{get_coord(addr_reg - 3, 0)}, ir.Imm32(1.f)),
+                    ir.FPSub(IR::F32{get_coord(addr_reg - 2, 1)}, ir.Imm32(1.f)),
+                    ir.FPFma(idx, ir.Imm32(-2.f), face));
             }
             return ir.CompositeConstruct(get_coord(addr_reg - 3, 0), get_coord(addr_reg - 2, 1),
                                          get_addr_reg(addr_reg - 1));
@@ -1149,7 +1151,7 @@ void PatchImageSampleArgs(IR::Block& block, IR::Inst& inst, Info& info,
     inst.ReplaceUsesWith(converted);
 }
 
-void PatchImageArgs(IR::Block& block, IR::Inst& inst, Info& info) {
+void PatchImageArgs(IR::Block& block, IR::Inst& inst, Info& info, const Profile& profile) {
     // Nothing to patch for dimension query.
     if (inst.GetOpcode() == IR::Opcode::ImageQueryDimensions) {
         return;
@@ -1162,7 +1164,7 @@ void PatchImageArgs(IR::Block& block, IR::Inst& inst, Info& info) {
 
     // Sample instructions must be handled separately using address register data.
     if (inst.GetOpcode() == IR::Opcode::ImageSampleRaw) {
-        return PatchImageSampleArgs(block, inst, info, image_res, image);
+        return PatchImageSampleArgs(block, inst, info, image_res, image, profile);
     }
 
     IR::IREmitter ir{block, IR::Block::InstructionList::s_iterator_to(inst)};
@@ -1271,7 +1273,7 @@ void ResourceTrackingPass(IR::Program& program, const Profile& profile) {
             if (IsBufferInstruction(inst)) {
                 PatchBufferArgs(*block, inst, info);
             } else if (IsImageInstruction(inst)) {
-                PatchImageArgs(*block, inst, info);
+                PatchImageArgs(*block, inst, info, profile);
             } else if (IsDataRingInstruction(inst)) {
                 PatchGlobalDataShareAccess(*block, inst, info, descriptors, profile);
             }
