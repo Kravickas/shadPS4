@@ -889,33 +889,45 @@ void PatchBufferArgs(IR::Block& block, IR::Inst& inst, Info& info) {
 }
 
 IR::Value FixCubeCoords(IR::IREmitter& ir, const AmdGpu::Image& image, const bool is_array,
-                        const IR::F32& coord_x, const IR::F32& coord_y, const IR::F32& face) {
-    // Recover the original direction from the cube op's input instead of inverting the projection.
+                        const IR::F32& x, const IR::F32& y, const IR::F32& face) {
+    IR::F32 dir_x, dir_y, dir_z;
     const auto pred = [](IR::Inst* inst) -> std::optional<IR::Inst*> {
         if (inst->GetOpcode() == IR::Opcode::CubeFaceIndex) {
             return inst;
         }
         return std::nullopt;
     };
-    const auto cube_inst = IR::BreadthFirstSearch(face, pred);
-    IR::F32 dir_x{}, dir_y{}, dir_z{};
-    if (cube_inst) {
+    if (const auto cube_inst = IR::BreadthFirstSearch(face, pred)) {
         const IR::Value dir{cube_inst.value()->Arg(0)};
         dir_x = IR::F32{ir.CompositeExtract(dir, 0)};
         dir_y = IR::F32{ir.CompositeExtract(dir, 1)};
         dir_z = IR::F32{ir.CompositeExtract(dir, 2)};
     } else {
-        LOG_WARNING(Render_Recompiler, "Cube face index source not found; using raw coordinates");
-        dir_x = coord_x;
-        dir_y = coord_y;
-        dir_z = face;
+        const IR::F32 s{ir.FPSub(x, ir.Imm32(1.f))};
+        const IR::F32 t{ir.FPSub(y, ir.Imm32(1.f))};
+        const IR::F32 sc{ir.FPSub(IR::F32{ir.FPMul(s, ir.Imm32(2.f))}, ir.Imm32(1.f))};
+        const IR::F32 tc{ir.FPSub(IR::F32{ir.FPMul(t, ir.Imm32(2.f))}, ir.Imm32(1.f))};
+        const IR::F32 nsc{ir.FPNeg(sc)};
+        const IR::F32 ntc{ir.FPNeg(tc)};
+        const IR::F32 pos{ir.Imm32(1.f)};
+        const IR::F32 neg{ir.Imm32(-1.f)};
+        const IR::F32 fid{ir.FPSub(
+            face, IR::F32{ir.FPMul(IR::F32{ir.FPFloor(IR::F32{ir.FPDiv(face, ir.Imm32(8.f))})},
+                                   ir.Imm32(8.f))})};
+        const auto on_face = [&](float f) -> IR::U1 { return ir.FPEqual(fid, ir.Imm32(f)); };
+        dir_x = IR::F32{ir.Select(on_face(0.f), pos,
+                                  ir.Select(on_face(1.f), neg, ir.Select(on_face(5.f), nsc, sc)))};
+        dir_y = IR::F32{ir.Select(on_face(2.f), pos, ir.Select(on_face(3.f), neg, ntc))};
+        dir_z = IR::F32{ir.Select(
+            on_face(0.f), nsc,
+            ir.Select(on_face(1.f), sc,
+                      ir.Select(on_face(2.f), tc,
+                                ir.Select(on_face(3.f), ntc, ir.Select(on_face(4.f), pos, neg)))))};
     }
-    const IR::F32 mag2{ir.FPFma(dir_x, dir_x, ir.FPFma(dir_y, dir_y, ir.FPMul(dir_z, dir_z)))};
-    dir_z = IR::F32{ir.Select(ir.FPEqual(mag2, ir.Imm32(0.f)), ir.Imm32(1.f), dir_z)};
     if (!is_array) {
         return ir.CompositeConstruct(dir_x, dir_y, dir_z);
     }
-    const IR::F32 cube_index{ir.FPFloor(ir.FPDiv(IR::F32{face}, ir.Imm32(8.f)))};
+    const IR::F32 cube_index{ir.FPFloor(IR::F32{ir.FPDiv(face, ir.Imm32(8.f))})};
     const IR::F32 max_index{ir.Imm32(static_cast<f32>(image.NumViewLayers(true) / 6) - 1.f)};
     const IR::F32 clamped{ir.FPMax(ir.FPMin(cube_index, max_index), ir.Imm32(0.f))};
     return ir.CompositeConstruct(dir_x, dir_y, dir_z, clamped);
@@ -1066,6 +1078,13 @@ void PatchImageSampleArgs(IR::Block& block, IR::Inst& inst, Info& info,
             return ir.CompositeConstruct(get_coord(addr_reg - 2, 0), get_coord(addr_reg - 1, 1));
         case AmdGpu::ImageType::Color2DArray: // x, y, slice
             addr_reg = addr_reg + 3;
+            if (image.IsCube()) {
+                const IR::F32 face{get_addr_reg(addr_reg - 1)};
+                const IR::F32 idx{ir.FPFloor(IR::F32{ir.FPDiv(face, ir.Imm32(8.f))})};
+                return ir.CompositeConstruct(ir.FPSub(get_coord(addr_reg - 3, 0), ir.Imm32(1.f)),
+                                             ir.FPSub(get_coord(addr_reg - 2, 1), ir.Imm32(1.f)),
+                                             ir.FPFma(idx, ir.Imm32(-2.f), face));
+            }
             return ir.CompositeConstruct(get_coord(addr_reg - 3, 0), get_coord(addr_reg - 2, 1),
                                          get_addr_reg(addr_reg - 1));
         case AmdGpu::ImageType::Cube:      // x, y, face
