@@ -1,0 +1,16 @@
+name: Remove old artifacts
+
+on:
+  schedule:
+    - cron: '0 1 * * *'
+  workflow_dispatch:
+
+jobs:
+  remove-old-artifacts:
+    runs-on: ubuntu-latest
+    permissions:
+      actions: write
+    steps:
+      - uses: c-hive/gha-remove-artifacts@v1
+        with:
+          age: '60 days'
