@@ -105,16 +105,23 @@ static bool ExecuteCopyShaderHLE(const Shader::Info& info, const AmdGpu::Compute
         auto* memory = Core::Memory::Instance();
         const VAddr src_span_addr = src_buf_sharp.base_address + src_offset_min;
         const VAddr dst_span_addr = dst_buf_sharp.base_address + dst_offset_min;
-        const u8* src_backing = nullptr;
-        u8* dst_backing = nullptr;
-        if (!buffer_cache.IsRegionGpuModified(src_span_addr, src_offset_max - src_offset_min)) {
-            src_backing = memory->TryGetBacking(src_span_addr, src_offset_max - src_offset_min);
-            dst_backing = memory->TryGetBacking(dst_span_addr, dst_offset_max - dst_offset_min);
-        }
+        const u8* src_backing =
+            memory->TryGetBacking(src_span_addr, src_offset_max - src_offset_min);
+        u8* dst_backing = memory->TryGetBacking(dst_span_addr, dst_offset_max - dst_offset_min);
         if (src_backing && dst_backing) {
-            for (const auto& copy : vk_copies) {
-                memcpy(dst_backing + (copy.dstOffset - dst_offset_min),
-                       src_backing + (copy.srcOffset - src_offset_min), copy.size);
+            if (!buffer_cache.IsRegionGpuModified(src_span_addr, src_offset_max - src_offset_min)) {
+                for (const auto& copy : vk_copies) {
+                    memcpy(dst_backing + (copy.dstOffset - dst_offset_min),
+                           src_backing + (copy.srcOffset - src_offset_min), copy.size);
+                }
+            } else {
+                for (const auto& copy : vk_copies) {
+                    if (!buffer_cache.IsRegionGpuModified(
+                            src_buf_sharp.base_address + copy.srcOffset, copy.size)) {
+                        memcpy(dst_backing + (copy.dstOffset - dst_offset_min),
+                               src_backing + (copy.srcOffset - src_offset_min), copy.size);
+                    }
+                }
             }
         } else {
             static std::vector<u8> mirror_data;
