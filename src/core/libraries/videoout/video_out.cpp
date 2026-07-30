@@ -353,9 +353,13 @@ s32 sceVideoOutSubmitEopFlip(s32 handle, u32 buf_id, u32 mode, s64 flip_arg, voi
         LOG_ERROR(Lib_VideoOut, "Invalid buf_id = {}", index);
         return ORBIS_VIDEO_OUT_ERROR_INVALID_INDEX;
     }
-    if (index != -1 && port->buffer_slots[index].group_index < 0) {
-        LOG_ERROR(Lib_VideoOut, "Slot in buf_id = {} is not registered", index);
+    if (index != -1 && port->buffer_slots[index].group_index == -1) {
+        LOG_ERROR(Lib_VideoOut, "Buffer {} is not registered", index);
         return ORBIS_VIDEO_OUT_ERROR_INVALID_INDEX;
+    }
+    if (mode - 1u > 5u) {
+        LOG_ERROR(Lib_VideoOut, "Invalid flip mode = {}", mode);
+        return ORBIS_VIDEO_OUT_ERROR_INVALID_FLIP_MODE;
     }
 
     Platform::IrqC::Instance()->RegisterOnce(
