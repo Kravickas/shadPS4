@@ -1,10 +1,17 @@
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <algorithm>
+#include <array>
+#include <string>
+#include <string_view>
+#include <fmt/format.h>
 #include "common/arch.h"
 #include "common/assert.h"
 #include "common/decoder.h"
+#include "common/logging/log.h"
 #include "common/signal_context.h"
+#include "common/string_util.h"
 #include "core/libraries/kernel/threads/exception.h"
 #include "core/signals.h"
 #include "emulator.h"
@@ -30,6 +37,177 @@ extern std::array<OrbisKernelExceptionHandler, 32> Handlers;
 namespace Core {
 
 #if defined(_WIN32)
+
+namespace {
+
+constexpr size_t MaxInstructionBytes = 16;
+constexpr size_t MaxBacktraceFrames = 32;
+constexpr DWORD PageReadable = PAGE_READONLY | PAGE_READWRITE | PAGE_WRITECOPY | PAGE_EXECUTE_READ |
+                               PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY;
+
+thread_local bool in_crash_report = false;
+
+size_t ReadableSpan(const void* address, size_t wanted) {
+    MEMORY_BASIC_INFORMATION mbi{};
+    if (VirtualQuery(address, &mbi, sizeof(mbi)) != sizeof(mbi)) {
+        return 0;
+    }
+    if (mbi.State != MEM_COMMIT || (mbi.Protect & PageReadable) == 0 ||
+        (mbi.Protect & PAGE_GUARD) != 0) {
+        return 0;
+    }
+    const auto region_end = reinterpret_cast<uintptr_t>(mbi.BaseAddress) + mbi.RegionSize;
+    return std::min<size_t>(wanted, region_end - reinterpret_cast<uintptr_t>(address));
+}
+
+std::string DescribeRegion(const void* address) {
+    MEMORY_BASIC_INFORMATION mbi{};
+    if (VirtualQuery(address, &mbi, sizeof(mbi)) != sizeof(mbi)) {
+        return "<query failed>";
+    }
+    // Protect and Type are undefined for MEM_FREE, Protect is undefined for MEM_RESERVE.
+    if (mbi.State == MEM_FREE) {
+        return fmt::format("free size={:#x}", mbi.RegionSize);
+    }
+    if (mbi.State == MEM_RESERVE) {
+        return fmt::format("reserved alloc_base={} size={:#x} type={:#x}", mbi.AllocationBase,
+                           mbi.RegionSize, mbi.Type);
+    }
+    return fmt::format("committed alloc_base={} size={:#x} prot={:#x} type={:#x}",
+                       mbi.AllocationBase, mbi.RegionSize, mbi.Protect, mbi.Type);
+}
+
+std::string DescribeModule(const void* address) {
+    HMODULE module{};
+    if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                                GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                            static_cast<LPCWSTR>(address), &module) ||
+        module == nullptr) {
+        return "<no module>";
+    }
+    wchar_t path[MAX_PATH]{};
+    const DWORD length = GetModuleFileNameW(module, path, MAX_PATH);
+    const auto offset = reinterpret_cast<uintptr_t>(address) - reinterpret_cast<uintptr_t>(module);
+    if (length == 0) {
+        return fmt::format("{}+{:#x}", static_cast<const void*>(module), offset);
+    }
+    std::wstring_view name{path, length};
+    if (const auto slash = name.find_last_of(L"\\/"); slash != std::wstring_view::npos) {
+        name.remove_prefix(slash + 1);
+    }
+    return fmt::format("{}+{:#x}", Common::UTF16ToUTF8(name), offset);
+}
+
+std::string DumpBytes(const void* address, size_t count) {
+    const auto* bytes = static_cast<const u8*>(address);
+    std::string out;
+    out.reserve(count * 3);
+    for (size_t i = 0; i < count; ++i) {
+        out += fmt::format("{:02x} ", bytes[i]);
+    }
+    return out;
+}
+
+#ifdef ARCH_X86_64
+std::string Disassemble(const void* address, size_t size) {
+    ZydisDecodedInstruction inst;
+    ZydisDecodedOperand operands[ZYDIS_MAX_OPERAND_COUNT];
+    auto* decoder = Common::Decoder::Instance();
+    if (!ZYAN_SUCCESS(
+            decoder->decodeInstruction(inst, operands, const_cast<void*>(address), size))) {
+        return "<decode failed>";
+    }
+    return decoder->disassembleInst(inst, operands, reinterpret_cast<u64>(address));
+}
+
+size_t CaptureBacktrace(const CONTEXT& initial, u64* frames, size_t max_frames) {
+    CONTEXT ctx = initial;
+    size_t count = 0;
+    while (count < max_frames && ctx.Rip != 0) {
+        frames[count++] = ctx.Rip;
+        DWORD64 image_base = 0;
+        PRUNTIME_FUNCTION entry = RtlLookupFunctionEntry(ctx.Rip, &image_base, nullptr);
+        if (entry == nullptr) {
+            // Leaf function: the return address is the qword at rsp.
+            const auto* stack = reinterpret_cast<const DWORD64*>(ctx.Rsp);
+            if (ReadableSpan(stack, sizeof(DWORD64)) < sizeof(DWORD64)) {
+                break;
+            }
+            ctx.Rip = *stack;
+            ctx.Rsp += sizeof(DWORD64);
+            continue;
+        }
+        PVOID handler_data = nullptr;
+        DWORD64 establisher_frame = 0;
+        RtlVirtualUnwind(UNW_FLAG_NHANDLER, image_base, ctx.Rip, entry, &ctx, &handler_data,
+                         &establisher_frame, nullptr);
+    }
+    return count;
+}
+#endif
+
+void LogCrashContext(EXCEPTION_POINTERS* pExp, DWORD code, const void* address) {
+    if (in_crash_report || pExp == nullptr || pExp->ExceptionRecord == nullptr ||
+        pExp->ContextRecord == nullptr) {
+        return;
+    }
+    in_crash_report = true;
+
+    const EXCEPTION_RECORD& record = *pExp->ExceptionRecord;
+    LOG_CRITICAL(Debug, "  rip          {} {}", address, DescribeModule(address));
+    LOG_CRITICAL(Debug, "  rip region   {}", DescribeRegion(address));
+
+    if (code == EXCEPTION_ACCESS_VIOLATION && record.NumberParameters >= 2) {
+        const auto operation = record.ExceptionInformation[0];
+        const auto* fault = reinterpret_cast<const void*>(record.ExceptionInformation[1]);
+        const char* kind = operation == 0   ? "read"
+                           : operation == 1 ? "write"
+                           : operation == 8 ? "execute"
+                                            : "unknown";
+        LOG_CRITICAL(Debug, "  fault        {} at {} {}", kind, fault, DescribeModule(fault));
+        LOG_CRITICAL(Debug, "  fault region {}", DescribeRegion(fault));
+        if (record.NumberParameters >= 3) {
+            LOG_CRITICAL(Debug, "  ntstatus     {:#x}", record.ExceptionInformation[2]);
+        }
+    }
+
+    if (const auto readable = ReadableSpan(address, MaxInstructionBytes); readable > 0) {
+        LOG_CRITICAL(Debug, "  bytes        {}", DumpBytes(address, readable));
+#ifdef ARCH_X86_64
+        LOG_CRITICAL(Debug, "  inst         {}", Disassemble(address, readable));
+#endif
+    } else {
+        LOG_CRITICAL(Debug, "  bytes        <not readable>");
+    }
+
+#ifdef ARCH_X86_64
+    const CONTEXT& ctx = *pExp->ContextRecord;
+    LOG_CRITICAL(Debug, "  rax {:016x} rbx {:016x} rcx {:016x} rdx {:016x}", ctx.Rax, ctx.Rbx,
+                 ctx.Rcx, ctx.Rdx);
+    LOG_CRITICAL(Debug, "  rsi {:016x} rdi {:016x} rbp {:016x} rsp {:016x}", ctx.Rsi, ctx.Rdi,
+                 ctx.Rbp, ctx.Rsp);
+    LOG_CRITICAL(Debug, "  r8  {:016x} r9  {:016x} r10 {:016x} r11 {:016x}", ctx.R8, ctx.R9,
+                 ctx.R10, ctx.R11);
+    LOG_CRITICAL(Debug, "  r12 {:016x} r13 {:016x} r14 {:016x} r15 {:016x}", ctx.R12, ctx.R13,
+                 ctx.R14, ctx.R15);
+    LOG_CRITICAL(Debug, "  rip {:016x} eflags {:08x}", ctx.Rip, ctx.EFlags);
+#endif
+    Common::Log::Flush();
+
+#ifdef ARCH_X86_64
+    std::array<u64, MaxBacktraceFrames> frames{};
+    const auto frame_count = CaptureBacktrace(ctx, frames.data(), frames.size());
+    for (size_t i = 0; i < frame_count; ++i) {
+        const auto* pc = reinterpret_cast<const void*>(frames[i]);
+        LOG_CRITICAL(Debug, "  #{:02} {} {}", i, pc, DescribeModule(pc));
+    }
+    Common::Log::Flush();
+#endif
+
+    in_crash_report = false;
+}
+
+} // Anonymous namespace
 
 static LONG WINAPI SignalHandler(EXCEPTION_POINTERS* pExp) noexcept {
     const auto* signals = Signals::Instance();
@@ -68,6 +246,7 @@ static LONG WINAPI SignalHandler(EXCEPTION_POINTERS* pExp) noexcept {
     // Breakpoints almost certainly come from our asserts/unreachables, no need to log it again.
     if (code != EXCEPTION_BREAKPOINT) {
         LOG_CRITICAL(Debug, "Unhandled Exception code {:#x} at {}", code, address);
+        LogCrashContext(pExp, code, address);
         Common::Singleton<Core::Emulator>::Instance()->Shutdown();
     }
 
