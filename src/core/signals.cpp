@@ -13,6 +13,7 @@
 #include "common/signal_context.h"
 #include "common/string_util.h"
 #include "core/libraries/kernel/threads/exception.h"
+#include "core/linker.h"
 #include "core/signals.h"
 #include "emulator.h"
 
@@ -42,6 +43,10 @@ namespace {
 
 constexpr size_t MaxInstructionBytes = 16;
 constexpr size_t MaxBacktraceFrames = 32;
+constexpr size_t StackDumpBytes = 256;
+constexpr size_t GprDumpBytes = 128;
+constexpr size_t ChaseDumpBytes = 64;
+constexpr size_t MaxChaseTargets = 8;
 constexpr DWORD PageReadable = PAGE_READONLY | PAGE_READWRITE | PAGE_WRITECOPY | PAGE_EXECUTE_READ |
                                PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY;
 
@@ -83,7 +88,7 @@ std::string DescribeModule(const void* address) {
                                 GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
                             static_cast<LPCWSTR>(address), &module) ||
         module == nullptr) {
-        return "<no module>";
+        return {};
     }
     wchar_t path[MAX_PATH]{};
     const DWORD length = GetModuleFileNameW(module, path, MAX_PATH);
@@ -98,6 +103,29 @@ std::string DescribeModule(const void* address) {
     return fmt::format("{}+{:#x}", Common::UTF16ToUTF8(name), offset);
 }
 
+std::string DescribeGuest(const void* address) {
+    auto* linker = Common::Singleton<Linker>::Instance();
+    if (linker == nullptr) {
+        return {};
+    }
+    const auto guest_addr = reinterpret_cast<VAddr>(address);
+    auto* module = linker->FindByAddress(guest_addr);
+    if (module == nullptr) {
+        return {};
+    }
+    return fmt::format("{}+{:#x}", module->name, guest_addr - module->GetBaseAddress());
+}
+
+std::string DescribeCode(const void* address) {
+    if (auto host = DescribeModule(address); !host.empty()) {
+        return host;
+    }
+    if (auto guest = DescribeGuest(address); !guest.empty()) {
+        return guest;
+    }
+    return "<unknown>";
+}
+
 std::string DumpBytes(const void* address, size_t count) {
     const auto* bytes = static_cast<const u8*>(address);
     std::string out;
@@ -109,6 +137,45 @@ std::string DumpBytes(const void* address, size_t count) {
 }
 
 #ifdef ARCH_X86_64
+void DumpMemory(const char* label, uintptr_t address, size_t wanted) {
+    const auto readable = ReadableSpan(reinterpret_cast<const void*>(address), wanted);
+    if (readable == 0) {
+        return;
+    }
+    const auto* bytes = reinterpret_cast<const u8*>(address);
+    for (size_t offset = 0; offset < readable; offset += 16) {
+        const auto count = std::min<size_t>(16, readable - offset);
+        std::string hex;
+        std::string ascii;
+        for (size_t i = 0; i < count; ++i) {
+            const u8 value = bytes[offset + i];
+            hex += fmt::format("{:02x} ", value);
+            ascii += value >= 0x20 && value < 0x7f ? static_cast<char>(value) : '.';
+        }
+        LOG_CRITICAL(Debug, "  {:<3} {:#018x}  {:<48}{}", label, address + offset, hex, ascii);
+    }
+}
+
+size_t CollectPointers(uintptr_t address, size_t length, uintptr_t* targets, size_t max_targets,
+                       size_t found) {
+    const auto* words = reinterpret_cast<const u64*>(address);
+    for (size_t i = 0; i < length / sizeof(u64) && found < max_targets; ++i) {
+        const auto candidate = static_cast<uintptr_t>(words[i]);
+        if (ReadableSpan(reinterpret_cast<const void*>(candidate), ChaseDumpBytes) <
+            ChaseDumpBytes) {
+            continue;
+        }
+        bool duplicate = false;
+        for (size_t j = 0; j < found; ++j) {
+            duplicate = duplicate || targets[j] == candidate;
+        }
+        if (!duplicate) {
+            targets[found++] = candidate;
+        }
+    }
+    return found;
+}
+
 std::string Disassemble(const void* address, size_t size) {
     ZydisDecodedInstruction inst;
     ZydisDecodedOperand operands[ZYDIS_MAX_OPERAND_COUNT];
@@ -120,15 +187,22 @@ std::string Disassemble(const void* address, size_t size) {
     return decoder->disassembleInst(inst, operands, reinterpret_cast<u64>(address));
 }
 
-size_t CaptureBacktrace(const CONTEXT& initial, u64* frames, size_t max_frames) {
+struct Frame {
+    u64 pc;
+    bool unwound;
+};
+
+size_t CaptureBacktrace(const CONTEXT& initial, Frame* frames, size_t max_frames) {
     CONTEXT ctx = initial;
     size_t count = 0;
     while (count < max_frames && ctx.Rip != 0) {
-        frames[count++] = ctx.Rip;
         DWORD64 image_base = 0;
         PRUNTIME_FUNCTION entry = RtlLookupFunctionEntry(ctx.Rip, &image_base, nullptr);
+        frames[count++] = {ctx.Rip, entry != nullptr};
         if (entry == nullptr) {
-            // Leaf function: the return address is the qword at rsp.
+            // No unwind data, which is the case for every guest module. Fall back to reading the
+            // qword at rsp, which is only the return address for a genuine leaf function, so these
+            // frames are guesses and are marked as such.
             const auto* stack = reinterpret_cast<const DWORD64*>(ctx.Rsp);
             if (ReadableSpan(stack, sizeof(DWORD64)) < sizeof(DWORD64)) {
                 break;
@@ -154,7 +228,7 @@ void LogCrashContext(EXCEPTION_POINTERS* pExp, DWORD code, const void* address) 
     in_crash_report = true;
 
     const EXCEPTION_RECORD& record = *pExp->ExceptionRecord;
-    LOG_CRITICAL(Debug, "  rip          {} {}", address, DescribeModule(address));
+    LOG_CRITICAL(Debug, "  rip          {} {}", address, DescribeCode(address));
     LOG_CRITICAL(Debug, "  rip region   {}", DescribeRegion(address));
 
     if (code == EXCEPTION_ACCESS_VIOLATION && record.NumberParameters >= 2) {
@@ -164,7 +238,7 @@ void LogCrashContext(EXCEPTION_POINTERS* pExp, DWORD code, const void* address) 
                            : operation == 1 ? "write"
                            : operation == 8 ? "execute"
                                             : "unknown";
-        LOG_CRITICAL(Debug, "  fault        {} at {} {}", kind, fault, DescribeModule(fault));
+        LOG_CRITICAL(Debug, "  fault        {} at {} {}", kind, fault, DescribeCode(fault));
         LOG_CRITICAL(Debug, "  fault region {}", DescribeRegion(fault));
         if (record.NumberParameters >= 3) {
             LOG_CRITICAL(Debug, "  ntstatus     {:#x}", record.ExceptionInformation[2]);
@@ -195,11 +269,47 @@ void LogCrashContext(EXCEPTION_POINTERS* pExp, DWORD code, const void* address) 
     Common::Log::Flush();
 
 #ifdef ARCH_X86_64
-    std::array<u64, MaxBacktraceFrames> frames{};
+    DumpMemory("rsp", static_cast<uintptr_t>(ctx.Rsp), StackDumpBytes);
+
+    const std::array<std::pair<const char*, DWORD64>, 15> gprs{{
+        {"rax", ctx.Rax},
+        {"rbx", ctx.Rbx},
+        {"rcx", ctx.Rcx},
+        {"rdx", ctx.Rdx},
+        {"rsi", ctx.Rsi},
+        {"rdi", ctx.Rdi},
+        {"rbp", ctx.Rbp},
+        {"r8", ctx.R8},
+        {"r9", ctx.R9},
+        {"r10", ctx.R10},
+        {"r11", ctx.R11},
+        {"r12", ctx.R12},
+        {"r13", ctx.R13},
+        {"r14", ctx.R14},
+        {"r15", ctx.R15},
+    }};
+    std::array<uintptr_t, MaxChaseTargets> chase{};
+    size_t chase_count = 0;
+    for (const auto& [name, value] : gprs) {
+        const auto base = static_cast<uintptr_t>(value);
+        const auto readable = ReadableSpan(reinterpret_cast<const void*>(base), GprDumpBytes);
+        if (readable == 0) {
+            continue;
+        }
+        DumpMemory(name, base, GprDumpBytes);
+        chase_count = CollectPointers(base, readable, chase.data(), chase.size(), chase_count);
+    }
+    for (size_t i = 0; i < chase_count; ++i) {
+        DumpMemory("ptr", chase[i], ChaseDumpBytes);
+    }
+    Common::Log::Flush();
+
+    std::array<Frame, MaxBacktraceFrames> frames{};
     const auto frame_count = CaptureBacktrace(ctx, frames.data(), frames.size());
     for (size_t i = 0; i < frame_count; ++i) {
-        const auto* pc = reinterpret_cast<const void*>(frames[i]);
-        LOG_CRITICAL(Debug, "  #{:02} {} {}", i, pc, DescribeModule(pc));
+        const auto* pc = reinterpret_cast<const void*>(frames[i].pc);
+        LOG_CRITICAL(Debug, "  #{:02}{} {} {}", i, frames[i].unwound ? ' ' : '?', pc,
+                     DescribeCode(pc));
     }
     Common::Log::Flush();
 #endif
