@@ -2089,21 +2089,40 @@ static inline s32 PatchFlipRequest(u32* cmdbuf, u32 size, u32 vo_handle, u32 buf
                                    s64 flip_arg, void* unk) {
     // check for `prepareFlip` packet
     cmdbuf += size - 64;
-    ASSERT_MSG(cmdbuf[0] == 0xc03e1000, "Can't find `prepareFlip` packet");
+    if (cmdbuf[0] != 0xc03e1000) {
+        LOG_ERROR(Lib_GnmDriver, "Can't find `prepareFlip` packet");
+        return ORBIS_GNM_ERROR_SUBMISSION_AND_FLIP_FAILED_INVALID_COMMAND_BUFFER;
+    }
 
     std::array<u32, 7> backup{};
     std::memcpy(backup.data(), cmdbuf, backup.size() * sizeof(decltype(backup)::value_type));
 
-    ASSERT_MSG(((backup[2] & 3) == 0u) || (backup[1] != PM4CmdNop::PayloadType::PrepareFlipLabel),
-               "Invalid flip packet");
-    ASSERT_MSG(buf_idx != 0xffff'ffffu, "Invalid VO buffer index");
+    switch (backup[1]) {
+    case PM4CmdNop::PayloadType::PrepareFlip:
+    case PM4CmdNop::PayloadType::PrepareFlipLabel:
+    case PM4CmdNop::PayloadType::PrepareFlipInterrupt:
+    case PM4CmdNop::PayloadType::PrepareFlipInterruptLabel:
+        break;
+    default:
+        LOG_ERROR(Lib_GnmDriver, "Invalid `prepareFlip` marker {:#x}", backup[1]);
+        return ORBIS_GNM_ERROR_SUBMISSION_AND_FLIP_FAILED_INVALID_COMMAND_BUFFER;
+    }
+
+    if (backup[1] == PM4CmdNop::PayloadType::PrepareFlipLabel && (backup[2] & 3) != 0u) {
+        LOG_ERROR(Lib_GnmDriver, "Unaligned flip label address");
+        return ORBIS_GNM_ERROR_SUBMISSION_AND_FLIP_FAILED_INVALID_COMMAND_BUFFER;
+    }
+    if (buf_idx == 0xffff'ffffu) {
+        LOG_ERROR(Lib_GnmDriver, "Invalid VO buffer index");
+        return ORBIS_GNM_ERROR_SUBMISSION_AND_FLIP_FAILED_REQUEST_FAILED;
+    }
 
     const s32 flip_result = VideoOut::sceVideoOutSubmitEopFlip(vo_handle, buf_idx, flip_mode,
                                                                flip_arg, nullptr /*unk*/);
     if (flip_result != 0) {
         if (flip_result == 0x80290012) {
             LOG_ERROR(Lib_GnmDriver, "Flip queue is full");
-            return 0x80d11081;
+            return ORBIS_GNM_ERROR_SUBMISSION_AND_FLIP_FAILED_INVALID_QUEUE_FULL;
         } else {
             LOG_ERROR(Lib_GnmDriver, "Flip request failed");
             return flip_result;
