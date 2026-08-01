@@ -320,6 +320,25 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
 
                 std::memcpy(&regs.reg_array[reg_addr], payload, (count - 1) * sizeof(u32));
 
+                {
+                    constexpr u32 kGenScissorTl = Regs::ContextRegWordOffset + 0x90;
+                    const u32 first = reg_addr;
+                    const u32 last = reg_addr + count - 2;
+                    if (first <= kGenScissorTl && kGenScissorTl <= last) {
+                        const u32 tl = payload[kGenScissorTl - first];
+                        if ((tl & 0x7FFF) > 16383 || ((tl >> 16) & 0x7FFF) > 16383) {
+                            LOG_WARNING(
+                                Render_Vulkan,
+                                "gen scissor TL raw={:#010x} tl_x={} tl_y={} "
+                                "pkt_va={:#018x} payload_va={:#018x} n={}",
+                                tl, tl & 0x7FFF, (tl >> 16) & 0x7FFF,
+                                reinterpret_cast<uintptr_t>(header),
+                                reinterpret_cast<uintptr_t>(&payload[kGenScissorTl - first]),
+                                count - 1);
+                        }
+                    }
+                }
+
                 // In the case of HW, render target memory has alignment as color block operates on
                 // tiles. There is no information of actual resource extents stored in CB context
                 // regs, so any deduction of it from slices/pitch will lead to a larger surface
