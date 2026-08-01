@@ -407,6 +407,8 @@ public:
                     const U32& multisampling, const Value& color, TextureInstInfo info);
 
     [[nodiscard]] F32 CubeFaceIndex(const Value& cube_coords);
+    [[nodiscard]] Value CubeFaceCoord(const Value& cube_coords);
+    [[nodiscard]] F32 CubeMajorAxis(const Value& cube_coords);
 
     void EmitVertex();
     void EmitPrimitive();

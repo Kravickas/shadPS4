@@ -99,6 +99,7 @@ ImageInfo::ImageInfo(const AmdGpu::DepthBuffer& buffer, u32 num_slices, VAddr ht
     size.depth = 1;
     pitch = buffer.Pitch();
     resources.layers = num_slices;
+    props.is_cube = size.width == size.height && resources.layers >= 6;
     meta_info.htile_addr = buffer.z_info.tile_surface_enable ? htile_address : 0;
 
     stencil_addr = write_buffer ? buffer.StencilWriteAddress() : buffer.StencilAddress();
@@ -127,7 +128,8 @@ ImageInfo::ImageInfo(const AmdGpu::Image& image, const Shader::ImageResource& de
     type = image.GetBaseType();
     props.is_tiled = image.IsTiled();
     props.is_volume = type == AmdGpu::ImageType::Color3D;
-    props.is_cube = image.IsCube();
+    props.is_cube =
+        type == AmdGpu::ImageType::Color2D && image.width == image.height && image.NumLayers() >= 6;
     props.is_pow2 = image.pow2pad;
     props.is_block = AmdGpu::IsBlockCoded(image.GetDataFmt());
     size.width = image.width + 1;

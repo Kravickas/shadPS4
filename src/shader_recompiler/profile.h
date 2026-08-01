@@ -36,6 +36,7 @@ struct Profile {
     bool support_legacy_vertex_attributes{};
     bool supports_image_load_store_lod{};
     bool supports_native_cube_calc{};
+    bool supports_native_cube_map{true};
     bool supports_trinary_minmax{};
     bool supports_buffer_fp32_atomic_min_max{};
     bool supports_image_fp32_atomic_min_max{};

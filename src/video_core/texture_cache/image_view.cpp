@@ -24,6 +24,8 @@ vk::ImageViewType ConvertImageViewType(AmdGpu::ImageType type) {
     case AmdGpu::ImageType::Color2DArray:
         return vk::ImageViewType::e2DArray;
     case AmdGpu::ImageType::Cube:
+        return vk::ImageViewType::eCube;
+    case AmdGpu::ImageType::CubeArray:
         return vk::ImageViewType::eCubeArray;
     case AmdGpu::ImageType::Color3D:
         return vk::ImageViewType::e3D;
@@ -45,6 +47,7 @@ bool IsViewTypeCompatible(AmdGpu::ImageType view_type, AmdGpu::ImageType image_t
     case AmdGpu::ImageType::Color3D:
         return image_type == AmdGpu::ImageType::Color3D;
     case AmdGpu::ImageType::Cube:
+    case AmdGpu::ImageType::CubeArray:
         return image_type == AmdGpu::ImageType::Color2D;
     default:
         UNREACHABLE();
@@ -67,18 +70,10 @@ ImageViewInfo::ImageViewInfo(const AmdGpu::Image& image, const Shader::ImageReso
     range.base.layer = image.base_array;
     range.extent.levels = image.NumViewLevels(desc.is_array);
     range.extent.layers = image.NumViewLayers(desc.is_array);
-    type = image.GetViewType(desc.is_array);
-    if (image.IsCube() && !desc.is_written && !desc.is_storage) {
-        if (desc.is_depth) {
-            // TODO: native cube sampling for depth cubemaps needs the backing image created
-            // VK_IMAGE_CREATE_CUBE_COMPATIBLE; sample them as a 2D array until that is handled.
-            LOG_WARNING(Render_Vulkan,
-                        "Depth cubemap (format {}) sampled as a 2D array; "
-                        "native depth cube sampling is not implemented",
-                        vk::to_string(format));
-        } else {
-            type = AmdGpu::ImageType::Cube;
-        }
+    type = image.GetViewType(desc.is_array, desc.is_storage || desc.is_written);
+    if (type == AmdGpu::ImageType::Cube) {
+        // Single cube view: exactly six faces.
+        range.extent.layers = 6;
     }
 
     if (!is_storage) {
@@ -125,10 +120,16 @@ ImageView::ImageView(const Vulkan::Instance& instance, const ImageViewInfo& info
         aspect = vk::ImageAspectFlagBits::eStencil;
     }
 
+    auto view_type = ConvertImageViewType(info.type);
+    if (!instance.IsNativeCubeSupported() &&
+        (info.type == AmdGpu::ImageType::Cube || info.type == AmdGpu::ImageType::CubeArray)) {
+        view_type = vk::ImageViewType::e2DArray;
+    }
+
     const vk::ImageViewCreateInfo image_view_ci = {
         .pNext = &usage_ci,
         .image = image.GetImage(),
-        .viewType = ConvertImageViewType(info.type),
+        .viewType = view_type,
         .format = instance.GetSupportedFormat(format, image.format_features),
         .components = info.mapping,
         .subresourceRange{

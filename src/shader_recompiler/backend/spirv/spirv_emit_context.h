@@ -195,6 +195,7 @@ public:
     const Profile& profile;
     Stage stage;
     LogicalStage l_stage{};
+    bool uses_sampled_cube{};
 
     Id last_label{};
 

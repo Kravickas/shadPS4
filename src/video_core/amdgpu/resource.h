@@ -112,6 +112,8 @@ enum class ImageType : u64 {
     Color2DArray = 13,
     Color2DMsaa = 14,
     Color2DMsaaArray = 15,
+    // View-only; no Sea Islands descriptor type.
+    CubeArray = 16,
 };
 
 constexpr std::string_view NameOf(ImageType type) {
@@ -134,6 +136,8 @@ constexpr std::string_view NameOf(ImageType type) {
         return "Color2DMsaa";
     case ImageType::Color2DMsaaArray:
         return "Color2DMsaaArray";
+    case ImageType::CubeArray:
+        return "CubeArray";
     default:
         return "Unknown";
     }
@@ -255,6 +259,16 @@ struct Image {
         return static_cast<ImageType>(type) == ImageType::Cube;
     }
 
+    bool IsValidCube() const noexcept {
+        if (!IsCube() || width != height) {
+            return false;
+        }
+        // Inlined NumViewLayers(false) so GetViewType can call this without recursing.
+        const u32 max_array = std::min<u32>(last_array + 1, NumLayers());
+        const u32 view_layers = max_array > base_array ? max_array - base_array : 1;
+        return view_layers % 6 == 0;
+    }
+
     ImageType GetType() const noexcept {
         return IsCube() ? ImageType::Color2DArray : static_cast<ImageType>(type);
     }
@@ -307,11 +321,14 @@ struct Image {
         return base_type;
     }
 
-    ImageType GetViewType(const bool is_array) const noexcept {
+    ImageType GetViewType(const bool is_array, const bool is_storage = false,
+                          const bool native_cube = true) const noexcept {
         const auto base_type = GetType();
         if (IsCube()) {
-            // Cube needs to remain array type regardless of instruction array specifier.
-            return base_type;
+            if (is_storage || !native_cube || !IsValidCube()) {
+                return base_type;
+            }
+            return is_array ? ImageType::CubeArray : ImageType::Cube;
         }
         if (base_type == ImageType::Color1DArray && !is_array) {
             return ImageType::Color1D;
