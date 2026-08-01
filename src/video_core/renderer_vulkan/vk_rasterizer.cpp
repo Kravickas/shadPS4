@@ -1138,6 +1138,23 @@ void Rasterizer::UpdateViewportScissorState() const {
         regs.generic_scissor.bottom_right_y,
         enable_offset ? regs.window_offset.window_y_offset : 0);
 
+    if (scsr.bottom_right_x < scsr.top_left_x || scsr.bottom_right_y < scsr.top_left_y) {
+        LOG_WARNING(
+            Render_Vulkan,
+            "inverted scissor: combined=({},{})-({},{}) scr=({},{})-({},{}) "
+            "win=({},{})-({},{}) gen=({},{})-({},{}) off=({},{}) dis={} vpe={}",
+            scsr.top_left_x, scsr.top_left_y, scsr.bottom_right_x, scsr.bottom_right_y,
+            regs.screen_scissor.top_left_x, regs.screen_scissor.top_left_y,
+            regs.screen_scissor.bottom_right_x, regs.screen_scissor.bottom_right_y,
+            u32(regs.window_scissor.top_left_x), u32(regs.window_scissor.top_left_y),
+            u32(regs.window_scissor.bottom_right_x), u32(regs.window_scissor.bottom_right_y),
+            u32(regs.generic_scissor.top_left_x), u32(regs.generic_scissor.top_left_y),
+            u32(regs.generic_scissor.bottom_right_x), u32(regs.generic_scissor.bottom_right_y),
+            s32(regs.window_offset.window_x_offset), s32(regs.window_offset.window_y_offset),
+            u32(regs.window_scissor.window_offset_disable),
+            u32(regs.mode_control.vport_scissor_enable));
+    }
+
     boost::container::static_vector<vk::Viewport, AmdGpu::NUM_VIEWPORTS> viewports;
     boost::container::static_vector<vk::Rect2D, AmdGpu::NUM_VIEWPORTS> scissors;
 
@@ -1211,6 +1228,17 @@ void Rasterizer::UpdateViewportScissorState() const {
             vp_scsr.bottom_right_y = std::min(AmdGpu::Scissor::Clamp(vp_scsr.bottom_right_y),
                                               regs.viewport_scissors[i].bottom_right_y);
         }
+        if (vp_scsr.bottom_right_x < vp_scsr.top_left_x ||
+            vp_scsr.bottom_right_y < vp_scsr.top_left_y) {
+            LOG_WARNING(Render_Vulkan,
+                        "inverted vp scissor {}: ({},{})-({},{}) vps=({},{})-({},{})", i,
+                        vp_scsr.top_left_x, vp_scsr.top_left_y, vp_scsr.bottom_right_x,
+                        vp_scsr.bottom_right_y, u32(regs.viewport_scissors[i].top_left_x),
+                        u32(regs.viewport_scissors[i].top_left_y),
+                        u32(regs.viewport_scissors[i].bottom_right_x),
+                        u32(regs.viewport_scissors[i].bottom_right_y));
+        }
+
         scissors.push_back({
             .offset = {vp_scsr.top_left_x, vp_scsr.top_left_y},
             .extent = {vp_scsr.GetWidth(), vp_scsr.GetHeight()},
