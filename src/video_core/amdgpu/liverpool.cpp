@@ -324,17 +324,18 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                     constexpr u32 kGenScissorTl = Regs::ContextRegWordOffset + 0x90;
                     const u32 first = reg_addr;
                     const u32 last = reg_addr + count - 2;
-                    if (first <= kGenScissorTl && kGenScissorTl <= last) {
+                    if (count >= 2 && first <= kGenScissorTl && kGenScissorTl <= last) {
                         const u32 tl = payload[kGenScissorTl - first];
                         if ((tl & 0x7FFF) > 16383 || ((tl >> 16) & 0x7FFF) > 16383) {
-                            LOG_WARNING(
-                                Render_Vulkan,
-                                "gen scissor TL raw={:#010x} tl_x={} tl_y={} "
-                                "pkt_va={:#018x} payload_va={:#018x} n={}",
-                                tl, tl & 0x7FFF, (tl >> 16) & 0x7FFF,
-                                reinterpret_cast<uintptr_t>(header),
-                                reinterpret_cast<uintptr_t>(&payload[kGenScissorTl - first]),
-                                count - 1);
+                            LOG_WARNING(Render_Vulkan,
+                                        "gen scissor TL raw={:#010x} tl_x={} tl_y={} "
+                                        "reg_offset={:#06x} hdr={:#010x} p0={:#010x} p1={:#010x} "
+                                        "pkt_va={:#018x} n={}",
+                                        tl, tl & 0x7FFF, (tl >> 16) & 0x7FFF,
+                                        u32(set_data->reg_offset),
+                                        *reinterpret_cast<const u32*>(header), payload[0],
+                                        count >= 3 ? payload[1] : 0u,
+                                        reinterpret_cast<uintptr_t>(header), count - 1);
                         }
                     }
                 }
