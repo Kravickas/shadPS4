@@ -194,8 +194,13 @@ Liverpool::Task Liverpool::ProcessCeUpdate(std::span<const u32> ccb) {
         }
         case PM4ItOpcode::IndirectBufferConst: {
             const auto* indirect_buffer = reinterpret_cast<const PM4CmdIndirectBuffer*>(header);
-            auto task =
-                ProcessCeUpdate({indirect_buffer->Address<const u32>(), indirect_buffer->ib_size});
+            const std::span<const u32> ib{indirect_buffer->Address<const u32>(),
+                                          indirect_buffer->ib_size};
+            if (indirect_buffer->chain != 0) {
+                ccb = ib;
+                continue;
+            }
+            auto task = ProcessCeUpdate(ib);
             RESUME_CE(task);
 
             while (!task.handle.done()) {
@@ -232,7 +237,7 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
     const bool host_markers_enabled = rasterizer && EmulatorSettings.IsVkHostMarkersEnabled();
     const bool guest_markers_enabled = rasterizer && EmulatorSettings.IsVkGuestMarkersEnabled();
 
-    const auto base_addr = reinterpret_cast<uintptr_t>(dcb.data());
+    auto base_addr = reinterpret_cast<uintptr_t>(dcb.data());
     while (!dcb.empty()) {
         ProcessCommands();
 
@@ -829,8 +834,14 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
             }
             case PM4ItOpcode::IndirectBuffer: {
                 const auto* indirect_buffer = reinterpret_cast<const PM4CmdIndirectBuffer*>(header);
-                auto task = ProcessGraphics(
-                    {indirect_buffer->Address<const u32>(), indirect_buffer->ib_size}, {});
+                const std::span<const u32> ib{indirect_buffer->Address<const u32>(),
+                                              indirect_buffer->ib_size};
+                if (indirect_buffer->chain != 0) {
+                    dcb = ib;
+                    base_addr = reinterpret_cast<uintptr_t>(dcb.data());
+                    continue;
+                }
+                auto task = ProcessGraphics(ib, {});
                 RESUME_GFX(task);
 
                 while (!task.handle.done()) {
