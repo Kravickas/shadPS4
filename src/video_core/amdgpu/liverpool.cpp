@@ -978,8 +978,13 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
         }
         case PM4ItOpcode::IndirectBuffer: {
             const auto* indirect_buffer = reinterpret_cast<const PM4CmdIndirectBuffer*>(header);
-            auto task = ProcessCompute<true>(
-                {indirect_buffer->Address<const u32>(), indirect_buffer->ib_size}, vqid);
+            const std::span<const u32> ib{indirect_buffer->Address<const u32>(),
+                                          indirect_buffer->ib_size};
+            if (indirect_buffer->chain != 0) {
+                acb = ib;
+                continue;
+            }
+            auto task = ProcessCompute<true>(ib, vqid);
             RESUME_ASC(task, vqid);
 
             while (!task.handle.done()) {
