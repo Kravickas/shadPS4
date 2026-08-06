@@ -22,6 +22,7 @@ struct VideoOutPort {
     std::array<VideoOutBuffer, MaxDisplayBuffers> buffer_slots;
     std::array<u64, MaxDisplayBuffers> buffer_labels; // should be contiguous in memory
     static_assert(sizeof(buffer_labels[0]) == 8u);
+    std::array<u32, MaxDisplayBuffers> buffer_queued{};
     std::array<BufferAttributeGroup, MaxDisplayBufferGroups> groups;
     FlipStatus flip_status;
     SceVideoOutVblankStatus vblank_status;
