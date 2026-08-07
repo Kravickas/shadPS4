@@ -46,7 +46,11 @@ constexpr size_t MaxBacktraceFrames = 32;
 constexpr size_t StackDumpBytes = 256;
 constexpr size_t GprDumpBytes = 128;
 constexpr size_t ChaseDumpBytes = 64;
-constexpr size_t MaxChaseTargets = 8;
+constexpr size_t MaxChaseTargets = 24;
+constexpr size_t ChasePerRegister = 3;
+constexpr size_t MaxScanSlots = 64;
+constexpr DWORD PageExecutable =
+    PAGE_EXECUTE | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY;
 constexpr DWORD PageReadable = PAGE_READONLY | PAGE_READWRITE | PAGE_WRITECOPY | PAGE_EXECUTE_READ |
                                PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY;
 
@@ -137,6 +141,15 @@ std::string DumpBytes(const void* address, size_t count) {
 }
 
 #ifdef ARCH_X86_64
+bool IsExecutable(uintptr_t address) {
+    MEMORY_BASIC_INFORMATION mbi{};
+    if (VirtualQuery(reinterpret_cast<const void*>(address), &mbi, sizeof(mbi)) != sizeof(mbi)) {
+        return false;
+    }
+    return mbi.State == MEM_COMMIT && (mbi.Protect & PageExecutable) != 0 &&
+           (mbi.Protect & PAGE_GUARD) == 0;
+}
+
 void DumpMemory(const char* label, uintptr_t address, size_t wanted) {
     const auto readable = ReadableSpan(reinterpret_cast<const void*>(address), wanted);
     if (readable == 0) {
@@ -156,10 +169,17 @@ void DumpMemory(const char* label, uintptr_t address, size_t wanted) {
     }
 }
 
+// Collects up to ChasePerRegister pointers from one register's dump. The per-register budget
+// matters: a single stack-pointing register otherwise fills the whole table with spilled scalars
+// and starves the later registers, which are the ones usually holding the object of interest.
 size_t CollectPointers(uintptr_t address, size_t length, uintptr_t* targets, size_t max_targets,
                        size_t found) {
     const auto* words = reinterpret_cast<const u64*>(address);
+    size_t taken = 0;
     for (size_t i = 0; i < length / sizeof(u64) && found < max_targets; ++i) {
+        if (taken >= ChasePerRegister) {
+            break;
+        }
         const auto candidate = static_cast<uintptr_t>(words[i]);
         if (ReadableSpan(reinterpret_cast<const void*>(candidate), ChaseDumpBytes) <
             ChaseDumpBytes) {
@@ -171,6 +191,7 @@ size_t CollectPointers(uintptr_t address, size_t length, uintptr_t* targets, siz
         }
         if (!duplicate) {
             targets[found++] = candidate;
+            ++taken;
         }
     }
     return found;
@@ -187,34 +208,79 @@ std::string Disassemble(const void* address, size_t size) {
     return decoder->disassembleInst(inst, operands, reinterpret_cast<u64>(address));
 }
 
+enum class FrameSource { Exact, Unwind, FramePointer, StackScan };
+
 struct Frame {
     u64 pc;
-    bool unwound;
+    FrameSource source;
 };
 
+char SourceMark(FrameSource source) {
+    switch (source) {
+    case FrameSource::Exact:
+        return ' ';
+    case FrameSource::Unwind:
+        return ' ';
+    case FrameSource::FramePointer:
+        return '+';
+    default:
+        return '?';
+    }
+}
+
+// Guest modules carry no Windows unwind data, so RtlLookupFunctionEntry always misses on them.
+// Fall back to the frame pointer chain, and only if that fails to scanning the stack for a
+// plausible return address. Frames are tagged with how they were obtained so a guess is never
+// presented as a real unwind.
 size_t CaptureBacktrace(const CONTEXT& initial, Frame* frames, size_t max_frames) {
     CONTEXT ctx = initial;
     size_t count = 0;
+    frames[count++] = {ctx.Rip, FrameSource::Exact};
+
     while (count < max_frames && ctx.Rip != 0) {
         DWORD64 image_base = 0;
         PRUNTIME_FUNCTION entry = RtlLookupFunctionEntry(ctx.Rip, &image_base, nullptr);
-        frames[count++] = {ctx.Rip, entry != nullptr};
-        if (entry == nullptr) {
-            // No unwind data, which is the case for every guest module. Fall back to reading the
-            // qword at rsp, which is only the return address for a genuine leaf function, so these
-            // frames are guesses and are marked as such.
-            const auto* stack = reinterpret_cast<const DWORD64*>(ctx.Rsp);
-            if (ReadableSpan(stack, sizeof(DWORD64)) < sizeof(DWORD64)) {
+        if (entry != nullptr) {
+            PVOID handler_data = nullptr;
+            DWORD64 establisher_frame = 0;
+            RtlVirtualUnwind(UNW_FLAG_NHANDLER, image_base, ctx.Rip, entry, &ctx, &handler_data,
+                             &establisher_frame, nullptr);
+            if (ctx.Rip == 0) {
                 break;
             }
-            ctx.Rip = *stack;
-            ctx.Rsp += sizeof(DWORD64);
+            frames[count++] = {ctx.Rip, FrameSource::Unwind};
             continue;
         }
-        PVOID handler_data = nullptr;
-        DWORD64 establisher_frame = 0;
-        RtlVirtualUnwind(UNW_FLAG_NHANDLER, image_base, ctx.Rip, entry, &ctx, &handler_data,
-                         &establisher_frame, nullptr);
+
+        const auto frame_ptr = static_cast<uintptr_t>(ctx.Rbp);
+        const auto* saved = reinterpret_cast<const u64*>(frame_ptr);
+        if (frame_ptr >= ctx.Rsp && ReadableSpan(saved, 2 * sizeof(u64)) == 2 * sizeof(u64) &&
+            static_cast<uintptr_t>(saved[0]) > frame_ptr && IsExecutable(saved[1])) {
+            ctx.Rip = saved[1];
+            ctx.Rsp = frame_ptr + 2 * sizeof(u64);
+            ctx.Rbp = saved[0];
+            frames[count++] = {ctx.Rip, FrameSource::FramePointer};
+            continue;
+        }
+
+        bool found = false;
+        for (size_t slot = 0; slot < MaxScanSlots && !found; ++slot) {
+            const auto address = ctx.Rsp + slot * sizeof(u64);
+            const auto* word = reinterpret_cast<const u64*>(address);
+            if (ReadableSpan(word, sizeof(u64)) < sizeof(u64)) {
+                break;
+            }
+            if (!IsExecutable(*word)) {
+                continue;
+            }
+            ctx.Rip = *word;
+            ctx.Rsp = address + sizeof(u64);
+            frames[count++] = {ctx.Rip, FrameSource::StackScan};
+            found = true;
+        }
+        if (!found) {
+            break;
+        }
     }
     return count;
 }
@@ -308,7 +374,7 @@ void LogCrashContext(EXCEPTION_POINTERS* pExp, DWORD code, const void* address) 
     const auto frame_count = CaptureBacktrace(ctx, frames.data(), frames.size());
     for (size_t i = 0; i < frame_count; ++i) {
         const auto* pc = reinterpret_cast<const void*>(frames[i].pc);
-        LOG_CRITICAL(Debug, "  #{:02}{} {} {}", i, frames[i].unwound ? ' ' : '?', pc,
+        LOG_CRITICAL(Debug, "  #{:02}{} {} {}", i, SourceMark(frames[i].source), pc,
                      DescribeCode(pc));
     }
     Common::Log::Flush();
