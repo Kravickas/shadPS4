@@ -1,6 +1,8 @@
 // SPDX-FileCopyrightText: Copyright 2025-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <algorithm>
+#include <ctime>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
@@ -12,6 +14,7 @@
 
 #include "common/debug.h"
 #include "common/logging/log.h"
+#include "common/string_util.h"
 #include "common/thread.h"
 #include "core/emulator_settings.h"
 #include "core/ipc/ipc.h"
@@ -25,6 +28,7 @@
 #include "common/polyfill_thread.h"
 #include "common/scm_rev.h"
 #include "common/singleton.h"
+#include "core/cpu_patches.h" // Windows static guest red-zone protection
 #include "core/debugger.h"
 #include "core/devtools/widget/module_list.h"
 #include "core/emulator_settings.h"
@@ -157,12 +161,13 @@ std::map<s32, std::string> ExtractTrophies(std::string_view npbind_guest,
         if (entry.is_directory) {
             continue;
         }
-        // Extension check: entry names carry the raw leaf, no path.
-        if (entry.name.size() < 4 || entry.name.compare(entry.name.size() - 4, 4, ".trp") != 0) {
+        // Extension check: match TROPHY00.TRP as well as trophy00.trp.
+        const std::string name_lower = Common::ToLower(entry.name);
+        if (!name_lower.ends_with(".trp")) {
             continue;
         }
-        const std::string stem = entry.name.substr(0, entry.name.size() - 4);
-        if (stem.find(pattern) != 0) {
+        const std::string stem = name_lower.substr(0, name_lower.size() - 4);
+        if (!stem.starts_with(pattern)) {
             continue;
         }
 
@@ -212,7 +217,18 @@ std::map<s32, std::string> ExtractTrophies(std::string_view npbind_guest,
                 continue;
             }
             TRP trp;
-            const bool ok = trp.Extract(trp_source, np_comm_id, trophy_output_dir);
+            bool ok = trp.Extract(trp_source, np_comm_id, trophy_output_dir);
+            if (!ok) {
+                // if it's an update and doesn't contain trophies fallback to base
+                const auto base_source = mnt->GetHostPath(
+                    entry_guest, nullptr, Core::FileSys::MntPoints::HostPathType::Base);
+                if (!base_source.empty() && base_source != trp_source &&
+                    std::filesystem::is_regular_file(base_source)) {
+                    LOG_WARNING(Loader, "Retrying trophy extraction with base game file {}",
+                                base_source.string());
+                    ok = trp.Extract(base_source, np_comm_id, trophy_output_dir);
+                }
+            }
             if (!temp_extract.empty()) {
                 std::error_code ec;
                 std::filesystem::remove(temp_extract, ec);
@@ -231,11 +247,19 @@ std::map<s32, std::string> ExtractTrophies(std::string_view npbind_guest,
             if (!std::filesystem::exists(user_trophy_file)) {
                 auto temp = user_trophy_file.parent_path();
                 std::filesystem::create_directories(temp);
-                std::error_code discard;
-                std::filesystem::copy_file(trophy_output_dir / "Xml" / "TROPCONF.XML",
-                                           user_trophy_file, discard);
+                std::error_code ec;
+                const auto tropconf = trophy_output_dir / "Xml" / "TROPCONF.XML";
+                std::filesystem::copy_file(tropconf, user_trophy_file, ec);
+                if (ec) {
+                    LOG_ERROR(Loader, "Failed to copy {} to {}: {}", tropconf.string(),
+                              user_trophy_file.string(), ec.message());
+                }
             }
         }
+    }
+
+    if (trophy_index_map.empty()) {
+        LOG_WARNING(Common_Filesystem, "No usable trophy files found in {}", trophy_dir_guest);
     }
 
     return trophy_index_map;
@@ -400,9 +424,20 @@ void Emulator::Run(std::filesystem::path file, std::vector<std::string> args,
     }
 
     EmulatorSettings.Load(id);
+    // Windows static guest red-zone protection
+    WindowsGuestRedZoneProtection::SetActiveMode(
+        EmulatorSettings.GetWindowsGuestRedZoneProtectionMode());
     // Switch to configured log
     Common::Log::Switch((!id.empty() && EmulatorSettings.IsLogSeparate()) ? id + ".log"
                                                                           : "shad_log.txt");
+#ifdef _WIN32
+    // Windows static guest red-zone protection
+    if (WindowsGuestRedZoneProtection::IsStaticPatchingEnabled()) {
+        LOG_INFO(Core,
+                 "Windows guest red-zone static protection uses module EH metadata and cannot "
+                 "cover code without function entries");
+    }
+#endif
 
     auto guest_eboot_path = "/app0/" + eboot_name.generic_string();
 
@@ -703,9 +738,6 @@ void Emulator::Restart(std::filesystem::path eboot_path,
         args.push_back(MemoryPatcher::patch_file);
     }
 
-    args.push_back("--wait-for-pid");
-    args.push_back(std::to_string(Debugger::GetCurrentPid()));
-
     if (waitForDebuggerBeforeRun) {
         args.push_back("--wait-for-debugger");
     }
@@ -717,8 +749,15 @@ void Emulator::Restart(std::filesystem::path eboot_path,
         }
     }
 
-    LOG_INFO(Common, "Restarting the emulator with args: {}", fmt::join(args, " "));
     Libraries::SaveData::Backup::StopThread();
+    Relaunch(std::move(args));
+}
+
+[[noreturn]] void Emulator::Relaunch(std::vector<std::string> args) {
+    const auto guest_args = std::find(args.begin(), args.end(), "--");
+    args.insert(guest_args, {"--wait-for-pid", std::to_string(Debugger::GetCurrentPid())});
+
+    LOG_INFO(Common, "Relaunching the emulator with args: {}", fmt::join(args, " "));
     Common::Log::Shutdown();
 
     auto& ipc = IPC::Instance();
@@ -730,23 +769,24 @@ void Emulator::Restart(std::filesystem::path eboot_path,
         }
     }
 #if defined(_WIN32)
-    std::string cmdline;
+    std::wstring cmdline;
     // Emulator executable
-    cmdline += "\"";
-    cmdline += executableName;
-    cmdline += "\"";
+    const auto executable = Common::UTF8ToUTF16W(executableName);
+    cmdline += L"\"";
+    cmdline += executable;
+    cmdline += L"\"";
     for (const auto& arg : args) {
-        cmdline += " \"";
-        cmdline += arg;
-        cmdline += "\"";
+        cmdline += L" \"";
+        cmdline += Common::UTF8ToUTF16W(arg);
+        cmdline += L"\"";
     }
-    cmdline += "\0";
+    cmdline += L'\0';
 
-    STARTUPINFOA si{};
+    STARTUPINFOW si{};
     si.cb = sizeof(si);
     PROCESS_INFORMATION pi{};
-    bool success = CreateProcessA(nullptr, cmdline.data(), nullptr, nullptr, TRUE, 0, nullptr,
-                                  nullptr, &si, &pi);
+    bool success = CreateProcessW(executable.c_str(), cmdline.data(), nullptr, nullptr, TRUE, 0,
+                                  nullptr, nullptr, &si, &pi);
 
     if (!success) {
         std::cerr << "Failed to restart game: {}" << GetLastError() << std::endl;
@@ -829,13 +869,15 @@ void Emulator::UpdatePlayTime(const std::string& serial) {
 
     std::string playTimeSaved = fmt::format("{:d}:{:02d}:{:02d}", hours, minutes, seconds);
 
+    const std::time_t last_time_played = std::time(nullptr);
+
     std::ofstream outfile(filePath, std::ios::trunc);
     bool lineUpdated = false;
     for (const auto& l : lines) {
         std::istringstream iss(l);
         std::string s;
         if (iss >> s && s == serial) {
-            outfile << fmt::format("{} {}\n", serial, playTimeSaved);
+            outfile << fmt::format("{} {} {}\n", serial, playTimeSaved, last_time_played);
             lineUpdated = true;
         } else {
             outfile << l << "\n";
@@ -843,10 +885,10 @@ void Emulator::UpdatePlayTime(const std::string& serial) {
     }
 
     if (!lineUpdated) {
-        outfile << fmt::format("{} {}\n", serial, playTimeSaved);
+        outfile << fmt::format("{} {} {}\n", serial, playTimeSaved, last_time_played);
     }
 
-    LOG_INFO(Loader, "Playing time for {}: {}", serial, playTimeSaved);
+    LOG_INFO(Loader, "Playing time for {}: {} {}", serial, playTimeSaved, last_time_played);
 }
 
 } // namespace Core
