@@ -8,12 +8,14 @@
 #include <functional>
 #include <memory>
 #include <mutex>
+#include <ostream> // Windows static guest red-zone protection
 #include <sstream>
 #include <string>
 #include <vector>
 #include <nlohmann/json.hpp>
 #include "common/logging/log.h"
 #include "common/types.h"
+#include "core/cpu_patches.h" // Windows static guest red-zone protection
 
 #define EmulatorSettings (*EmulatorSettingsImpl::GetInstance())
 
@@ -35,6 +37,16 @@ enum GpuReadbacksMode : int {
     Relaxed,
     Precise,
 };
+
+// Windows static guest red-zone protection
+NLOHMANN_JSON_SERIALIZE_ENUM(WindowsGuestRedZoneProtectionMode,
+                             {{WindowsGuestRedZoneProtectionMode::Disabled, "Disabled"},
+                              {WindowsGuestRedZoneProtectionMode::StaticPatching,
+                               "StaticPatching"}})
+
+inline std::ostream& operator<<(std::ostream& output, WindowsGuestRedZoneProtectionMode mode) {
+    return output << nlohmann::json(mode).get<std::string>();
+}
 
 enum class ConfigMode {
     Default,
@@ -221,6 +233,7 @@ struct GeneralSettings {
                                            &GeneralSettings::trophy_notification_side),
             make_override<GeneralSettings>("connected_to_network",
                                            &GeneralSettings::connected_to_network),
+            make_override<GeneralSettings>("console_language", &GeneralSettings::console_language),
             make_override<GeneralSettings>("shadnet_server", &GeneralSettings::shadnet_server),
             make_override<GeneralSettings>("shadnet_webapi_server",
                                            &GeneralSettings::shadnet_webapi_server),
@@ -245,6 +258,7 @@ struct LogSettings {
     Setting<bool> append{false}; // specific
     Setting<bool> enable{true};  // specific
     Setting<std::string> filter{""};
+    Setting<std::string> flush_level{""};
     Setting<u32> max_skip_duration{5'000};
     Setting<bool> separate{false}; // specific
     Setting<unsigned long long> size_limit{100_MB};
@@ -260,6 +274,7 @@ struct LogSettings {
             make_override<LogSettings>("append", &LogSettings::append),
             make_override<LogSettings>("enable", &LogSettings::enable),
             make_override<LogSettings>("filter", &LogSettings::filter),
+            make_override<LogSettings>("flush_level", &LogSettings::flush_level),
             make_override<LogSettings>("max_skip_duration", &LogSettings::max_skip_duration),
             make_override<LogSettings>("separate", &LogSettings::separate),
             make_override<LogSettings>("size_limit", &LogSettings::size_limit),
@@ -272,11 +287,12 @@ struct LogSettings {
     }
 };
 #ifdef _WIN32
-NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE(LogSettings, append, enable, filter, max_skip_duration, separate,
-                                   size_limit, skip_duplicate, sync, type)
+NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE(LogSettings, append, enable, filter, flush_level,
+                                   max_skip_duration, separate, size_limit, skip_duplicate, sync,
+                                   type)
 #else
-NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE(LogSettings, append, enable, filter, max_skip_duration, separate,
-                                   size_limit, skip_duplicate, sync)
+NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE(LogSettings, append, enable, filter, flush_level,
+                                   max_skip_duration, separate, size_limit, skip_duplicate, sync)
 #endif
 
 // -------------------------------
@@ -376,6 +392,21 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE(AudioSettings, audio_backend, sdl_mic_device,
                                    sdl_main_output_device, sdl_padSpk_output_device,
                                    openal_mic_device, openal_main_output_device,
                                    openal_padSpk_output_device, openal_hrtf, openal_output_mode)
+
+// Windows static guest red-zone protection
+struct WindowsGuestRedZoneProtectionSettings {
+    Setting<WindowsGuestRedZoneProtectionMode> windows_guest_red_zone_protection_mode{
+        WindowsGuestRedZoneProtectionMode::Disabled};
+
+    std::vector<OverrideItem> GetOverrideableFields() const {
+        return std::vector<OverrideItem>{make_override<WindowsGuestRedZoneProtectionSettings>(
+            "windows_guest_red_zone_protection_mode",
+            &WindowsGuestRedZoneProtectionSettings::windows_guest_red_zone_protection_mode)};
+    }
+};
+
+NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE(WindowsGuestRedZoneProtectionSettings,
+                                   windows_guest_red_zone_protection_mode)
 
 // -------------------------------
 // GPU settings
@@ -533,6 +564,8 @@ private:
     DebugSettings m_debug{};
     InputSettings m_input{};
     AudioSettings m_audio{};
+    // Windows static guest red-zone protection
+    WindowsGuestRedZoneProtectionSettings m_windows_guest_red_zone_protection{};
     GPUSettings m_gpu{};
     VulkanSettings m_vulkan{};
     ConfigMode m_configMode{ConfigMode::Default};
@@ -586,6 +619,10 @@ public:
     }
     std::vector<OverrideItem> GetAudioOverrideableFields() const {
         return m_audio.GetOverrideableFields();
+    }
+    // Windows static guest red-zone protection
+    std::vector<OverrideItem> GetWindowsGuestRedZoneProtectionOverrideableFields() const {
+        return m_windows_guest_red_zone_protection.GetOverrideableFields();
     }
     std::vector<OverrideItem> GetGPUOverrideableFields() const {
         return m_gpu.GetOverrideableFields();
@@ -653,6 +690,7 @@ public:
     SETTING_FORWARD_BOOL(m_log, LogAppend, append)
     SETTING_FORWARD_BOOL(m_log, LogEnable, enable)
     SETTING_FORWARD(m_log, LogFilter, filter)
+    SETTING_FORWARD(m_log, LogFlushLevel, flush_level)
     SETTING_FORWARD(m_log, LogMaxSkipDuration, max_skip_duration)
     SETTING_FORWARD_BOOL(m_log, LogSeparate, separate)
     SETTING_FORWARD(m_log, LogSizeLimit, size_limit)
@@ -672,6 +710,10 @@ public:
     SETTING_FORWARD(m_audio, OpenALPadSpkOutputDevice, openal_padSpk_output_device)
     SETTING_FORWARD(m_audio, OpenALHrtf, openal_hrtf)
     SETTING_FORWARD(m_audio, OpenALOutputMode, openal_output_mode)
+
+    // Windows static guest red-zone protection
+    SETTING_FORWARD(m_windows_guest_red_zone_protection, WindowsGuestRedZoneProtectionMode,
+                    windows_guest_red_zone_protection_mode)
 
     // Debug settings
     SETTING_FORWARD_BOOL(m_debug, DebugDump, debug_dump)
