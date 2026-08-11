@@ -9,6 +9,7 @@
 #include <core/emulator_settings.h>
 #include <magic_enum/magic_enum.hpp>
 #include "common/assert.h"
+#include "common/elf_info.h"
 #include "common/logging/log.h"
 #include "common/thread.h"
 #include "core/libraries/audio/audioout.h"
@@ -383,9 +384,8 @@ s32 PS4_SYSV_ABI sceAudioOutClose(s32 handle) {
 
     std::shared_ptr<PortOut> port;
     {
-        std::unique_lock write_lock{port_table_mutex};
-        port = std::move(port_table[port_id]);
-        port_table[port_id].reset();
+        std::shared_lock read_lock{port_table_mutex};
+        port = port_table[port_id];
     }
 
     if (!port) {
@@ -393,17 +393,29 @@ s32 PS4_SYSV_ABI sceAudioOutClose(s32 handle) {
         return ORBIS_AUDIO_OUT_ERROR_NOT_OPENED;
     }
 
+    // Fail with BUSY if a buffer is queued or a thread is waiting, before changing anything.
     {
-        std::unique_lock lock{port->mutex};
-        port->closing = true;
+        std::unique_lock port_lock{port->mutex};
+        if (Common::ElfInfo::Instance().CompiledSdkVer() >= 0x2000001 && port->output_ready) {
+            LOG_WARNING(Lib_AudioOut, "Port {} still has output in flight", port_id);
+            return ORBIS_AUDIO_OUT_ERROR_BUSY;
+        }
+        if (port->pending_output) {
+            LOG_WARNING(Lib_AudioOut, "Port {} has a pending output", port_id);
+            return ORBIS_AUDIO_OUT_ERROR_BUSY;
+        }
     }
-    port->output_cv.notify_all();
+
+    {
+        std::unique_lock write_lock{port_table_mutex};
+        port_table[port_id].reset();
+    }
 
     // Stop the output thread
     port->output_thread.Stop();
 
     {
-        std::unique_lock lock{port->mutex};
+        std::unique_lock port_lock{port->mutex};
         std::free(port->output_buffer);
         port->output_buffer = nullptr;
     }
@@ -558,11 +570,15 @@ s32 PS4_SYSV_ABI sceAudioOutOutput(s32 handle, void* ptr) {
     s32 samples_sent = 0;
     {
         std::unique_lock lock{port->mutex};
-        port->output_cv.wait(lock, [&] { return !port->output_ready || port->closing; });
-
-        if (port->closing) {
-            LOG_ERROR(Lib_AudioOut, "Port is not opened {}", port_id);
-            return ORBIS_AUDIO_OUT_ERROR_NOT_OPENED;
+        if (port->output_ready) {
+            // Only one waiter per port.
+            if (port->pending_output) {
+                LOG_ERROR(Lib_AudioOut, "Output already pending on port {}", port_id);
+                return ORBIS_AUDIO_OUT_ERROR_BUSY;
+            }
+            port->pending_output = true;
+            port->output_cv.wait(lock, [&] { return !port->output_ready; });
+            port->pending_output = false;
         }
 
         if (ptr != nullptr) {
@@ -660,11 +676,14 @@ s32 PS4_SYSV_ABI sceAudioOutOutputs(OrbisAudioOutOutputParam* param, u32 num) {
 
     // Wait for all ports to be ready
     for (u32 i = 0; i < num; i++) {
-        ports[i]->output_cv.wait(locks[i],
-                                 [&] { return !ports[i]->output_ready || ports[i]->closing; });
-        if (ports[i]->closing) {
-            LOG_ERROR(Lib_AudioOut, "Port is not opened");
-            return ORBIS_AUDIO_OUT_ERROR_NOT_OPENED;
+        if (ports[i]->output_ready) {
+            if (ports[i]->pending_output) {
+                LOG_ERROR(Lib_AudioOut, "Output already pending on port");
+                return ORBIS_AUDIO_OUT_ERROR_BUSY;
+            }
+            ports[i]->pending_output = true;
+            ports[i]->output_cv.wait(locks[i], [&] { return !ports[i]->output_ready; });
+            ports[i]->pending_output = false;
         }
     }
 
