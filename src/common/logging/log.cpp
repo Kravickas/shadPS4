@@ -210,7 +210,7 @@ void Setup(std::string_view shadps4_filename) {
     g_shad_file_sink = std::make_shared<LogFileSink>(
         (GetUserPath(Common::FS::PathType::LogDir) / shadps4_filename).string(), false,
         EmulatorSettings.GetLogSizeLimit());
-    g_shad_file_sink->set_pattern("%^%v%$");
+    g_shad_file_sink->set_pattern("%^[%H:%M:%S.%f] %v%$");
 
     UpdateSinks();
 }
