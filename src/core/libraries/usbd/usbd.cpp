@@ -10,6 +10,7 @@
 #include <libusb.h>
 
 #include "core/emulator_settings.h"
+#include "core/libraries/kernel/time.h"
 
 namespace Libraries::Usbd {
 
@@ -406,16 +407,32 @@ void PS4_SYSV_ABI sceUsbdUnlockEventWaiters() {
     usb_backend->UnlockEventWaiters();
 }
 
-s32 PS4_SYSV_ABI sceUsbdWaitForEvent(timeval* tv) {
+s32 PS4_SYSV_ABI sceUsbdWaitForEvent(Kernel::OrbisKernelTimeval* tv) {
     LOG_DEBUG(Lib_Usbd, "called");
 
-    return libusb_to_orbis_error(usb_backend->WaitForEvent(tv));
+    timeval host_tv{};
+    timeval* host_tv_ptr = nullptr;
+    if (tv != nullptr) {
+        host_tv.tv_sec = static_cast<decltype(host_tv.tv_sec)>(tv->tv_sec);
+        host_tv.tv_usec = static_cast<decltype(host_tv.tv_usec)>(tv->tv_usec);
+        host_tv_ptr = &host_tv;
+    }
+
+    return libusb_to_orbis_error(usb_backend->WaitForEvent(host_tv_ptr));
 }
 
-s32 PS4_SYSV_ABI sceUsbdHandleEventsTimeout(timeval* tv) {
-    LOG_INFO(Lib_Usbd, "called tv={}s {}us", tv ? tv->tv_sec : -1, tv ? tv->tv_usec : -1);
+s32 PS4_SYSV_ABI sceUsbdHandleEventsTimeout(Kernel::OrbisKernelTimeval* tv) {
+    LOG_DEBUG(Lib_Usbd, "called");
 
-    return libusb_to_orbis_error(usb_backend->HandleEventsTimeout(tv));
+    timeval host_tv{};
+    timeval* host_tv_ptr = nullptr;
+    if (tv != nullptr) {
+        host_tv.tv_sec = static_cast<decltype(host_tv.tv_sec)>(tv->tv_sec);
+        host_tv.tv_usec = static_cast<decltype(host_tv.tv_usec)>(tv->tv_usec);
+        host_tv_ptr = &host_tv;
+    }
+
+    return libusb_to_orbis_error(usb_backend->HandleEventsTimeout(host_tv_ptr));
 }
 
 s32 PS4_SYSV_ABI sceUsbdHandleEvents() {
@@ -424,10 +441,18 @@ s32 PS4_SYSV_ABI sceUsbdHandleEvents() {
     return libusb_to_orbis_error(usb_backend->HandleEvents());
 }
 
-s32 PS4_SYSV_ABI sceUsbdHandleEventsLocked(timeval* tv) {
+s32 PS4_SYSV_ABI sceUsbdHandleEventsLocked(Kernel::OrbisKernelTimeval* tv) {
     LOG_DEBUG(Lib_Usbd, "called");
 
-    return libusb_to_orbis_error(usb_backend->HandleEventsTimeout(tv));
+    timeval host_tv{};
+    timeval* host_tv_ptr = nullptr;
+    if (tv != nullptr) {
+        host_tv.tv_sec = static_cast<decltype(host_tv.tv_sec)>(tv->tv_sec);
+        host_tv.tv_usec = static_cast<decltype(host_tv.tv_usec)>(tv->tv_usec);
+        host_tv_ptr = &host_tv;
+    }
+
+    return libusb_to_orbis_error(usb_backend->HandleEventsTimeout(host_tv_ptr));
 }
 
 s32 PS4_SYSV_ABI sceUsbdCheckConnected(SceUsbdDeviceHandle* dev_handle) {
