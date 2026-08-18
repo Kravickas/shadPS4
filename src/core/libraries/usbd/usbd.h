@@ -19,6 +19,10 @@ struct libusb_control_setup;
 struct timeval;
 }
 
+namespace Libraries::Kernel {
+struct OrbisKernelTimeval;
+}
+
 namespace Core::Loader {
 class SymbolsResolver;
 }
@@ -147,11 +151,11 @@ s32 PS4_SYSV_ABI sceUsbdEventHandlingOk();
 s32 PS4_SYSV_ABI sceUsbdEventHandlerActive();
 void PS4_SYSV_ABI sceUsbdLockEventWaiters();
 void PS4_SYSV_ABI sceUsbdUnlockEventWaiters();
-s32 PS4_SYSV_ABI sceUsbdWaitForEvent(timeval* tv);
+s32 PS4_SYSV_ABI sceUsbdWaitForEvent(Kernel::OrbisKernelTimeval* tv);
 
-s32 PS4_SYSV_ABI sceUsbdHandleEventsTimeout(timeval* tv);
+s32 PS4_SYSV_ABI sceUsbdHandleEventsTimeout(Kernel::OrbisKernelTimeval* tv);
 s32 PS4_SYSV_ABI sceUsbdHandleEvents();
-s32 PS4_SYSV_ABI sceUsbdHandleEventsLocked(timeval* tv);
+s32 PS4_SYSV_ABI sceUsbdHandleEventsLocked(Kernel::OrbisKernelTimeval* tv);
 
 s32 PS4_SYSV_ABI sceUsbdCheckConnected(SceUsbdDeviceHandle* dev_handle);
 
