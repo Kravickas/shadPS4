@@ -348,10 +348,31 @@ s32 sceVideoOutSubmitEopFlip(s32 handle, u32 buf_id, u32 mode, s64 flip_arg, voi
         return ORBIS_VIDEO_OUT_ERROR_INVALID_HANDLE;
     }
 
+    const s32 index = static_cast<s32>(buf_id);
+    if (index < -1 || index > 15) {
+        LOG_ERROR(Lib_VideoOut, "Invalid buf_id = {}", index);
+        return ORBIS_VIDEO_OUT_ERROR_INVALID_INDEX;
+    }
+    if (index != -1 && port->buffer_slots[index].group_index == -1) {
+        LOG_ERROR(Lib_VideoOut, "Buffer {} is not registered", index);
+        return ORBIS_VIDEO_OUT_ERROR_INVALID_INDEX;
+    }
+    if (mode - 1u > 5u) {
+        LOG_ERROR(Lib_VideoOut, "Invalid flip mode = {}", mode);
+        return ORBIS_VIDEO_OUT_ERROR_INVALID_FLIP_MODE;
+    }
+
+    {
+        std::unique_lock lock{port->port_mutex};
+        if (index != -1 && port->flip_status.flip_pending_num > 16) {
+            LOG_ERROR(Lib_VideoOut, "Flip queue is full");
+            return ORBIS_VIDEO_OUT_ERROR_FLIP_QUEUE_FULL;
+        }
+    }
+
     Platform::IrqC::Instance()->RegisterOnce(
         Platform::InterruptId::GfxFlip, [=](Platform::InterruptId irq) {
             ASSERT_MSG(irq == Platform::InterruptId::GfxFlip, "An unexpected IRQ occured");
-            ASSERT_MSG(port->buffer_labels[buf_id] == 1, "Out of order flip IRQ");
             const auto result = driver->SubmitFlip(port, buf_id, flip_arg, true);
             ASSERT_MSG(result, "EOP flip submission failed");
         });
@@ -478,6 +499,10 @@ void RegisterLib(Core::Loader::SymbolsResolver* sym) {
                  sceVideoOutSetBufferAttribute);
     LIB_FUNCTION("6kPnj51T62Y", "libSceVideoOut", 1, "libSceVideoOut",
                  sceVideoOutGetResolutionStatus);
+    LIB_FUNCTION("8XGijEoThE0", "libSceVideoOut", 1, "libSceVideoOut",
+                 sceVideoOutGetResolutionStatus); // sceVideoOutSysGetResolutionStatus
+    LIB_FUNCTION("Ek+VR4lcJQI", "libSceVideoOut", 1, "libSceVideoOut",
+                 sceVideoOutAddVblankEvent); // sceVideoOutSysAddVblankEvent
     LIB_FUNCTION("Up36PTk687E", "libSceVideoOut", 1, "libSceVideoOut", sceVideoOutOpen);
     LIB_FUNCTION("zgXifHT9ErY", "libSceVideoOut", 1, "libSceVideoOut", sceVideoOutIsFlipPending);
     LIB_FUNCTION("N5KDtkIjjJ4", "libSceVideoOut", 1, "libSceVideoOut",
@@ -486,6 +511,7 @@ void RegisterLib(Core::Loader::SymbolsResolver* sym) {
                  sceVideoOutGetBufferLabelAddress);
     LIB_FUNCTION("uquVH4-Du78", "libSceVideoOut", 1, "libSceVideoOut", sceVideoOutClose);
     LIB_FUNCTION("1FZBKy8HeNU", "libSceVideoOut", 1, "libSceVideoOut", sceVideoOutGetVblankStatus);
+    LIB_FUNCTION("d1AjT2uZJn0", "libSceVideoOut", 1, "libSceVideoOut", sceVideoOutGetVblankStatus);
     LIB_FUNCTION("kGVLc3htQE8", "libSceVideoOut", 1, "libSceVideoOut",
                  sceVideoOutGetDeviceCapabilityInfo);
     LIB_FUNCTION("j6RaAUlaLv0", "libSceVideoOut", 1, "libSceVideoOut", sceVideoOutWaitVblank);
