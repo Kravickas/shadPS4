@@ -413,7 +413,7 @@ s32 PS4_SYSV_ABI sceUsbdWaitForEvent(timeval* tv) {
 }
 
 s32 PS4_SYSV_ABI sceUsbdHandleEventsTimeout(timeval* tv) {
-    LOG_DEBUG(Lib_Usbd, "called");
+    LOG_INFO(Lib_Usbd, "called tv={}s {}us", tv ? tv->tv_sec : -1, tv ? tv->tv_usec : -1);
 
     return libusb_to_orbis_error(usb_backend->HandleEventsTimeout(tv));
 }
