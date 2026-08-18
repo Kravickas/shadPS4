@@ -3,7 +3,9 @@
 
 #pragma once
 
+#include <chrono>
 #include <list>
+#include <thread>
 
 #include <libusb.h>
 
@@ -437,6 +439,13 @@ public:
     }
 
     s32 HandleEventsTimeout(timeval* tv) override {
+        if (flight_list.empty() && tv != nullptr) {
+            const auto timeout =
+                std::chrono::seconds{tv->tv_sec} + std::chrono::microseconds{tv->tv_usec};
+            if (timeout > std::chrono::microseconds::zero()) {
+                std::this_thread::sleep_for(timeout);
+            }
+        }
         return HandleEvents();
     }
     s32 HandleEvents() override {
