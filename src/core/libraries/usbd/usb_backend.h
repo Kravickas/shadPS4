@@ -445,11 +445,16 @@ public:
     }
 
     s32 HandleEventsTimeout(timeval* tv) override {
-        if (flight_list.empty() && tv != nullptr) {
+        if (flight_list.empty()) {
             const auto timeout =
-                std::chrono::seconds{tv->tv_sec} + std::chrono::microseconds{tv->tv_usec};
+                tv != nullptr
+                    ? std::chrono::duration_cast<std::chrono::microseconds>(
+                          std::chrono::seconds{tv->tv_sec} + std::chrono::microseconds{tv->tv_usec})
+                    : std::chrono::microseconds::zero();
             if (timeout > std::chrono::microseconds::zero()) {
                 std::this_thread::sleep_for(timeout);
+            } else {
+                std::this_thread::yield();
             }
         }
         return HandleEvents();
