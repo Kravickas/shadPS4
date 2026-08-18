@@ -1,6 +1,9 @@
 // SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <chrono>
+#include <mutex>
+#include <thread>
 #include "common/logging/log.h"
 #include "core/libraries/error_codes.h"
 #include "core/libraries/libs.h"
@@ -226,8 +229,15 @@ int PS4_SYSV_ABI sceSslGetSubjectName() {
     return ORBIS_OK;
 }
 
+static constexpr auto kProbeDelay = std::chrono::milliseconds{1000};
+
 int PS4_SYSV_ABI sceSslInit(std::size_t poolSize) {
     LOG_ERROR(Lib_Ssl2, "(DUMMY) called poolSize = {}", poolSize);
+    static std::once_flag probe_flag;
+    std::call_once(probe_flag, [] {
+        LOG_ERROR(Lib_Ssl2, "PROBE: delaying {} ms", kProbeDelay.count());
+        std::this_thread::sleep_for(kProbeDelay);
+    });
     // return a value >1
     static int id = 0;
     return ++id;
