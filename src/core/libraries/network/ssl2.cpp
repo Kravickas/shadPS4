@@ -229,7 +229,7 @@ int PS4_SYSV_ABI sceSslGetSubjectName() {
     return ORBIS_OK;
 }
 
-static constexpr auto kProbeDelay = std::chrono::milliseconds{1000};
+static constexpr auto kProbeDelay = std::chrono::milliseconds{3000};
 
 int PS4_SYSV_ABI sceSslInit(std::size_t poolSize) {
     LOG_ERROR(Lib_Ssl2, "(DUMMY) called poolSize = {}", poolSize);
