@@ -1,9 +1,11 @@
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <chrono>
 #include <thread>
 #include "common/arch.h"
 #include "common/assert.h"
+#include "common/logging/log.h"
 #include "common/types.h"
 #include "core/libraries/kernel/kernel.h"
 #include "core/libraries/kernel/posix_error.h"
@@ -260,7 +262,15 @@ s32 PS4_SYSV_ABI posix_pthread_mutex_trylock(PthreadMutexT* mutex) {
 
 s32 PS4_SYSV_ABI posix_pthread_mutex_lock(PthreadMutexT* mutex) {
     CHECK_AND_INIT_MUTEX
-    return (*mutex)->Lock(nullptr);
+    const auto start = std::chrono::steady_clock::now();
+    const s32 ret = (*mutex)->Lock(nullptr);
+    const auto blocked = std::chrono::duration_cast<std::chrono::microseconds>(
+                             std::chrono::steady_clock::now() - start)
+                             .count();
+    if (blocked >= 1000) {
+        LOG_INFO(Kernel_Pthread, "SYNCPROBE mutex_lock blocked {} us", blocked);
+    }
+    return ret;
 }
 
 s32 PS4_SYSV_ABI posix_pthread_mutex_timedlock(PthreadMutexT* mutex,
