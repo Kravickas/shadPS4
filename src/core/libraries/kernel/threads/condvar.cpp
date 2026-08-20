@@ -5,6 +5,7 @@
 #include <chrono>
 #include <cstring>
 #include "common/assert.h"
+#include "common/logging/log.h"
 #include "core/libraries/kernel/kernel.h"
 #include "core/libraries/kernel/posix_error.h"
 #include "core/libraries/kernel/threads/pthread.h"
@@ -199,7 +200,13 @@ int PthreadCond::Wait(PthreadMutexT* mutex, const OrbisKernelTimespec* abstime, 
 int PS4_SYSV_ABI posix_pthread_cond_wait(PthreadCondT* cond, PthreadMutexT* mutex) {
     PthreadCond* cvp{};
     CHECK_AND_INIT_COND
-    return cvp->Wait(mutex, nullptr);
+    const auto start = std::chrono::steady_clock::now();
+    const int ret = cvp->Wait(mutex, nullptr);
+    const auto blocked = std::chrono::duration_cast<std::chrono::microseconds>(
+                             std::chrono::steady_clock::now() - start)
+                             .count();
+    LOG_INFO(Kernel_Pthread, "SYNCPROBE cond_wait blocked {} us", blocked);
+    return ret;
 }
 
 int PS4_SYSV_ABI posix_pthread_cond_timedwait(PthreadCondT* cond, PthreadMutexT* mutex,
