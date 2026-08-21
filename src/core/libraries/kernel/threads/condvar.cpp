@@ -205,7 +205,8 @@ int PS4_SYSV_ABI posix_pthread_cond_wait(PthreadCondT* cond, PthreadMutexT* mute
     const auto blocked = std::chrono::duration_cast<std::chrono::microseconds>(
                              std::chrono::steady_clock::now() - start)
                              .count();
-    LOG_INFO(Kernel_Pthread, "SYNCPROBE cond_wait blocked {} us", blocked);
+    LOG_INFO(Kernel_Pthread, "SYNCPROBE wait cv={} mtx={} blocked {} us", (void*)cvp,
+             (void*)(mutex ? *mutex : nullptr), blocked);
     return ret;
 }
 
@@ -339,6 +340,7 @@ int PthreadCond::Broadcast() {
 int PS4_SYSV_ABI posix_pthread_cond_signal(PthreadCondT* cond) {
     PthreadCond* cvp{};
     CHECK_AND_INIT_COND
+    LOG_INFO(Kernel_Pthread, "SYNCPROBE signal cv={}", (void*)cvp);
     return cvp->Signal(nullptr);
 }
 
@@ -351,6 +353,7 @@ int PS4_SYSV_ABI posix_pthread_cond_signalto_np(PthreadCondT* cond, Pthread* thr
 int PS4_SYSV_ABI posix_pthread_cond_broadcast(PthreadCondT* cond) {
     PthreadCond* cvp{};
     CHECK_AND_INIT_COND
+    LOG_INFO(Kernel_Pthread, "SYNCPROBE broadcast cv={}", (void*)cvp);
     cvp->Broadcast();
     return 0;
 }
