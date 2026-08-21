@@ -213,7 +213,8 @@ int PS4_SYSV_ABI posix_pthread_join(PthreadT pthread, void** thread_return) {
     const auto blocked = std::chrono::duration_cast<std::chrono::microseconds>(
                              std::chrono::steady_clock::now() - start)
                              .count();
-    LOG_INFO(Kernel_Pthread, "SYNCPROBE join blocked {} us", blocked);
+    LOG_INFO(Kernel_Pthread, "SYNCPROBE join tid={} blocked {} us",
+	           g_curthread ? g_curthread->tid.load() : -1, blocked);
     return ret;
 }
 
