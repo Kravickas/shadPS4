@@ -268,7 +268,8 @@ s32 PS4_SYSV_ABI posix_pthread_mutex_lock(PthreadMutexT* mutex) {
                              std::chrono::steady_clock::now() - start)
                              .count();
     if (blocked >= 100) {
-        LOG_INFO(Kernel_Pthread, "SYNCPROBE lock mtx={} blocked {} us", (void*)*mutex, blocked);
+        LOG_INFO(Kernel_Pthread, "SYNCPROBE lock tid={} mtx={} blocked {} us",
+                 g_curthread ? g_curthread->tid.load() : -1, (void*)*mutex, blocked);
     }
     return ret;
 }
