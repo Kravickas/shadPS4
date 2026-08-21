@@ -267,8 +267,8 @@ s32 PS4_SYSV_ABI posix_pthread_mutex_lock(PthreadMutexT* mutex) {
     const auto blocked = std::chrono::duration_cast<std::chrono::microseconds>(
                              std::chrono::steady_clock::now() - start)
                              .count();
-    if (blocked >= 1000) {
-        LOG_INFO(Kernel_Pthread, "SYNCPROBE mutex_lock blocked {} us", blocked);
+    if (blocked >= 100) {
+        LOG_INFO(Kernel_Pthread, "SYNCPROBE lock mtx={} blocked {} us", (void*)*mutex, blocked);
     }
     return ret;
 }
