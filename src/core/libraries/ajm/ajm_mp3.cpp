@@ -1,6 +1,10 @@
 // SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <algorithm>
+#include <bit>
+#include <cstring>
+
 #include "ajm_error.h"
 #include "ajm_mp3.h"
 #include "ajm_result.h"
@@ -26,11 +30,9 @@ static constexpr std::array<std::array<s32, 4>, 4> Mp3SampleRateTable = {
     std::array<s32, 4>{44100, 48000, 32000, 0},
 };
 
-static constexpr std::array<std::array<s32, 16>, 4> Mp3BitRateTable = {
-    std::array<s32, 16>{0, 8, 16, 24, 32, 40, 48, 56, 64, 0, 0, 0, 0, 0, 0, 0},
-    std::array<s32, 16>{0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0},
-    std::array<s32, 16>{0, 8, 16, 24, 32, 40, 48, 56, 64, 80, 96, 112, 128, 144, 160, 0},
+static constexpr std::array<std::array<s32, 16>, 2> Mp3BitRateTable = {
     std::array<s32, 16>{0, 32, 40, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320, 0},
+    std::array<s32, 16>{0, 8, 16, 24, 32, 40, 48, 56, 64, 80, 96, 112, 128, 144, 160, 0},
 };
 
 enum class Mp3AudioVersion : u32 {
@@ -63,6 +65,15 @@ struct Mp3Header {
     u32 sync : 11;
 };
 static_assert(sizeof(Mp3Header) == sizeof(u32));
+
+static constexpr u32 Mp3LayerIII = 1;
+
+static constexpr u32 Mp3SideInfoSize(Mp3AudioVersion version, u32 num_channels) {
+    if (version == Mp3AudioVersion::V1) {
+        return num_channels == 1 ? 17 : 32;
+    }
+    return num_channels == 1 ? 9 : 17;
+}
 
 static AVSampleFormat AjmToAVSampleFormat(AjmFormatEncoding format) {
     switch (format) {
@@ -286,15 +297,23 @@ int AjmMp3Decoder::ParseMp3Header(const u8* p_begin, u32 stream_size, int parse_
 
     const auto* p_current = p_begin;
 
-    auto bytes = std::byteswap(*reinterpret_cast<const u32*>(p_current));
+    u32 raw_header = 0;
+    std::memcpy(&raw_header, p_current, sizeof(raw_header));
+    auto bytes = std::byteswap(raw_header);
     p_current += 4;
     auto header = reinterpret_cast<const Mp3Header*>(&bytes);
     if (header->sync != 0x7FF) {
         return ORBIS_AJM_ERROR_INVALID_PARAMETER;
     }
 
+    if (header->layer_type != Mp3LayerIII || header->version == Mp3AudioVersion::Reserved ||
+        header->bitrate_idx == 0xF || header->sampling_rate_idx == 3) {
+        return ORBIS_AJM_ERROR_INVALID_PARAMETER;
+    }
+
     frame->sample_rate = Mp3SampleRateTable[u32(header->version)][header->sampling_rate_idx];
-    frame->bitrate = Mp3BitRateTable[u32(header->version)][header->bitrate_idx] * 1000;
+    frame->bitrate =
+        Mp3BitRateTable[header->version != Mp3AudioVersion::V1][header->bitrate_idx] * 1000;
     frame->num_channels = header->channel_mode == Mp3ChannelMode::SingleChannel ? 1 : 2;
     if (header->version == Mp3AudioVersion::V1) {
         frame->frame_size = (144 * frame->bitrate) / frame->sample_rate + header->padding;
@@ -313,11 +332,11 @@ int AjmMp3Decoder::ParseMp3Header(const u8* p_begin, u32 stream_size, int parse_
         return ORBIS_OK;
     }
 
-    BitReader reader(p_current);
-    if (header->protection_type == 0) {
-        // crc = reader.Read<u16>(16);
-        reader.Skip(16);
+    if (stream_size < 4 + Mp3SideInfoSize(header->version, frame->num_channels)) {
+        return ORBIS_OK;
     }
+
+    BitReader reader(p_current);
 
     if (header->version == Mp3AudioVersion::V1) {
         // main_data_begin = reader.Read<u16>(9);
@@ -397,37 +416,51 @@ int AjmMp3Decoder::ParseMp3Header(const u8* p_begin, u32 stream_size, int parse_
 
     p_current += ((reader.GetCurrentOffset() + 7) / 8);
 
-    const auto* p_end = p_begin + frame->frame_size;
-    if (memcmp(p_current, "Xing", 4) == 0 || memcmp(p_current, "Info", 4) == 0) {
+    const auto* p_buffer_end = p_begin + stream_size;
+    const u64 limit = std::min<u64>(frame->frame_size, stream_size);
+    const u64 ancillary_offset = static_cast<u64>(p_current - p_begin);
+
+    const bool xing_in_bounds = p_current + 8 < p_buffer_end;
+    const bool vbri_in_bounds =
+        frame->frame_size <= stream_size && frame->frame_size >= ancillary_offset + 26;
+
+    if (xing_in_bounds &&
+        (memcmp(p_current, "Xing", 4) == 0 || memcmp(p_current, "Info", 4) == 0)) {
         // TODO: Parse Xing/Lame header
         LOG_ERROR(Lib_Ajm, "Xing/Lame header is not implemented.");
-    } else if (memcmp(p_current, "VBRI", 4) == 0) {
+    } else if (vbri_in_bounds && memcmp(p_current, "VBRI", 4) == 0) {
         // TODO: Parse VBRI header
         LOG_ERROR(Lib_Ajm, "VBRI header is not implemented.");
-    } else {
+    } else if (ancillary_offset + 10 <= limit) {
         // Parse FGH header
-        constexpr auto fgh_indicator = 0xB4;
-        while ((p_current + 9) < p_end && *p_current != fgh_indicator) {
-            ++p_current;
-        }
-        auto p_fgh = p_current;
-        if ((p_current + 9) < p_end && *p_current == fgh_indicator) {
-            u8 crc = 0xFF;
-            auto crc_func = [](u8 c, u8 v, u8 s) {
-                if (((c >> 7) & 1) != ((v >> s) & 1)) {
-                    return c * 2;
+        constexpr u8 fgh_indicator = 0xB4;
+        constexpr auto crc_step = [](u8 c, u8 v, u8 s) -> u8 {
+            if (((c >> 7) & 1) != ((v >> s) & 1)) {
+                return static_cast<u8>(c * 2);
+            }
+            return static_cast<u8>((c * 2) ^ 0x45);
+        };
+        for (const u8* p_fgh = p_current;; ++p_fgh) {
+            if (*p_fgh == fgh_indicator) {
+                u8 crc = 0xFF;
+                for (u8 i = 0; i < 9; ++i) {
+                    for (u8 j = 0; j < 8; ++j) {
+                        crc = crc_step(crc, p_fgh[i], 7 - j);
+                    }
                 }
-                return (c * 2) ^ 0x45;
-            };
-            for (u8 i = 0; i < 9; ++i, ++p_current) {
-                for (u8 j = 0; j < 8; ++j) {
-                    crc = crc_func(crc, *p_current, 7 - j);
+                if (p_fgh[9] == crc) {
+                    u16 raw_delay = 0;
+                    u32 raw_samples = 0;
+                    std::memcpy(&raw_delay, p_fgh + 1, sizeof(raw_delay));
+                    std::memcpy(&raw_samples, p_fgh + 3, sizeof(raw_samples));
+                    frame->encoder_delay = std::byteswap(raw_delay);
+                    frame->total_samples = std::byteswap(raw_samples);
+                    frame->ofl_type = AjmDecMp3OflType::Fgh;
+                    break;
                 }
             }
-            if (p_fgh[9] == crc) {
-                frame->encoder_delay = std::byteswap(*reinterpret_cast<const u16*>(p_fgh + 1));
-                frame->total_samples = std::byteswap(*reinterpret_cast<const u32*>(p_fgh + 3));
-                frame->ofl_type = AjmDecMp3OflType::Fgh;
+            if (static_cast<u64>(p_fgh - p_begin) + 11 > limit) {
+                break;
             }
         }
     }
