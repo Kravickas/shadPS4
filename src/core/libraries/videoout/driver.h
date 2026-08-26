@@ -1,4 +1,4 @@
-﻿// SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
+// SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #pragma once
@@ -7,6 +7,7 @@
 #include "common/polyfill_thread.h"
 #include "core/libraries/videoout/video_out.h"
 
+#include <atomic>
 #include <condition_variable>
 #include <mutex>
 #include <queue>
@@ -22,6 +23,7 @@ struct VideoOutPort {
     std::array<VideoOutBuffer, MaxDisplayBuffers> buffer_slots;
     std::array<u64, MaxDisplayBuffers> buffer_labels; // should be contiguous in memory
     static_assert(sizeof(buffer_labels[0]) == 8u);
+    std::array<std::atomic<u32>, MaxDisplayBuffers> buffer_queued{};
     std::array<BufferAttributeGroup, MaxDisplayBufferGroups> groups;
     FlipStatus flip_status;
     SceVideoOutVblankStatus vblank_status;
