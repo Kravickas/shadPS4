@@ -167,6 +167,7 @@ int VideoOutDriver::RegisterBuffers(VideoOutPort* port, s32 startIndex, void* co
 
         // Reset flip label also when registering buffer
         port->buffer_labels[startIndex + i] = 0;
+        port->buffer_queued[startIndex + i] = 0;
         port->SignalVoLabel();
 
         presenter->RegisterVideoOutSurface(group, address);
@@ -268,8 +269,12 @@ void VideoOutDriver::Flip(const Request& req) {
         }
     }
 
-    // Reset prev flip label
-    if (port->prev_index != -1) {
+    if (req.index != -1) {
+        --port->buffer_queued[req.index];
+    }
+
+    // Release the previous buffer, unless a queued flip still targets it
+    if (port->prev_index != -1 && port->buffer_queued[port->prev_index] == 0) {
         port->buffer_labels[port->prev_index] = 0;
         port->SignalVoLabel();
     }
@@ -327,6 +332,9 @@ void VideoOutDriver::SubmitFlipInternal(VideoOutPort* port, s32 index, s64 flip_
     }
 
     std::scoped_lock lock{mutex};
+    if (index != -1 && !is_eop) {
+        ++port->buffer_queued[index];
+    }
     requests.push({
         .frame = frame,
         .port = port,
