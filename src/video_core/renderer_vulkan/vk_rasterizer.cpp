@@ -64,7 +64,7 @@ void Rasterizer::EnqueueEopFence(Common::UniqueFunction<void>&& signal) {
     scheduler.DeferPriorityOperation(std::move(signal));
     Flush();
 }
- 
+
 bool Rasterizer::FilterDraw() {
     const auto& regs = liverpool->regs;
     if (regs.color_control.mode == AmdGpu::ColorControl::OperationMode::EliminateFastClear) {

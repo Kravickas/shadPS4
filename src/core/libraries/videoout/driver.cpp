@@ -167,7 +167,6 @@ int VideoOutDriver::RegisterBuffers(VideoOutPort* port, s32 startIndex, void* co
 
         // Reset flip label also when registering buffer
         port->buffer_labels[startIndex + i] = 0;
-        port->buffer_queued[startIndex + i] = 0;
         port->SignalVoLabel();
 
         presenter->RegisterVideoOutSurface(group, address);
@@ -296,16 +295,15 @@ void VideoOutDriver::DrawLastFrame() {
 
 bool VideoOutDriver::SubmitFlip(VideoOutPort* port, s32 index, s64 flip_arg,
                                 bool is_eop /*= false*/) {
-    {
+    if (!is_eop) {
+        // Eop flips were already admitted and counted when the guest submitted them, this is
+        // only the GPU executing them, so it cannot fail or be counted a second time.
         std::unique_lock lock{port->port_mutex};
         if (index != -1 && port->flip_status.flip_pending_num > 16) {
             LOG_ERROR(Lib_VideoOut, "Flip queue is full");
             return false;
         }
 
-        if (is_eop) {
-            ++port->flip_status.gc_queue_num;
-        }
         ++port->flip_status.flip_pending_num; // integral GPU and CPU pending flips counter
         port->flip_status.submit_tsc = Libraries::Kernel::sceKernelReadTsc();
     }
