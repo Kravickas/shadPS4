@@ -245,6 +245,8 @@ public:
     boost::container::small_vector<Id, 16> interfaces;
 
     Id output_position{};
+    Id xfb_vertex_index{};
+    bool xfb_capture{};
     Id output_point_size{};
     Id output_layer{};
     Id output_viewport_index{};

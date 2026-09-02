@@ -7,6 +7,7 @@
 #include "shader_recompiler/frontend/fetch_shader.h"
 #include "shader_recompiler/ir/microinstruction.h"
 #include "shader_recompiler/runtime_info.h"
+#include "shader_recompiler/xfb_layout.h"
 #include "video_core/buffer_cache/buffer_cache.h"
 
 #include <boost/container/static_vector.hpp>
@@ -551,6 +552,11 @@ void EmitContext::DefineVertexBlock() {
     const std::array<Id, 8> zero{f32_zero_value, f32_zero_value, f32_zero_value, f32_zero_value,
                                  f32_zero_value, f32_zero_value, f32_zero_value, f32_zero_value};
     output_position = DefineVariable(F32[4], spv::BuiltIn::Position, spv::StorageClass::Output);
+    if (xfb_capture) {
+        Decorate(output_position, spv::Decoration::XfbBuffer, 0U);
+        Decorate(output_position, spv::Decoration::XfbStride, XfbVertexStride);
+        Decorate(output_position, spv::Decoration::Offset, 0U);
+    }
     const bool needs_clip_distance_emulation = l_stage == LogicalStage::Vertex &&
                                                stage == Stage::Vertex &&
                                                profile.needs_clip_distance_emulation;
@@ -583,6 +589,11 @@ void EmitContext::DefineVertexBlock() {
 void EmitContext::DefineOutputs() {
     switch (l_stage) {
     case LogicalStage::Vertex: {
+        u32 xfb_location = 0;
+        if (XfbCaptureEnabled(info, profile, runtime_info.vs_info.tess_emulated_primitive)) {
+            xfb_capture = true;
+            xfb_location = *XfbVertexIndexLocation(info, profile);
+        }
         DefineVertexBlock();
         if (stage == Shader::Stage::Local) {
             const u32 num_attrs = Common::AlignUp(runtime_info.ls_info.ls_stride, 16) >> 4;
@@ -615,6 +626,14 @@ void EmitContext::DefineOutputs() {
                 output_params[num_attrs] = GetAttributeInfo(
                     AmdGpu::NumberFormat::Float, clip_distances, MaxEmulatedClipDistances, true);
                 Name(clip_distances, fmt::format("cldist_attr{}", 0));
+            }
+            if (xfb_capture) {
+                xfb_vertex_index = DefineOutput(U32[1], xfb_location);
+                Decorate(xfb_vertex_index, spv::Decoration::Flat);
+                Decorate(xfb_vertex_index, spv::Decoration::XfbBuffer, 0U);
+                Decorate(xfb_vertex_index, spv::Decoration::XfbStride, XfbVertexStride);
+                Decorate(xfb_vertex_index, spv::Decoration::Offset, XfbVertexIndexOffset);
+                Name(xfb_vertex_index, "xfb_vertex_index");
             }
         }
         break;

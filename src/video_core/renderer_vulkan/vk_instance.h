@@ -190,6 +190,11 @@ public:
         return provoking_vertex;
     }
 
+    /// Returns true when VK_EXT_transform_feedback is supported.
+    bool IsTransformFeedbackSupported() const {
+        return transform_feedback;
+    }
+
     /// Returns true when VK_AMD_shader_image_load_store_lod is supported.
     bool IsImageLoadStoreLodSupported() const {
         return image_load_store_lod;
@@ -501,6 +506,7 @@ private:
     bool vertex_input_dynamic_state{};
     bool list_restart{};
     bool provoking_vertex{};
+    bool transform_feedback{};
     bool shader_stencil_export{};
     bool image_load_store_lod{};
     bool amd_gcn_shader{};

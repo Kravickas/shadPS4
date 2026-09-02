@@ -1,11 +1,15 @@
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <algorithm>
+#include <limits>
 #include "common/debug.h"
+#include "common/hash.h"
 #include "core/debug_state.h"
 #include "core/emulator_settings.h"
 #include "core/memory.h"
 #include "shader_recompiler/runtime_info.h"
+#include "shader_recompiler/xfb_layout.h"
 #include "video_core/amdgpu/liverpool.h"
 #include "video_core/renderer_vulkan/liverpool_to_vk.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
@@ -32,6 +36,62 @@ static Shader::PushData MakeUserData(const AmdGpu::Regs& regs) {
     return push_data;
 }
 
+namespace {
+
+// Transform feedback writes every vertex of every assembled primitive, so strips and fans
+// expand beyond their index count.
+u32 XfbMaxVertices(AmdGpu::PrimitiveType type, u32 count, u32 instances) {
+    u32 per_index = 3;
+    switch (type) {
+    case AmdGpu::PrimitiveType::PointList:
+    case AmdGpu::PrimitiveType::LineList:
+    case AmdGpu::PrimitiveType::TriangleList:
+        per_index = 1;
+        break;
+    case AmdGpu::PrimitiveType::LineStrip:
+    case AmdGpu::PrimitiveType::LineLoop:
+        per_index = 2;
+        break;
+    default:
+        break;
+    }
+    const u64 total = u64(count) * per_index * instances;
+    return static_cast<u32>(std::min<u64>(total, std::numeric_limits<u32>::max()));
+}
+
+bool IsXfbCapturable(const GraphicsPipeline& pipeline, const Shader::Profile& profile,
+                     AmdGpu::PrimitiveType type) {
+    const auto stages = pipeline.GetStages();
+    if (stages[u32(Shader::LogicalStage::Geometry)] ||
+        stages[u32(Shader::LogicalStage::TessellationControl)] ||
+        stages[u32(Shader::LogicalStage::TessellationEval)]) {
+        return false;
+    }
+    const bool tess_emulated =
+        type == AmdGpu::PrimitiveType::RectList || type == AmdGpu::PrimitiveType::QuadList;
+    const auto* vs_info = stages[u32(Shader::LogicalStage::Vertex)];
+    return vs_info && Shader::XfbCaptureEnabled(*vs_info, profile, tess_emulated);
+}
+
+// Geometry identity: vertex stream addresses, index range and topology. Deliberately excludes
+// constant buffer pointers, which many engines rotate every frame.
+u64 XfbDrawKey(const Shader::Info& vs_info,
+               const std::optional<const Shader::Gcn::FetchShaderData>& fetch_shader,
+               VAddr index_base, u32 vertex_offset, u32 num_indices, AmdGpu::PrimitiveType type) {
+    u64 key = vs_info.pgm_hash;
+    key = HashCombine(key, u64(index_base));
+    key = HashCombine(key, u64(vertex_offset) | (u64(num_indices) << 32));
+    key = HashCombine(key, u64(type));
+    if (fetch_shader) {
+        for (const auto& attrib : fetch_shader->attributes) {
+            key = HashCombine(key, u64(attrib.GetSharp(vs_info).base_address));
+        }
+    }
+    return key;
+}
+
+} // Anonymous namespace
+
 Rasterizer::Rasterizer(const Instance& instance_, Scheduler& scheduler_,
                        AmdGpu::Liverpool* liverpool_)
     : instance{instance_}, scheduler{scheduler_}, page_manager{this},
@@ -39,6 +99,9 @@ Rasterizer::Rasterizer(const Instance& instance_, Scheduler& scheduler_,
       texture_cache{instance, scheduler, liverpool_, buffer_cache, page_manager},
       liverpool{liverpool_}, memory{Core::Memory::Instance()},
       pipeline_cache{instance, scheduler, liverpool} {
+    if (instance.IsTransformFeedbackSupported()) {
+        xfb_capture.emplace(instance, scheduler);
+    }
     if (!EmulatorSettings.IsNullGPU()) {
         liverpool->BindRasterizer(this);
     }
@@ -201,6 +264,18 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset) {
         return;
     }
 
+    if (xfb_capture) {
+        const u32 frame_num = DebugState.GetFrameNum();
+        if (!xfb_has_frame) {
+            xfb_frame = frame_num;
+            xfb_has_frame = true;
+        } else if (frame_num != xfb_frame) {
+            scheduler.EndRendering();
+            xfb_capture->EndFrame(scheduler.CommandBuffer());
+            xfb_frame = frame_num;
+        }
+    }
+
     PrepareRenderState(pipeline);
     if (!BindResources(pipeline)) {
         return;
@@ -223,12 +298,26 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset) {
     const auto cmdbuf = scheduler.CommandBuffer();
     cmdbuf.bindPipeline(vk::PipelineBindPoint::eGraphics, pipeline->Handle());
 
+    bool capturing = false;
+    if (xfb_capture &&
+        IsXfbCapturable(*pipeline, pipeline_cache.GetProfile(), regs.primitive_type)) {
+        const VAddr index_base = is_indexed ? regs.index_base_address.Address<VAddr>() : 0;
+        const u64 key = XfbDrawKey(vs_info, fetch_shader, index_base, vertex_offset,
+                                   regs.num_indices, regs.primitive_type);
+        const u32 max_vertices = XfbMaxVertices(regs.primitive_type, regs.num_indices,
+                                                regs.num_instances.NumInstances());
+        capturing = xfb_capture->Begin(cmdbuf, key, max_vertices);
+    }
+
     if (is_indexed) {
         cmdbuf.drawIndexed(regs.num_indices, regs.num_instances.NumInstances(), 0,
                            s32(vertex_offset), instance_offset);
     } else {
         cmdbuf.draw(regs.num_indices, regs.num_instances.NumInstances(), vertex_offset,
                     instance_offset);
+    }
+    if (capturing) {
+        xfb_capture->End(cmdbuf);
     }
     DebugState.IncDrawCall();
 

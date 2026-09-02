@@ -303,6 +303,7 @@ bool Instance::CreateDevice() {
             add_extension(VK_KHR_FRAGMENT_SHADER_BARYCENTRIC_EXTENSION_NAME);
     }
     provoking_vertex = add_extension(VK_EXT_PROVOKING_VERTEX_EXTENSION_NAME);
+    transform_feedback = add_extension(VK_EXT_TRANSFORM_FEEDBACK_EXTENSION_NAME);
     shader_stencil_export = add_extension(VK_EXT_SHADER_STENCIL_EXPORT_EXTENSION_NAME);
     image_load_store_lod = add_extension(VK_AMD_SHADER_IMAGE_LOAD_STORE_LOD_EXTENSION_NAME);
     amd_gcn_shader = add_extension(VK_AMD_GCN_SHADER_EXTENSION_NAME);
@@ -475,6 +476,9 @@ bool Instance::CreateDevice() {
         vk::PhysicalDeviceProvokingVertexFeaturesEXT{
             .provokingVertexLast = true,
         },
+        vk::PhysicalDeviceTransformFeedbackFeaturesEXT{
+            .transformFeedback = true,
+        },
         vk::PhysicalDeviceVertexAttributeDivisorFeatures{
             .vertexAttributeInstanceRateDivisor = true,
         },
@@ -534,6 +538,9 @@ bool Instance::CreateDevice() {
     }
     if (!provoking_vertex) {
         device_chain.unlink<vk::PhysicalDeviceProvokingVertexFeaturesEXT>();
+    }
+    if (!transform_feedback) {
+        device_chain.unlink<vk::PhysicalDeviceTransformFeedbackFeaturesEXT>();
     }
     if (!maintenance_8) {
         device_chain.unlink<vk::PhysicalDeviceMaintenance8FeaturesKHR>();
