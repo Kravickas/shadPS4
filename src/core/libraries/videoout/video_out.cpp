@@ -141,7 +141,15 @@ s32 PS4_SYSV_ABI sceVideoOutRegisterBuffers(s32 handle, s32 startIndex, void* co
 
 s32 PS4_SYSV_ABI sceVideoOutSetFlipRate(s32 handle, s32 rate) {
     LOG_TRACE(Lib_VideoOut, "called");
-    driver->GetPort(handle)->flip_rate = rate;
+    auto* port = driver->GetPort(handle);
+    if (!port) {
+        return ORBIS_VIDEO_OUT_ERROR_INVALID_HANDLE;
+    }
+    if (rate < -1 || rate > 2) {
+        LOG_ERROR(Lib_VideoOut, "Invalid flip rate = {}", rate);
+        return ORBIS_VIDEO_OUT_ERROR_INVALID_VALUE;
+    }
+    port->flip_rate = rate;
     return ORBIS_OK;
 }
 
@@ -373,10 +381,6 @@ s32 sceVideoOutSubmitEopFlip(s32 handle, u32 buf_id, u32 mode, s64 flip_arg, voi
         ++port->flip_status.gc_queue_num;
         ++port->flip_status.flip_pending_num;
         port->flip_status.submit_tsc = Libraries::Kernel::sceKernelReadTsc();
-    }
-
-    if (index != -1) {
-        ++port->buffer_queued[index];
     }
 
     Platform::IrqC::Instance()->RegisterOnce(
