@@ -233,7 +233,7 @@ int VideoOutDriver::ChangeBufferAttribute(VideoOutPort* port, s32 attributeIndex
     return 0;
 }
 
-void VideoOutDriver::Flip(const Request& req) {
+void VideoOutDriver::Flip(const Request& req, u32 queued_buffers) {
     // Update HDR status before presenting.
     presenter->SetHDR(req.port->is_hdr);
 
@@ -268,12 +268,8 @@ void VideoOutDriver::Flip(const Request& req) {
         }
     }
 
-    if (req.index != -1) {
-        --port->buffer_queued[req.index];
-    }
-
-    // Release the previous buffer, unless a queued flip still targets it
-    if (port->prev_index != -1 && port->buffer_queued[port->prev_index] == 0) {
+    // Release the previous buffer, unless a pending flip still targets it
+    if (port->prev_index != -1 && !(queued_buffers & (1u << port->prev_index))) {
         port->buffer_labels[port->prev_index] = 0;
         port->SignalVoLabel();
     }
@@ -330,10 +326,7 @@ void VideoOutDriver::SubmitFlipInternal(VideoOutPort* port, s32 index, s64 flip_
     }
 
     std::scoped_lock lock{mutex};
-    if (index != -1 && !is_eop) {
-        ++port->buffer_queued[index];
-    }
-    requests.push({
+    requests.push_back({
         .frame = frame,
         .port = port,
         .flip_arg = flip_arg,
@@ -351,14 +344,20 @@ void VideoOutDriver::PresentThread(std::stop_token token) {
 
     Common::AccurateTimer timer{vblank_period};
 
-    const auto receive_request = [this] -> Request {
+    const auto receive_request = [this] -> std::pair<Request, u32> {
         std::scoped_lock lk{mutex};
-        if (!requests.empty()) {
-            const auto request = requests.front();
-            requests.pop();
-            return request;
+        if (requests.empty()) {
+            return {};
         }
-        return {};
+        const auto request = requests.front();
+        requests.pop_front();
+        u32 queued_buffers = 0;
+        for (const auto& pending : requests) {
+            if (pending.index >= 0) {
+                queued_buffers |= 1u << pending.index;
+            }
+        }
+        return {request, queued_buffers};
     };
 
     while (!token.stop_requested()) {
@@ -372,8 +371,8 @@ void VideoOutDriver::PresentThread(std::stop_token token) {
 
         // Check if it's time to take a request.
         auto& vblank_status = main_port.vblank_status;
-        if (vblank_status.count % (main_port.flip_rate + 1) == 0) {
-            const auto request = receive_request();
+        if (main_port.flip_rate < 0 || vblank_status.count % (main_port.flip_rate + 1) == 0) {
+            const auto [request, queued_buffers] = receive_request();
             if (!request) {
                 if (timer.GetTotalWait().count() < 0) { // Dont draw too fast
                     if (!main_port.is_open) {
@@ -383,7 +382,7 @@ void VideoOutDriver::PresentThread(std::stop_token token) {
                     }
                 }
             } else {
-                Flip(request);
+                Flip(request, queued_buffers);
                 FRAME_END;
             }
         }
