@@ -299,7 +299,7 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset) {
     cmdbuf.bindPipeline(vk::PipelineBindPoint::eGraphics, pipeline->Handle());
 
     bool capturing = false;
-    if (xfb_capture &&
+    if (xfb_capture && pipeline->GetGraphicsKey().mrt_mask != 0 &&
         IsXfbCapturable(*pipeline, pipeline_cache.GetProfile(), regs.primitive_type)) {
         const VAddr index_base = is_indexed ? regs.index_base_address.Address<VAddr>() : 0;
         const u64 key = XfbDrawKey(vs_info, fetch_shader, index_base, vertex_offset,

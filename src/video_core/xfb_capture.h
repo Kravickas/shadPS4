@@ -40,7 +40,7 @@ public:
     }
 
 private:
-    static constexpr u64 BufferSize = 128_MB;
+    static constexpr u64 BufferSize = 256_MB;
 
     Buffer& Current() noexcept {
         return parity == 0 ? buffer_a : buffer_b;
