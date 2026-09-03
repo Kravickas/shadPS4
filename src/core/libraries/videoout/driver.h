@@ -1,4 +1,4 @@
-// SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
+﻿// SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #pragma once
@@ -7,9 +7,10 @@
 #include "common/polyfill_thread.h"
 #include "core/libraries/videoout/video_out.h"
 
+#include <atomic>
 #include <condition_variable>
-#include <deque>
 #include <mutex>
+#include <queue>
 
 namespace Vulkan {
 struct Frame;
@@ -22,6 +23,7 @@ struct VideoOutPort {
     std::array<VideoOutBuffer, MaxDisplayBuffers> buffer_slots;
     std::array<u64, MaxDisplayBuffers> buffer_labels; // should be contiguous in memory
     static_assert(sizeof(buffer_labels[0]) == 8u);
+    std::array<std::atomic<u32>, MaxDisplayBuffers> buffer_queued{};
     std::array<BufferAttributeGroup, MaxDisplayBufferGroups> groups;
     FlipStatus flip_status;
     SceVideoOutVblankStatus vblank_status;
@@ -105,7 +107,7 @@ private:
         }
     };
 
-    void Flip(const Request& req, u32 queued_buffers);
+    void Flip(const Request& req);
     void DrawBlankFrame(); // Video port out not open
     void DrawLastFrame();  // Used when there is no flip request
     void SubmitFlipInternal(VideoOutPort* port, s32 index, s64 flip_arg, bool is_eop = false);
@@ -114,7 +116,7 @@ private:
     std::mutex mutex;
     VideoOutPort main_port{};
     std::jthread present_thread;
-    std::deque<Request> requests;
+    std::queue<Request> requests;
 };
 
 } // namespace Libraries::VideoOut
