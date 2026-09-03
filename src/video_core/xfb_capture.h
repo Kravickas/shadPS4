@@ -37,6 +37,7 @@ struct XfbRegion {
     u32 max_vertices;
     u32 counter_offset;
     ImageId depth_id;
+    vk::Image depth_image;
     vk::ImageView depth_view;
     vk::Format depth_format;
     bool has_stencil;
@@ -76,7 +77,7 @@ public:
         return parity == 0 ? counters_a : counters_b;
     }
 
-    static constexpr u64 BufferSize = 256_MB;
+    static constexpr u64 BufferSize = 512_MB;
     static constexpr u32 MaxRegions = 65536;
 
 private:

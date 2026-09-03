@@ -5,7 +5,6 @@
 #include <array>
 #include <unordered_map>
 #include <vector>
-#include <boost/container/static_vector.hpp>
 #include "common/assert.h"
 #include "common/hash.h"
 #include "common/logging/log.h"
@@ -281,16 +280,17 @@ void XfbVelocityPass::Render(const VideoCore::XfbCapture& capture) {
     if (!main || !main->depth_view) {
         return;
     }
+    // The texture cache may have deleted or recycled the depth target since capture.
+    if (!texture_cache.IsImageAllocated(main->depth_id) ||
+        texture_cache.GetImage(main->depth_id).GetImage() != main->depth_image) {
+        return;
+    }
 
     ResizeTargets(main->width, main->height);
 
-    std::unordered_map<u64, boost::container::static_vector<const VideoCore::XfbRegion*, 8>>
-        prev_by_key;
+    std::unordered_map<u64, std::vector<const VideoCore::XfbRegion*>> prev_by_key;
     for (const auto& region : capture.PreviousRegions()) {
-        auto& list = prev_by_key[region.key];
-        if (list.size() < list.capacity()) {
-            list.push_back(&region);
-        }
+        prev_by_key[region.key].push_back(&region);
     }
 
     const vk::CommandBuffer cmdbuf = scheduler.CommandBuffer();

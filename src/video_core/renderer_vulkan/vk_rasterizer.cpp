@@ -322,6 +322,7 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset) {
                                            regs.num_instances.NumInstances()),
             .counter_offset = 0,
             .depth_id = db_desc.first,
+            .depth_image = depth_image.GetImage(),
             .depth_view = state.depth_stencil_attachment.image_view,
             .depth_format = depth_image.info.pixel_format,
             .has_stencil = depth_image.info.props.has_stencil != 0,
