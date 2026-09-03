@@ -18,6 +18,8 @@ set(SHADER_FILES
     fsr.comp
     post_process.frag
     tiling.comp
+    xfb_velocity.frag
+    xfb_velocity.vert
 )
 
 set(SHADER_INCLUDE ${CMAKE_CURRENT_BINARY_DIR}/include)

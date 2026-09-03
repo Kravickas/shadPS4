@@ -101,6 +101,9 @@ Rasterizer::Rasterizer(const Instance& instance_, Scheduler& scheduler_,
       pipeline_cache{instance, scheduler, liverpool} {
     if (instance.IsTransformFeedbackSupported()) {
         xfb_capture.emplace(instance, scheduler);
+        if (instance.IsTransformFeedbackDrawSupported()) {
+            xfb_velocity.emplace(instance, scheduler, texture_cache);
+        }
     }
     if (!EmulatorSettings.IsNullGPU()) {
         liverpool->BindRasterizer(this);
@@ -271,6 +274,9 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset) {
             xfb_has_frame = true;
         } else if (frame_num != xfb_frame) {
             scheduler.EndRendering();
+            if (xfb_velocity) {
+                xfb_velocity->Render(*xfb_capture);
+            }
             xfb_capture->EndFrame(scheduler.CommandBuffer());
             xfb_frame = frame_num;
         }
@@ -299,14 +305,44 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset) {
     cmdbuf.bindPipeline(vk::PipelineBindPoint::eGraphics, pipeline->Handle());
 
     bool capturing = false;
-    if (xfb_capture && pipeline->GetGraphicsKey().mrt_mask != 0 &&
+    const auto& gkey = pipeline->GetGraphicsKey();
+    const auto& dyn = scheduler.GetDynamicState();
+    if (xfb_capture && gkey.mrt_mask != 0 && gkey.num_samples == 1 &&
+        gkey.polygon_mode == AmdGpu::PolygonMode::Fill &&
+        state.depth_stencil_attachment.has_depth && !dyn.viewports.empty() &&
+        !dyn.scissors.empty() &&
         IsXfbCapturable(*pipeline, pipeline_cache.GetProfile(), regs.primitive_type)) {
         const VAddr index_base = is_indexed ? regs.index_base_address.Address<VAddr>() : 0;
-        const u64 key = XfbDrawKey(vs_info, fetch_shader, index_base, vertex_offset,
-                                   regs.num_indices, regs.primitive_type);
-        const u32 max_vertices = XfbMaxVertices(regs.primitive_type, regs.num_indices,
-                                                regs.num_instances.NumInstances());
-        capturing = xfb_capture->Begin(cmdbuf, key, max_vertices);
+        const auto& depth_image = texture_cache.GetImage(db_desc.first);
+        const VideoCore::XfbRegion region{
+            .key = XfbDrawKey(vs_info, fetch_shader, index_base, vertex_offset, regs.num_indices,
+                              regs.primitive_type),
+            .offset = 0,
+            .max_vertices = XfbMaxVertices(regs.primitive_type, regs.num_indices,
+                                           regs.num_instances.NumInstances()),
+            .counter_offset = 0,
+            .depth_id = db_desc.first,
+            .depth_view = state.depth_stencil_attachment.image_view,
+            .depth_format = depth_image.info.pixel_format,
+            .has_stencil = depth_image.info.props.has_stencil != 0,
+            .width = depth_image.info.size.width,
+            .height = depth_image.info.size.height,
+            .state =
+                {
+                    .viewport = dyn.viewports[0],
+                    .scissor = dyn.scissors[0],
+                    .cull_mode = dyn.cull_mode,
+                    .front_face = dyn.front_face,
+                    .depth_bias_constant = dyn.depth_bias_constant,
+                    .depth_bias_clamp = dyn.depth_bias_clamp,
+                    .depth_bias_slope = dyn.depth_bias_slope,
+                    .depth_bias_enabled = dyn.depth_bias_enabled,
+                    .depth_clamp = gkey.depth_clamp_enable != 0,
+                    .depth_clip = gkey.depth_clip_enable != 0,
+                    .negative_one_to_one = gkey.clip_space == AmdGpu::ClipSpace::MinusWToW,
+                },
+        };
+        capturing = xfb_capture->Begin(cmdbuf, region);
     }
 
     if (is_indexed) {

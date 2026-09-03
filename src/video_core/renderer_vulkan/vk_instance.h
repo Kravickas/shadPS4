@@ -195,6 +195,11 @@ public:
         return transform_feedback;
     }
 
+    /// Returns true when vkCmdDrawIndirectByteCountEXT is supported.
+    bool IsTransformFeedbackDrawSupported() const {
+        return transform_feedback && transform_feedback_props.transformFeedbackDraw;
+    }
+
     /// Returns true when VK_AMD_shader_image_load_store_lod is supported.
     bool IsImageLoadStoreLodSupported() const {
         return image_load_store_lod;
@@ -507,6 +512,7 @@ private:
     bool list_restart{};
     bool provoking_vertex{};
     bool transform_feedback{};
+    vk::PhysicalDeviceTransformFeedbackPropertiesEXT transform_feedback_props{};
     bool shader_stencil_export{};
     bool image_load_store_lod{};
     bool amd_gcn_shader{};
