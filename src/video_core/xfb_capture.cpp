@@ -34,7 +34,8 @@ bool XfbCapture::Begin(vk::CommandBuffer cmdbuf, u64 key, u32 max_vertices) {
     const vk::DeviceSize offset = write_offset;
     const vk::DeviceSize size = bytes;
     cmdbuf.bindTransformFeedbackBuffersEXT(0, 1, &handle, &offset, &size);
-    cmdbuf.beginTransformFeedbackEXT(0, 0, nullptr, nullptr);
+    cmdbuf.beginTransformFeedbackEXT(0, vk::ArrayProxy<const vk::Buffer>{},
+                                     vk::ArrayProxy<const vk::DeviceSize>{});
     regions.push_back(Region{key, static_cast<u32>(write_offset), max_vertices});
     write_offset += bytes;
     ++window_draws;
@@ -43,7 +44,8 @@ bool XfbCapture::Begin(vk::CommandBuffer cmdbuf, u64 key, u32 max_vertices) {
 }
 
 void XfbCapture::End(vk::CommandBuffer cmdbuf) {
-    cmdbuf.endTransformFeedbackEXT(0, 0, nullptr, nullptr);
+    cmdbuf.endTransformFeedbackEXT(0, vk::ArrayProxy<const vk::Buffer>{},
+                                   vk::ArrayProxy<const vk::DeviceSize>{});
 }
 
 void XfbCapture::EndFrame(vk::CommandBuffer cmdbuf) {
