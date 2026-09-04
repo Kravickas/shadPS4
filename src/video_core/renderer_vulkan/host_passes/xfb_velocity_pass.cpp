@@ -6,6 +6,7 @@
 #include <unordered_map>
 #include <vector>
 #include "common/assert.h"
+#include "common/enum.h"
 #include "common/hash.h"
 #include "common/logging/log.h"
 #include "shader_recompiler/xfb_layout.h"
@@ -280,9 +281,14 @@ void XfbVelocityPass::Render(const VideoCore::XfbCapture& capture) {
     if (!main || !main->depth_view) {
         return;
     }
-    // The texture cache may have deleted or recycled the depth target since capture.
-    if (!texture_cache.IsImageAllocated(main->depth_id) ||
-        texture_cache.GetImage(main->depth_id).GetImage() != main->depth_image) {
+    // The texture cache may have deleted or recycled the depth target since capture. An
+    // unregistered image is already queued for destruction and must not be recorded against.
+    if (!texture_cache.IsImageAllocated(main->depth_id)) {
+        return;
+    }
+    if (const auto& image = texture_cache.GetImage(main->depth_id);
+        image.GetImage() != main->depth_image ||
+        False(image.flags & VideoCore::ImageFlagBits::Registered)) {
         return;
     }
 
