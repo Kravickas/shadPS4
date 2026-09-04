@@ -59,7 +59,7 @@ struct VideoOutPort {
 
     void SignalVoLabel() {
         std::scoped_lock lk{vo_mutex};
-        vo_cv.notify_one();
+        vo_cv.notify_all();
     }
 
     [[nodiscard]] int NumRegisteredBuffers() const {

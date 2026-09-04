@@ -279,8 +279,8 @@ void VideoOutDriver::Flip(const Request& req) {
     // Release the previous buffer, unless a queued flip still targets it
     if (release_prev) {
         port->buffer_labels[port->prev_index] = 0;
-        port->SignalVoLabel();
     }
+    port->SignalVoLabel();
     // save to prev buf index
     port->prev_index = req.index;
 }
@@ -311,9 +311,6 @@ bool VideoOutDriver::SubmitFlip(VideoOutPort* port, s32 index, s64 flip_arg,
             }
             ++port->flip_status.flip_pending_num;
             port->flip_status.submit_tsc = Libraries::Kernel::sceKernelReadTsc();
-            if (index != -1) {
-                ++port->buffer_queued[index];
-            }
         }
     }
 
@@ -339,6 +336,9 @@ void VideoOutDriver::SubmitFlipInternal(VideoOutPort* port, s32 index, s64 flip_
     }
 
     std::scoped_lock lock{mutex};
+    if (index != -1) {
+        ++port->buffer_queued[index];
+    }
     requests.push({
         .frame = frame,
         .port = port,
