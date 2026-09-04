@@ -5,6 +5,7 @@
 #include "common/elf_info.h"
 #include "common/logging/log.h"
 #include "core/emulator_settings.h"
+#include "core/libraries/kernel/time.h"
 #include "core/libraries/libs.h"
 #include "core/libraries/system/userservice.h"
 #include "core/libraries/videoout/driver.h"
@@ -364,14 +365,16 @@ s32 sceVideoOutSubmitEopFlip(s32 handle, u32 buf_id, u32 mode, s64 flip_arg, voi
 
     {
         std::unique_lock lock{port->port_mutex};
-        if (index != -1 && port->flip_status.flip_pending_num > 16) {
+        if (index != -1 && port->flip_status.flip_pending_num >= 16) {
             LOG_ERROR(Lib_VideoOut, "Flip queue is full");
             return ORBIS_VIDEO_OUT_ERROR_FLIP_QUEUE_FULL;
         }
-    }
-
-    if (index != -1) {
-        ++port->buffer_queued[index];
+        ++port->flip_status.flip_pending_num;
+        ++port->flip_status.gc_queue_num;
+        port->flip_status.submit_tsc = Libraries::Kernel::sceKernelReadTsc();
+        if (index != -1) {
+            ++port->buffer_queued[index];
+        }
     }
 
     Platform::IrqC::Instance()->RegisterOnce(
