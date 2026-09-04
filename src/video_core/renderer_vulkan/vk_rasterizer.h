@@ -68,7 +68,6 @@ public:
 
     void CpSync();
     void EnqueueEopFence(Common::UniqueFunction<void>&& signal);
-    void FlushPendingEopFences();
     u64 Flush();
     void Finish();
     void OnSubmit();
@@ -87,7 +86,6 @@ public:
     }
 
 private:
-    u32 pending_eop_fences{};
     void PrepareRenderState(const GraphicsPipeline* pipeline);
     RenderState BeginRendering(const GraphicsPipeline* pipeline);
     void Resolve();

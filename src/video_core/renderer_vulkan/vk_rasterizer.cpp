@@ -62,14 +62,6 @@ void Rasterizer::CpSync() {
 
 void Rasterizer::EnqueueEopFence(Common::UniqueFunction<void>&& signal) {
     scheduler.DeferPriorityOperation(std::move(signal));
-    ++pending_eop_fences;
-}
-
-void Rasterizer::FlushPendingEopFences() {
-    if (pending_eop_fences == 0) {
-        return;
-    }
-    pending_eop_fences = 0;
     Flush();
 }
 
