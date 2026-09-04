@@ -369,9 +369,6 @@ s32 sceVideoOutSubmitEopFlip(s32 handle, u32 buf_id, u32 mode, s64 flip_arg, voi
             LOG_ERROR(Lib_VideoOut, "Flip queue is full");
             return ORBIS_VIDEO_OUT_ERROR_FLIP_QUEUE_FULL;
         }
-        ++port->flip_status.flip_pending_num;
-        ++port->flip_status.gc_queue_num;
-        port->flip_status.submit_tsc = Libraries::Kernel::sceKernelReadTsc();
     }
 
     Platform::IrqC::Instance()->RegisterOnce(

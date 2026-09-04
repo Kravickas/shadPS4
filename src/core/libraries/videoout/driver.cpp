@@ -256,6 +256,9 @@ void VideoOutDriver::Flip(const Request& req) {
         flip_status.tsc = Libraries::Kernel::sceKernelReadTsc();
         flip_status.flip_arg = req.flip_arg;
         flip_status.current_buffer = req.index;
+        if (req.eop) {
+            --flip_status.gc_queue_num;
+        }
         --flip_status.flip_pending_num;
 
         if (req.index != -1) {
@@ -301,17 +304,15 @@ bool VideoOutDriver::SubmitFlip(VideoOutPort* port, s32 index, s64 flip_arg,
                                 bool is_eop /*= false*/) {
     {
         std::unique_lock lock{port->port_mutex};
-        if (is_eop) {
-            // Registered and counted at submit; the GPU has now run the flip packet.
-            --port->flip_status.gc_queue_num;
-        } else {
-            if (index != -1 && port->flip_status.flip_pending_num >= 16) {
-                LOG_ERROR(Lib_VideoOut, "Flip queue is full");
-                return false;
-            }
-            ++port->flip_status.flip_pending_num;
-            port->flip_status.submit_tsc = Libraries::Kernel::sceKernelReadTsc();
+        if (index != -1 && port->flip_status.flip_pending_num >= 16) {
+            LOG_ERROR(Lib_VideoOut, "Flip queue is full");
+            return false;
         }
+        if (is_eop) {
+            ++port->flip_status.gc_queue_num;
+        }
+        ++port->flip_status.flip_pending_num;
+        port->flip_status.submit_tsc = Libraries::Kernel::sceKernelReadTsc();
     }
 
     if (!is_eop) {
