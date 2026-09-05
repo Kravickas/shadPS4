@@ -160,19 +160,31 @@ F32 IREmitter::GetVectorReg(IR::VectorReg reg) {
 }
 
 void IREmitter::SetScalarReg(IR::ScalarReg reg, const U32F32& value) {
-    ASSERT(static_cast<u32>(reg) < IR::NumScalarRegs);
+    ASSERT(reg < IR::ScalarReg::Max);
     const U32 value_typed = value.Type() == Type::F32 ? BitCast<U32>(F32{value}) : U32{value};
     Inst(Opcode::SetScalarRegister, reg, value_typed);
 }
 
 void IREmitter::SetVectorReg(IR::VectorReg reg, const U32F32& value) {
-    ASSERT(static_cast<u32>(reg) < IR::NumVectorRegs);
+    ASSERT(reg < IR::VectorReg::Max);
     const U32 value_typed = value.Type() == Type::F32 ? BitCast<U32>(F32{value}) : U32{value};
     Inst(Opcode::SetVectorRegister, reg, value_typed);
 }
 
+Value IREmitter::GetVirtualReg(IR::VirtualReg reg) {
+    return Inst(Opcode::GetVirtualRegister, reg);
+}
+
+void IREmitter::SetVirtualReg(IR::VirtualReg reg, const Value& value) {
+    Inst(Opcode::SetVirtualRegister, reg, value);
+}
+
 U1 IREmitter::GetGotoVariable(u32 id) {
     return Inst<U1>(Opcode::GetGotoVariable, id);
+}
+
+U1 IREmitter::GetMaskLaneVariable(IR::VectorReg vgpr, u32 lane) {
+    return Inst<U1>(Opcode::GetMaskLaneVariable, vgpr, Imm32(lane));
 }
 
 U1 IREmitter::Condition(IR::Condition cond) {
@@ -200,6 +212,10 @@ U1 IREmitter::Condition(IR::Condition cond) {
 
 void IREmitter::SetGotoVariable(u32 id, const U1& value) {
     Inst(Opcode::SetGotoVariable, id, value);
+}
+
+void IREmitter::SetMaskLaneVariable(IR::VectorReg vgpr, u32 lane, const U1& value) {
+    Inst(Opcode::SetMaskLaneVariable, vgpr, Imm32(lane), value);
 }
 
 U1 IREmitter::GetScc() {
@@ -236,10 +252,6 @@ void IREmitter::SetExec(const U1& value) {
 
 void IREmitter::SetVcc(const U1& value) {
     Inst(Opcode::SetVcc, value);
-}
-
-void IREmitter::SetSccLo(const U32& value) {
-    Inst(Opcode::SetSccLo, value);
 }
 
 void IREmitter::SetVccLo(const U32& value) {
@@ -280,6 +292,10 @@ F32 IREmitter::ReadTcsGenericOuputAttribute(const U32& vertex_index, const U32& 
                                             const U32& comp_index) {
     return Inst<F32>(IR::Opcode::ReadTcsGenericOuputAttribute, vertex_index, attr_index,
                      comp_index);
+}
+
+U32 IREmitter::GetPcLo(const U32& pc) {
+    return Inst<U32>(IR::Opcode::GetPcLo, pc);
 }
 
 F32 IREmitter::GetPatch(Patch patch) {
@@ -372,13 +388,12 @@ U32U64 IREmitter::SharedAtomicAnd(const U32& address, const U32U64& data, bool i
 U32U64 IREmitter::SharedAtomicOr(const U32& address, const U32U64& data, bool is_gds) {
     switch (data.Type()) {
     case Type::U32:
-        return Inst<U32>(Opcode::SharedAtomicAnd32, Flags{is_gds}, address, data);
+        return Inst<U32>(Opcode::SharedAtomicOr32, Flags{is_gds}, address, data);
     case Type::U64:
-        return Inst<U64>(Opcode::SharedAtomicAnd64, Flags{is_gds}, address, data);
+        return Inst<U64>(Opcode::SharedAtomicOr64, Flags{is_gds}, address, data);
     default:
         ThrowInvalidType(data.Type());
     }
-    return Inst<U32>(Opcode::SharedAtomicOr32, address, data);
 }
 
 U32U64 IREmitter::SharedAtomicXor(const U32& address, const U32U64& data, bool is_gds) {
@@ -2064,6 +2079,10 @@ Value IREmitter::ImageAtomicExchange(const Value& handle, const Value& coords, c
 Value IREmitter::ImageAtomicCmpSwap(const Value& handle, const Value& coords, const Value& value,
                                     const Value& cmp_value, TextureInstInfo info) {
     return Inst(Opcode::ImageAtomicCmpSwap32, Flags{info}, handle, coords, value, cmp_value);
+}
+
+Value IREmitter::ImageHandle(const Value& tsharp_low, const Value& tsharp_high) {
+    return Inst(Opcode::ImageHandle, tsharp_low, tsharp_high);
 }
 
 Value IREmitter::ImageSampleRaw(const Value& image_handle, const Value& sampler_handle,

@@ -81,9 +81,18 @@ void SettingsWindow::LoadSettings(std::string profile) {
         readbacksModeSetting = EmulatorSettings.GetReadbacksMode();
         readbackLinearImagesSetting = EmulatorSettings.IsReadbackLinearImagesEnabled();
         directMemoryAccessSetting = EmulatorSettings.IsDirectMemoryAccessEnabled();
+        // Windows static guest red-zone protection
+        windowsGuestRedZoneProtectionModeSetting =
+            static_cast<int>(EmulatorSettings.GetWindowsGuestRedZoneProtectionMode());
+        if (windowsGuestRedZoneProtectionModeSetting < 0 ||
+            windowsGuestRedZoneProtectionModeSetting >=
+                static_cast<int>(windowsGuestRedZoneProtectionModeOptions.size())) {
+            windowsGuestRedZoneProtectionModeSetting =
+                static_cast<int>(WindowsGuestRedZoneProtectionMode::Disabled);
+        }
         devkitConsoleSetting = EmulatorSettings.IsDevKit();
         neoModeSetting = EmulatorSettings.IsNeo();
-        shadnetEnabledSetting = EmulatorSettings.IsShadNetEnabled();
+        shadnetEnabledSetting = EmulatorSettings.IsShadNetEnabledSetting();
         connectedNetworkSetting = EmulatorSettings.IsConnectedToNetwork();
         pipelineCacheEnabledSetting = EmulatorSettings.IsPipelineCacheEnabled();
         pipelineCacheArchiveSetting = EmulatorSettings.IsPipelineCacheArchived();
@@ -136,6 +145,11 @@ void SettingsWindow::SaveSettings(std::string profile) {
         EmulatorSettings.SetReadbacksMode(readbacksModeSetting, true);
         EmulatorSettings.SetReadbackLinearImagesEnabled(readbackLinearImagesSetting, true);
         EmulatorSettings.SetDirectMemoryAccessEnabled(directMemoryAccessSetting, true);
+        // Windows static guest red-zone protection
+        EmulatorSettings.SetWindowsGuestRedZoneProtectionMode(
+            static_cast<WindowsGuestRedZoneProtectionMode>(
+                windowsGuestRedZoneProtectionModeSetting),
+            true);
         EmulatorSettings.SetDevKit(devkitConsoleSetting, true);
         EmulatorSettings.SetNeo(neoModeSetting, true);
         EmulatorSettings.SetShadNetEnabled(shadnetEnabledSetting, true);
@@ -187,14 +201,14 @@ SettingsWindow::SettingsWindow(bool gameRunning) : isGameRunning(gameRunning) {
                     : texture = BigPictureMode::LoadSdlTextureData(texData);
     };
 
-    loadTexture("src/images/big_picture/settings.png", generalTexture);
-    loadTexture("src/images/big_picture/experimental.png", experimentalTexture);
-    loadTexture("src/images/big_picture/graphics.png", graphicsTexture);
-    loadTexture("src/images/big_picture/controller.png", inputTexture);
-    loadTexture("src/images/big_picture/trophy.png", trophyTexture);
-    loadTexture("src/images/big_picture/log.png", logTexture);
-    loadTexture("src/images/big_picture/folder.png", foldersTexture);
-    loadTexture("src/images/big_picture/profiles.png", profilesTexture);
+    loadTexture("src/resources/big_picture/settings.png", generalTexture);
+    loadTexture("src/resources/big_picture/experimental.png", experimentalTexture);
+    loadTexture("src/resources/big_picture/graphics.png", graphicsTexture);
+    loadTexture("src/resources/big_picture/controller.png", inputTexture);
+    loadTexture("src/resources/big_picture/trophy.png", trophyTexture);
+    loadTexture("src/resources/big_picture/log.png", logTexture);
+    loadTexture("src/resources/big_picture/folder.png", foldersTexture);
+    loadTexture("src/resources/big_picture/profiles.png", profilesTexture);
 
     auto languageKeys = std::views::keys(languageMap);
     languageOptions.assign(languageKeys.begin(), languageKeys.end());
@@ -202,7 +216,6 @@ SettingsWindow::SettingsWindow(bool gameRunning) : isGameRunning(gameRunning) {
     currentProfile = "Global";
     m_GameInstallDirs = EmulatorSettings.GetAllGameInstallDirs();
     currentCategory = isGameRunning ? SettingsCategory::General : SettingsCategory::Profiles;
-    uiScale = static_cast<float>(EmulatorSettings.GetBigPictureScale() / 1000.f);
 
     bool customConfigFound = false;
     if (isGameRunning) {
@@ -223,6 +236,10 @@ SettingsWindow::SettingsWindow(bool gameRunning) : isGameRunning(gameRunning) {
     customConfigFound ? LoadSettings(runningGameSerial) : LoadSettings("Global");
 }
 
+void SettingsWindow::Prepare() {
+    uiScale = EmulatorSettings.GetBigPictureScale() / 1000.f;
+}
+
 void SettingsWindow::DeInit() {
     EmulatorSettings.Load();
     EmulatorSettings.SetBigPictureScale(static_cast<int>(uiScale * 1000));
@@ -232,7 +249,7 @@ void SettingsWindow::DeInit() {
         EmulatorSettings.Load(runningGameSerial);
     }
 }
-void SettingsWindow::DrawSettings(bool* open) {
+void SettingsWindow::DrawSettings(bool* open, const std::function<void()>& applySettings) {
     ImGui::PushStyleColor(ImGuiCol_WindowBg, ImVec4(0.06f, 0.06f, 0.06f, 1.00f)); // black
     ImGui::PushStyleColor(ImGuiCol_Header, ImVec4(0.20f, 0.40f, 0.70f, 1.00f));   // blue
     ImGui::PushStyleColor(ImGuiCol_HeaderHovered,
@@ -253,7 +270,7 @@ void SettingsWindow::DrawSettings(bool* open) {
 
     SetupWindow();
     DrawCategoryTabs();
-    DrawMainContent(open);
+    DrawMainContent(open, applySettings);
 
     ImGui::PopStyleVar(8);
     ImGui::PopStyleColor(5);
@@ -302,11 +319,13 @@ void SettingsWindow::DrawCategoryTabs() {
 
     float vertSize = (settingsIconSize * uiScale + ImGui::CalcTextSize("Profiles").y) +
                      ImGui::GetStyle().FramePadding.y * 4.f + 20.0 * uiScale;
-    ImGuiWindowFlags child_flags = ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize |
-                                   ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NavFlattened;
-    ImGui::BeginChild("Categories", ImVec2(0, vertSize), true,
-                      child_flags | ImGuiWindowFlags_HorizontalScrollbar |
-                          ImGuiWindowFlags_NoScrollWithMouse);
+    ImGuiChildFlags child_flags = ImGuiChildFlags_Borders | ImGuiChildFlags_NavFlattened;
+
+    ImGuiWindowFlags window_flags =
+        ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoCollapse |
+        ImGuiWindowFlags_HorizontalScrollbar | ImGuiWindowFlags_NoScrollWithMouse;
+
+    ImGui::BeginChild("Categories", ImVec2(0, vertSize), child_flags, window_flags);
 
     ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(30.0f * uiScale, 0.0f));
 
@@ -366,11 +385,9 @@ void SettingsWindow::AddCategory(std::string name,
     ImGui::EndGroup();
 }
 
-void SettingsWindow::DrawMainContent(bool* open) {
+void SettingsWindow::DrawMainContent(bool* open, const std::function<void()>& applySettings) {
     ImVec4 settingsColor = ImVec4(0.1f, 0.1f, 0.12f, 0.8f); // Darker gray
     ImGui::PushStyleColor(ImGuiCol_ChildBg, settingsColor);
-    ImGuiWindowFlags child_flags = ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize |
-                                   ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NavFlattened;
 
     std::string centeredText;
     currentCategory == SettingsCategory::Folders
@@ -442,6 +459,9 @@ void SettingsWindow::DrawMainContent(bool* open) {
             } else {
                 ImGui::CloseCurrentPopup();
             }
+            if (applySettings) {
+                applySettings();
+            }
         }
 
         ImGui::EndPopup();
@@ -451,20 +471,27 @@ void SettingsWindow::DrawMainContent(bool* open) {
     if (ImGui::Button("Cancel")) {
         DeInit();
         *open = false;
+        if (applySettings) {
+            applySettings();
+        }
     }
 }
 
 void SettingsWindow::DrawProfileSelector() {
-    ImGuiWindowFlags child_flags = ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize |
-                                   ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NavFlattened;
+    ImGuiChildFlags child_flags = ImGuiChildFlags_Borders | ImGuiChildFlags_NavFlattened;
+
+    ImGuiWindowFlags window_flags =
+        ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoCollapse;
+
     ImVec4 settingsColor = ImVec4(0.1f, 0.1f, 0.12f, 0.8f); // Darker gray
     ImGui::PushStyleColor(ImGuiCol_ChildBg, settingsColor);
     ImGui::PushStyleVar(ImGuiStyleVar_ButtonTextAlign, ImVec2(0.0f, 0.5f));
     ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0, 0));
     ImGui::PushStyleVar(ImGuiStyleVar_ChildBorderSize, 0.0f);
 
-    ImGui::BeginChild("Profile Selection", ImVec2(0, -ImGui::GetFrameHeightWithSpacing()), true,
-                      child_flags);
+    ImGui::BeginChild("Profile Selection", ImVec2(0, -ImGui::GetFrameHeightWithSpacing()),
+                      child_flags, window_flags);
+
     ImGui::PopStyleColor();
 
     if (ImGui::BeginTable("ProfilesTable", 2, ImGuiTableFlags_RowBg | ImGuiTableFlags_Borders)) {
@@ -559,10 +586,13 @@ void SettingsWindow::DrawProfileSelector() {
 }
 
 void SettingsWindow::DrawGameFolderManager() {
-    ImGuiWindowFlags child_flags = ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize |
-                                   ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NavFlattened;
-    ImGui::BeginChild("ContentRegion", ImVec2(0, -ImGui::GetFrameHeightWithSpacing()), true,
-                      child_flags);
+    ImGuiChildFlags child_flags = ImGuiChildFlags_Borders | ImGuiChildFlags_NavFlattened;
+
+    ImGuiWindowFlags window_flags =
+        ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoCollapse;
+
+    ImGui::BeginChild("ContentRegion", ImVec2(0, -ImGui::GetFrameHeightWithSpacing()), child_flags,
+                      window_flags);
 
     if (ImGui::Button("Add Folder", ImVec2(400.f * uiScale, 0))) {
         ImGuiFileDialog::Instance()->OpenDialog("OpenFolder", "Add shadPS4 game folder", nullptr,
@@ -642,11 +672,13 @@ void SettingsWindow::DrawGameFolderManager() {
 
 void SettingsWindow::DrawSettingsTable(SettingsCategory category) {
     ImGui::PushStyleVar(ImGuiStyleVar_CellPadding, ImVec2(4.0f * uiScale, 10.0f * uiScale));
-    ImGuiWindowFlags child_flags = ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize |
-                                   ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NavFlattened;
+    ImGuiChildFlags child_flags = ImGuiChildFlags_Borders | ImGuiChildFlags_NavFlattened;
 
-    ImGui::BeginChild("ContentRegion", ImVec2(0, -ImGui::GetFrameHeightWithSpacing()), true,
-                      child_flags);
+    ImGuiWindowFlags window_flags =
+        ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoCollapse;
+
+    ImGui::BeginChild("ContentRegion", ImVec2(0, -ImGui::GetFrameHeightWithSpacing()), child_flags,
+                      window_flags);
 
     if (category == SettingsCategory::General) {
         if (ImGui::BeginTable("SettingsTable", 2)) {
@@ -735,6 +767,12 @@ void SettingsWindow::DrawSettingsTable(SettingsCategory category) {
             AddSettingCombo("Readbacks Mode", readbacksModeSetting, readbacksModeOptions);
             AddSettingCheckbox("Enable Readback Linear Images", readbackLinearImagesSetting);
             AddSettingCheckbox("Enable Direct Memory Access", directMemoryAccessSetting);
+#ifdef _WIN32
+            // Windows static guest red-zone protection
+            AddSettingCombo("Windows Guest Red Zone Protection (Requires Restart)",
+                            windowsGuestRedZoneProtectionModeSetting,
+                            windowsGuestRedZoneProtectionModeOptions);
+#endif
             AddSettingCheckbox("Enable Devkit Console Mode", devkitConsoleSetting);
             AddSettingCheckbox("Enable PS4 Neo Mode", neoModeSetting);
             AddSettingCheckbox("Enable ShadNet", shadnetEnabledSetting);

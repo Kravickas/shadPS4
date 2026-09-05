@@ -136,6 +136,8 @@ Id TypeId(const EmitContext& ctx, IR::Type type) {
         return ctx.U1[1];
     case IR::Type::U32:
         return ctx.U32[1];
+    case IR::Type::F32:
+        return ctx.F32[1];
     default:
         UNREACHABLE_MSG("Phi node type {}", type);
     }
@@ -236,6 +238,12 @@ spv::ExecutionMode ExecutionMode(AmdGpu::TessellationPartitioning spacing) {
         return spv::ExecutionMode::SpacingFractionalOdd;
     case AmdGpu::TessellationPartitioning::FracEven:
         return spv::ExecutionMode::SpacingFractionalEven;
+    case AmdGpu::TessellationPartitioning::Pow2:
+        // Pow2 rounds tessellation factors to the nearest power of 2, which has no
+        // direct Vulkan equivalent. SpacingEqual (integer) is the closest match.
+        LOG_WARNING(Render_Vulkan, "Tessellation partitioning Pow2 has no Vulkan equivalent, "
+                                   "falling back to SpacingEqual");
+        return spv::ExecutionMode::SpacingEqual;
     default:
         break;
     }
@@ -250,8 +258,8 @@ void SetupCapabilities(const Info& info, const Profile& profile, const RuntimeIn
     ctx.AddCapability(spv::Capability::Int8);
     ctx.AddCapability(spv::Capability::Int16);
     ctx.AddCapability(spv::Capability::Int64);
-    ctx.AddCapability(spv::Capability::UniformAndStorageBuffer8BitAccess);
-    ctx.AddCapability(spv::Capability::UniformAndStorageBuffer16BitAccess);
+    ctx.AddCapability(spv::Capability::StorageBuffer8BitAccess);
+    ctx.AddCapability(spv::Capability::StorageBuffer16BitAccess);
     if (info.uses_fp16) {
         ctx.AddCapability(spv::Capability::Float16);
     }
@@ -301,14 +309,22 @@ void SetupCapabilities(const Info& info, const Profile& profile, const RuntimeIn
         } else if (profile.supports_fragment_shader_barycentric) {
             ctx.AddExtension("SPV_KHR_fragment_shader_barycentric");
             ctx.AddCapability(spv::Capability::FragmentBarycentricKHR);
+            ctx.AddCapability(spv::Capability::InterpolationFunction);
         }
         if (info.loads.Get(IR::Attribute::SampleIndex) ||
             runtime_info.fs_info.addr_flags.linear_sample_ena ||
-            runtime_info.fs_info.addr_flags.persp_sample_ena) {
+            runtime_info.fs_info.addr_flags.persp_sample_ena ||
+            (!profile.supports_amd_shader_explicit_vertex_parameter &&
+             profile.supports_fragment_shader_barycentric &&
+             info.loads.Get(IR::Attribute::BaryCoordSmoothSample))) {
             ctx.AddCapability(spv::Capability::SampleRateShading);
         }
         if (info.loads.GetAny(IR::Attribute::RenderTargetIndex)) {
             ctx.AddCapability(spv::Capability::Geometry);
+        }
+        if (info.stores.Get(IR::Attribute::StencilRef) && profile.supports_shader_stencil_export) {
+            ctx.AddExtension("SPV_EXT_shader_stencil_export");
+            ctx.AddCapability(spv::Capability::StencilExportEXT);
         }
     }
     if (stage == LogicalStage::TessellationControl || stage == LogicalStage::TessellationEval) {
@@ -549,9 +565,21 @@ void SetupRoundingMode(EmitContext& ctx, const Profile& profile, const RuntimeIn
 
 void SetupInfNanPreserveMode(EmitContext& ctx, const Profile& profile,
                              const RuntimeInfo& runtime_info, Id main_func) {
-    ctx.AddCapability(spv::Capability::SignedZeroInfNanPreserve);
-    // universally supported (98.85% on gpuinfo) so no flag checked
-    ctx.AddExecutionMode(main_func, spv::ExecutionMode::SignedZeroInfNanPreserve, 32U);
+    if (profile.support_fp16_signed_zero_inf_nan_preserve ||
+        profile.support_fp32_signed_zero_inf_nan_preserve ||
+        profile.support_fp64_signed_zero_inf_nan_preserve) {
+        ctx.AddCapability(spv::Capability::SignedZeroInfNanPreserve);
+    }
+
+    if (profile.support_fp32_signed_zero_inf_nan_preserve) {
+        ctx.AddExecutionMode(main_func, spv::ExecutionMode::SignedZeroInfNanPreserve, 32U);
+    } else {
+        static std::once_flag logged;
+        std::call_once(logged, [] {
+            LOG_WARNING(Render_Vulkan,
+                        "Float32 signed zero/inf/nan preserve mode is not supported by the GPU");
+        });
+    }
     if (ctx.info.uses_fp16) {
         if (profile.support_fp16_signed_zero_inf_nan_preserve) {
             ctx.AddExecutionMode(main_func, spv::ExecutionMode::SignedZeroInfNanPreserve, 16U);
@@ -592,14 +620,13 @@ void PatchPhiNodes(const IR::Program& program, EmitContext& ctx) {
     ctx.PatchDeferredPhi([&](u32 phi_arg, Id first_parent) {
         if (phi_arg == 0) {
             ++inst;
-            if (inst == program.blocks[block_index]->end() ||
-                inst->GetOpcode() != IR::Opcode::Phi) {
-                do {
-                    ++block_index;
-                    inst = program.blocks[block_index]->begin();
-                } while (inst->GetOpcode() != IR::Opcode::Phi);
+            while (inst == program.blocks[block_index]->end() ||
+                   inst->GetOpcode() != IR::Opcode::Phi) {
+                ++block_index;
+                inst = program.blocks[block_index]->begin();
             }
         }
+        ASSERT(inst != program.blocks[block_index]->end());
         const Id arg = ctx.Def(inst->Arg(phi_arg));
         const Id parent = ctx.first_to_last_label_map[first_parent.value];
         return std::make_pair(arg, parent);
@@ -632,10 +659,6 @@ Id EmitPhi(EmitContext& ctx, IR::Inst* inst) {
 }
 
 void EmitVoid(EmitContext&) {}
-
-Id EmitIdentity(EmitContext& ctx, const IR::Value& value) {
-    UNREACHABLE_MSG("Forward identity declaration");
-}
 
 Id EmitConditionRef(EmitContext& ctx, const IR::Value& value) {
     const Id id{ctx.Def(value)};
@@ -686,10 +709,6 @@ void EmitSetExec(EmitContext& ctx) {
 }
 
 void EmitSetVcc(EmitContext& ctx) {
-    UNREACHABLE_MSG("Unreachable instruction");
-}
-
-void EmitSetSccLo(EmitContext& ctx) {
     UNREACHABLE_MSG("Unreachable instruction");
 }
 

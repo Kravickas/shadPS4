@@ -9,7 +9,11 @@ include(FetchContent)
 )
 FetchContent_MakeAvailable(googletest)
 
-set(TEST_TARGETS shadps4_settings_test shadps4_gcn_test)
+set(TEST_TARGETS
+    shadps4_settings_test
+    shadps4_ngs2_test
+    shadps4_gcn_test
+)
 
 set(SETTINGS_TEST_SOURCES
     # Under test
@@ -25,13 +29,43 @@ set(SETTINGS_TEST_SOURCES
 
     # Stubs that replace dependencies
     stubs/common_stub.cpp
+    stubs/core_stub.cpp
+    stubs/signals_stub.cpp
+    stubs/file_sys_stub.cpp
     stubs/scm_rev_stub.cpp
     stubs/sdl_stub.cpp
 
     # Tests
     test_emulator_settings.cpp
+    # Windows static guest red-zone protection
+    test_windows_guest_red_zone_protection_settings.cpp
 )
 
+set(NGS2_TEST_SOURCES
+    # Under test
+    ${CMAKE_SOURCE_DIR}/src/core/libraries/ngs2/ngs2_impl.cpp
+
+    # Minimal common and kernel support
+    ${CMAKE_SOURCE_DIR}/src/core/emulator_settings.cpp
+    ${CMAKE_SOURCE_DIR}/src/core/emulator_state.cpp
+    ${CMAKE_SOURCE_DIR}/src/core/libraries/kernel/sync/mutex.cpp
+    ${CMAKE_SOURCE_DIR}/src/common/path_util.cpp
+    ${CMAKE_SOURCE_DIR}/src/common/assert.cpp
+    ${CMAKE_SOURCE_DIR}/src/common/error.cpp
+    ${CMAKE_SOURCE_DIR}/src/common/string_util.cpp
+    ${CMAKE_SOURCE_DIR}/src/common/logging/log.cpp
+
+    # Stubs that replace dependencies
+    stubs/common_stub.cpp
+    stubs/core_stub.cpp
+    stubs/signals_stub.cpp
+    stubs/file_sys_stub.cpp
+    stubs/scm_rev_stub.cpp
+    stubs/sdl_stub.cpp
+
+    # Tests
+    test_ngs2.cpp
+)
 set(GCN_TEST_SOURCES
     # Under test
     ${CMAKE_SOURCE_DIR}/src/core/emulator_settings.cpp
@@ -89,7 +123,6 @@ set(GCN_TEST_SOURCES
     ${CMAKE_SOURCE_DIR}/src/shader_recompiler/ir/passes/ir_passes.h
     ${CMAKE_SOURCE_DIR}/src/shader_recompiler/ir/passes/constant_propagation_pass.cpp
     ${CMAKE_SOURCE_DIR}/src/shader_recompiler/ir/passes/dead_code_elimination_pass.cpp
-    ${CMAKE_SOURCE_DIR}/src/shader_recompiler/ir/passes/identity_removal_pass.cpp
     ${CMAKE_SOURCE_DIR}/src/shader_recompiler/ir/passes/shader_info_collection_pass.cpp
     ${CMAKE_SOURCE_DIR}/src/shader_recompiler/ir/passes/ssa_rewrite_pass.cpp
     ${CMAKE_SOURCE_DIR}/src/shader_recompiler/ir/post_order.cpp
@@ -115,6 +148,10 @@ set(GCN_TEST_SOURCES
     stubs/common_stub.cpp
     stubs/resource_tracking_pass_stub.cpp
     stubs/scm_rev_stub.cpp
+    stubs/sdl_stub.cpp
+    stubs/core_stub.cpp
+    stubs/signals_stub.cpp
+    stubs/file_sys_stub.cpp
 
     gcn/gcn_test_runner.hpp
     gcn/gcn_test_runner.cpp
@@ -126,6 +163,7 @@ set(GCN_TEST_SOURCES
 )
 
 add_executable(shadps4_settings_test ${SETTINGS_TEST_SOURCES})
+add_executable(shadps4_ngs2_test ${NGS2_TEST_SOURCES})
 add_executable(shadps4_gcn_test ${GCN_TEST_SOURCES})
 
 foreach(t ${TEST_TARGETS})
@@ -138,6 +176,14 @@ foreach(t ${TEST_TARGETS})
 endforeach()
 
 target_link_libraries(shadps4_settings_test PRIVATE
+    GTest::gtest_main
+    fmt::fmt
+    nlohmann_json::nlohmann_json
+    toml11::toml11
+    SDL3::SDL3
+    spdlog::spdlog
+)
+target_link_libraries(shadps4_ngs2_test PRIVATE
     GTest::gtest_main
     fmt::fmt
     nlohmann_json::nlohmann_json
@@ -196,7 +242,7 @@ include(GoogleTest)
 foreach(t ${TEST_TARGETS})
     gtest_discover_tests(${t}
         WORKING_DIRECTORY ${CMAKE_BINARY_DIR}
-        PROPERTIES TIMEOUT 60
+        DISCOVERY_TIMEOUT 60
     )
 endforeach()
 
@@ -209,7 +255,6 @@ endforeach()
 set(HTTP_TEST_SOURCES
     # Under test
     ${CMAKE_SOURCE_DIR}/src/core/libraries/network/http.cpp
-
     # Required to link RegisterLib's LIB_FUNCTION calls and the logger's
     # access to EmulatorSettings.
     ${CMAKE_SOURCE_DIR}/src/core/emulator_settings.cpp
@@ -227,11 +272,16 @@ set(HTTP_TEST_SOURCES
     stubs/scm_rev_stub.cpp
     stubs/sdl_stub.cpp
     stubs/loader_stub.cpp
+    stubs/core_stub.cpp
+    stubs/signals_stub.cpp
+    stubs/file_sys_stub.cpp
+    stubs/kernel_stub.cpp
 
     # Tests
     network/test_http_uri.cpp
     network/test_http_status_line.cpp
     network/test_http_parse_response_header.cpp
+    network/test_http_lifecycle.cpp
 )
 
 add_executable(shadps4_http_test ${HTTP_TEST_SOURCES})
@@ -253,6 +303,7 @@ target_link_libraries(shadps4_http_test PRIVATE
     toml11::toml11
     SDL3::SDL3
     spdlog::spdlog
+    ZLIB::ZLIB
 )
 
 if (CMAKE_CXX_COMPILER_ID STREQUAL "Clang" OR
@@ -285,5 +336,5 @@ endif()
 
 gtest_discover_tests(shadps4_http_test
     WORKING_DIRECTORY ${CMAKE_BINARY_DIR}
-    PROPERTIES TIMEOUT 60
+    DISCOVERY_TIMEOUT 60
 )
