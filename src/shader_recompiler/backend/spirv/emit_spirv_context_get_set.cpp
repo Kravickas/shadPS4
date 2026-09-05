@@ -6,6 +6,7 @@
 #include "shader_recompiler/backend/spirv/emit_spirv_instructions.h"
 #include "shader_recompiler/backend/spirv/spirv_emit_context.h"
 #include "shader_recompiler/ir/attribute.h"
+#include "shader_recompiler/ir/microinstruction.h"
 #include "shader_recompiler/ir/patch.h"
 #include "shader_recompiler/runtime_info.h"
 
@@ -61,12 +62,10 @@ Id EmitReadConst(EmitContext& ctx, IR::Inst* inst, Id addr, Id offset) {
     if (!EmulatorSettings.IsDirectMemoryAccessEnabled()) {
         return ctx.EmitFlatbufferLoad(ctx.ConstU32(flatbuf_off_dw));
     }
-    // We can only provide a fallback for immediate offsets.
     if (flatbuf_off_dw == 0) {
         return ctx.OpFunctionCall(ctx.U32[1], ctx.read_const_dynamic, addr, offset);
     } else {
-        return ctx.OpFunctionCall(ctx.U32[1], ctx.read_const, addr, offset,
-                                  ctx.ConstU32(flatbuf_off_dw));
+        return ctx.EmitFlatbufferLoad(ctx.ConstU32(flatbuf_off_dw));
     }
 }
 
@@ -128,15 +127,33 @@ Id EmitGetAttribute(EmitContext& ctx, IR::Attribute attr, u32 comp, u32 index) {
         return ctx.OpLoad(ctx.F32[1],
                           ctx.OpAccessChain(ctx.input_f32, ctx.tess_coord, ctx.ConstU32(1U)));
     case IR::Attribute::BaryCoordSmooth:
-        return ctx.OpLoad(ctx.F32[1], ctx.OpAccessChain(ctx.input_f32, ctx.bary_coord_smooth,
-                                                        ctx.ConstU32(comp)));
+        if (ctx.profile.supports_amd_shader_explicit_vertex_parameter) {
+            return ctx.OpLoad(ctx.F32[1], ctx.OpAccessChain(ctx.input_f32, ctx.bary_coord_smooth,
+                                                            ctx.ConstU32(comp)));
+        } else {
+            return ctx.OpCompositeExtract(ctx.F32[1], ctx.OpLoad(ctx.F32[3], ctx.bary_coord), comp);
+        }
     case IR::Attribute::BaryCoordSmoothCentroid:
-        return ctx.OpLoad(
-            ctx.F32[1],
-            ctx.OpAccessChain(ctx.input_f32, ctx.bary_coord_smooth_centroid, ctx.ConstU32(comp)));
+        if (ctx.profile.supports_amd_shader_explicit_vertex_parameter) {
+            return ctx.OpLoad(ctx.F32[1],
+                              ctx.OpAccessChain(ctx.input_f32, ctx.bary_coord_smooth_centroid,
+                                                ctx.ConstU32(comp)));
+        } else {
+            return ctx.OpCompositeExtract(
+                ctx.F32[1], ctx.OpInterpolateAtCentroid(ctx.F32[3], ctx.bary_coord), comp);
+        }
     case IR::Attribute::BaryCoordSmoothSample:
-        return ctx.OpLoad(ctx.F32[1], ctx.OpAccessChain(ctx.input_f32, ctx.bary_coord_smooth_sample,
-                                                        ctx.ConstU32(comp)));
+        if (ctx.profile.supports_amd_shader_explicit_vertex_parameter) {
+            return ctx.OpLoad(
+                ctx.F32[1],
+                ctx.OpAccessChain(ctx.input_f32, ctx.bary_coord_smooth_sample, ctx.ConstU32(comp)));
+        } else {
+            return ctx.OpCompositeExtract(
+                ctx.F32[1],
+                ctx.OpInterpolateAtSample(ctx.F32[3], ctx.bary_coord,
+                                          ctx.OpLoad(ctx.U32[1], ctx.sample_index)),
+                comp);
+        }
     case IR::Attribute::BaryCoordNoPersp:
         return ctx.OpLoad(ctx.F32[1], ctx.OpAccessChain(ctx.input_f32, ctx.bary_coord_nopersp,
                                                         ctx.ConstU32(comp)));
@@ -228,6 +245,10 @@ void EmitSetAttribute(EmitContext& ctx, IR::Attribute attr, Id value, u32 elemen
     if (IR::IsMrt(attr)) {
         const u32 index{u32(attr) - u32(IR::Attribute::RenderTarget0)};
         const auto& info{ctx.frag_outputs.at(index)};
+        if (element < 3 && ctx.runtime_info.fs_info.color_buffers[index].blend_self_scale) {
+            // Emulates GCN's factor-scaled min/max blend: min/max(src*src, dst*dst).
+            value = ctx.OpFMul(ctx.F32[1], value, value);
+        }
         if (info.num_components == 1) {
             return op_store(info.id);
         } else {
@@ -521,6 +542,14 @@ void EmitSetVectorRegister(EmitContext& ctx) {
     UNREACHABLE_MSG("Unreachable instruction");
 }
 
+void EmitSetVirtualRegister(EmitContext& ctx) {
+    UNREACHABLE_MSG("Unreachable instruction");
+}
+
+void EmitGetVirtualRegister(EmitContext& ctx) {
+    UNREACHABLE_MSG("Unreachable instruction");
+}
+
 void EmitSetGotoVariable(EmitContext&) {
     UNREACHABLE_MSG("Unreachable instruction");
 }
@@ -534,6 +563,10 @@ void EmitSetMaskLaneVariable(EmitContext&) {
 }
 
 void EmitGetMaskLaneVariable(EmitContext&) {
+    UNREACHABLE_MSG("Unreachable instruction");
+}
+
+Id EmitGetPcLo(EmitContext& ctx, Id pc) {
     UNREACHABLE_MSG("Unreachable instruction");
 }
 
