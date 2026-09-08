@@ -1,4 +1,4 @@
-// SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
+// SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include "shader_recompiler/frontend/opcodes.h"
@@ -380,6 +380,10 @@ void Translator::EmitVectorAlu(const GcnInst& inst) {
         return V_CMP_U64(ConditionOp::GT, false, false, inst);
     case Opcode::V_CMP_LT_U64:
         return V_CMP_U64(ConditionOp::LT, false, false, inst);
+
+        //     V_CMPX_{OP8}_U64
+    case Opcode::V_CMPX_NE_U64:
+        return V_CMP_U64(ConditionOp::LG, false, true, inst);
 
     case Opcode::V_CMP_CLASS_F32:
         return V_CMP_CLASS_F32(inst);
@@ -1283,7 +1287,11 @@ void Translator::V_CMP_U64(ConditionOp op, bool is_signed, bool set_exec, const 
         UNREACHABLE_MSG("V_CMP_U64 with signed integers is not supported");
     }
     if (set_exec) {
-        UNREACHABLE_MSG("Exec setting for V_CMP_U64 is not supported");
+        // See the V_CMPX note in V_CMP_F32.
+        const IR::U1 masked{ir.LogicalAnd(ir.GetExec(), result)};
+        ir.SetExec(masked);
+        SetDst64(inst.dst[1], ir.Ballot(masked));
+        return;
     }
     SetDst64(inst.dst[1], ir.Ballot(result));
 }
