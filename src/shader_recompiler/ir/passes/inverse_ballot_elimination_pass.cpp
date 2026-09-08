@@ -81,13 +81,18 @@ void InverseBallotEliminationPass(IR::Program& program) {
 
         IR::Value value{inst->Arg(0)};
         if (value.IsImmediate()) {
-            if (value.U64() == 0ull) {
+            const u64 mask{value.U64()};
+            if (mask == 0ull) {
                 inst->ReplaceUsesWithAndRemove(IR::Value{false});
-            } else if (value.U64() == std::numeric_limits<u64>::max()) {
+            } else if (mask == std::numeric_limits<u64>::max()) {
                 inst->ReplaceUsesWithAndRemove(IR::Value{true});
             } else {
-                UNREACHABLE_MSG("Unexpected immediate argument for InverseBallot {:#x}",
-                                value.U64());
+                IR::Block* const block = inst->GetParent();
+                auto insert_point = IR::Block::InstructionList::s_iterator_to(*inst);
+                IR::IREmitter ir{*block, insert_point};
+                const IR::U64 bit{ir.ShiftRightLogical(ir.Imm64(mask), ir.LaneId())};
+                inst->ReplaceUsesWithAndRemove(
+                    ir.INotEqual(ir.BitwiseAnd(bit, ir.Imm64(u64(1))), ir.Imm64(u64(0))));
             }
             continue;
         }
