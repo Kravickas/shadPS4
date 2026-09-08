@@ -5,6 +5,7 @@
 
 #include <unordered_map>
 #include "common/types.h"
+#include "video_core/buffer_cache/buffer.h"
 #include "video_core/renderer_vulkan/vk_common.h"
 #include "video_core/texture_cache/image.h"
 
@@ -68,6 +69,10 @@ private:
     vk::UniqueDescriptorSetLayout desc_set_layout;
     vk::UniquePipelineLayout pipeline_layout;
     std::unordered_map<PipelineKey, vk::UniquePipeline, PipelineKeyHash> pipelines;
+
+    // One entry per velocity draw, in issue order, so a capture can be verified without
+    // decoding push constants. Mirrors the PushConstants layout.
+    VideoCore::Buffer region_table;
 
     vk::Extent2D size{};
     VideoCore::UniqueImage motion_image;

@@ -38,9 +38,16 @@ size_t XfbVelocityPass::PipelineKeyHash::operator()(const PipelineKey& key) cons
 XfbVelocityPass::XfbVelocityPass(const Instance& instance_, Scheduler& scheduler_,
                                  VideoCore::TextureCache& texture_cache_)
     : instance{instance_}, scheduler{scheduler_}, texture_cache{texture_cache_},
+      region_table{instance,
+                   scheduler,
+                   VideoCore::MemoryUsage::Upload,
+                   0,
+                   vk::BufferUsageFlagBits::eTransferSrc,
+                   sizeof(PushConstants) * VideoCore::XfbCapture::MaxRegions},
       motion_image{instance.GetDevice(), instance.GetAllocator()},
       mask_image{instance.GetDevice(), instance.GetAllocator()} {
     const vk::Device device = instance.GetDevice();
+    SetObjectName(device, region_table.Handle(), "XFB Velocity Regions");
 
     vertex_module =
         Compile(HostShaders::XFB_VELOCITY_VERT, vk::ShaderStageFlagBits::eVertex, device);
@@ -442,6 +449,8 @@ void XfbVelocityPass::Render(const VideoCore::XfbCapture& capture) {
     std::unordered_map<u64, u32> occurrence;
     vk::Pipeline bound_pipeline{};
     u64 matched = 0;
+    u32 table_index = 0;
+    auto* table = reinterpret_cast<PushConstants*>(region_table.mapped_data.data());
     for (const auto& region : cur_regions) {
         if (region.depth_id != main->depth_id) {
             continue;
@@ -488,6 +497,9 @@ void XfbVelocityPass::Render(const VideoCore::XfbCapture& capture) {
         cmdbuf.pushConstants(*pipeline_layout,
                              vk::ShaderStageFlagBits::eVertex | vk::ShaderStageFlagBits::eFragment,
                              0, sizeof(constants), &constants);
+        if (table_index < VideoCore::XfbCapture::MaxRegions) {
+            table[table_index++] = constants;
+        }
 
         cmdbuf.drawIndirectByteCountEXT(1, 0, capture.CurrentCounters().Handle(),
                                         region.counter_offset, region.offset,
