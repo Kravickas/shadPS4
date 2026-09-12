@@ -3,6 +3,7 @@
 // SPDX-FileCopyrightText: Copyright 2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <algorithm>
 #include <ctime>
 #include <string>
 #include <thread>
@@ -109,16 +110,35 @@ void SetCurrentThreadPriority(ThreadPriority new_priority) {
     SetThreadPriority(handle, windows_priority);
 }
 
+namespace {
+
+HANDLE CreateSleepTimer() {
+    // High resolution timers land within tens of microseconds; the legacy kind within the
+    // system tick, about a millisecond.
+    HANDLE timer = ::CreateWaitableTimerExW(NULL, NULL, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION,
+                                            TIMER_ALL_ACCESS);
+    if (!timer) {
+        timer = ::CreateWaitableTimer(NULL, TRUE, NULL);
+    }
+    return timer;
+}
+
+DWORD TimerSleep(HANDLE timer, const std::chrono::nanoseconds duration, const bool interruptible) {
+    LARGE_INTEGER interval{
+        .QuadPart = -1 * (duration.count() / 100u),
+    };
+    SetWaitableTimer(timer, &interval, 0, NULL, NULL, 0);
+    return WaitForSingleObjectEx(timer, INFINITE, interruptible);
+}
+
+} // namespace
+
 bool AccurateSleep(const std::chrono::nanoseconds duration, std::chrono::nanoseconds* remaining,
                    const bool interruptible) {
     const auto begin_sleep = std::chrono::high_resolution_clock::now();
 
-    LARGE_INTEGER interval{
-        .QuadPart = -1 * (duration.count() / 100u),
-    };
-    HANDLE timer = ::CreateWaitableTimer(NULL, TRUE, NULL);
-    SetWaitableTimer(timer, &interval, 0, NULL, NULL, 0);
-    const auto ret = WaitForSingleObjectEx(timer, INFINITE, interruptible);
+    HANDLE timer = CreateSleepTimer();
+    const auto ret = TimerSleep(timer, duration, interruptible);
     ::CloseHandle(timer);
 
     if (remaining) {
@@ -233,21 +253,64 @@ void SetThreadName(void* thread, const char* name) {
 #endif
 
 AccurateTimer::AccurateTimer(std::chrono::nanoseconds target_interval)
-    : target_interval(target_interval) {}
+    : target_interval(target_interval) {
+#ifdef _WIN32
+    timer = CreateSleepTimer();
+#endif
+}
+
+AccurateTimer::~AccurateTimer() {
+#ifdef _WIN32
+    if (timer) {
+        ::CloseHandle(timer);
+    }
+#endif
+}
 
 void AccurateTimer::Start() {
-    const auto begin_sleep = std::chrono::high_resolution_clock::now();
-    if (total_wait.count() > 0) {
-        AccurateSleep(total_wait, nullptr, false);
+    using Clock = std::chrono::steady_clock;
+    const auto now = Clock::now();
+    if (deadline == Clock::time_point{}) {
+        deadline = now;
     }
-    start_time = std::chrono::high_resolution_clock::now();
-    total_wait -= std::chrono::duration_cast<std::chrono::nanoseconds>(start_time - begin_sleep);
+    total_wait = std::chrono::duration_cast<std::chrono::nanoseconds>(deadline - now);
+    if (deadline > now) {
+        // Sleep to just short of the deadline, then spin the rest. The margin tracks how late the
+        // sleep actually wakes, so the spin is only as long as the timer is imprecise.
+        constexpr auto min_margin = std::chrono::microseconds(50);
+        constexpr auto max_margin = std::chrono::milliseconds(1);
+        if (spin_margin < min_margin) {
+            spin_margin = max_margin;
+        }
+        const auto wake = deadline - spin_margin;
+        if (wake > now) {
+            const auto sleep_for = std::chrono::duration_cast<std::chrono::nanoseconds>(wake - now);
+#ifdef _WIN32
+            TimerSleep(timer, sleep_for, false);
+#else
+            AccurateSleep(sleep_for, nullptr, false);
+#endif
+            const auto late = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::max(Clock::now() - wake, Clock::duration::zero()));
+            spin_margin = std::clamp(std::max(late + std::chrono::microseconds(20),
+                                              spin_margin - spin_margin / 8),
+                                     std::chrono::nanoseconds(min_margin),
+                                     std::chrono::nanoseconds(max_margin));
+        }
+        while (Clock::now() < deadline) {
+            std::this_thread::yield();
+        }
+    }
 }
 
 void AccurateTimer::End() {
-    auto now = std::chrono::high_resolution_clock::now();
-    total_wait +=
-        target_interval - std::chrono::duration_cast<std::chrono::nanoseconds>(now - start_time);
+    deadline += target_interval;
+    // More than a period behind: resynchronise. Missed ticks are missed, as on hardware, rather
+    // than fired back to back.
+    const auto now = std::chrono::steady_clock::now();
+    if (deadline + target_interval < now) {
+        deadline = now;
+    }
 }
 
 std::string GetCurrentThreadName() {
