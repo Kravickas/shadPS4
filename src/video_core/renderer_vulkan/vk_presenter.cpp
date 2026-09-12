@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include "common/frame_trace.h"
 #include "common/debug.h"
 #include "common/elf_info.h"
 #include "common/io_file.h"
@@ -853,6 +854,7 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame) {
         swapchain.Recreate(window.GetWidth(), window.GetHeight());
     }
 
+    const u64 t_acquire0 = Common::FrameTraceNow();
     if (!swapchain.AcquireNextImage()) {
         swapchain.Recreate(window.GetWidth(), window.GetHeight());
         if (!swapchain.AcquireNextImage()) {
@@ -1068,12 +1070,14 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame) {
             [deferred_screenshots]() { SavePendingScreenshots(*deferred_screenshots); });
     }
 
+    const u64 t_acquire1 = Common::FrameTraceNow();
     SubmitInfo info{};
     info.AddWait(swapchain.GetImageAcquiredSemaphore());
     info.AddWait(frame->ready_semaphore, frame->ready_tick);
     info.AddSignal(swapchain.GetPresentReadySemaphore());
     info.AddSignal(frame->present_done);
     scheduler.Flush(info);
+    const u64 t_flush = Common::FrameTraceNow();
 
     // Present to swapchain.
     {
@@ -1082,6 +1086,9 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame) {
             swapchain.Recreate(window.GetWidth(), window.GetHeight());
         }
     }
+    const u64 t_present = Common::FrameTraceNow();
+    LOG_INFO(Render_Vulkan, "[FT] present t={} acquire={} record_flush={} presentkhr={}",
+             t_present, t_acquire1 - t_acquire0, t_flush - t_acquire1, t_present - t_flush);
 
     free_frame();
     if (!is_reusing_frame) {
@@ -1094,7 +1101,13 @@ Frame* Presenter::GetRenderFrame() {
     Frame* frame;
     {
         std::unique_lock lock{free_mutex};
+        const u64 t0 = Common::FrameTraceNow();
         free_cv.wait(lock, [this] { return !free_queue.empty(); });
+        const u64 t1 = Common::FrameTraceNow();
+        if (t1 - t0 > 100) {
+            LOG_INFO(Render_Vulkan, "[FT] frame_wait t={} dur={} free={}", t1, t1 - t0,
+                     free_queue.size());
+        }
         LOG_DEBUG(Render_Vulkan, "Got render frame, remaining {}", free_queue.size() - 1);
 
         // Take the frame from the queue

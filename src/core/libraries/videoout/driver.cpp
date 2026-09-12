@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2025-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include "common/frame_trace.h"
 #include "common/assert.h"
 #include "common/debug.h"
 #include "common/thread.h"
@@ -243,7 +244,11 @@ void VideoOutDriver::Flip(const Request& req) {
     presenter->SetHDR(req.port->is_hdr);
 
     // Present the frame.
+    const u64 t0 = Common::FrameTraceNow();
     presenter->Present(req.frame);
+    const u64 t1 = Common::FrameTraceNow();
+    LOG_INFO(Lib_VideoOut, "[FT] flip t={} buf={} eop={} vblank={} present_dur={} latency={}", t1,
+             req.index, req.eop, main_port.vblank_status.count, t1 - t0, t1 - req.submit_time);
 
     // Update flip status.
     auto* port = req.port;
@@ -314,19 +319,25 @@ bool VideoOutDriver::SubmitFlip(VideoOutPort* port, s32 index, s64 flip_arg,
         ++port->flip_status.flip_pending_num;
         port->flip_status.submit_tsc = Libraries::Kernel::sceKernelReadTsc();
     }
+    const u64 submit_time = Common::FrameTraceNow();
+    LOG_INFO(Lib_VideoOut, "[FT] submit t={} buf={} eop={} pending={} gc={}", submit_time, index,
+             is_eop, port->flip_status.flip_pending_num, port->flip_status.gc_queue_num);
 
     if (!is_eop) {
         // Non EOP flips can arrive from any thread so ask GPU thread to perform them
-        liverpool->SendCommand([=, this]() { SubmitFlipInternal(port, index, flip_arg, is_eop); });
+        liverpool->SendCommand(
+            [=, this]() { SubmitFlipInternal(port, index, flip_arg, is_eop, submit_time); });
     } else {
-        SubmitFlipInternal(port, index, flip_arg, is_eop);
+        SubmitFlipInternal(port, index, flip_arg, is_eop, submit_time);
     }
 
     return true;
 }
 
-void VideoOutDriver::SubmitFlipInternal(VideoOutPort* port, s32 index, s64 flip_arg, bool is_eop) {
+void VideoOutDriver::SubmitFlipInternal(VideoOutPort* port, s32 index, s64 flip_arg, bool is_eop,
+                                        u64 submit_time) {
     Vulkan::Frame* frame;
+    const u64 t0 = Common::FrameTraceNow();
     if (index == -1) {
         frame = presenter->PrepareBlankFrame(false);
     } else {
@@ -335,6 +346,7 @@ void VideoOutDriver::SubmitFlipInternal(VideoOutPort* port, s32 index, s64 flip_
         const auto& group = port->groups[buffer.group_index];
         frame = presenter->PrepareFrame(group, buffer.address_left);
     }
+    const u64 t1 = Common::FrameTraceNow();
 
     std::scoped_lock lock{mutex};
     if (index != -1) {
@@ -346,7 +358,10 @@ void VideoOutDriver::SubmitFlipInternal(VideoOutPort* port, s32 index, s64 flip_
         .flip_arg = flip_arg,
         .index = index,
         .eop = is_eop,
+        .submit_time = submit_time,
     });
+    LOG_INFO(Lib_VideoOut, "[FT] prepare t={} buf={} dur={} queued={} since_submit={}", t1, index,
+             t1 - t0, requests.size(), t1 - submit_time);
 }
 
 void VideoOutDriver::PresentThread(std::stop_token token) {
@@ -379,9 +394,16 @@ void VideoOutDriver::PresentThread(std::stop_token token) {
 
         // Check if it's time to take a request.
         auto& vblank_status = main_port.vblank_status;
+        s32 took = -1;
+        u64 queued = 0;
         if (vblank_status.count % (main_port.flip_rate + 1) == 0) {
             const auto request = receive_request();
+            {
+                std::scoped_lock lk{mutex};
+                queued = requests.size();
+            }
             if (!request) {
+                took = 0;
                 if (timer.GetTotalWait().count() < 0) { // Dont draw too fast
                     if (!main_port.is_open) {
                         DrawBlankFrame();
@@ -390,10 +412,14 @@ void VideoOutDriver::PresentThread(std::stop_token token) {
                     }
                 }
             } else {
+                took = 1;
                 Flip(request);
                 FRAME_END;
             }
         }
+        LOG_INFO(Lib_VideoOut, "[FT] vblank t={} n={} took={} queued={} flip_rate={} slack={}",
+                 Common::FrameTraceNow(), vblank_status.count, took, queued, main_port.flip_rate,
+                 timer.GetTotalWait().count() / 1000);
 
         {
             // Needs lock here as can be concurrently read by `sceVideoOutGetVblankStatus`

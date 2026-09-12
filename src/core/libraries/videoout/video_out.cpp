@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include "common/frame_trace.h"
 #include "common/assert.h"
 #include "common/elf_info.h"
 #include "common/logging/log.h"
@@ -402,7 +403,11 @@ s32 PS4_SYSV_ABI sceVideoOutWaitVblank(s32 handle) {
 
     std::unique_lock lock{port->vo_mutex};
     const auto prev_counter = port->vblank_status.count;
+    const u64 t0 = Common::FrameTraceNow();
     port->vblank_cv.wait(lock, [&]() { return prev_counter != port->vblank_status.count; });
+    const u64 t1 = Common::FrameTraceNow();
+    LOG_INFO(Lib_VideoOut, "[FT] waitvblank t={} dur={} n={}", t1, t1 - t0,
+             port->vblank_status.count);
     return ORBIS_OK;
 }
 

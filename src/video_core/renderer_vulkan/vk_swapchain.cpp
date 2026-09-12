@@ -219,6 +219,7 @@ void Swapchain::FindPresentMode() {
                     vk::to_string(present_mode), vk::to_string(fallback));
         present_mode = fallback;
     }
+    LOG_INFO(Render_Vulkan, "[FT] present_mode {}", vk::to_string(present_mode));
 }
 
 void Swapchain::SetSurfaceProperties() {
