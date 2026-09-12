@@ -48,8 +48,10 @@ struct ImageInfo {
     }
 
     Extent2D BlockDim() const {
+        // Padded height: a pow2 padded texture and its render target agree on it, not on the
+        // logical height.
         const auto dim = props.is_block ? 2 : 0;
-        return Extent2D{pitch >> dim, size.height >> dim};
+        return Extent2D{pitch >> dim, mips_layout[0].height >> dim};
     }
 
     s32 MipOf(const ImageInfo& info) const;
