@@ -32,6 +32,7 @@ void ParseBlendControl(u32 value, bool begin_table = true);
 void ParseDepthRenderControl(u32 value, bool begin_table = true);
 void ParseDepthControl(u32 value, bool begin_table = true);
 void ParseEqaa(u32 value, bool begin_table = true);
+void ParseDbAlphaToMask(u32 value, bool begin_table = true);
 void ParseZInfo(u32 value, bool begin_table = true);
 
 struct CmdListFilter {

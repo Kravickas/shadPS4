@@ -683,8 +683,7 @@ void ParseDepthControl(u32 value, bool begin_table) {
 void ParseEqaa(u32 value, bool begin_table) {
     auto const reg = reinterpret_cast<AmdGpu::Eqaa const&>(value);
 
-    if (!begin_table ||
-        BeginTable("DB_DEPTH_CONTROL", 2, ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg)) {
+    if (!begin_table || BeginTable("DB_EQAA", 2, ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg)) {
         TableNextRow();
         TableSetColumnIndex(0);
         Text("MAX_ANCHOR_SAMPLES");
@@ -763,11 +762,58 @@ void ParseEqaa(u32 value, bool begin_table) {
     }
 }
 
+void ParseDbAlphaToMask(u32 value, bool begin_table) {
+    auto const reg = reinterpret_cast<AmdGpu::DbAlphaToMask const&>(value);
+
+    if (!begin_table ||
+        BeginTable("DB_ALPHA_TO_MASK", 2, ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg)) {
+        TableNextRow();
+        TableSetColumnIndex(0);
+        Text("ALPHA_TO_MASK_ENABLE");
+        TableSetColumnIndex(1);
+        Text("%X", reg.alpha_to_mask_enable);
+
+        TableNextRow();
+        TableSetColumnIndex(0);
+        Text("ALPHA_TO_MASK_OFFSET0");
+        TableSetColumnIndex(1);
+        Text("%X", reg.alpha_to_mask_offset0);
+
+        TableNextRow();
+        TableSetColumnIndex(0);
+        Text("ALPHA_TO_MASK_OFFSET1");
+        TableSetColumnIndex(1);
+        Text("%X", reg.alpha_to_mask_offset1);
+
+        TableNextRow();
+        TableSetColumnIndex(0);
+        Text("ALPHA_TO_MASK_OFFSET2");
+        TableSetColumnIndex(1);
+        Text("%X", reg.alpha_to_mask_offset2);
+
+        TableNextRow();
+        TableSetColumnIndex(0);
+        Text("ALPHA_TO_MASK_OFFSET3");
+        TableSetColumnIndex(1);
+        Text("%X", reg.alpha_to_mask_offset3);
+
+        TableNextRow();
+        TableSetColumnIndex(0);
+        Text("OFFSET_ROUND");
+        TableSetColumnIndex(1);
+        Text("%X", reg.offset_round);
+
+        if (begin_table) {
+            EndTable();
+        }
+    }
+}
+
 void ParseZInfo(u32 value, bool begin_table) {
     auto const reg = reinterpret_cast<AmdGpu::DepthBuffer::ZInfo const&>(value);
 
     if (!begin_table ||
-        BeginTable("DB_DEPTH_CONTROL", 2, ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg)) {
+        BeginTable("DB_Z_INFO", 2, ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg)) {
         TableNextRow();
         TableSetColumnIndex(0);
         Text("FORMAT");
@@ -1016,6 +1062,13 @@ void CmdListViewer::OnSetContextReg(AmdGpu::PM4Type3Header const* header, u32 co
         case mmDB_EQAA: {
             if (IsItemHovered() && BeginTooltip()) {
                 ParseEqaa(body[1]);
+                EndTooltip();
+            }
+            break;
+        }
+        case mmDB_ALPHA_TO_MASK: {
+            if (IsItemHovered() && BeginTooltip()) {
+                ParseDbAlphaToMask(body[1]);
                 EndTooltip();
             }
             break;

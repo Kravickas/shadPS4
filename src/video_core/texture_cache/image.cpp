@@ -505,6 +505,8 @@ void Image::CopyImage(Image& src_image) {
     const u32 base_height = src_info.size.height;
     const u32 base_depth =
         info.type == AmdGpu::ImageType::Color3D ? info.size.depth : src_info.size.depth;
+    const u32 dst_width = info.size.width;
+    const u32 dst_height = info.size.height;
 
     // Match sample count before copying
     SetBackingSamples(info.num_samples, false);
@@ -528,8 +530,10 @@ void Image::CopyImage(Image& src_image) {
     const bool is_same_type = !is_2d_to_3d && !is_3d_to_2d;
 
     for (u32 mip = 0; mip < num_mips; ++mip) {
-        const u32 mip_w = std::max(base_width >> mip, 1u);
-        const u32 mip_h = std::max(base_height >> mip, 1u);
+        const u32 src_w = std::max(base_width >> mip, 1u);
+        const u32 src_h = std::max(base_height >> mip, 1u);
+        const u32 mip_w = std::min(src_w, std::max(dst_width >> mip, 1u));
+        const u32 mip_h = std::min(src_h, std::max(dst_height >> mip, 1u));
         const u32 mip_d = std::max(base_depth >> mip, 1u);
 
         auto [src_layers, dst_layers] = SanitizeCopyLayers(src_info, info, mip_d);
