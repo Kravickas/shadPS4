@@ -284,8 +284,10 @@ std::tuple<ImageId, int, int> TextureCache::ResolveOverlap(const ImageInfo& imag
     if (image_info.guest_address == cache_image.info.guest_address) {
         const u32 lhs_block_size = image_info.num_bits * image_info.num_samples;
         const u32 rhs_block_size = cache_image.info.num_bits * cache_image.info.num_samples;
-        if (image_info.BlockDim() != cache_image.info.BlockDim() ||
-            lhs_block_size != rhs_block_size) {
+        // A pow2 padded texture and its target disagree on logical height but not on padded.
+        const bool same_dim = image_info.BlockDim() == cache_image.info.BlockDim() ||
+                              image_info.PaddedDim() == cache_image.info.PaddedDim();
+        if (!same_dim || lhs_block_size != rhs_block_size) {
             // Very likely this kind of overlap is caused by allocation from a pool.
             if (safe_to_delete) {
                 FreeImage(cache_image_id);
