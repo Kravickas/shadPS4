@@ -161,29 +161,25 @@ DecoderResult AjmMp3Decoder::ProcessData(std::span<u8>& in_buf, SparseOutputBuff
     DecoderResult result{};
     AVPacket* pkt = av_packet_alloc();
 
-    m_header = std::byteswap(*reinterpret_cast<u32*>(in_buf.data()));
-    AjmDecMp3ParseFrame info{};
-    ParseMp3Header(in_buf.data(), in_buf.size(), true, &info);
-    m_frame_samples = info.samples_per_channel;
-    if (info.total_samples != 0 || info.encoder_delay != 0) {
-        gapless.init = {
-            .total_samples = info.total_samples,
-            .skip_samples = static_cast<u16>(info.encoder_delay),
-            .skipped_samples = 0,
-        };
-        gapless.current = gapless.init;
-    }
-
-    if (in_buf.size() < info.frame_size) {
-        result.result |= ORBIS_AJM_RESULT_PARTIAL_INPUT;
-    }
-
     int ret = av_parser_parse2(m_parser, m_codec_context, &pkt->data, &pkt->size, in_buf.data(),
                                in_buf.size(), AV_NOPTS_VALUE, AV_NOPTS_VALUE, 0);
     ASSERT_MSG(ret >= 0, "Error while parsing {}", ret);
     in_buf = in_buf.subspan(ret);
 
     if (pkt->size) {
+        m_header = std::byteswap(*reinterpret_cast<u32*>(pkt->data));
+        AjmDecMp3ParseFrame info{};
+        ASSERT(ParseMp3Header(pkt->data, pkt->size, true, &info) == ORBIS_OK);
+        m_frame_samples = info.samples_per_channel;
+        if (info.total_samples != 0 || info.encoder_delay != 0) {
+            gapless.init = {
+                .total_samples = info.total_samples,
+                .skip_samples = static_cast<u16>(info.encoder_delay),
+                .skipped_samples = 0,
+            };
+            gapless.current = gapless.init;
+        }
+
         // Send the packet with the compressed data to the decoder
         pkt->pts = m_parser->pts;
         pkt->dts = m_parser->dts;
@@ -239,6 +235,8 @@ DecoderResult AjmMp3Decoder::ProcessData(std::span<u8>& in_buf, SparseOutputBuff
 
             av_frame_free(&frame);
         }
+    } else {
+        result.result |= ORBIS_AJM_RESULT_PARTIAL_INPUT;
     }
 
     av_packet_free(&pkt);
