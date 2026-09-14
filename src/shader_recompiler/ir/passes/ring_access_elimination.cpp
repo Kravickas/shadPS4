@@ -104,13 +104,6 @@ void RingAccessElimination(const IR::Program& program, const RuntimeInfo& runtim
                         output_vertices, info.gs_copy_data.output_vertices);
             output_vertices = info.gs_copy_data.output_vertices;
         }
-        u32 dwords_per_vertex = gs_info.out_vertex_data_size;
-        if (info.gs_copy_data.num_comps && info.gs_copy_data.num_comps > dwords_per_vertex) {
-            LOG_WARNING(Render_Vulkan,
-                        "VERT_ITEMSIZE {} is different than actual number of dwords per vertex {}",
-                        dwords_per_vertex, info.gs_copy_data.num_comps);
-            dwords_per_vertex = info.gs_copy_data.num_comps;
-        }
 
         ForEachInstruction([&](IR::IREmitter& ir, IR::Inst& inst) {
             const auto opcode = inst.GetOpcode();
@@ -146,11 +139,13 @@ void RingAccessElimination(const IR::Program& program, const RuntimeInfo& runtim
                 const auto offset = inst.Flags<IR::BufferInstInfo>().inst_offset.Value();
                 const auto data = ir.BitCast<IR::F32>(IR::U32{inst.Arg(2)});
                 const auto comp_ofs = output_vertices * 4u;
-                const auto output_size = comp_ofs * dwords_per_vertex;
+                const auto vc_read_ofs = (offset / comp_ofs) * comp_ofs * 16u;
 
-                const auto vc_read_ofs = (((offset / comp_ofs) * comp_ofs) % output_size) * 16u;
                 const auto& it = info.gs_copy_data.attr_map.find(vc_read_ofs);
-                ASSERT(it != info.gs_copy_data.attr_map.cend());
+                ASSERT_MSG(it != info.gs_copy_data.attr_map.cend(),
+                           "No copy shader load for GSVS ring offset {}, inst_offset = {}, "
+                           "output_vertices = {}",
+                           vc_read_ofs, offset, output_vertices);
                 const auto& [attr, comp] = it->second;
 
                 inst.Invalidate();
