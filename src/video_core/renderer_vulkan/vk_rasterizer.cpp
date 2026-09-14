@@ -1,7 +1,9 @@
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
-#include <cstdlib>
+#include <fstream>
+
+#include "common/path_util.h"
 
 #include "common/debug.h"
 #include "core/debug_state.h"
@@ -65,16 +67,28 @@ void Rasterizer::CpSync() {
                            vk::DependencyFlagBits::eByRegion, ib_barrier, {}, {});
 }
 
-static u32 EopScopeFromEnv(const char* name) {
-    const char* value = std::getenv(name);
-    return value != nullptr ? static_cast<u32>(std::strtoul(value, nullptr, 0)) : 0xFu;
+static void ReadEopScope(u32& src_sel, u32& dst_sel) {
+    src_sel = 0xFu;
+    dst_sel = 0xFu;
+    const auto path = Common::FS::GetUserPath(Common::FS::PathType::UserDir) / "eop_scope.txt";
+    std::ifstream file{path};
+    if (file) {
+        u32 src = 0;
+        u32 dst = 0;
+        if (file >> std::hex >> src >> dst) {
+            src_sel = src;
+            dst_sel = dst;
+        }
+    }
+    LOG_INFO(Render_Vulkan, "EOP barrier scope: src={:#x} dst={:#x} (from {})", src_sel, dst_sel,
+             Common::FS::PathToUTF8String(path));
 }
 
 void Rasterizer::EopSync() {
-    static const u32 src_sel = EopScopeFromEnv("SHADPS4_EOP_SRC");
-    static const u32 dst_sel = EopScopeFromEnv("SHADPS4_EOP_DST");
-    [[maybe_unused]] static const bool logged = [] {
-        LOG_INFO(Render_Vulkan, "EOP barrier scope: src={:#x} dst={:#x}", src_sel, dst_sel);
+    static u32 src_sel = 0;
+    static u32 dst_sel = 0;
+    [[maybe_unused]] static const bool loaded = [] {
+        ReadEopScope(src_sel, dst_sel);
         return true;
     }();
 
