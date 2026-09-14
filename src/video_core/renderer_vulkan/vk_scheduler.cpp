@@ -89,22 +89,6 @@ void Scheduler::EndRendering() {
     }
     is_rendering = false;
     current_cmdbuf.endRendering();
-
-    // Inside a render pass attachment writes are ordered by rasterization order alone. Nothing
-    // orders them against accesses recorded after the pass, so make them available here.
-    const vk::MemoryBarrier2 barrier{
-        .srcStageMask = vk::PipelineStageFlagBits2::eColorAttachmentOutput |
-                        vk::PipelineStageFlagBits2::eEarlyFragmentTests |
-                        vk::PipelineStageFlagBits2::eLateFragmentTests,
-        .srcAccessMask = vk::AccessFlagBits2::eColorAttachmentWrite |
-                         vk::AccessFlagBits2::eDepthStencilAttachmentWrite,
-        .dstStageMask = vk::PipelineStageFlagBits2::eAllCommands,
-        .dstAccessMask = vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite,
-    };
-    current_cmdbuf.pipelineBarrier2(vk::DependencyInfo{
-        .memoryBarrierCount = 1,
-        .pMemoryBarriers = &barrier,
-    });
 }
 
 void Scheduler::Flush(SubmitInfo& info) {
