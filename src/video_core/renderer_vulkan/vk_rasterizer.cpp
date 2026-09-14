@@ -65,6 +65,19 @@ void Rasterizer::CpSync() {
 
 void Rasterizer::EopSync() {
     scheduler.EndRendering();
+    const auto cmdbuf = scheduler.CommandBuffer();
+
+    // End-of-pipe event: prior work is drained and GPU caches are written back and invalidated.
+    const vk::MemoryBarrier2 barrier{
+        .srcStageMask = vk::PipelineStageFlagBits2::eAllCommands,
+        .srcAccessMask = vk::AccessFlagBits2::eMemoryWrite,
+        .dstStageMask = vk::PipelineStageFlagBits2::eAllCommands,
+        .dstAccessMask = vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite,
+    };
+    cmdbuf.pipelineBarrier2(vk::DependencyInfo{
+        .memoryBarrierCount = 1,
+        .pMemoryBarriers = &barrier,
+    });
 }
 
 void Rasterizer::EnqueueEopFence(Common::UniqueFunction<void>&& signal) {
