@@ -63,6 +63,10 @@ void Rasterizer::CpSync() {
                            vk::DependencyFlagBits::eByRegion, ib_barrier, {}, {});
 }
 
+void Rasterizer::EopSync() {
+    scheduler.EndRendering();
+}
+
 void Rasterizer::EnqueueEopFence(Common::UniqueFunction<void>&& signal) {
     scheduler.DeferPriorityOperation(std::move(signal));
     Flush();

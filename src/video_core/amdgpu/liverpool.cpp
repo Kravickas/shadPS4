@@ -675,6 +675,7 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 const auto* event_eop = reinterpret_cast<const PM4CmdEventWriteEop*>(header);
                 if (rasterizer) {
                     rasterizer->ProcessDownloadImages();
+                    rasterizer->EopSync();
                 }
                 event_eop->SignalFence(
                     [](void* address, u64 data, u32 num_bytes) {
@@ -684,9 +685,6 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                         }
                     },
                     [] { Platform::IrqC::Instance()->Signal(Platform::InterruptId::GfxEop); });
-                if (rasterizer) {
-                    rasterizer->Flush();
-                }
                 break;
             }
             case PM4ItOpcode::DmaData: {

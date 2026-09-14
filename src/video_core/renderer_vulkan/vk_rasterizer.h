@@ -77,6 +77,7 @@ public:
     void UnmapMemory(VAddr addr, u64 size);
 
     void CpSync();
+    void EopSync();
     void EnqueueEopFence(Common::UniqueFunction<void>&& signal);
     u64 Flush();
     void Finish();
