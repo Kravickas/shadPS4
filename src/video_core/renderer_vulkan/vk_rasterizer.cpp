@@ -1,6 +1,8 @@
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <cstdlib>
+
 #include "common/debug.h"
 #include "core/debug_state.h"
 #include "core/emulator_settings.h"
@@ -63,21 +65,73 @@ void Rasterizer::CpSync() {
                            vk::DependencyFlagBits::eByRegion, ib_barrier, {}, {});
 }
 
-void Rasterizer::EopSync(bool flush_caches) {
+static u32 EopScopeFromEnv(const char* name) {
+    const char* value = std::getenv(name);
+    return value != nullptr ? static_cast<u32>(std::strtoul(value, nullptr, 0)) : 0xFu;
+}
+
+void Rasterizer::EopSync() {
+    static const u32 src_sel = EopScopeFromEnv("SHADPS4_EOP_SRC");
+    static const u32 dst_sel = EopScopeFromEnv("SHADPS4_EOP_DST");
+    [[maybe_unused]] static const bool logged = [] {
+        LOG_INFO(Render_Vulkan, "EOP barrier scope: src={:#x} dst={:#x}", src_sel, dst_sel);
+        return true;
+    }();
+
+    vk::PipelineStageFlags2 src_stage{};
+    vk::AccessFlags2 src_access{};
+    if ((src_sel & 1u) != 0) {
+        src_stage |=
+            vk::PipelineStageFlagBits2::eAllGraphics | vk::PipelineStageFlagBits2::eComputeShader;
+        src_access |= vk::AccessFlagBits2::eShaderWrite;
+    }
+    if ((src_sel & 2u) != 0) {
+        src_stage |= vk::PipelineStageFlagBits2::eTransfer;
+        src_access |= vk::AccessFlagBits2::eTransferWrite;
+    }
+    if ((src_sel & 4u) != 0) {
+        src_stage |= vk::PipelineStageFlagBits2::eColorAttachmentOutput |
+                     vk::PipelineStageFlagBits2::eEarlyFragmentTests |
+                     vk::PipelineStageFlagBits2::eLateFragmentTests;
+        src_access |= vk::AccessFlagBits2::eColorAttachmentWrite |
+                      vk::AccessFlagBits2::eDepthStencilAttachmentWrite;
+    }
+    if ((src_sel & 8u) != 0) {
+        src_stage |= vk::PipelineStageFlagBits2::eAllCommands;
+        src_access |= vk::AccessFlagBits2::eMemoryWrite;
+    }
+
+    vk::PipelineStageFlags2 dst_stage{};
+    vk::AccessFlags2 dst_access{};
+    if ((dst_sel & 1u) != 0) {
+        dst_stage |=
+            vk::PipelineStageFlagBits2::eAllGraphics | vk::PipelineStageFlagBits2::eComputeShader;
+        dst_access |= vk::AccessFlagBits2::eShaderRead;
+    }
+    if ((dst_sel & 2u) != 0) {
+        dst_stage |= vk::PipelineStageFlagBits2::eTransfer;
+        dst_access |= vk::AccessFlagBits2::eTransferRead;
+    }
+    if ((dst_sel & 4u) != 0) {
+        dst_stage |= vk::PipelineStageFlagBits2::eVertexAttributeInput |
+                     vk::PipelineStageFlagBits2::eIndexInput;
+        dst_access |= vk::AccessFlagBits2::eVertexAttributeRead | vk::AccessFlagBits2::eIndexRead;
+    }
+    if ((dst_sel & 8u) != 0) {
+        dst_stage |= vk::PipelineStageFlagBits2::eAllCommands;
+        dst_access |= vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite;
+    }
+
+    if (!src_stage || !dst_stage) {
+        return;
+    }
+
     scheduler.EndRendering();
     const auto cmdbuf = scheduler.CommandBuffer();
-
-    // An end of pipe event drains all prior work. The cache action bits additionally write back
-    // and invalidate L1/L2, making those writes visible to everything recorded after it.
-    const vk::AccessFlags2 src_access =
-        flush_caches ? vk::AccessFlags2{vk::AccessFlagBits2::eMemoryWrite} : vk::AccessFlags2{};
-    const vk::AccessFlags2 dst_access =
-        flush_caches ? vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite
-                     : vk::AccessFlags2{};
     const vk::MemoryBarrier2 barrier{
-        .srcStageMask = vk::PipelineStageFlagBits2::eAllCommands,
+        .srcStageMask = src_stage,
         .srcAccessMask = src_access,
-        .dstStageMask = vk::PipelineStageFlagBits2::eAllCommands,
+        .dstStageMask = dst_stage,
         .dstAccessMask = dst_access,
     };
     cmdbuf.pipelineBarrier2(vk::DependencyInfo{
