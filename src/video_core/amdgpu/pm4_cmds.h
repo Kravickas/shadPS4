@@ -441,6 +441,11 @@ struct PM4CmdEventWriteEop {
         u32 event_control;
         BitField<0, 6, u32> event_type;  ///< Event type written to VGT_EVENT_INITIATOR
         BitField<8, 4, u32> event_index; ///< Event index
+        BitField<12, 1, u32> tcl1_vol_action_ena;
+        BitField<13, 1, u32> tc_vol_action_ena;
+        BitField<15, 1, u32> tc_wb_action_ena;
+        BitField<16, 1, u32> tcl1_action_ena;
+        BitField<17, 1, u32> tc_action_ena;
     };
     u32 address_lo;
     union {
@@ -463,6 +468,12 @@ struct PM4CmdEventWriteEop {
 
     u64 DataQWord() const {
         return data_lo | u64(data_hi) << 32;
+    }
+
+    /// True when the event requests a GPU cache write-back or invalidate.
+    bool FlushesCaches() const {
+        return tcl1_vol_action_ena != 0 || tc_vol_action_ena != 0 || tc_wb_action_ena != 0 ||
+               tcl1_action_ena != 0 || tc_action_ena != 0;
     }
 
     void SignalFence(auto&& write_mem, auto&& signal_irq) const {

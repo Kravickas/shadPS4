@@ -63,16 +63,22 @@ void Rasterizer::CpSync() {
                            vk::DependencyFlagBits::eByRegion, ib_barrier, {}, {});
 }
 
-void Rasterizer::EopSync() {
+void Rasterizer::EopSync(bool flush_caches) {
     scheduler.EndRendering();
     const auto cmdbuf = scheduler.CommandBuffer();
 
-    // End-of-pipe event: prior work is drained and GPU caches are written back and invalidated.
+    // An end of pipe event drains all prior work. The cache action bits additionally write back
+    // and invalidate L1/L2, making those writes visible to everything recorded after it.
+    const vk::AccessFlags2 src_access =
+        flush_caches ? vk::AccessFlags2{vk::AccessFlagBits2::eMemoryWrite} : vk::AccessFlags2{};
+    const vk::AccessFlags2 dst_access =
+        flush_caches ? vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite
+                     : vk::AccessFlags2{};
     const vk::MemoryBarrier2 barrier{
         .srcStageMask = vk::PipelineStageFlagBits2::eAllCommands,
-        .srcAccessMask = vk::AccessFlagBits2::eMemoryWrite,
+        .srcAccessMask = src_access,
         .dstStageMask = vk::PipelineStageFlagBits2::eAllCommands,
-        .dstAccessMask = vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite,
+        .dstAccessMask = dst_access,
     };
     cmdbuf.pipelineBarrier2(vk::DependencyInfo{
         .memoryBarrierCount = 1,
