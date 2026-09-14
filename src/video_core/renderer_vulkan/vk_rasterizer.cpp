@@ -67,9 +67,10 @@ void Rasterizer::CpSync() {
                            vk::DependencyFlagBits::eByRegion, ib_barrier, {}, {});
 }
 
-static void ReadEopScope(u32& src_sel, u32& dst_sel) {
+static void ReadEopScope(u32& src_sel, u32& dst_sel, u32& end_rendering) {
     src_sel = 0xFu;
     dst_sel = 0xFu;
+    end_rendering = 1u;
     const auto path = Common::FS::GetUserPath(Common::FS::PathType::UserDir) / "eop_scope.txt";
     std::ifstream file{path};
     if (file) {
@@ -78,17 +79,22 @@ static void ReadEopScope(u32& src_sel, u32& dst_sel) {
         if (file >> std::hex >> src >> dst) {
             src_sel = src;
             dst_sel = dst;
+            u32 end = 0;
+            if (file >> std::hex >> end) {
+                end_rendering = end;
+            }
         }
     }
-    LOG_INFO(Render_Vulkan, "EOP barrier scope: src={:#x} dst={:#x} (from {})", src_sel, dst_sel,
-             Common::FS::PathToUTF8String(path));
+    LOG_INFO(Render_Vulkan, "EOP barrier scope: src={:#x} dst={:#x} end_rendering={} (from {})",
+             src_sel, dst_sel, end_rendering, Common::FS::PathToUTF8String(path));
 }
 
 void Rasterizer::EopSync() {
     static u32 src_sel = 0;
     static u32 dst_sel = 0;
+    static u32 end_rendering = 0;
     [[maybe_unused]] static const bool loaded = [] {
-        ReadEopScope(src_sel, dst_sel);
+        ReadEopScope(src_sel, dst_sel, end_rendering);
         return true;
     }();
 
@@ -137,6 +143,9 @@ void Rasterizer::EopSync() {
     }
 
     if (!src_stage || !dst_stage) {
+        if (end_rendering != 0) {
+            scheduler.EndRendering();
+        }
         return;
     }
 
