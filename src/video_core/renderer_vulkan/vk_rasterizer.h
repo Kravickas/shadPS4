@@ -76,6 +76,7 @@ public:
     void UnmapMemory(VAddr addr, u64 size);
 
     void CpSync();
+    void EopSync();
     u64 Flush();
     void Finish();
     void OnSubmit();
