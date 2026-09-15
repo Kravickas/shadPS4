@@ -7,6 +7,7 @@
 #include <optional>
 #include <utility>
 #include <vector>
+#include "common/logging/log.h"
 #include "common/types.h"
 #include "core/memory.h"
 #include "video_core/amdgpu/resource.h"
@@ -134,6 +135,11 @@ public:
         const bool is_write = static_cast<bool>(access_mask & write_flags);
         if (dst_acess_mask == access_mask && stage == dst_stage && !is_write) {
             return {};
+        }
+        if (dst_acess_mask == access_mask && stage == dst_stage && is_write) {
+            LOG_WARNING(Render_Vulkan, "WAW rescued: addr={:#x} size={:#x} access={} stage={}",
+                        static_cast<u64>(cpu_addr), size_bytes, vk::to_string(access_mask),
+                        vk::to_string(stage));
         }
 
         DEBUG_ASSERT(offset < size_bytes);

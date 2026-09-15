@@ -1,10 +1,6 @@
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
-#include <fstream>
-
-#include "common/path_util.h"
-
 #include "common/debug.h"
 #include "core/debug_state.h"
 #include "core/emulator_settings.h"
@@ -67,94 +63,21 @@ void Rasterizer::CpSync() {
                            vk::DependencyFlagBits::eByRegion, ib_barrier, {}, {});
 }
 
-static void ReadEopScope(u32& src_sel, u32& dst_sel, u32& end_rendering) {
-    src_sel = 0xFu;
-    dst_sel = 0xFu;
-    end_rendering = 1u;
-    const auto path = Common::FS::GetUserPath(Common::FS::PathType::UserDir) / "eop_scope.txt";
-    std::ifstream file{path};
-    if (file) {
-        u32 src = 0;
-        u32 dst = 0;
-        if (file >> std::hex >> src >> dst) {
-            src_sel = src;
-            dst_sel = dst;
-            u32 end = 0;
-            if (file >> std::hex >> end) {
-                end_rendering = end;
-            }
-        }
-    }
-    LOG_INFO(Render_Vulkan, "EOP barrier scope: src={:#x} dst={:#x} end_rendering={} (from {})",
-             src_sel, dst_sel, end_rendering, Common::FS::PathToUTF8String(path));
-}
-
-void Rasterizer::EopSync() {
-    static u32 src_sel = 0;
-    static u32 dst_sel = 0;
-    static u32 end_rendering = 0;
-    [[maybe_unused]] static const bool loaded = [] {
-        ReadEopScope(src_sel, dst_sel, end_rendering);
-        return true;
-    }();
-
-    vk::PipelineStageFlags2 src_stage{};
-    vk::AccessFlags2 src_access{};
-    if ((src_sel & 1u) != 0) {
-        src_stage |=
-            vk::PipelineStageFlagBits2::eAllGraphics | vk::PipelineStageFlagBits2::eComputeShader;
-        src_access |= vk::AccessFlagBits2::eShaderWrite;
-    }
-    if ((src_sel & 2u) != 0) {
-        src_stage |= vk::PipelineStageFlagBits2::eTransfer;
-        src_access |= vk::AccessFlagBits2::eTransferWrite;
-    }
-    if ((src_sel & 4u) != 0) {
-        src_stage |= vk::PipelineStageFlagBits2::eColorAttachmentOutput |
-                     vk::PipelineStageFlagBits2::eEarlyFragmentTests |
-                     vk::PipelineStageFlagBits2::eLateFragmentTests;
-        src_access |= vk::AccessFlagBits2::eColorAttachmentWrite |
-                      vk::AccessFlagBits2::eDepthStencilAttachmentWrite;
-    }
-    if ((src_sel & 8u) != 0) {
-        src_stage |= vk::PipelineStageFlagBits2::eAllCommands;
-        src_access |= vk::AccessFlagBits2::eMemoryWrite;
-    }
-
-    vk::PipelineStageFlags2 dst_stage{};
-    vk::AccessFlags2 dst_access{};
-    if ((dst_sel & 1u) != 0) {
-        dst_stage |=
-            vk::PipelineStageFlagBits2::eAllGraphics | vk::PipelineStageFlagBits2::eComputeShader;
-        dst_access |= vk::AccessFlagBits2::eShaderRead;
-    }
-    if ((dst_sel & 2u) != 0) {
-        dst_stage |= vk::PipelineStageFlagBits2::eTransfer;
-        dst_access |= vk::AccessFlagBits2::eTransferRead;
-    }
-    if ((dst_sel & 4u) != 0) {
-        dst_stage |= vk::PipelineStageFlagBits2::eVertexAttributeInput |
-                     vk::PipelineStageFlagBits2::eIndexInput;
-        dst_access |= vk::AccessFlagBits2::eVertexAttributeRead | vk::AccessFlagBits2::eIndexRead;
-    }
-    if ((dst_sel & 8u) != 0) {
-        dst_stage |= vk::PipelineStageFlagBits2::eAllCommands;
-        dst_access |= vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite;
-    }
-
-    if (!src_stage || !dst_stage) {
-        if (end_rendering != 0) {
-            scheduler.EndRendering();
-        }
-        return;
-    }
-
+void Rasterizer::EopSync(bool flush_caches) {
     scheduler.EndRendering();
     const auto cmdbuf = scheduler.CommandBuffer();
+
+    // An end of pipe event drains all prior work. The cache action bits additionally write
+    // back and invalidate L1/L2, making those writes visible to everything after it.
+    const vk::AccessFlags2 src_access =
+        flush_caches ? vk::AccessFlags2{vk::AccessFlagBits2::eMemoryWrite} : vk::AccessFlags2{};
+    const vk::AccessFlags2 dst_access =
+        flush_caches ? vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite
+                     : vk::AccessFlags2{};
     const vk::MemoryBarrier2 barrier{
-        .srcStageMask = src_stage,
+        .srcStageMask = vk::PipelineStageFlagBits2::eAllCommands,
         .srcAccessMask = src_access,
-        .dstStageMask = dst_stage,
+        .dstStageMask = vk::PipelineStageFlagBits2::eAllCommands,
         .dstAccessMask = dst_access,
     };
     cmdbuf.pipelineBarrier2(vk::DependencyInfo{

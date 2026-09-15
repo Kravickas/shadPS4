@@ -226,6 +226,9 @@ void BufferCache::BindVertexBuffers(
         const auto [buffer, offset] = ObtainBuffer(range.base_address, size, false);
         range.vk_buffer = buffer->buffer;
         range.offset = offset;
+        LOG_WARNING(Render_Vulkan, "VTX bind: addr={:#x} size={:#x} gpu_modified={}",
+                    static_cast<u64>(range.base_address), static_cast<u64>(range.GetSize()),
+                    IsRegionGpuModified(range.base_address, range.GetSize()));
         if (IsRegionGpuModified(range.base_address, size)) {
             if (auto barrier =
                     buffer->GetBarrier(vk::AccessFlagBits2::eVertexAttributeRead,
@@ -283,6 +286,9 @@ void BufferCache::BindIndexBuffer(
     // Bind index buffer.
     const u32 index_buffer_size = regs.num_indices * index_size;
     const auto [vk_buffer, offset] = ObtainBuffer(index_address, index_buffer_size, false);
+    LOG_WARNING(Render_Vulkan, "IDX bind: addr={:#x} size={:#x} gpu_modified={}",
+                static_cast<u64>(index_address), static_cast<u64>(index_buffer_size),
+                IsRegionGpuModified(index_address, index_buffer_size));
     if (IsRegionGpuModified(index_address, index_buffer_size)) {
         if (auto barrier = vk_buffer->GetBarrier(vk::AccessFlagBits2::eIndexRead,
                                                  vk::PipelineStageFlagBits2::eIndexInput)) {
