@@ -8,6 +8,7 @@
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
+#include <fmt/format.h>
 #include <xxhash.h>
 
 #include "common/assert.h"
@@ -44,6 +45,15 @@ struct ImageTrace {
 
 std::mutex trace_mutex;
 std::unordered_map<VAddr, ImageTrace> trace_map;
+std::mutex trace_file_mutex;
+
+void TraceLine(const std::string& text) {
+    std::scoped_lock lk{trace_file_mutex};
+    static std::ofstream file(
+        Common::FS::GetUserPath(Common::FS::PathType::UserDir) / "imgtrace.log", std::ios::trunc);
+    file << text << '\n';
+    file.flush();
+}
 
 struct TraceConfig {
     std::unordered_set<u64> addrs;
@@ -78,8 +88,8 @@ const TraceConfig& GetTraceConfig() {
         }
         cfg.enabled = !cfg.addrs.empty() || cfg.min_size != 0;
         if (cfg.enabled) {
-            LOG_WARNING(Render_Vulkan, "[imgtrace] enabled from {}: {} address(es), min size {:#x}",
-                        path.string(), cfg.addrs.size(), cfg.min_size);
+            TraceLine(fmt::format("[imgtrace] enabled from {}: {} address(es), min size {:#x}",
+                                  path.string(), cfg.addrs.size(), cfg.min_size));
         }
         return cfg;
     }();
@@ -117,17 +127,16 @@ void TraceRefresh(const ImageInfo& info, const char* decision, u64 guest_hash, u
     }
     if (missed) {
         ++t.missed;
-        LOG_WARNING(Render_Vulkan,
-                    "[imgtrace] MISSED WRITE addr={:#x} size={:#x} decision={} flags={:#x} "
-                    "guest_hash={:#x} uploaded_hash={:#x} (refresh {} upload {} skip {} missed {})",
-                    info.guest_address, info.guest_size, decision, flags, guest_hash,
-                    t.last_upload_hash, t.refreshes, t.uploads, t.skips, t.missed);
+        TraceLine(fmt::format(
+            "[imgtrace] MISSED WRITE addr={:#x} size={:#x} decision={} flags={:#x} "
+            "guest_hash={:#x} uploaded_hash={:#x} (refresh {} upload {} skip {} missed {})",
+            info.guest_address, info.guest_size, decision, flags, guest_hash, t.last_upload_hash,
+            t.refreshes, t.uploads, t.skips, t.missed));
     } else {
-        LOG_WARNING(Render_Vulkan,
-                    "[imgtrace] {} addr={:#x} size={:#x} flags={:#x} guest_hash={:#x} "
-                    "uploaded_hash={:#x}",
-                    decision, info.guest_address, info.guest_size, flags, guest_hash,
-                    t.last_upload_hash);
+        TraceLine(fmt::format("[imgtrace] {} addr={:#x} size={:#x} flags={:#x} guest_hash={:#x} "
+                              "uploaded_hash={:#x}",
+                              decision, info.guest_address, info.guest_size, flags, guest_hash,
+                              t.last_upload_hash));
     }
 }
 
@@ -233,14 +242,13 @@ void TextureCache::MarkAsMaybeDirty(ImageId image_id, Image& image) {
         const u8* addr = std::bit_cast<u8*>(image.info.guest_address);
         image.hash = XXH3_64bits(addr, image.info.guest_size);
         if (Traced(image.info)) {
-            LOG_WARNING(Render_Vulkan,
-                        "[imgtrace] MarkAsMaybeDirty seeded hash over FULL {:#x} bytes -> {:#x}",
-                        image.info.guest_size, image.hash);
+            TraceLine(fmt::format(
+                "[imgtrace] MarkAsMaybeDirty seeded hash over FULL {:#x} bytes -> {:#x}",
+                image.info.guest_size, image.hash));
         }
     } else if (Traced(image.info)) {
-        LOG_WARNING(Render_Vulkan,
-                    "[imgtrace] MarkAsMaybeDirty reusing stored hash {:#x} (NOT recomputed)",
-                    image.hash);
+        TraceLine(fmt::format(
+            "[imgtrace] MarkAsMaybeDirty reusing stored hash {:#x} (NOT recomputed)", image.hash));
     }
     image.flags |= ImageFlagBits::MaybeCpuDirty;
     UntrackImage(image_id);
@@ -271,9 +279,9 @@ void TextureCache::InvalidateMemory(VAddr addr, size_t size) {
             // it will receive more invalidations on its other pages.
             // Remove tracking from this page only.
             if (traced) {
-                LOG_WARNING(Render_Vulkan,
-                            "[imgtrace] invalidate UntrackHead addr={:#x} write={:#x}+{:#x}",
-                            image.info.guest_address, addr, size);
+                TraceLine(
+                    fmt::format("[imgtrace] invalidate UntrackHead addr={:#x} write={:#x}+{:#x}",
+                                image.info.guest_address, addr, size))
             }
             UntrackImageHead(image_id);
         } else if (image_begin < pages_start) {
@@ -281,20 +289,19 @@ void TextureCache::InvalidateMemory(VAddr addr, size_t size) {
             // We should not mark this image as dirty now. If it really was modified
             // it will receive more invalidations on its other pages.
             if (traced) {
-                LOG_WARNING(Render_Vulkan,
-                            "[imgtrace] invalidate UntrackTail addr={:#x} write={:#x}+{:#x}",
-                            image.info.guest_address, addr, size);
+                TraceLine(
+                    fmt::format("[imgtrace] invalidate UntrackTail addr={:#x} write={:#x}+{:#x}",
+                                image.info.guest_address, addr, size))
             }
             UntrackImageTail(image_id);
         } else {
             // Image begins and ends on this page so it can not receive any more invalidations.
             // We will check it's hash later to see if it really was modified.
             if (traced) {
-                LOG_WARNING(Render_Vulkan,
-                            "[imgtrace] invalidate MaybeCpuDirty addr={:#x} size={:#x} "
-                            "write={:#x}+{:#x} stored_hash={:#x}",
-                            image.info.guest_address, image.info.guest_size, addr, size,
-                            image.hash);
+                TraceLine(fmt::format("[imgtrace] invalidate MaybeCpuDirty addr={:#x} size={:#x} "
+                                      "write={:#x}+{:#x} stored_hash={:#x}",
+                                      image.info.guest_address, image.info.guest_size, addr, size,
+                                      image.hash));
             }
             MarkAsMaybeDirty(image_id, image);
         }
@@ -881,10 +888,9 @@ void TextureCache::RefreshImage(Image& image) {
         const u32 size = s_w * s_h * (image.info.num_bits / 8);
         const u64 hash = XXH3_64bits(addr, size);
         if (traced) {
-            LOG_WARNING(Render_Vulkan,
-                        "[imgtrace] MaybeCpuDirty check hashes only {} of {:#x} bytes "
-                        "(stored={:#x} now={:#x})",
-                        size, image.info.guest_size, image.hash, hash);
+            TraceLine(fmt::format("[imgtrace] MaybeCpuDirty check hashes only {} of {:#x} bytes "
+                                  "(stored={:#x} now={:#x})",
+                                  size, image.info.guest_size, image.hash, hash));
         }
         if (image.hash == hash) {
             image.flags &= ~ImageFlagBits::MaybeCpuDirty;
