@@ -281,7 +281,7 @@ void TextureCache::InvalidateMemory(VAddr addr, size_t size) {
             if (traced) {
                 TraceLine(
                     fmt::format("[imgtrace] invalidate UntrackHead addr={:#x} write={:#x}+{:#x}",
-                                image.info.guest_address, addr, size))
+                                image.info.guest_address, addr, size));
             }
             UntrackImageHead(image_id);
         } else if (image_begin < pages_start) {
@@ -291,7 +291,7 @@ void TextureCache::InvalidateMemory(VAddr addr, size_t size) {
             if (traced) {
                 TraceLine(
                     fmt::format("[imgtrace] invalidate UntrackTail addr={:#x} write={:#x}+{:#x}",
-                                image.info.guest_address, addr, size))
+                                image.info.guest_address, addr, size));
             }
             UntrackImageTail(image_id);
         } else {
