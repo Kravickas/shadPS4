@@ -2,9 +2,18 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
+#include <bit>
+#include <cstdlib>
+#include <fstream>
+#include <mutex>
+#include <string>
+#include <unordered_set>
+#include <fmt/format.h>
 #include <magic_enum/magic_enum.hpp>
+#include <xxhash.h>
 #include "common/alignment.h"
 #include "common/debug.h"
+#include "common/path_util.h"
 #include "common/scope_exit.h"
 #include "core/memory.h"
 #include "video_core/amdgpu/liverpool.h"
@@ -16,6 +25,76 @@
 #include "video_core/texture_cache/texture_cache.h"
 
 namespace VideoCore {
+
+namespace {
+
+std::mutex buftrace_mutex;
+
+void BufTrace(const std::string& text, bool flush = false) {
+    std::scoped_lock lk{buftrace_mutex};
+    static std::ofstream file(
+        Common::FS::GetUserPath(Common::FS::PathType::UserDir) / "buftrace.log", std::ios::trunc);
+    static u32 pending = 0;
+    file << text << '\n';
+    if (flush || ++pending >= 64) {
+        file.flush();
+        pending = 0;
+    }
+}
+
+struct BufTraceConfig {
+    std::unordered_set<u64> addrs;
+    u64 min_size{};
+    bool enabled{};
+};
+
+const BufTraceConfig& GetBufTraceConfig() {
+    static const BufTraceConfig config = [] {
+        BufTraceConfig cfg;
+        const auto path = Common::FS::GetUserPath(Common::FS::PathType::UserDir) / "imgtrace.txt";
+        std::ifstream file(path);
+        if (file) {
+            std::string key;
+            std::string value;
+            while (file >> key) {
+                if (key.empty() || key[0] == '#') {
+                    std::getline(file, value);
+                    continue;
+                }
+                if (!(file >> value)) {
+                    break;
+                }
+                const u64 parsed = std::strtoull(value.c_str(), nullptr, 0);
+                if (key == "addr") {
+                    cfg.addrs.insert(parsed);
+                } else if (key == "min") {
+                    cfg.min_size = parsed;
+                }
+            }
+        }
+        cfg.enabled = !cfg.addrs.empty() || cfg.min_size != 0;
+        if (cfg.enabled) {
+            BufTrace(fmt::format("[buftrace] enabled: {} address(es), min size {:#x}",
+                                 cfg.addrs.size(), cfg.min_size),
+                     true);
+        }
+        return cfg;
+    }();
+    return config;
+}
+
+bool BufTraced(VAddr addr, u64 size) {
+    const auto& cfg = GetBufTraceConfig();
+    if (!cfg.enabled) {
+        return false;
+    }
+    if (!cfg.addrs.empty() && cfg.addrs.contains(addr)) {
+        return true;
+    }
+    return cfg.min_size != 0 && size >= cfg.min_size;
+}
+
+} // Anonymous namespace
 
 static constexpr size_t DataShareBufferSize = 64_KB;
 static constexpr size_t StagingBufferSize = 512_MB;
@@ -423,22 +502,39 @@ std::pair<Buffer*, u32> BufferCache::ObtainBuffer(VAddr device_addr, u32 size, b
 }
 
 std::pair<Buffer*, u32> BufferCache::ObtainBufferForImage(VAddr gpu_addr, u32 size) {
+    const bool traced = BufTraced(gpu_addr, size);
     // Check if any buffer contains the full requested range.
     const BufferId buffer_id = page_table[gpu_addr >> CACHING_PAGEBITS].buffer_id;
     if (buffer_id) {
         if (Buffer& buffer = slot_buffers[buffer_id]; buffer.IsInBounds(gpu_addr, size)) {
+            const bool cpu_modified = IsRegionCpuModified(gpu_addr, size);
+            const bool gpu_modified = IsRegionGpuModified(gpu_addr, size);
             SynchronizeBuffer(buffer, gpu_addr, size, false, false);
+            if (traced) {
+                BufTrace(fmt::format("[buftrace] branch=resident-buffer addr={:#x} size={:#x} "
+                                     "cpu_modified={} gpu_modified={} guest_hash={:#x}",
+                                     gpu_addr, size, cpu_modified, gpu_modified,
+                                     XXH3_64bits(std::bit_cast<u8*>(gpu_addr), size)));
+            }
             return {&buffer, buffer.Offset(gpu_addr)};
         }
     }
     // If some buffer within was GPU modified create a full buffer to avoid losing GPU data.
     if (IsRegionGpuModified(gpu_addr, size)) {
+        if (traced) {
+            BufTrace(fmt::format("[buftrace] branch=gpu-modified addr={:#x} size={:#x}", gpu_addr,
+                                 size));
+        }
         return ObtainBuffer(gpu_addr, size, false, false);
     }
     // In all other cases, just do a CPU copy to the staging buffer.
     const auto [data, offset] = staging_buffer.Map(size, instance.StorageMinAlignment());
     memory->CopySparseMemory(gpu_addr, data, size);
     staging_buffer.Commit();
+    if (traced) {
+        BufTrace(fmt::format("[buftrace] branch=cpu-copy addr={:#x} size={:#x} guest_hash={:#x}",
+                             gpu_addr, size, XXH3_64bits(data, size)));
+    }
     return {&staging_buffer, offset};
 }
 
@@ -677,6 +773,14 @@ bool BufferCache::SynchronizeBuffer(Buffer& buffer, VAddr device_addr, u32 size,
             total_size_bytes += range_size;
         },
         [&] { src_buffer = UploadCopies(buffer, copies, total_size_bytes); });
+
+    if (BufTraced(device_addr, size)) {
+        BufTrace(fmt::format("[buftrace] sync addr={:#x} size={:#x} is_written={} ranges={} "
+                             "uploaded={:#x} {}",
+                             device_addr, size, is_written, copies.size(), total_size_bytes,
+                             total_size_bytes == 0 ? "SKIPPED-CLEAN" : ""),
+                 total_size_bytes == 0);
+    }
 
     if (src_buffer) {
         scheduler.EndRendering();
