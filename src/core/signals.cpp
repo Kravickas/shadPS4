@@ -1,13 +1,24 @@
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <atomic>
+#include <chrono>
+#include <cstdlib>
+#include <fstream>
+#include <mutex>
+#include <string>
+#include <thread>
+#include <vector>
+#include <fmt/format.h>
 #include "common/arch.h"
 #include "common/assert.h"
 #include "common/decoder.h"
+#include "common/path_util.h"
 #include "common/signal_context.h"
 #include "core/cpu_patches.h" // Windows static guest red-zone protection
 #include "core/libraries/kernel/kernel.h"
 #include "core/libraries/kernel/threads/exception.h"
+#include "core/linker.h"
 #include "core/signals.h"
 #include "emulator.h"
 
@@ -25,6 +36,171 @@ static constexpr DWORD MS_VC_EXCEPTION = 0x406D1388;
 namespace Core {
 
 #if defined(_WIN32)
+
+namespace {
+
+// Guest tracepoints. Config lines in <user dir>/imgtrace.txt:
+//     bp eboot.bin+0xdd2147
+// An int3 is written at each address and handled here, so the guest runs at full speed between
+// hits instead of being stopped by a debugger. Output goes to <user dir>/bptrace.log.
+struct Tracepoint {
+    std::string spec;
+    VAddr address{};
+    u8 original{};
+    u64 hits{};
+    bool armed{};
+};
+
+std::mutex bp_mutex;
+std::vector<Tracepoint> bp_list;
+std::atomic<bool> bp_ready{false};
+thread_local Tracepoint* bp_stepping = nullptr;
+
+void BpTrace(const std::string& text) {
+    static std::mutex file_mutex;
+    std::scoped_lock lk{file_mutex};
+    static std::ofstream file(
+        Common::FS::GetUserPath(Common::FS::PathType::UserDir) / "bptrace.log", std::ios::trunc);
+    file << text << '\n';
+    file.flush();
+}
+
+std::vector<std::string> ReadBpSpecs() {
+    std::vector<std::string> out;
+    std::ifstream file(Common::FS::GetUserPath(Common::FS::PathType::UserDir) / "imgtrace.txt");
+    std::string key;
+    std::string value;
+    while (file >> key) {
+        if (key != "bp") {
+            std::getline(file, value);
+            continue;
+        }
+        if (!(file >> value)) {
+            break;
+        }
+        out.push_back(value);
+    }
+    return out;
+}
+
+// "eboot.bin+0xdd2147" or a bare guest address.
+bool ResolveSpec(const std::string& spec, VAddr& out) {
+    const auto plus = spec.find('+');
+    if (plus == std::string::npos) {
+        out = static_cast<VAddr>(std::strtoull(spec.c_str(), nullptr, 0));
+        return out != 0;
+    }
+    const auto name = spec.substr(0, plus);
+    const auto offset = std::strtoull(spec.c_str() + plus + 1, nullptr, 0);
+    auto* linker = Common::Singleton<Linker>::Instance();
+    if (linker == nullptr) {
+        return false;
+    }
+    for (u32 i = 0;; ++i) {
+        auto* module = linker->GetModule(i);
+        if (module == nullptr) {
+            return false;
+        }
+        if (module->name == name) {
+            out = module->GetBaseAddress() + offset;
+            return true;
+        }
+    }
+}
+
+void ArmTracepoints() {
+    const auto specs = ReadBpSpecs();
+    if (specs.empty()) {
+        return;
+    }
+    // Modules are not loaded yet when signal handling is set up, so wait for them.
+    std::thread([specs] {
+        for (int attempt = 0; attempt < 600; ++attempt) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            std::vector<Tracepoint> resolved;
+            bool all = true;
+            for (const auto& spec : specs) {
+                Tracepoint tp;
+                tp.spec = spec;
+                if (!ResolveSpec(spec, tp.address)) {
+                    all = false;
+                    break;
+                }
+                resolved.push_back(tp);
+            }
+            if (!all) {
+                continue;
+            }
+            std::scoped_lock lk{bp_mutex};
+            bp_list = std::move(resolved);
+            for (auto& tp : bp_list) {
+                auto* code = std::bit_cast<u8*>(tp.address);
+                tp.original = *code;
+                *code = 0xCC;
+                tp.armed = true;
+                BpTrace(fmt::format("[bptrace] armed {} at {:#x} (original byte {:#04x})", tp.spec,
+                                    tp.address, tp.original));
+            }
+            bp_ready = true;
+            return;
+        }
+        BpTrace("[bptrace] gave up waiting for modules");
+    }).detach();
+}
+
+Tracepoint* FindTracepoint(VAddr address) {
+    for (auto& tp : bp_list) {
+        if (tp.address == address) {
+            return &tp;
+        }
+    }
+    return nullptr;
+}
+
+// Returns true when the exception was a tracepoint and execution should continue.
+bool HandleTracepoint(EXCEPTION_POINTERS* pExp, DWORD code) {
+    if (!bp_ready.load(std::memory_order_relaxed) || pExp == nullptr ||
+        pExp->ContextRecord == nullptr) {
+        return false;
+    }
+    auto& ctx = *pExp->ContextRecord;
+
+    if (code == EXCEPTION_SINGLE_STEP && bp_stepping != nullptr) {
+        std::scoped_lock lk{bp_mutex};
+        *std::bit_cast<u8*>(bp_stepping->address) = 0xCC;
+        bp_stepping->armed = true;
+        bp_stepping = nullptr;
+        ctx.EFlags &= ~0x100u;
+        return true;
+    }
+
+    if (code != EXCEPTION_BREAKPOINT) {
+        return false;
+    }
+
+    // int3 leaves rip one byte past the trap.
+    const auto hit = static_cast<VAddr>(ctx.Rip) - 1;
+    std::scoped_lock lk{bp_mutex};
+    auto* tp = FindTracepoint(hit);
+    if (tp == nullptr || !tp->armed) {
+        return false;
+    }
+
+    ++tp->hits;
+    BpTrace(fmt::format("[bptrace] {} hit {} ax={:#06x} rax={:#x} rbx={:#x} rcx={:#x} rdx={:#x} "
+                        "rsi={:#x} rdi={:#x} rbp={:#x} rsp={:#x}",
+                        tp->spec, tp->hits, ctx.Rax & 0xFFFF, ctx.Rax, ctx.Rbx, ctx.Rcx, ctx.Rdx,
+                        ctx.Rsi, ctx.Rdi, ctx.Rbp, ctx.Rsp));
+
+    *std::bit_cast<u8*>(tp->address) = tp->original;
+    tp->armed = false;
+    bp_stepping = tp;
+    ctx.Rip = tp->address;
+    ctx.EFlags |= 0x100u; // single step over the restored instruction, then re-arm
+    return true;
+}
+
+} // Anonymous namespace
 
 static LONG WINAPI SignalHandler(EXCEPTION_POINTERS* pExp) noexcept {
     using namespace Libraries::Kernel;
@@ -112,6 +288,9 @@ static LONG WINAPI SignalHandler(EXCEPTION_POINTERS* pExp) noexcept {
         break;
     case EXCEPTION_BREAKPOINT:
     case EXCEPTION_SINGLE_STEP:
+        if (HandleTracepoint(pExp, code)) {
+            return EXCEPTION_CONTINUE_EXECUTION;
+        }
         guest_info._si_signo = POSIX_SIGTRAP;
         guest_info._si_code = POSIX_TRAP_BRKPT;
         break;
@@ -315,6 +494,7 @@ SignalDispatch::SignalDispatch() {
 #if defined(_WIN32)
     ASSERT_MSG(handle = AddVectoredExceptionHandler(0, SignalHandler),
                "Failed to register exception handler.");
+    ArmTracepoints();
 #else
     struct sigaction action{};
     action.sa_sigaction = SignalHandler;
