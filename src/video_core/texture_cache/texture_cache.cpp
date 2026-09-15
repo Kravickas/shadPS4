@@ -37,6 +37,7 @@ namespace {
 // Absent or empty file disables it entirely.
 struct ImageTrace {
     u64 last_upload_hash{};
+    bool ever_skipped{};
     u64 refreshes{};
     u64 uploads{};
     u64 skips{};
@@ -47,12 +48,16 @@ std::mutex trace_mutex;
 std::unordered_map<VAddr, ImageTrace> trace_map;
 std::mutex trace_file_mutex;
 
-void TraceLine(const std::string& text) {
+void TraceLine(const std::string& text, bool flush = false) {
     std::scoped_lock lk{trace_file_mutex};
     static std::ofstream file(
         Common::FS::GetUserPath(Common::FS::PathType::UserDir) / "imgtrace.log", std::ios::trunc);
+    static u32 pending = 0;
     file << text << '\n';
-    file.flush();
+    if (flush || ++pending >= 64) {
+        file.flush();
+        pending = 0;
+    }
 }
 
 struct TraceConfig {
@@ -107,6 +112,12 @@ bool Traced(const ImageInfo& info) {
     return cfg.min_size != 0 && info.guest_size >= cfg.min_size;
 }
 
+bool TraceNeedsHash(VAddr addr) {
+    std::scoped_lock lk{trace_mutex};
+    const auto it = trace_map.find(addr);
+    return it != trace_map.end() && it->second.ever_skipped;
+}
+
 u64 GuestHash(const ImageInfo& info) {
     return XXH3_64bits(std::bit_cast<u8*>(info.guest_address), info.guest_size);
 }
@@ -117,7 +128,11 @@ void TraceRefresh(const ImageInfo& info, const char* decision, u64 guest_hash, u
     std::scoped_lock lk{trace_mutex};
     auto& t = trace_map[info.guest_address];
     const bool uploaded = std::strcmp(decision, "upload") == 0;
-    const bool missed = !uploaded && t.last_upload_hash != 0 && guest_hash != t.last_upload_hash;
+    if (!uploaded) {
+        t.ever_skipped = true;
+    }
+    const bool missed =
+        !uploaded && guest_hash != 0 && t.last_upload_hash != 0 && guest_hash != t.last_upload_hash;
     ++t.refreshes;
     if (uploaded) {
         ++t.uploads;
@@ -868,7 +883,6 @@ void TextureCache::RefreshImage(Image& image) {
     }
 
     const bool traced = Traced(image.info);
-    const u64 trace_hash = traced ? GuestHash(image.info) : 0;
     const u32 trace_flags = traced ? static_cast<u32>(image.flags) : 0;
 
     RENDERER_TRACE;
@@ -895,7 +909,7 @@ void TextureCache::RefreshImage(Image& image) {
         if (image.hash == hash) {
             image.flags &= ~ImageFlagBits::MaybeCpuDirty;
             if (traced) {
-                TraceRefresh(image.info, "skip-hash", trace_hash, trace_flags);
+                TraceRefresh(image.info, "skip-hash", GuestHash(image.info), trace_flags);
             }
             return;
         }
@@ -945,7 +959,7 @@ void TextureCache::RefreshImage(Image& image) {
     if (image_copies.empty()) {
         image.flags &= ~ImageFlagBits::Dirty;
         if (traced) {
-            TraceRefresh(image.info, "skip-nocopies", trace_hash, trace_flags);
+            TraceRefresh(image.info, "skip-nocopies", GuestHash(image.info), trace_flags);
         }
         return;
     }
@@ -972,7 +986,9 @@ void TextureCache::RefreshImage(Image& image) {
     image.Upload(image_copies, buffer, offset);
 
     if (traced) {
-        TraceRefresh(image.info, "upload", trace_hash, trace_flags);
+        TraceRefresh(image.info, "upload",
+                     TraceNeedsHash(image.info.guest_address) ? GuestHash(image.info) : 0,
+                     trace_flags);
     }
 }
 
