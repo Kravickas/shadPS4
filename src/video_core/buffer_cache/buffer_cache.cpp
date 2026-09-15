@@ -44,7 +44,9 @@ void BufTrace(const std::string& text, bool flush = false) {
 
 struct BufTraceConfig {
     std::unordered_set<u64> addrs;
+    std::unordered_set<u64> dumps;
     u64 min_size{};
+    bool force_cpu_copy{};
     bool enabled{};
 };
 
@@ -69,18 +71,50 @@ const BufTraceConfig& GetBufTraceConfig() {
                     cfg.addrs.insert(parsed);
                 } else if (key == "min") {
                     cfg.min_size = parsed;
+                } else if (key == "dump") {
+                    cfg.dumps.insert(parsed);
+                } else if (key == "force_cpu_copy") {
+                    cfg.force_cpu_copy = parsed != 0;
                 }
             }
         }
         cfg.enabled = !cfg.addrs.empty() || cfg.min_size != 0;
         if (cfg.enabled) {
-            BufTrace(fmt::format("[buftrace] enabled: {} address(es), min size {:#x}",
-                                 cfg.addrs.size(), cfg.min_size),
+            BufTrace(fmt::format("[buftrace] enabled: {} address(es), min size {:#x}, {} dump(s), "
+                                 "force_cpu_copy={}",
+                                 cfg.addrs.size(), cfg.min_size, cfg.dumps.size(),
+                                 cfg.force_cpu_copy),
                      true);
         }
         return cfg;
     }();
     return config;
+}
+
+// Writes the guest bytes backing a range to <user dir>/dump_<addr>.bin, once per address.
+// Decoding that offline shows whether the badge is present in guest memory or only in the
+// image the GPU was given.
+void BufDumpGuest(VAddr addr, u64 size) {
+    const auto& cfg = GetBufTraceConfig();
+    if (!cfg.dumps.contains(addr)) {
+        return;
+    }
+    static std::mutex dump_mutex;
+    static std::unordered_set<u64> done;
+    std::scoped_lock lk{dump_mutex};
+    if (!done.insert(addr).second) {
+        return;
+    }
+    const auto path = Common::FS::GetUserPath(Common::FS::PathType::UserDir) /
+                      fmt::format("dump_{:#x}.bin", addr);
+    std::ofstream file(path, std::ios::binary | std::ios::trunc);
+    file.write(std::bit_cast<const char*>(addr), static_cast<std::streamsize>(size));
+    BufTrace(fmt::format("[buftrace] dumped {:#x} bytes of guest memory at {:#x}", size, addr),
+             true);
+}
+
+bool BufForceCpuCopy() {
+    return GetBufTraceConfig().force_cpu_copy;
 }
 
 bool BufTraced(VAddr addr, u64 size) {
@@ -504,7 +538,8 @@ std::pair<Buffer*, u32> BufferCache::ObtainBuffer(VAddr device_addr, u32 size, b
 std::pair<Buffer*, u32> BufferCache::ObtainBufferForImage(VAddr gpu_addr, u32 size) {
     const bool traced = BufTraced(gpu_addr, size);
     // Check if any buffer contains the full requested range.
-    const BufferId buffer_id = page_table[gpu_addr >> CACHING_PAGEBITS].buffer_id;
+    const BufferId buffer_id =
+        BufForceCpuCopy() ? BufferId{} : page_table[gpu_addr >> CACHING_PAGEBITS].buffer_id;
     if (buffer_id) {
         if (Buffer& buffer = slot_buffers[buffer_id]; buffer.IsInBounds(gpu_addr, size)) {
             const bool cpu_modified = IsRegionCpuModified(gpu_addr, size);
@@ -531,6 +566,7 @@ std::pair<Buffer*, u32> BufferCache::ObtainBufferForImage(VAddr gpu_addr, u32 si
     const auto [data, offset] = staging_buffer.Map(size, instance.StorageMinAlignment());
     memory->CopySparseMemory(gpu_addr, data, size);
     staging_buffer.Commit();
+    BufDumpGuest(gpu_addr, size);
     if (traced) {
         BufTrace(fmt::format("[buftrace] branch=cpu-copy addr={:#x} size={:#x} guest_hash={:#x}",
                              gpu_addr, size, XXH3_64bits(data, size)));
