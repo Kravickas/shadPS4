@@ -63,29 +63,6 @@ void Rasterizer::CpSync() {
                            vk::DependencyFlagBits::eByRegion, ib_barrier, {}, {});
 }
 
-void Rasterizer::EopSync(bool flush_caches) {
-    scheduler.EndRendering();
-    const auto cmdbuf = scheduler.CommandBuffer();
-
-    // An end of pipe event drains all prior work. The cache action bits additionally write
-    // back and invalidate L1/L2, making those writes visible to everything after it.
-    const vk::AccessFlags2 src_access =
-        flush_caches ? vk::AccessFlags2{vk::AccessFlagBits2::eMemoryWrite} : vk::AccessFlags2{};
-    const vk::AccessFlags2 dst_access =
-        flush_caches ? vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite
-                     : vk::AccessFlags2{};
-    const vk::MemoryBarrier2 barrier{
-        .srcStageMask = vk::PipelineStageFlagBits2::eAllCommands,
-        .srcAccessMask = src_access,
-        .dstStageMask = vk::PipelineStageFlagBits2::eAllCommands,
-        .dstAccessMask = dst_access,
-    };
-    cmdbuf.pipelineBarrier2(vk::DependencyInfo{
-        .memoryBarrierCount = 1,
-        .pMemoryBarriers = &barrier,
-    });
-}
-
 void Rasterizer::EnqueueEopFence(Common::UniqueFunction<void>&& signal) {
     scheduler.DeferPriorityOperation(std::move(signal));
     Flush();
