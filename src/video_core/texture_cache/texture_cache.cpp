@@ -1,20 +1,11 @@
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
-#include <cstdlib>
-#include <cstring>
-#include <fstream>
-#include <mutex>
-#include <string>
-#include <unordered_map>
-#include <unordered_set>
-#include <fmt/format.h>
 #include <xxhash.h>
 
 #include "common/assert.h"
 #include "common/debug.h"
 #include "common/div_ceil.h"
-#include "common/path_util.h"
 #include "common/scope_exit.h"
 #include "core/emulator_settings.h"
 #include "core/memory.h"
@@ -27,135 +18,6 @@
 #include "video_core/texture_cache/tile_manager.h"
 
 namespace VideoCore {
-
-namespace {
-
-// Debug instrumentation for tracking stale image uploads.
-// Reads <user dir>/imgtrace.txt, one directive per line:
-//     addr 0x5181630000     trace this guest address (repeatable)
-//     min  1048576          trace every image at least this many bytes
-// Absent or empty file disables it entirely.
-struct ImageTrace {
-    u64 last_upload_hash{};
-    bool ever_skipped{};
-    u64 refreshes{};
-    u64 uploads{};
-    u64 skips{};
-    u64 missed{};
-};
-
-std::mutex trace_mutex;
-std::unordered_map<VAddr, ImageTrace> trace_map;
-std::mutex trace_file_mutex;
-
-void TraceLine(const std::string& text, bool flush = false) {
-    std::scoped_lock lk{trace_file_mutex};
-    static std::ofstream file(
-        Common::FS::GetUserPath(Common::FS::PathType::UserDir) / "imgtrace.log", std::ios::trunc);
-    static u32 pending = 0;
-    file << text << '\n';
-    if (flush || ++pending >= 64) {
-        file.flush();
-        pending = 0;
-    }
-}
-
-struct TraceConfig {
-    std::unordered_set<u64> addrs;
-    u64 min_size{};
-    bool enabled{};
-};
-
-const TraceConfig& GetTraceConfig() {
-    static const TraceConfig config = [] {
-        TraceConfig cfg;
-        const auto path = Common::FS::GetUserPath(Common::FS::PathType::UserDir) / "imgtrace.txt";
-        std::ifstream file(path);
-        if (!file) {
-            return cfg;
-        }
-        std::string key;
-        std::string value;
-        while (file >> key) {
-            if (key.empty() || key[0] == '#') {
-                std::getline(file, value);
-                continue;
-            }
-            if (!(file >> value)) {
-                break;
-            }
-            const u64 parsed = std::strtoull(value.c_str(), nullptr, 0);
-            if (key == "addr") {
-                cfg.addrs.insert(parsed);
-            } else if (key == "min") {
-                cfg.min_size = parsed;
-            }
-        }
-        cfg.enabled = !cfg.addrs.empty() || cfg.min_size != 0;
-        if (cfg.enabled) {
-            TraceLine(fmt::format("[imgtrace] enabled from {}: {} address(es), min size {:#x}",
-                                  path.string(), cfg.addrs.size(), cfg.min_size));
-        }
-        return cfg;
-    }();
-    return config;
-}
-
-bool Traced(const ImageInfo& info) {
-    const auto& cfg = GetTraceConfig();
-    if (!cfg.enabled) {
-        return false;
-    }
-    if (!cfg.addrs.empty() && cfg.addrs.contains(info.guest_address)) {
-        return true;
-    }
-    return cfg.min_size != 0 && info.guest_size >= cfg.min_size;
-}
-
-bool TraceNeedsHash(VAddr addr) {
-    std::scoped_lock lk{trace_mutex};
-    const auto it = trace_map.find(addr);
-    return it != trace_map.end() && it->second.ever_skipped;
-}
-
-u64 GuestHash(const ImageInfo& info) {
-    return XXH3_64bits(std::bit_cast<u8*>(info.guest_address), info.guest_size);
-}
-
-// Records the outcome of one RefreshImage. A skip whose guest hash differs from the hash at the
-// last upload means the cache is serving pixels the guest has since overwritten.
-void TraceRefresh(const ImageInfo& info, const char* decision, u64 guest_hash, u32 flags) {
-    std::scoped_lock lk{trace_mutex};
-    auto& t = trace_map[info.guest_address];
-    const bool uploaded = std::strcmp(decision, "upload") == 0;
-    if (!uploaded) {
-        t.ever_skipped = true;
-    }
-    const bool missed =
-        !uploaded && guest_hash != 0 && t.last_upload_hash != 0 && guest_hash != t.last_upload_hash;
-    ++t.refreshes;
-    if (uploaded) {
-        ++t.uploads;
-        t.last_upload_hash = guest_hash;
-    } else {
-        ++t.skips;
-    }
-    if (missed) {
-        ++t.missed;
-        TraceLine(fmt::format(
-            "[imgtrace] MISSED WRITE addr={:#x} size={:#x} decision={} flags={:#x} "
-            "guest_hash={:#x} uploaded_hash={:#x} (refresh {} upload {} skip {} missed {})",
-            info.guest_address, info.guest_size, decision, flags, guest_hash, t.last_upload_hash,
-            t.refreshes, t.uploads, t.skips, t.missed));
-    } else {
-        TraceLine(fmt::format("[imgtrace] {} addr={:#x} size={:#x} flags={:#x} guest_hash={:#x} "
-                              "uploaded_hash={:#x}",
-                              decision, info.guest_address, info.guest_size, flags, guest_hash,
-                              t.last_upload_hash));
-    }
-}
-
-} // Anonymous namespace
 
 static constexpr u64 PageShift = 12;
 static constexpr u64 NumFramesBeforeRemoval = 32;
@@ -256,14 +118,6 @@ void TextureCache::MarkAsMaybeDirty(ImageId image_id, Image& image) {
         // Initialize hash
         const u8* addr = std::bit_cast<u8*>(image.info.guest_address);
         image.hash = XXH3_64bits(addr, image.info.guest_size);
-        if (Traced(image.info)) {
-            TraceLine(fmt::format(
-                "[imgtrace] MarkAsMaybeDirty seeded hash over FULL {:#x} bytes -> {:#x}",
-                image.info.guest_size, image.hash));
-        }
-    } else if (Traced(image.info)) {
-        TraceLine(fmt::format(
-            "[imgtrace] MarkAsMaybeDirty reusing stored hash {:#x} (NOT recomputed)", image.hash));
     }
     image.flags |= ImageFlagBits::MaybeCpuDirty;
     UntrackImage(image_id);
@@ -276,16 +130,9 @@ void TextureCache::InvalidateMemory(VAddr addr, size_t size) {
     ForEachImageInRegion(pages_start, pages_end - pages_start, [&](ImageId image_id, Image& image) {
         const auto image_begin = image.info.guest_address;
         const auto image_end = image.info.guest_address + image.info.guest_size;
-        const bool traced = Traced(image.info);
         if (image.Overlaps(addr, size)) {
             // Modified region overlaps image, so the image was definitely accessed by this fault.
             // Untrack the image, so that the range is unprotected and the guest can write freely.
-            if (traced) {
-                LOG_WARNING(
-                    Render_Vulkan,
-                    "[imgtrace] invalidate CpuDirty addr={:#x} size={:#x} write={:#x}+{:#x}",
-                    image.info.guest_address, image.info.guest_size, addr, size);
-            }
             image.flags |= ImageFlagBits::CpuDirty;
             UntrackImage(image_id);
         } else if (pages_end < image_end) {
@@ -293,31 +140,15 @@ void TextureCache::InvalidateMemory(VAddr addr, size_t size) {
             // We should not mark it as dirty now. If it really was modified
             // it will receive more invalidations on its other pages.
             // Remove tracking from this page only.
-            if (traced) {
-                TraceLine(
-                    fmt::format("[imgtrace] invalidate UntrackHead addr={:#x} write={:#x}+{:#x}",
-                                image.info.guest_address, addr, size));
-            }
             UntrackImageHead(image_id);
         } else if (image_begin < pages_start) {
             // This page access does not modify the image but the page should be untracked.
             // We should not mark this image as dirty now. If it really was modified
             // it will receive more invalidations on its other pages.
-            if (traced) {
-                TraceLine(
-                    fmt::format("[imgtrace] invalidate UntrackTail addr={:#x} write={:#x}+{:#x}",
-                                image.info.guest_address, addr, size));
-            }
             UntrackImageTail(image_id);
         } else {
             // Image begins and ends on this page so it can not receive any more invalidations.
             // We will check it's hash later to see if it really was modified.
-            if (traced) {
-                TraceLine(fmt::format("[imgtrace] invalidate MaybeCpuDirty addr={:#x} size={:#x} "
-                                      "write={:#x}+{:#x} stored_hash={:#x}",
-                                      image.info.guest_address, image.info.guest_size, addr, size,
-                                      image.hash));
-            }
             MarkAsMaybeDirty(image_id, image);
         }
     });
@@ -882,9 +713,6 @@ void TextureCache::RefreshImage(Image& image) {
         return;
     }
 
-    const bool traced = Traced(image.info);
-    const u32 trace_flags = traced ? static_cast<u32>(image.flags) : 0;
-
     RENDERER_TRACE;
     TRACE_HINT(fmt::format("{:x}:{:x}", image.info.guest_address, image.info.guest_size));
 
@@ -901,16 +729,8 @@ void TextureCache::RefreshImage(Image& image) {
         const u32 s_h = image.info.props.is_block ? Common::DivCeil(h, 4u) : h;
         const u32 size = s_w * s_h * (image.info.num_bits / 8);
         const u64 hash = XXH3_64bits(addr, size);
-        if (traced) {
-            TraceLine(fmt::format("[imgtrace] MaybeCpuDirty check hashes only {} of {:#x} bytes "
-                                  "(stored={:#x} now={:#x})",
-                                  size, image.info.guest_size, image.hash, hash));
-        }
         if (image.hash == hash) {
             image.flags &= ~ImageFlagBits::MaybeCpuDirty;
-            if (traced) {
-                TraceRefresh(image.info, "skip-hash", GuestHash(image.info), trace_flags);
-            }
             return;
         }
         image.hash = hash;
@@ -958,9 +778,6 @@ void TextureCache::RefreshImage(Image& image) {
 
     if (image_copies.empty()) {
         image.flags &= ~ImageFlagBits::Dirty;
-        if (traced) {
-            TraceRefresh(image.info, "skip-nocopies", GuestHash(image.info), trace_flags);
-        }
         return;
     }
 
@@ -984,12 +801,6 @@ void TextureCache::RefreshImage(Image& image) {
     }
 
     image.Upload(image_copies, buffer, offset);
-
-    if (traced) {
-        TraceRefresh(image.info, "upload",
-                     TraceNeedsHash(image.info.guest_address) ? GuestHash(image.info) : 0,
-                     trace_flags);
-    }
 }
 
 vk::Sampler TextureCache::GetSampler(const AmdGpu::Sampler& sampler,
