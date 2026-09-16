@@ -29,8 +29,6 @@ namespace VideoCore {
 
 namespace {
 
-// Debug instrumentation, same <user dir>/imgtrace.txt config as the texture cache.
-// Writes a separate <user dir>/buftrace.log so the two do not fight over one file.
 std::mutex buftrace_mutex;
 
 void BufTrace(const std::string& text, bool flush = false) {
@@ -96,9 +94,6 @@ const BufTraceConfig& GetBufTraceConfig() {
     return config;
 }
 
-// Writes the guest bytes backing a range to <user dir>/dump_<addr>.bin, once per address.
-// Decoding that offline shows whether the badge is present in guest memory or only in the
-// image the GPU was given.
 void BufDumpGuest(VAddr addr, u64 size) {
     const auto& cfg = GetBufTraceConfig();
     if (!cfg.dumps.contains(addr)) {

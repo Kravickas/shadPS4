@@ -9,7 +9,6 @@
 
 namespace Common {
 
-// Shared by the debug tracers so lines from different files can be ordered against each other.
 inline std::atomic<u64> trace_sequence{0};
 
 inline u64 NextTraceSeq() {

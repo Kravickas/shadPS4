@@ -48,11 +48,6 @@ namespace VideoCore {
 
 namespace {
 
-// Logs which guest instruction writes into a watched address range, so the code that composites
-// a livery sheet can be identified. Config lives in <user dir>/imgtrace.txt:
-//     riprange 0x50e0000000 0x5140000000
-// Output goes to <user dir>/riptrace.log. Each distinct RIP is reported once, then every
-// 10000th hit, so a hot write loop cannot flood the file.
 struct RipRange {
     u64 begin;
     u64 end;
@@ -118,8 +113,6 @@ std::string DescribeGuestRip(u64 rip) {
     return "<unknown>";
 }
 
-// memcpy is a single RIP serving every copy in the game, so the interesting part is who called
-// it. Driveclub's eboot keeps frame pointers, which makes an rbp chain walk reliable here.
 u64 GuestFramePointer(void* context) {
 #if defined(_WIN32)
     auto* pExp = static_cast<EXCEPTION_POINTERS*>(context);
@@ -177,7 +170,6 @@ void ReportGuestWrite(void* context, VAddr fault_address) {
         frame = next;
     }
 
-    // Key on the whole chain so different callers of the same memcpy are reported separately.
     u64 key = 0xcbf29ce484222325ULL;
     for (const u64 f : frames) {
         key = (key ^ f) * 0x100000001b3ULL;

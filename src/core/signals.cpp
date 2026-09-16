@@ -39,10 +39,6 @@ namespace Core {
 
 namespace {
 
-// Guest tracepoints. Config lines in <user dir>/imgtrace.txt:
-//     bp eboot.bin+0xdd2147
-// An int3 is written at each address and handled here, so the guest runs at full speed between
-// hits instead of being stopped by a debugger. Output goes to <user dir>/bptrace.log.
 struct Tracepoint {
     std::string spec;
     VAddr address{};
@@ -83,7 +79,6 @@ std::vector<std::string> ReadBpSpecs() {
     return out;
 }
 
-// "eboot.bin+0xdd2147" or a bare guest address.
 bool ResolveSpec(const std::string& spec, VAddr& out) {
     const auto plus = spec.find('+');
     if (plus == std::string::npos) {
@@ -113,7 +108,6 @@ void ArmTracepoints() {
     if (specs.empty()) {
         return;
     }
-    // Modules are not loaded yet when signal handling is set up, so wait for them.
     std::thread([specs] {
         for (int attempt = 0; attempt < 600; ++attempt) {
             std::this_thread::sleep_for(std::chrono::milliseconds(100));
@@ -157,7 +151,6 @@ Tracepoint* FindTracepoint(VAddr address) {
     return nullptr;
 }
 
-// Returns true when the exception was a tracepoint and execution should continue.
 bool HandleTracepoint(EXCEPTION_POINTERS* pExp, DWORD code) {
     if (!bp_ready.load(std::memory_order_relaxed) || pExp == nullptr ||
         pExp->ContextRecord == nullptr) {
@@ -178,7 +171,6 @@ bool HandleTracepoint(EXCEPTION_POINTERS* pExp, DWORD code) {
         return false;
     }
 
-    // int3 leaves rip one byte past the trap.
     const auto hit = static_cast<VAddr>(ctx.Rip) - 1;
     std::scoped_lock lk{bp_mutex};
     auto* tp = FindTracepoint(hit);
@@ -187,16 +179,18 @@ bool HandleTracepoint(EXCEPTION_POINTERS* pExp, DWORD code) {
     }
 
     ++tp->hits;
-    BpTrace(fmt::format("[bptrace] {} hit {} ax={:#06x} rax={:#x} rbx={:#x} rcx={:#x} rdx={:#x} "
-                        "rsi={:#x} rdi={:#x} rbp={:#x} rsp={:#x}",
-                        tp->spec, tp->hits, ctx.Rax & 0xFFFF, ctx.Rax, ctx.Rbx, ctx.Rcx, ctx.Rdx,
-                        ctx.Rsi, ctx.Rdi, ctx.Rbp, ctx.Rsp));
+    BpTrace(fmt::format("[bptrace] {} hit {} rax={:#x} rbx={:#x} rcx={:#x} rdx={:#x} rsi={:#x} "
+                        "rdi={:#x} rbp={:#x} rsp={:#x} r8={:#x} r9={:#x} r10={:#x} r11={:#x} "
+                        "r12={:#x} r13={:#x} r14={:#x} r15={:#x}",
+                        tp->spec, tp->hits, ctx.Rax, ctx.Rbx, ctx.Rcx, ctx.Rdx, ctx.Rsi, ctx.Rdi,
+                        ctx.Rbp, ctx.Rsp, ctx.R8, ctx.R9, ctx.R10, ctx.R11, ctx.R12, ctx.R13,
+                        ctx.R14, ctx.R15));
 
     *std::bit_cast<u8*>(tp->address) = tp->original;
     tp->armed = false;
     bp_stepping = tp;
     ctx.Rip = tp->address;
-    ctx.EFlags |= 0x100u; // single step over the restored instruction, then re-arm
+    ctx.EFlags |= 0x100u;
     return true;
 }
 
