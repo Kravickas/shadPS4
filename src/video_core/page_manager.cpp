@@ -1,12 +1,21 @@
 // SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <cstdlib>
+#include <fstream>
+#include <mutex>
+#include <string>
+#include <unordered_map>
+#include <vector>
 #include <boost/container/small_vector.hpp>
+#include <fmt/format.h>
 #include "common/assert.h"
 #include "common/debug.h"
 #include "common/div_ceil.h"
+#include "common/path_util.h"
 #include "common/range_lock.h"
 #include "common/signal_context.h"
+#include "core/linker.h"
 #include "core/memory.h"
 #include "core/signals.h"
 #include "video_core/page_manager.h"
@@ -35,6 +44,96 @@
 #endif
 
 namespace VideoCore {
+
+namespace {
+
+// Logs which guest instruction writes into a watched address range, so the code that composites
+// a livery sheet can be identified. Config lives in <user dir>/imgtrace.txt:
+//     riprange 0x50e0000000 0x5140000000
+// Output goes to <user dir>/riptrace.log. Each distinct RIP is reported once, then every
+// 10000th hit, so a hot write loop cannot flood the file.
+struct RipRange {
+    u64 begin;
+    u64 end;
+};
+
+std::mutex riptrace_mutex;
+
+void RipTrace(const std::string& text) {
+    std::scoped_lock lk{riptrace_mutex};
+    static std::ofstream file(
+        Common::FS::GetUserPath(Common::FS::PathType::UserDir) / "riptrace.log", std::ios::trunc);
+    file << text << '\n';
+    file.flush();
+}
+
+const std::vector<RipRange>& GetRipRanges() {
+    static const std::vector<RipRange> ranges = [] {
+        std::vector<RipRange> out;
+        std::ifstream file(Common::FS::GetUserPath(Common::FS::PathType::UserDir) / "imgtrace.txt");
+        std::string key;
+        std::string lo;
+        std::string hi;
+        while (file >> key) {
+            if (key != "riprange") {
+                std::getline(file, lo);
+                continue;
+            }
+            if (!(file >> lo) || !(file >> hi)) {
+                break;
+            }
+            out.push_back(
+                {std::strtoull(lo.c_str(), nullptr, 0), std::strtoull(hi.c_str(), nullptr, 0)});
+        }
+        if (!out.empty()) {
+            RipTrace(fmt::format("[riptrace] {} range(s) armed", out.size()));
+            for (const auto& r : out) {
+                RipTrace(fmt::format("[riptrace]   {:#x} - {:#x}", r.begin, r.end));
+            }
+        }
+        return out;
+    }();
+    return ranges;
+}
+
+bool InRipRange(VAddr addr) {
+    for (const auto& r : GetRipRanges()) {
+        if (addr >= r.begin && addr < r.end) {
+            return true;
+        }
+    }
+    return false;
+}
+
+std::string DescribeGuestRip(u64 rip) {
+    auto* linker = Common::Singleton<Core::Linker>::Instance();
+    if (linker != nullptr) {
+        if (auto* module = linker->FindByAddress(rip); module != nullptr) {
+            return fmt::format("{}+{:#x}", module->name, rip - module->GetBaseAddress());
+        }
+    }
+    return "<unknown>";
+}
+
+void ReportGuestWrite(void* context, VAddr fault_address) {
+    if (GetRipRanges().empty() || !InRipRange(fault_address)) {
+        return;
+    }
+    const auto rip = reinterpret_cast<u64>(Common::GetRip(context));
+    static std::mutex counter_mutex;
+    static std::unordered_map<u64, u64> hits;
+    u64 count = 0;
+    {
+        std::scoped_lock lk{counter_mutex};
+        count = ++hits[rip];
+    }
+    if (count == 1 || count % 10000 == 0) {
+        RipTrace(fmt::format("[riptrace] rip={:#x} {} wrote {:#x}  (hit {})", rip,
+                             DescribeGuestRip(rip), fault_address, count));
+    }
+}
+
+} // Anonymous namespace
 
 constexpr size_t PM_PAGE_SIZE = 4_KB;
 constexpr size_t PM_PAGE_BITS = 12;
@@ -210,6 +309,7 @@ struct PageManager::Impl {
     static bool GuestFaultSignalHandler(void* context, void* fault_address) {
         const auto addr = reinterpret_cast<VAddr>(fault_address);
         if (Common::IsWriteError(context)) {
+            ReportGuestWrite(context, addr);
             return rasterizer->InvalidateMemory(addr, 8);
         } else {
             return rasterizer->ReadMemory(addr, 8);
