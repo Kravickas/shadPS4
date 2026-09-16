@@ -115,22 +115,86 @@ std::string DescribeGuestRip(u64 rip) {
     return "<unknown>";
 }
 
+// memcpy is a single RIP serving every copy in the game, so the interesting part is who called
+// it. Driveclub's eboot keeps frame pointers, which makes an rbp chain walk reliable here.
+u64 GuestFramePointer(void* context) {
+#if defined(_WIN32)
+    auto* pExp = static_cast<EXCEPTION_POINTERS*>(context);
+    if (pExp == nullptr || pExp->ContextRecord == nullptr) {
+        return 0;
+    }
+    return pExp->ContextRecord->Rbp;
+#else
+    return 0;
+#endif
+}
+
+bool ReadableQword(u64 address, u64& out) {
+#if defined(_WIN32)
+    MEMORY_BASIC_INFORMATION mbi{};
+    if (VirtualQuery(reinterpret_cast<const void*>(address), &mbi, sizeof(mbi)) != sizeof(mbi)) {
+        return false;
+    }
+    constexpr DWORD readable = PAGE_READONLY | PAGE_READWRITE | PAGE_WRITECOPY | PAGE_EXECUTE_READ |
+                               PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY;
+    if (mbi.State != MEM_COMMIT || (mbi.Protect & readable) == 0 ||
+        (mbi.Protect & PAGE_GUARD) != 0) {
+        return false;
+    }
+    const auto end = reinterpret_cast<u64>(mbi.BaseAddress) + mbi.RegionSize;
+    if (address + sizeof(u64) > end) {
+        return false;
+    }
+    out = *reinterpret_cast<const u64*>(address);
+    return true;
+#else
+    return false;
+#endif
+}
+
 void ReportGuestWrite(void* context, VAddr fault_address) {
     if (GetRipRanges().empty() || !InRipRange(fault_address)) {
         return;
     }
     const auto rip = reinterpret_cast<u64>(Common::GetRip(context));
+
+    std::vector<u64> frames;
+    frames.push_back(rip);
+    u64 frame = GuestFramePointer(context);
+    for (int depth = 0; depth < 6 && frame != 0; ++depth) {
+        u64 next = 0;
+        u64 ret = 0;
+        if (!ReadableQword(frame, next) || !ReadableQword(frame + 8, ret)) {
+            break;
+        }
+        if (next <= frame || ret == 0) {
+            break;
+        }
+        frames.push_back(ret);
+        frame = next;
+    }
+
+    // Key on the whole chain so different callers of the same memcpy are reported separately.
+    u64 key = 0xcbf29ce484222325ULL;
+    for (const u64 f : frames) {
+        key = (key ^ f) * 0x100000001b3ULL;
+    }
+
     static std::mutex counter_mutex;
     static std::unordered_map<u64, u64> hits;
     u64 count = 0;
     {
         std::scoped_lock lk{counter_mutex};
-        count = ++hits[rip];
+        count = ++hits[key];
     }
-    if (count == 1 || count % 10000 == 0) {
-        RipTrace(fmt::format("[riptrace] rip={:#x} {} wrote {:#x}  (hit {})", rip,
-                             DescribeGuestRip(rip), fault_address, count));
+    if (count != 1 && count % 50000 != 0) {
+        return;
     }
+    std::string chain;
+    for (size_t i = 0; i < frames.size(); ++i) {
+        chain += fmt::format("{}{}", i == 0 ? "" : " <- ", DescribeGuestRip(frames[i]));
+    }
+    RipTrace(fmt::format("[riptrace] wrote {:#x} (hit {})  {}", fault_address, count, chain));
 }
 
 } // Anonymous namespace
