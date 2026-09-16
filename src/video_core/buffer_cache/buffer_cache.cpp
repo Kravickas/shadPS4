@@ -15,6 +15,7 @@
 #include "common/debug.h"
 #include "common/path_util.h"
 #include "common/scope_exit.h"
+#include "common/trace_seq.h"
 #include "core/memory.h"
 #include "video_core/amdgpu/liverpool.h"
 #include "video_core/buffer_cache/buffer_cache.h"
@@ -28,14 +29,18 @@ namespace VideoCore {
 
 namespace {
 
+// Debug instrumentation, same <user dir>/imgtrace.txt config as the texture cache.
+// Writes a separate <user dir>/buftrace.log so the two do not fight over one file.
 std::mutex buftrace_mutex;
 
 void BufTrace(const std::string& text, bool flush = false) {
+    const auto seq = Common::NextTraceSeq();
+    const auto tid = Common::TraceThreadId();
     std::scoped_lock lk{buftrace_mutex};
     static std::ofstream file(
         Common::FS::GetUserPath(Common::FS::PathType::UserDir) / "buftrace.log", std::ios::trunc);
     static u32 pending = 0;
-    file << text << '\n';
+    file << fmt::format("[{:010}][t{:02}] ", seq, tid) << text << '\n';
     if (flush || ++pending >= 64) {
         file.flush();
         pending = 0;

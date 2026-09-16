@@ -824,6 +824,7 @@ set(COMMON src/common/logging/classes.h
            src/common/string_util.cpp
            src/common/string_util.h
            src/common/thread.cpp
+           src/common/trace_seq.h
            src/common/thread.h
            src/common/types.h
            src/common/uint128.h

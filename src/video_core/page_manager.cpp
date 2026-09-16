@@ -15,6 +15,7 @@
 #include "common/path_util.h"
 #include "common/range_lock.h"
 #include "common/signal_context.h"
+#include "common/trace_seq.h"
 #include "core/linker.h"
 #include "core/memory.h"
 #include "core/signals.h"
@@ -60,10 +61,12 @@ struct RipRange {
 std::mutex riptrace_mutex;
 
 void RipTrace(const std::string& text) {
+    const auto seq = Common::NextTraceSeq();
+    const auto tid = Common::TraceThreadId();
     std::scoped_lock lk{riptrace_mutex};
     static std::ofstream file(
         Common::FS::GetUserPath(Common::FS::PathType::UserDir) / "riptrace.log", std::ios::trunc);
-    file << text << '\n';
+    file << fmt::format("[{:010}][t{:02}] ", seq, tid) << text << '\n';
     file.flush();
 }
 
