@@ -44,6 +44,7 @@ struct Tracepoint {
     VAddr address{};
     u8 original{};
     u64 hits{};
+    u64 concurrent{};
     bool armed{};
 };
 
@@ -178,17 +179,22 @@ bool HandleTracepoint(EXCEPTION_POINTERS* pExp, DWORD code) {
     const auto hit = static_cast<VAddr>(ctx.Rip) - 1;
     std::unique_lock lock{bp_mutex};
     auto* tp = FindTracepoint(hit);
-    if (tp == nullptr || !tp->armed) {
+    if (tp == nullptr) {
         return false;
+    }
+    if (!tp->armed) {
+        ++tp->concurrent;
+        ctx.Rip = tp->address;
+        return true;
     }
 
     ++tp->hits;
     const auto line = fmt::format(
-        "[bptrace] {} hit {} rax={:#x} rbx={:#x} rcx={:#x} rdx={:#x} rsi={:#x} "
+        "[bptrace] {} hit {} (concurrent {}) rax={:#x} rbx={:#x} rcx={:#x} rdx={:#x} rsi={:#x} "
         "rdi={:#x} rbp={:#x} rsp={:#x} r8={:#x} r9={:#x} r10={:#x} r11={:#x} "
         "r12={:#x} r13={:#x} r14={:#x} r15={:#x}",
-        tp->spec, tp->hits, ctx.Rax, ctx.Rbx, ctx.Rcx, ctx.Rdx, ctx.Rsi, ctx.Rdi, ctx.Rbp, ctx.Rsp,
-        ctx.R8, ctx.R9, ctx.R10, ctx.R11, ctx.R12, ctx.R13, ctx.R14, ctx.R15);
+        tp->spec, tp->hits, tp->concurrent, ctx.Rax, ctx.Rbx, ctx.Rcx, ctx.Rdx, ctx.Rsi, ctx.Rdi,
+        ctx.Rbp, ctx.Rsp, ctx.R8, ctx.R9, ctx.R10, ctx.R11, ctx.R12, ctx.R13, ctx.R14, ctx.R15);
 
     *std::bit_cast<u8*>(tp->address) = tp->original;
     tp->armed = false;
