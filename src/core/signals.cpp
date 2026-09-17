@@ -176,9 +176,18 @@ bool HandleTracepoint(EXCEPTION_POINTERS* pExp, DWORD code) {
         return false;
     }
 
-    const auto hit = static_cast<VAddr>(ctx.Rip) - 1;
     std::unique_lock lock{bp_mutex};
-    auto* tp = FindTracepoint(hit);
+    Tracepoint* tp = nullptr;
+    if (pExp->ExceptionRecord != nullptr) {
+        tp = FindTracepoint(static_cast<VAddr>(
+            reinterpret_cast<uintptr_t>(pExp->ExceptionRecord->ExceptionAddress)));
+    }
+    if (tp == nullptr) {
+        tp = FindTracepoint(static_cast<VAddr>(ctx.Rip) - 1);
+    }
+    if (tp == nullptr) {
+        tp = FindTracepoint(static_cast<VAddr>(ctx.Rip));
+    }
     if (tp == nullptr) {
         return false;
     }
