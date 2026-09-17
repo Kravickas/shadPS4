@@ -49,7 +49,6 @@ struct Tracepoint {
 
 std::mutex bp_mutex;
 std::vector<Tracepoint> bp_list;
-std::atomic<bool> bp_ready{false};
 thread_local Tracepoint* bp_stepping = nullptr;
 
 void BpTrace(const std::string& text) {
@@ -125,17 +124,23 @@ void ArmTracepoints() {
             if (!all) {
                 continue;
             }
-            std::scoped_lock lk{bp_mutex};
-            bp_list = std::move(resolved);
-            for (auto& tp : bp_list) {
-                auto* code = std::bit_cast<u8*>(tp.address);
-                tp.original = *code;
-                *code = 0xCC;
-                tp.armed = true;
-                BpTrace(fmt::format("[bptrace] armed {} at {:#x} (original byte {:#04x})", tp.spec,
+            std::vector<std::string> notes;
+            {
+                std::scoped_lock lk{bp_mutex};
+                bp_list = std::move(resolved);
+                for (auto& tp : bp_list) {
+                    auto* code = std::bit_cast<u8*>(tp.address);
+                    tp.original = *code;
+                    *code = 0xCC;
+                    tp.armed = true;
+                    notes.push_back(
+                        fmt::format("[bptrace] armed {} at {:#x} (original byte {:#04x})", tp.spec,
                                     tp.address, tp.original));
+                }
             }
-            bp_ready = true;
+            for (const auto& note : notes) {
+                BpTrace(note);
+            }
             return;
         }
         BpTrace("[bptrace] gave up waiting for modules");
@@ -152,14 +157,13 @@ Tracepoint* FindTracepoint(VAddr address) {
 }
 
 bool HandleTracepoint(EXCEPTION_POINTERS* pExp, DWORD code) {
-    if (!bp_ready.load(std::memory_order_relaxed) || pExp == nullptr ||
-        pExp->ContextRecord == nullptr) {
+    if (pExp == nullptr || pExp->ContextRecord == nullptr) {
         return false;
     }
     auto& ctx = *pExp->ContextRecord;
 
     if (code == EXCEPTION_SINGLE_STEP && bp_stepping != nullptr) {
-        std::scoped_lock lk{bp_mutex};
+        std::scoped_lock step_lock{bp_mutex};
         *std::bit_cast<u8*>(bp_stepping->address) = 0xCC;
         bp_stepping->armed = true;
         bp_stepping = nullptr;
@@ -172,25 +176,27 @@ bool HandleTracepoint(EXCEPTION_POINTERS* pExp, DWORD code) {
     }
 
     const auto hit = static_cast<VAddr>(ctx.Rip) - 1;
-    std::scoped_lock lk{bp_mutex};
+    std::unique_lock lock{bp_mutex};
     auto* tp = FindTracepoint(hit);
     if (tp == nullptr || !tp->armed) {
         return false;
     }
 
     ++tp->hits;
-    BpTrace(fmt::format("[bptrace] {} hit {} rax={:#x} rbx={:#x} rcx={:#x} rdx={:#x} rsi={:#x} "
-                        "rdi={:#x} rbp={:#x} rsp={:#x} r8={:#x} r9={:#x} r10={:#x} r11={:#x} "
-                        "r12={:#x} r13={:#x} r14={:#x} r15={:#x}",
-                        tp->spec, tp->hits, ctx.Rax, ctx.Rbx, ctx.Rcx, ctx.Rdx, ctx.Rsi, ctx.Rdi,
-                        ctx.Rbp, ctx.Rsp, ctx.R8, ctx.R9, ctx.R10, ctx.R11, ctx.R12, ctx.R13,
-                        ctx.R14, ctx.R15));
+    const auto line = fmt::format(
+        "[bptrace] {} hit {} rax={:#x} rbx={:#x} rcx={:#x} rdx={:#x} rsi={:#x} "
+        "rdi={:#x} rbp={:#x} rsp={:#x} r8={:#x} r9={:#x} r10={:#x} r11={:#x} "
+        "r12={:#x} r13={:#x} r14={:#x} r15={:#x}",
+        tp->spec, tp->hits, ctx.Rax, ctx.Rbx, ctx.Rcx, ctx.Rdx, ctx.Rsi, ctx.Rdi, ctx.Rbp, ctx.Rsp,
+        ctx.R8, ctx.R9, ctx.R10, ctx.R11, ctx.R12, ctx.R13, ctx.R14, ctx.R15);
 
     *std::bit_cast<u8*>(tp->address) = tp->original;
     tp->armed = false;
     bp_stepping = tp;
     ctx.Rip = tp->address;
     ctx.EFlags |= 0x100u;
+    lock.unlock();
+    BpTrace(line);
     return true;
 }
 
