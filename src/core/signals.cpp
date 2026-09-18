@@ -6,8 +6,10 @@
 #include <cstdlib>
 #include <fstream>
 #include <mutex>
+#include <sstream>
 #include <string>
 #include <thread>
+#include <unordered_map>
 #include <vector>
 #include <fmt/format.h>
 #include "common/arch.h"
@@ -41,6 +43,8 @@ namespace {
 
 struct Tracepoint {
     std::string spec;
+    std::string dump_reg;
+    u32 dump_len{};
     VAddr address{};
     u8 original{};
     u64 hits{};
@@ -61,20 +65,71 @@ void BpTrace(const std::string& text) {
     file.flush();
 }
 
-std::vector<std::string> ReadBpSpecs() {
-    std::vector<std::string> out;
+struct BpSpec {
+    std::string spec;
+    std::string reg;
+    u32 len{};
+};
+
+std::vector<BpSpec> ReadBpSpecs() {
+    std::vector<BpSpec> out;
     std::ifstream file(Common::FS::GetUserPath(Common::FS::PathType::UserDir) / "imgtrace.txt");
-    std::string key;
-    std::string value;
-    while (file >> key) {
-        if (key != "bp") {
-            std::getline(file, value);
+    std::string line;
+    while (std::getline(file, line)) {
+        std::istringstream stream(line);
+        std::string key;
+        if (!(stream >> key) || key != "bp") {
             continue;
         }
-        if (!(file >> value)) {
-            break;
+        BpSpec bp;
+        if (!(stream >> bp.spec)) {
+            continue;
         }
-        out.push_back(value);
+        if (stream >> bp.reg) {
+            std::string len;
+            bp.len = (stream >> len) ? static_cast<u32>(std::strtoul(len.c_str(), nullptr, 0)) : 32;
+        }
+        out.push_back(bp);
+    }
+    return out;
+}
+
+u64 RegisterByName(const CONTEXT& ctx, const std::string& name) {
+    static const std::unordered_map<std::string, u64 CONTEXT::*> table{
+        {"rax", &CONTEXT::Rax}, {"rbx", &CONTEXT::Rbx}, {"rcx", &CONTEXT::Rcx},
+        {"rdx", &CONTEXT::Rdx}, {"rsi", &CONTEXT::Rsi}, {"rdi", &CONTEXT::Rdi},
+        {"rbp", &CONTEXT::Rbp}, {"rsp", &CONTEXT::Rsp}, {"r8", &CONTEXT::R8},
+        {"r9", &CONTEXT::R9},   {"r10", &CONTEXT::R10}, {"r11", &CONTEXT::R11},
+        {"r12", &CONTEXT::R12}, {"r13", &CONTEXT::R13}, {"r14", &CONTEXT::R14},
+        {"r15", &CONTEXT::R15},
+    };
+    const auto it = table.find(name);
+    return it == table.end() ? 0 : ctx.*(it->second);
+}
+
+std::string DumpAt(u64 address, u32 len) {
+    if (address == 0 || len == 0) {
+        return {};
+    }
+    MEMORY_BASIC_INFORMATION mbi{};
+    if (VirtualQuery(reinterpret_cast<const void*>(address), &mbi, sizeof(mbi)) != sizeof(mbi)) {
+        return " mem=<unreadable>";
+    }
+    constexpr DWORD readable = PAGE_READONLY | PAGE_READWRITE | PAGE_WRITECOPY | PAGE_EXECUTE_READ |
+                               PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY;
+    if (mbi.State != MEM_COMMIT || (mbi.Protect & readable) == 0 ||
+        (mbi.Protect & PAGE_GUARD) != 0) {
+        return " mem=<unreadable>";
+    }
+    const auto end = reinterpret_cast<u64>(mbi.BaseAddress) + mbi.RegionSize;
+    const auto avail = static_cast<u32>(std::min<u64>(len, end - address));
+    const auto* bytes = reinterpret_cast<const u8*>(address);
+    std::string out = " mem=";
+    for (u32 i = 0; i < avail; ++i) {
+        out += fmt::format("{:02x}", bytes[i]);
+        if ((i & 7) == 7 && i + 1 < avail) {
+            out += '_';
+        }
     }
     return out;
 }
@@ -113,10 +168,12 @@ void ArmTracepoints() {
             std::this_thread::sleep_for(std::chrono::milliseconds(100));
             std::vector<Tracepoint> resolved;
             bool all = true;
-            for (const auto& spec : specs) {
+            for (const auto& bp : specs) {
                 Tracepoint tp;
-                tp.spec = spec;
-                if (!ResolveSpec(spec, tp.address)) {
+                tp.spec = bp.spec;
+                tp.dump_reg = bp.reg;
+                tp.dump_len = bp.len;
+                if (!ResolveSpec(bp.spec, tp.address)) {
                     all = false;
                     break;
                 }
