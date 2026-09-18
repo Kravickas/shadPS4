@@ -686,10 +686,9 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 if (rasterizer) {
                     rasterizer->ProcessDownloadImages();
                     rasterizer->LogEopFence(event_eop->Address<void>(), event_eop->DataQWord());
-                    rasterizer->EnqueueEopFence(std::move(signal));
-                } else {
-                    signal();
+                    rasterizer->Flush();
                 }
+                signal();
                 break;
             }
             case PM4ItOpcode::DmaData: {
