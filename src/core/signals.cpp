@@ -191,9 +191,11 @@ void ArmTracepoints() {
                     tp.original = *code;
                     *code = 0xCC;
                     tp.armed = true;
-                    notes.push_back(
-                        fmt::format("[bptrace] armed {} at {:#x} (original byte {:#04x})", tp.spec,
-                                    tp.address, tp.original));
+                    notes.push_back(fmt::format(
+                        "[bptrace] armed {} at {:#x} (original byte {:#04x}) dump={}", tp.spec,
+                        tp.address, tp.original,
+                        tp.dump_reg.empty() ? std::string{"none"}
+                                            : fmt::format("{}/{}", tp.dump_reg, tp.dump_len)));
                 }
             }
             for (const auto& note : notes) {
@@ -255,12 +257,16 @@ bool HandleTracepoint(EXCEPTION_POINTERS* pExp, DWORD code) {
     }
 
     ++tp->hits;
-    const auto line = fmt::format(
-        "[bptrace] {} hit {} (concurrent {}) rax={:#x} rbx={:#x} rcx={:#x} rdx={:#x} rsi={:#x} "
-        "rdi={:#x} rbp={:#x} rsp={:#x} r8={:#x} r9={:#x} r10={:#x} r11={:#x} "
-        "r12={:#x} r13={:#x} r14={:#x} r15={:#x}",
-        tp->spec, tp->hits, tp->concurrent, ctx.Rax, ctx.Rbx, ctx.Rcx, ctx.Rdx, ctx.Rsi, ctx.Rdi,
-        ctx.Rbp, ctx.Rsp, ctx.R8, ctx.R9, ctx.R10, ctx.R11, ctx.R12, ctx.R13, ctx.R14, ctx.R15);
+    const auto line =
+        fmt::format(
+            "[bptrace] {} hit {} (concurrent {}) rax={:#x} rbx={:#x} rcx={:#x} rdx={:#x} rsi={:#x} "
+            "rdi={:#x} rbp={:#x} rsp={:#x} r8={:#x} r9={:#x} r10={:#x} r11={:#x} "
+            "r12={:#x} r13={:#x} r14={:#x} r15={:#x}",
+            tp->spec, tp->hits, tp->concurrent, ctx.Rax, ctx.Rbx, ctx.Rcx, ctx.Rdx, ctx.Rsi,
+            ctx.Rdi, ctx.Rbp, ctx.Rsp, ctx.R8, ctx.R9, ctx.R10, ctx.R11, ctx.R12, ctx.R13, ctx.R14,
+            ctx.R15) +
+        (tp->dump_reg.empty() ? std::string{}
+                              : DumpAt(RegisterByName(ctx, tp->dump_reg), tp->dump_len));
 
     *std::bit_cast<u8*>(tp->address) = tp->original;
     tp->armed = false;
