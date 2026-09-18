@@ -1,7 +1,11 @@
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <fstream>
+#include <mutex>
 #include "common/debug.h"
+#include "common/path_util.h"
+#include "common/trace_seq.h"
 #include "core/debug_state.h"
 #include "core/emulator_settings.h"
 #include "core/memory.h"
@@ -49,6 +53,33 @@ Rasterizer::Rasterizer(const Instance& instance_, Scheduler& scheduler_,
 }
 
 Rasterizer::~Rasterizer() = default;
+
+namespace {
+
+std::mutex eop_trace_mutex;
+
+void EopTrace(const std::string& text) {
+    const auto seq = Common::NextTraceSeq();
+    const auto tid = Common::TraceThreadId();
+    std::scoped_lock lk{eop_trace_mutex};
+    static std::ofstream file(
+        Common::FS::GetUserPath(Common::FS::PathType::UserDir) / "eoptrace.log", std::ios::trunc);
+    file << fmt::format("[{:010}][t{:02}] ", seq, tid) << text << '\n';
+    file.flush();
+}
+
+} // Anonymous namespace
+
+void Rasterizer::LogEopFence(const void* address, u64 data) {
+    const auto current = scheduler.CurrentTick();
+    const auto known = scheduler.GetMasterSemaphore()->KnownGpuTick();
+    scheduler.GetMasterSemaphore()->Refresh();
+    const auto refreshed = scheduler.GetMasterSemaphore()->KnownGpuTick();
+    EopTrace(fmt::format(
+        "[eop] addr={} data={:#x} cpu_tick={} gpu_tick={} after_refresh={} outstanding={}",
+        fmt::ptr(address), data, current, known, refreshed,
+        current > refreshed ? current - refreshed : 0));
+}
 
 void Rasterizer::CpSync() {
     scheduler.EndRendering();

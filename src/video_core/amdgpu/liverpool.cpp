@@ -675,6 +675,7 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 const auto* event_eop = reinterpret_cast<const PM4CmdEventWriteEop*>(header);
                 if (rasterizer) {
                     rasterizer->ProcessDownloadImages();
+                    rasterizer->LogEopFence(event_eop->Address<void>(), event_eop->DataQWord());
                 }
                 event_eop->SignalFence(
                     [](void* address, u64 data, u32 num_bytes) {

@@ -76,6 +76,7 @@ public:
     void UnmapMemory(VAddr addr, u64 size);
 
     void CpSync();
+    void LogEopFence(const void* address, u64 data);
     u64 Flush();
     void Finish();
     void OnSubmit();
