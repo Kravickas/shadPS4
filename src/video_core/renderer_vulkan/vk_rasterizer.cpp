@@ -70,6 +70,11 @@ void EopTrace(const std::string& text) {
 
 } // Anonymous namespace
 
+void Rasterizer::EnqueueEopFence(Common::UniqueFunction<void>&& signal) {
+    scheduler.DeferPriorityOperation(std::move(signal));
+    Flush();
+}
+
 void Rasterizer::LogEopFence(const void* address, u64 data) {
     const auto current = scheduler.CurrentTick();
     const auto known = scheduler.GetMasterSemaphore()->KnownGpuTick();
