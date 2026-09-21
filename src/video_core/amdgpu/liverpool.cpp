@@ -254,8 +254,15 @@ Liverpool::Task Liverpool::ProcessCeUpdate(std::span<const u32> ccb) {
                              trailing ? ibtrace::DecodeFollowing(raw + total, trailing, 6)
                                       : std::string("<none>"));
             }
-            auto task =
-                ProcessCeUpdate({indirect_buffer->Address<const u32>(), indirect_buffer->ib_size});
+            const std::span<const u32> ib{indirect_buffer->Address<const u32>(),
+                                          indirect_buffer->ib_size};
+            if (indirect_buffer->chain != 0) {
+                LOG_CRITICAL(Lib_GnmDriver, "ibtrace CE-JUMP to={:#x} dw={}",
+                             reinterpret_cast<uintptr_t>(ib.data()), ib.size());
+                ccb = ib;
+                continue;
+            }
+            auto task = ProcessCeUpdate(ib);
             RESUME_CE(task);
 
             while (!task.handle.done()) {
@@ -294,7 +301,7 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
         RESUME_GFX(ce_task);
     }
 
-    const auto base_addr = reinterpret_cast<uintptr_t>(dcb.data());
+    auto base_addr = reinterpret_cast<uintptr_t>(dcb.data());
     while (!dcb.empty()) {
         ProcessCommands();
 
@@ -881,12 +888,21 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                         trailing ? ibtrace::DecodeFollowing(raw + total, trailing, 6)
                                  : std::string("<none>"));
                 }
+                const std::span<const u32> ib{indirect_buffer->Address<const u32>(),
+                                              indirect_buffer->ib_size};
+                if (indirect_buffer->chain != 0) {
+                    LOG_CRITICAL(Lib_GnmDriver, "ibtrace JUMP d={} from={:#x} to={:#x} dw={}",
+                                 ibtrace_depth, reinterpret_cast<uintptr_t>(header),
+                                 reinterpret_cast<uintptr_t>(ib.data()), ib.size());
+                    dcb = ib;
+                    base_addr = reinterpret_cast<uintptr_t>(dcb.data());
+                    continue;
+                }
                 const u32 ibtrace_pre[4] = {reinterpret_cast<const volatile u32*>(header)[0],
                                             reinterpret_cast<const volatile u32*>(header)[1],
                                             reinterpret_cast<const volatile u32*>(header)[2],
                                             reinterpret_cast<const volatile u32*>(header)[3]};
-                auto task = ProcessGraphics(
-                    {indirect_buffer->Address<const u32>(), indirect_buffer->ib_size}, {});
+                auto task = ProcessGraphics(ib, {});
                 RESUME_GFX(task);
 
                 while (!task.handle.done()) {
@@ -1039,8 +1055,16 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
         }
         case PM4ItOpcode::IndirectBuffer: {
             const auto* indirect_buffer = reinterpret_cast<const PM4CmdIndirectBuffer*>(header);
-            auto task = ProcessCompute<true>(
-                {indirect_buffer->Address<const u32>(), indirect_buffer->ib_size}, vqid);
+            const std::span<const u32> ib{indirect_buffer->Address<const u32>(),
+                                          indirect_buffer->ib_size};
+            LOG_CRITICAL(Lib_GnmDriver, "ibtrace CMP-IB at={:#x} chain={} dw={} is_indirect={}",
+                         reinterpret_cast<uintptr_t>(header), indirect_buffer->chain.Value(),
+                         ib.size(), is_indirect);
+            if (indirect_buffer->chain != 0) {
+                acb = ib;
+                continue;
+            }
+            auto task = ProcessCompute<true>(ib, vqid);
             RESUME_ASC(task, vqid);
 
             while (!task.handle.done()) {
