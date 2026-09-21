@@ -1,7 +1,10 @@
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <atomic>
+#include <string>
 #include <boost/preprocessor/stringize.hpp>
+#include <fmt/format.h>
 
 #include "common/assert.h"
 #include "common/debug.h"
@@ -51,6 +54,42 @@ static const char* acb_task_name[] = NAME_ARRAY(ACB_TASK, MAX_NAMES);
 
 std::array<u8, 48_KB> Liverpool::ConstantEngine::constants_heap;
 
+namespace ibtrace {
+thread_local int depth = 0;
+std::atomic<u64> submit_id{0};
+uintptr_t prev_submit_end = 0;
+
+// Decode up to `count` packets starting at `p`, bounded by `remaining` dwords.
+static std::string DecodeFollowing(const u32* p, size_t remaining, int count) {
+    std::string out;
+    size_t off = 0;
+    for (int i = 0; i < count && off < remaining; ++i) {
+        const u32 raw = p[off];
+        const u32 type = raw >> 30;
+        if (type == 3) {
+            const u32 op = (raw >> 8) & 0xff;
+            const u32 cnt = (raw >> 16) & 0x3fff;
+            out += fmt::format("[+{} t3 op={:#04x} cnt={} tot={}]", off, op, cnt, cnt + 2);
+            off += cnt + 2;
+        } else if (type == 2) {
+            out += fmt::format("[+{} t2 nop]", off);
+            off += 1;
+        } else if (type == 0) {
+            const u32 cnt = (raw >> 16) & 0x3fff;
+            out += fmt::format("[+{} t0 base={} cnt={}]", off, raw & 0xffff, cnt);
+            off += cnt + 2;
+        } else {
+            out += fmt::format("[+{} t1 raw={:#010x}]", off, raw);
+            off += 1;
+        }
+    }
+    if (out.empty()) {
+        out = "<none>";
+    }
+    return out;
+}
+} // namespace ibtrace
+
 static std::span<const u32> NextPacket(std::span<const u32> span, size_t offset) {
     if (offset > span.size()) {
         LOG_ERROR(
@@ -58,6 +97,12 @@ static std::span<const u32> NextPacket(std::span<const u32> span, size_t offset)
             ": packet length exceeds remaining submission size. Packet dword count={}, remaining "
             "submission dwords={}",
             offset, span.size());
+        LOG_CRITICAL(Lib_GnmDriver,
+                     "ibtrace OVERRUN: span_base={:#x} span_dw={} want={} first_dw={:#010x} "
+                     "following={}",
+                     reinterpret_cast<uintptr_t>(span.data()), span.size(), offset,
+                     span.empty() ? 0u : span[0],
+                     ibtrace::DecodeFollowing(span.data(), span.size(), 4));
         // Return empty subspan so check for next packet bails out
         return {};
     }
@@ -194,6 +239,21 @@ Liverpool::Task Liverpool::ProcessCeUpdate(std::span<const u32> ccb) {
         }
         case PM4ItOpcode::IndirectBufferConst: {
             const auto* indirect_buffer = reinterpret_cast<const PM4CmdIndirectBuffer*>(header);
+            {
+                const auto* raw = reinterpret_cast<const u32*>(header);
+                const u32 total = header->type3.NumWords() + 1;
+                const size_t trailing = ccb.size() > total ? ccb.size() - total : 0;
+                LOG_CRITICAL(Lib_GnmDriver,
+                             "ibtrace CE-IB at={:#x} ccb_dw={} pkt=[{:08x} {:08x} {:08x} {:08x}] "
+                             "chain={} valid={} size={} target={:#x} trailing_dw={} following={}",
+                             reinterpret_cast<uintptr_t>(raw), ccb.size(), raw[0], raw[1], raw[2],
+                             raw[3], indirect_buffer->chain.Value(), (raw[3] >> 23) & 1,
+                             indirect_buffer->ib_size.Value(),
+                             reinterpret_cast<uintptr_t>(indirect_buffer->Address<const u32>()),
+                             trailing,
+                             trailing ? ibtrace::DecodeFollowing(raw + total, trailing, 6)
+                                      : std::string("<none>"));
+            }
             auto task =
                 ProcessCeUpdate({indirect_buffer->Address<const u32>(), indirect_buffer->ib_size});
             RESUME_CE(task);
@@ -217,6 +277,10 @@ Liverpool::Task Liverpool::ProcessCeUpdate(std::span<const u32> ccb) {
 
 Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<const u32> ccb) {
     FIBER_ENTER(dcb_task_name);
+
+    const int ibtrace_depth = ++ibtrace::depth;
+    LOG_CRITICAL(Lib_GnmDriver, "ibtrace ENTER d={} span={:#x} dw={} ccb_dw={}", ibtrace_depth,
+                 reinterpret_cast<uintptr_t>(dcb.data()), dcb.size(), ccb.size());
 
     cblock.Reset();
 
@@ -242,6 +306,13 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
             UNREACHABLE_MSG("Wrong PM4 type {}", type);
             break;
         case 0:
+            LOG_CRITICAL(Lib_GnmDriver,
+                         "ibtrace TYPE0 d={} at={:#x} span_dw={} dwords=[{:08x} {:08x} {:08x} "
+                         "{:08x} {:08x} {:08x}]",
+                         ibtrace_depth, reinterpret_cast<uintptr_t>(dcb.data()), dcb.size(),
+                         dcb.size() > 0 ? dcb[0] : 0, dcb.size() > 1 ? dcb[1] : 0,
+                         dcb.size() > 2 ? dcb[2] : 0, dcb.size() > 3 ? dcb[3] : 0,
+                         dcb.size() > 4 ? dcb[4] : 0, dcb.size() > 5 ? dcb[5] : 0);
             UNREACHABLE_MSG("Unimplemented PM4 type 0, base reg: {}, size: {}",
                             header->type0.base.Value(), header->type0.NumWords());
             break;
@@ -791,6 +862,29 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
             }
             case PM4ItOpcode::IndirectBuffer: {
                 const auto* indirect_buffer = reinterpret_cast<const PM4CmdIndirectBuffer*>(header);
+                {
+                    const auto* raw = reinterpret_cast<const u32*>(header);
+                    const u32 total = header->type3.NumWords() + 1;
+                    const size_t trailing = dcb.size() > total ? dcb.size() - total : 0;
+                    LOG_CRITICAL(
+                        Lib_GnmDriver,
+                        "ibtrace IB d={} at={:#x} span_off={} span_dw={} pkt=[{:08x} {:08x} "
+                        "{:08x} {:08x}] total_dw={} chain={} valid={} vmid={} size={} "
+                        "target={:#x} trailing_dw={} following={}",
+                        ibtrace_depth, reinterpret_cast<uintptr_t>(raw),
+                        static_cast<size_t>(raw - reinterpret_cast<const u32*>(base_addr)),
+                        dcb.size(), raw[0], raw[1], raw[2], raw[3], total,
+                        indirect_buffer->chain.Value(), (raw[3] >> 23) & 1,
+                        indirect_buffer->vmid.Value(), indirect_buffer->ib_size.Value(),
+                        reinterpret_cast<uintptr_t>(indirect_buffer->Address<const u32>()),
+                        trailing,
+                        trailing ? ibtrace::DecodeFollowing(raw + total, trailing, 6)
+                                 : std::string("<none>"));
+                }
+                const u32 ibtrace_pre[4] = {reinterpret_cast<const volatile u32*>(header)[0],
+                                            reinterpret_cast<const volatile u32*>(header)[1],
+                                            reinterpret_cast<const volatile u32*>(header)[2],
+                                            reinterpret_cast<const volatile u32*>(header)[3]};
                 auto task = ProcessGraphics(
                     {indirect_buffer->Address<const u32>(), indirect_buffer->ib_size}, {});
                 RESUME_GFX(task);
@@ -798,6 +892,20 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 while (!task.handle.done()) {
                     YIELD_GFX();
                     RESUME_GFX(task);
+                }
+                {
+                    const auto* v = reinterpret_cast<const volatile u32*>(header);
+                    const u32 post[4] = {v[0], v[1], v[2], v[3]};
+                    const bool changed = post[0] != ibtrace_pre[0] || post[1] != ibtrace_pre[1] ||
+                                         post[2] != ibtrace_pre[2] || post[3] != ibtrace_pre[3];
+                    LOG_CRITICAL(Lib_GnmDriver,
+                                 "ibtrace IB-RET d={} at={:#x} pre=[{:08x} {:08x} {:08x} {:08x}] "
+                                 "post=[{:08x} {:08x} {:08x} {:08x}] chain-pre={} chain-now={} "
+                                 "changed={} span_dw_left={}",
+                                 ibtrace_depth, reinterpret_cast<uintptr_t>(header), ibtrace_pre[0],
+                                 ibtrace_pre[1], ibtrace_pre[2], ibtrace_pre[3], post[0], post[1],
+                                 post[2], post[3], (ibtrace_pre[3] >> 20) & 1, (post[3] >> 20) & 1,
+                                 changed, dcb.size());
                 }
                 break;
             }
@@ -859,6 +967,9 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
         }
         ce_task.handle.destroy();
     }
+
+    LOG_CRITICAL(Lib_GnmDriver, "ibtrace EXIT  d={}", ibtrace_depth);
+    --ibtrace::depth;
 
     FIBER_EXIT;
 }
@@ -1163,6 +1274,20 @@ Liverpool::CmdBuffer Liverpool::CopyCmdBuffers(std::span<const u32> dcb, std::sp
 }
 
 void Liverpool::SubmitGfx(std::span<const u32> dcb, std::span<const u32> ccb) {
+    {
+        const auto base = reinterpret_cast<uintptr_t>(dcb.data());
+        const auto end = base + dcb.size_bytes();
+        const auto id = ibtrace::submit_id.fetch_add(1);
+        LOG_CRITICAL(Lib_GnmDriver,
+                     "ibtrace SUBMIT #{}: dcb={:#x}..{:#x} ({} dw) ccb={:#x} ({} dw) "
+                     "prev_end={:#x} adjacent={} gap={}",
+                     id, base, end, dcb.size(), reinterpret_cast<uintptr_t>(ccb.data()), ccb.size(),
+                     ibtrace::prev_submit_end, ibtrace::prev_submit_end == base,
+                     ibtrace::prev_submit_end
+                         ? static_cast<s64>(base) - static_cast<s64>(ibtrace::prev_submit_end)
+                         : 0);
+        ibtrace::prev_submit_end = end;
+    }
     auto& queue = mapped_queues[GfxQueueId];
 
     if (EmulatorSettings.IsCopyGpuBuffers()) {
