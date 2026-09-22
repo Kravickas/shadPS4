@@ -3,6 +3,7 @@
 
 #include <atomic>
 #include <string>
+#include <vector>
 #include <boost/preprocessor/stringize.hpp>
 #include <fmt/format.h>
 
@@ -302,6 +303,18 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
     }
 
     auto base_addr = reinterpret_cast<uintptr_t>(dcb.data());
+
+    // Every chain IB we transfer away from, recorded with the bytes it held at the time, so the
+    // buffer can be re-read once the submission has finished.
+    struct JumpedFrom {
+        const u32* at;
+        u32 pre[4];
+        const u32* target;
+        u32 target_dw;
+        u32 target_pre[4];
+    };
+    std::vector<JumpedFrom> ibtrace_jumped;
+
     while (!dcb.empty()) {
         ProcessCommands();
 
@@ -894,6 +907,18 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                     LOG_CRITICAL(Lib_GnmDriver, "ibtrace JUMP d={} from={:#x} to={:#x} dw={}",
                                  ibtrace_depth, reinterpret_cast<uintptr_t>(header),
                                  reinterpret_cast<uintptr_t>(ib.data()), ib.size());
+                    {
+                        const auto* v = reinterpret_cast<const volatile u32*>(header);
+                        const auto* t = reinterpret_cast<const volatile u32*>(ib.data());
+                        const bool have_t = ib.size() >= 4;
+                        ibtrace_jumped.push_back(
+                            JumpedFrom{reinterpret_cast<const u32*>(header),
+                                       {v[0], v[1], v[2], v[3]},
+                                       ib.data(),
+                                       static_cast<u32>(ib.size()),
+                                       {have_t ? t[0] : 0u, have_t ? t[1] : 0u, have_t ? t[2] : 0u,
+                                        have_t ? t[3] : 0u}});
+                    }
                     dcb = ib;
                     base_addr = reinterpret_cast<uintptr_t>(dcb.data());
                     continue;
@@ -984,6 +1009,40 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
         ce_task.handle.destroy();
     }
 
+    {
+        u32 src_changed = 0, tgt_changed = 0;
+        for (const auto& j : ibtrace_jumped) {
+            const auto* v = reinterpret_cast<const volatile u32*>(j.at);
+            const u32 post[4] = {v[0], v[1], v[2], v[3]};
+            const bool sc = post[0] != j.pre[0] || post[1] != j.pre[1] || post[2] != j.pre[2] ||
+                            post[3] != j.pre[3];
+            const auto* t = reinterpret_cast<const volatile u32*>(j.target);
+            const bool have_t = j.target_dw >= 4;
+            const u32 tpost[4] = {have_t ? t[0] : 0u, have_t ? t[1] : 0u, have_t ? t[2] : 0u,
+                                  have_t ? t[3] : 0u};
+            const bool tc = have_t && (tpost[0] != j.target_pre[0] || tpost[1] != j.target_pre[1] ||
+                                       tpost[2] != j.target_pre[2] || tpost[3] != j.target_pre[3]);
+            src_changed += sc ? 1 : 0;
+            tgt_changed += tc ? 1 : 0;
+            if (sc || tc) {
+                LOG_CRITICAL(Lib_GnmDriver,
+                             "ibtrace RECYCLED src={:#x} src_changed={} pre=[{:08x} {:08x} "
+                             "{:08x} {:08x}] post=[{:08x} {:08x} {:08x} {:08x}] | tgt={:#x} "
+                             "tgt_changed={} tpre=[{:08x} {:08x} {:08x} {:08x}] tpost=[{:08x} "
+                             "{:08x} {:08x} {:08x}]",
+                             reinterpret_cast<uintptr_t>(j.at), sc, j.pre[0], j.pre[1], j.pre[2],
+                             j.pre[3], post[0], post[1], post[2], post[3],
+                             reinterpret_cast<uintptr_t>(j.target), tc, j.target_pre[0],
+                             j.target_pre[1], j.target_pre[2], j.target_pre[3], tpost[0], tpost[1],
+                             tpost[2], tpost[3]);
+            }
+        }
+        if (!ibtrace_jumped.empty()) {
+            LOG_CRITICAL(Lib_GnmDriver,
+                         "ibtrace JUMPSUM d={} jumps={} src_recycled={} tgt_recycled={}",
+                         ibtrace_depth, ibtrace_jumped.size(), src_changed, tgt_changed);
+        }
+    }
     LOG_CRITICAL(Lib_GnmDriver, "ibtrace EXIT  d={}", ibtrace_depth);
     --ibtrace::depth;
 
