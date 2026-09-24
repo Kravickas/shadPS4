@@ -621,6 +621,12 @@ set(VDEC_LIB src/core/libraries/videodec/video_utils.cpp
              src/core/libraries/videodec/video_utils.h
              src/core/libraries/videodec/vdecsw.cpp
              src/core/libraries/videodec/vdecsw.h
+             src/core/libraries/videodec/vdecsw_avc.cpp
+             src/core/libraries/videodec/vdecsw_avc.h
+             src/core/libraries/videodec/vdecsw_core.cpp
+             src/core/libraries/videodec/vdecsw_core.h
+             src/core/libraries/videodec/vdecsw_memory.cpp
+             src/core/libraries/videodec/vdecsw_memory.h
              src/core/libraries/videodec/videodec2_impl.cpp
              src/core/libraries/videodec/videodec2_impl.h
              src/core/libraries/videodec/videodec2.cpp

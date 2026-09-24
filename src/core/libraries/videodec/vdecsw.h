@@ -1,4 +1,4 @@
-// SPDX-FileCopyrightText: Copyright 2026 shadPS4 Emulator Project
+// SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #pragma once
@@ -10,9 +10,9 @@ class SymbolsResolver;
 }
 namespace Libraries::Vdecsw {
 
-class VdecDecoder;
+struct VdecswInstance;
 
-using OrbisVdecswDecoder = VdecDecoder*;
+using OrbisVdecswDecoder = VdecswInstance*;
 using OrbisVdecswComputeQueue = void*;
 
 enum class OrbisVdecswCodecType : u32 {
@@ -33,13 +33,13 @@ struct OrbisVdecswDecoderConfigInfo {
     OrbisVdecswComputeQueue compute_queue;
     u64 cpu_affinity_mask;
     s32 cpu_thread_priority;
-    bool optimize_progressive_video;
-    bool check_memory_type;
+    u8 optimize_progressive_video;
+    u8 check_memory_type;
     u8 reserved0;
     s8 extra_dpb_frame_count;
     void* extra_config_info;
-    bool disable_sync_decode_output;
-    u32 max_pending_sync_count;
+    u8 disable_sync_decode_output;
+    s32 max_pending_sync_count;
 };
 static_assert(sizeof(OrbisVdecswDecoderConfigInfo) == 0x50);
 
@@ -111,7 +111,7 @@ struct OrbisVdecswComputeConfigInfo {
     u64 this_size;
     u16 compute_pipe_id;
     u16 compute_queue_id;
-    bool check_memory_type;
+    u8 check_memory_type;
     u8 reserved0;
     u16 reserved1;
 };
