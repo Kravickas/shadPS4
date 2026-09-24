@@ -11,6 +11,7 @@ namespace Shader::Optimization {
 void Visit(Info& info, const IR::Inst& inst) {
     switch (inst.GetOpcode()) {
     case IR::Opcode::GetAttribute:
+    case IR::Opcode::GetAttributeU1:
     case IR::Opcode::GetAttributeU32:
         info.loads.Set(inst.Arg(0).Attribute(), inst.Arg(1).U32());
         break;
@@ -53,6 +54,7 @@ void Visit(Info& info, const IR::Inst& inst) {
     case IR::Opcode::SharedAtomicAnd32:
     case IR::Opcode::SharedAtomicOr32:
     case IR::Opcode::SharedAtomicXor32:
+    case IR::Opcode::SharedAtomicCmpSwap32:
         info.shared_types |= IR::Type::U32;
         break;
     case IR::Opcode::SharedAtomicIAdd64:
@@ -66,6 +68,7 @@ void Visit(Info& info, const IR::Inst& inst) {
     case IR::Opcode::SharedAtomicAnd64:
     case IR::Opcode::SharedAtomicOr64:
     case IR::Opcode::SharedAtomicXor64:
+    case IR::Opcode::SharedAtomicCmpSwap64:
         info.uses_shared_int64_atomics = true;
         [[fallthrough]];
     case IR::Opcode::LoadSharedU64:
@@ -85,8 +88,12 @@ void Visit(Info& info, const IR::Inst& inst) {
     case IR::Opcode::ImageWrite:
         info.has_storage_images = true;
         break;
-    case IR::Opcode::QuadShuffle:
+    case IR::Opcode::QuadBroadcast:
         info.uses_group_quad = true;
+        break;
+    case IR::Opcode::Shuffle:
+    case IR::Opcode::ShuffleXor:
+        info.uses_group_shuffle = true;
         break;
     case IR::Opcode::ReadLane:
     case IR::Opcode::ReadFirstLane:
@@ -123,8 +130,18 @@ void Visit(Info& info, const IR::Inst& inst) {
     case IR::Opcode::BufferAtomicUMin64:
         info.uses_buffer_int64_atomics = true;
         break;
+    case IR::Opcode::DataAppend:
+    case IR::Opcode::DataConsume:
+    case IR::Opcode::Ballot:
+    case IR::Opcode::InverseBallot:
+    case IR::Opcode::BallotFindLsb:
+        info.uses_group_ballot = true;
+        [[fallthrough]];
     case IR::Opcode::LaneId:
         info.uses_lane_id = true;
+        break;
+    case IR::Opcode::Memtime:
+        info.uses_shader_clock = true;
         break;
     case IR::Opcode::ReadConst:
         if (!info.has_readconst) {
