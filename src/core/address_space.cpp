@@ -190,7 +190,8 @@ struct AddressSpace::Impl {
         user_size = supported_user_max - USER_MIN - 1;
 
         // Increase BackingSize to account for config options.
-        BackingSize += EmulatorSettings.GetExtraDmemInMBytes() * 1_MB;
+        BackingSize += EmulatorSettings.GetExtraDmemInMBytes() * 1_MB +
+                       EmulatorSettings.GetExtraFmemInMBytes() * 1_MB;
 
         // Allocate backing file that represents the total physical memory.
         backing_handle = CreateFileMapping2(INVALID_HANDLE_VALUE, nullptr, FILE_MAP_ALL_ACCESS,
@@ -629,7 +630,8 @@ enum PosixPageProtection {
 
 struct AddressSpace::Impl {
     Impl() {
-        BackingSize += EmulatorSettings.GetExtraDmemInMBytes() * 1_MB;
+        BackingSize += EmulatorSettings.GetExtraDmemInMBytes() * 1_MB +
+                       EmulatorSettings.GetExtraFmemInMBytes() * 1_MB;
         // Allocate virtual address placeholder for our address space.
         system_managed_size = SystemManagedSize;
         system_reserved_size = SystemReservedSize;
@@ -758,11 +760,14 @@ struct AddressSpace::Impl {
         // Check to see if we are adjacent to any regions.
         VAddr start_address = virtual_addr;
         VAddr end_address = start_address + size;
-        auto it = m_free_regions.find({start_address - 1, end_address + 1});
 
         // If we are, join with them, ensuring we stay in bounds.
+        auto it = m_free_regions.find({start_address - 1, end_address});
         if (it != m_free_regions.end()) {
             start_address = std::min(start_address, it->lower());
+        }
+        it = m_free_regions.find({start_address, end_address + 1});
+        if (it != m_free_regions.end()) {
             end_address = std::max(end_address, it->upper());
         }
 

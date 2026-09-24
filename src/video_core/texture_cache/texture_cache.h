@@ -25,6 +25,10 @@ namespace AmdGpu {
 struct Liverpool;
 }
 
+namespace Vulkan {
+class Runtime;
+}
+
 namespace VideoCore {
 
 class BufferCache;
@@ -77,7 +81,8 @@ public:
 
 public:
     TextureCache(const Vulkan::Instance& instance, Vulkan::Scheduler& scheduler,
-                 AmdGpu::Liverpool* liverpool, BufferCache& buffer_cache, PageManager& tracker);
+                 Vulkan::Runtime& runtime, AmdGpu::Liverpool* liverpool, BufferCache& buffer_cache,
+                 PageManager& tracker);
     ~TextureCache();
 
     TileManager& GetTileManager() noexcept {
@@ -138,7 +143,8 @@ public:
 
     /// Retrieves the sampler that matches the provided S# descriptor.
     [[nodiscard]] vk::Sampler GetSampler(const AmdGpu::Sampler& sampler,
-                                         AmdGpu::BorderColorBuffer border_color_base);
+                                         AmdGpu::BorderColorBuffer border_color_base,
+                                         bool is_depth);
 
     /// Retrieves the image with the specified id.
     [[nodiscard]] Image& GetImage(ImageId id) {
@@ -169,9 +175,19 @@ public:
         return {};
     }
 
-    /// Returns true if the specified address is a metadata surface.
-    bool IsMeta(VAddr address) const {
-        return surface_metas.contains(address);
+    enum class MetaType {
+        CMask,
+        FMask,
+        HTile,
+    };
+
+    /// Returns meta type if the specified address is a metadata surface.
+    std::optional<MetaType> IsMeta(VAddr address) const {
+        auto it = surface_metas.find(address);
+        if (it != surface_metas.end()) {
+            return it->second.type;
+        }
+        return std::nullopt;
     }
 
     /// Returns true if a slice of the specified metadata surface has been cleared.
@@ -313,6 +329,7 @@ private:
 private:
     const Vulkan::Instance& instance;
     Vulkan::Scheduler& scheduler;
+    Vulkan::Runtime& runtime;
     AmdGpu::Liverpool* liverpool;
     BufferCache& buffer_cache;
     PageManager& tracker;
@@ -333,18 +350,13 @@ private:
     u64 gc_tick = 0;
     Common::LeastRecentlyUsedCache<ImageId, u64> lru_cache;
     Common::LeastRecentlyUsedCache<u64, u64> sampler_lru_cache;
-    bool readback_linear_images;
+    const bool readback_linear_images;
     PageTable page_table;
     std::mutex mutex;
     std::mutex samplers_mutex;
     std::mutex download_images_mutex;
     struct MetaDataInfo {
-        enum class Type {
-            CMask,
-            FMask,
-            HTile,
-        };
-        Type type;
+        MetaType type;
         s32 clear_mask = -1;
     };
     tsl::robin_map<VAddr, MetaDataInfo> surface_metas;
