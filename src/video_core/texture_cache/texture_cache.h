@@ -147,6 +147,11 @@ public:
                                          AmdGpu::BorderColorBuffer border_color_base,
                                          bool is_depth);
 
+    /// Returns true when the id still refers to a live image.
+    [[nodiscard]] bool IsImageAllocated(ImageId id) const noexcept {
+        return slot_images.is_allocated(id);
+    }
+
     /// Retrieves the image with the specified id.
     [[nodiscard]] Image& GetImage(ImageId id) {
         auto& image = slot_images[id];

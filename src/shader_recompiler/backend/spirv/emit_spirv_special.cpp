@@ -74,6 +74,9 @@ void EmitEpilogue(EmitContext& ctx) {
     if (ctx.hw_stage == HwStage::Vertex && ctx.runtime_info.hw.vs.clip_disable) {
         ConvertPositionToClipSpace(ctx);
     }
+    if (Sirit::ValidId(ctx.xfb_vertex_index)) {
+        ctx.OpStore(ctx.xfb_vertex_index, ctx.OpLoad(ctx.U32[1], ctx.vertex_index));
+    }
 }
 
 void EmitDiscard(EmitContext& ctx) {

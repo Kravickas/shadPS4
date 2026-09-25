@@ -1,11 +1,15 @@
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <algorithm>
+#include <limits>
 #include "common/debug.h"
+#include "common/hash.h"
 #include "core/debug_state.h"
 #include "core/emulator_settings.h"
 #include "core/memory.h"
 #include "shader_recompiler/runtime_info.h"
+#include "shader_recompiler/xfb_layout.h"
 #include "video_core/amdgpu/liverpool.h"
 #include "video_core/buffer_cache/buffer.h"
 #include "video_core/buffer_cache/buffer_cache.h"
@@ -32,6 +36,84 @@ static Shader::PushData MakeUserData(const AmdGpu::Regs& regs) {
     return push_data;
 }
 
+namespace {
+
+// Transform feedback writes every vertex of every assembled primitive, so strips and fans
+// expand beyond their index count.
+u32 XfbMaxVertices(AmdGpu::PrimitiveType type, u32 count, u32 instances) {
+    u32 per_index = 3;
+    switch (type) {
+    case AmdGpu::PrimitiveType::PointList:
+    case AmdGpu::PrimitiveType::LineList:
+    case AmdGpu::PrimitiveType::TriangleList:
+        per_index = 1;
+        break;
+    case AmdGpu::PrimitiveType::LineStrip:
+    case AmdGpu::PrimitiveType::LineLoop:
+        per_index = 2;
+        break;
+    default:
+        break;
+    }
+    const u64 total = u64(count) * per_index * instances;
+    return static_cast<u32>(std::min<u64>(total, std::numeric_limits<u32>::max()));
+}
+
+bool IsXfbCapturable(const GraphicsPipeline& pipeline, const Shader::Profile& profile,
+                     AmdGpu::PrimitiveType type) {
+    // Captures are replayed as triangle lists.
+    if (type != AmdGpu::PrimitiveType::TriangleList &&
+        type != AmdGpu::PrimitiveType::TriangleStrip &&
+        type != AmdGpu::PrimitiveType::TriangleFan) {
+        return false;
+    }
+    const auto stages = pipeline.GetStages();
+    if (stages[u32(Shader::SwStage::Geometry)] ||
+        stages[u32(Shader::SwStage::TessellationControl)] ||
+        stages[u32(Shader::SwStage::TessellationEval)]) {
+        return false;
+    }
+    const auto* vs_info = stages[u32(Shader::SwStage::Vertex)];
+    return vs_info && Shader::XfbCaptureEnabled(*vs_info, profile, false);
+}
+
+// Blended draws that don't write depth don't own motion vectors; the surface under them does.
+// Those that do own their pixels, flagged untrusted, like a reactive mask.
+bool IsXfbBlended(const GraphicsPipelineKey& key) {
+    using BlendControl = AmdGpu::BlendControl;
+    for (u32 i = 0; i < key.num_color_attachments; ++i) {
+        const auto& control = key.blend_controls[i];
+        if (!control.enable || !key.write_masks[i]) {
+            continue;
+        }
+        if (control.color_src_factor != BlendControl::BlendFactor::One ||
+            control.color_dst_factor != BlendControl::BlendFactor::Zero ||
+            control.color_func != BlendControl::BlendFunc::Add) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// Geometry identity: vertex stream addresses, index range and topology. Deliberately excludes
+// constant buffer pointers, which many engines rotate every frame.
+u64 XfbDrawKey(const Shader::Info& vs_info,
+               const std::optional<const Shader::Gcn::FetchShaderData>& fetch_shader,
+               VAddr index_base, u32 vertex_offset, u32 num_indices, AmdGpu::PrimitiveType type) {
+    u64 key = vs_info.pgm_hash;
+    key = HashCombine(key, u64(index_base));
+    key = HashCombine(key, u64(vertex_offset) | (u64(num_indices) << 32));
+    key = HashCombine(key, u64(type));
+    if (fetch_shader) {
+        for (const auto& attrib : fetch_shader->attributes) {
+            key = HashCombine(key, u64(attrib.GetSharp(vs_info).base_address));
+        }
+    }
+    return key;
+}
+
+} // Anonymous namespace
+
 Rasterizer::Rasterizer(const Instance& instance_, Scheduler& scheduler_, Runtime& runtime_,
                        AmdGpu::Liverpool* liverpool_)
     : instance{instance_}, scheduler{scheduler_}, runtime{runtime_}, page_manager{this},
@@ -41,6 +123,12 @@ Rasterizer::Rasterizer(const Instance& instance_, Scheduler& scheduler_, Runtime
       pipeline_cache{instance, scheduler, liverpool, buffer_cache.GetSparsePageShift()},
       host_markers_enabled{EmulatorSettings.IsVkHostMarkersEnabled()},
       guest_markers_enabled{EmulatorSettings.IsVkGuestMarkersEnabled()} {
+    if (instance.IsTransformFeedbackSupported()) {
+        xfb_capture.emplace(instance);
+        if (instance.IsTransformFeedbackDrawSupported()) {
+            xfb_velocity.emplace(instance, scheduler, runtime, texture_cache);
+        }
+    }
     if (!EmulatorSettings.IsNullGPU()) {
         liverpool->BindRasterizer(this);
     }
@@ -223,12 +311,67 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset) {
     const auto cmdbuf = scheduler.CommandBuffer();
     cmdbuf.bindPipeline(vk::PipelineBindPoint::eGraphics, pipeline->Handle());
 
+    bool capturing = false;
+    const auto& gkey = pipeline->GetGraphicsKey();
+    const auto& dyn = scheduler.GetDynamicState();
+    if (xfb_capture && gkey.polygon_mode == AmdGpu::PolygonMode::Fill &&
+        state.depth_stencil_attachment.has_depth && !dyn.viewports.empty() &&
+        !dyn.scissors.empty() &&
+        IsXfbCapturable(*pipeline, pipeline_cache.GetProfile(), regs.primitive_type)) {
+        const auto& depth_image = texture_cache.GetImage(db_desc.first);
+        // A depth prepass holds the scene depth bit for bit; its color pass may not.
+        const bool scene_depth_only =
+            gkey.mrt_mask == 0 && dyn.depth_write_enabled &&
+            VideoCore::XfbMatchesAspect(depth_image.info.size.width, depth_image.info.size.height,
+                                        xfb_output_extent);
+        const bool owns_motion = !IsXfbBlended(gkey) || dyn.depth_write_enabled;
+        if ((gkey.mrt_mask != 0 && owns_motion) || scene_depth_only) {
+            const VAddr index_base = is_indexed ? regs.index_base_address.Address<VAddr>() : 0;
+            const VideoCore::XfbRegion region{
+                .key = XfbDrawKey(vs_info, fetch_shader, index_base, vertex_offset,
+                                  regs.num_indices, regs.primitive_type),
+                .offset = 0,
+                .max_vertices = XfbMaxVertices(regs.primitive_type, regs.num_indices,
+                                               regs.num_instances.NumInstances()),
+                .counter_offset = 0,
+                .depth_id = db_desc.first,
+                .depth_image = depth_image.GetImage(),
+                .depth_view = state.depth_stencil_attachment.image_view,
+                .depth_format = depth_image.info.pixel_format,
+                .has_stencil = depth_image.info.props.has_stencil != 0,
+                .samples = depth_image.backing ? depth_image.backing->image.image_ci.samples
+                                               : vk::SampleCountFlagBits::e1,
+                .blended = gkey.mrt_mask != 0 && IsXfbBlended(gkey),
+                .width = depth_image.info.size.width,
+                .height = depth_image.info.size.height,
+                .state =
+                    {
+                        .viewport = dyn.viewports[0],
+                        .scissor = dyn.scissors[0],
+                        .cull_mode = dyn.cull_mode,
+                        .front_face = dyn.front_face,
+                        .depth_bias_constant = dyn.depth_bias_constant,
+                        .depth_bias_clamp = dyn.depth_bias_clamp,
+                        .depth_bias_slope = dyn.depth_bias_slope,
+                        .depth_bias_enabled = dyn.depth_bias_enabled,
+                        .depth_clamp = gkey.depth_clamp_enable != 0,
+                        .depth_clip = gkey.depth_clip_enable != 0,
+                        .negative_one_to_one = gkey.clip_space == AmdGpu::ClipSpace::MinusWToW,
+                    },
+            };
+            capturing = xfb_capture->Begin(cmdbuf, region);
+        }
+    }
+
     if (is_indexed) {
         cmdbuf.drawIndexed(regs.num_indices, regs.num_instances.NumInstances(), 0,
                            s32(vertex_offset), instance_offset);
     } else {
         cmdbuf.draw(regs.num_indices, regs.num_instances.NumInstances(), vertex_offset,
                     instance_offset);
+    }
+    if (capturing) {
+        xfb_capture->End(cmdbuf);
     }
     DebugState.IncDrawCall();
 
@@ -390,6 +533,18 @@ u64 Rasterizer::Flush() {
 
 void Rasterizer::Finish() {
     scheduler.Finish();
+}
+
+void Rasterizer::EndXfbFrame(vk::Extent2D output_extent) {
+    if (!xfb_capture) {
+        return;
+    }
+    scheduler.EndRendering();
+    if (xfb_velocity) {
+        xfb_velocity->Render(*xfb_capture, output_extent);
+    }
+    xfb_capture->EndFrame(scheduler.CommandBuffer());
+    xfb_output_extent = output_extent;
 }
 
 void Rasterizer::OnSubmit() {

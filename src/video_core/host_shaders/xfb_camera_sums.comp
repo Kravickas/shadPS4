@@ -1,0 +1,109 @@
+// SPDX-FileCopyrightText: Copyright 2026 shadPS4 Emulator Project
+// SPDX-License-Identifier: GPL-2.0-or-later
+
+#version 450
+
+layout(local_size_x = 64) in;
+
+// Mirrors XfbVelocityPass::RegionEntry.
+struct Region {
+    uint cur_offset;
+    uint prev_offset;
+    uint prev_max_vertices;
+    uint has_prev;
+    vec2 viewport_size;
+    vec2 viewport_offset;
+    vec2 depth_range;
+    uint blended;
+    uint negative_one_to_one;
+    uint counter_offset;
+    uint pad0;
+    uint pad1;
+    uint pad2;
+};
+
+layout(set = 0, binding = 0, std430) readonly buffer CurCapture {
+    uint cur_data[];
+};
+layout(set = 0, binding = 1, std430) readonly buffer PrevCapture {
+    uint prev_data[];
+};
+layout(set = 0, binding = 2, std430) readonly buffer Counters {
+    uint counters[];
+};
+layout(set = 0, binding = 3, std430) readonly buffer Regions {
+    Region regions[];
+};
+// Per region: sum(c c^T) upper (10), sum(p c^T) rows (16), sum(|p|^2), count, 4 scratch.
+layout(set = 0, binding = 4, std430) writeonly buffer Sums {
+    double sums[];
+};
+
+const uint MaxSamples = 512u;
+const uint SumCount = 28u;
+const uint RegionStride = 32u;
+
+shared double partial[64][SumCount];
+
+void main() {
+    const uint region_index = gl_WorkGroupID.x;
+    const uint lane = gl_LocalInvocationID.x;
+    const Region region = regions[region_index];
+
+    double acc[SumCount];
+    for (uint i = 0u; i < SumCount; ++i) {
+        acc[i] = 0.0LF;
+    }
+    if (region.has_prev != 0u && region.blended == 0u) {
+        const uint count =
+            min(counters[region.counter_offset / 4u] / 20u, region.prev_max_vertices);
+        const uint step = max(1u, count / MaxSamples);
+        for (uint v = lane * step; v < count; v += 64u * step) {
+            const uint cur_base = region.cur_offset + v * 5u;
+            const uint prev_base = region.prev_offset + v * 5u;
+            if (cur_data[cur_base + 4u] != prev_data[prev_base + 4u]) {
+                continue;
+            }
+            const dvec4 c = dvec4(uintBitsToFloat(cur_data[cur_base + 0u]),
+                                  uintBitsToFloat(cur_data[cur_base + 1u]),
+                                  uintBitsToFloat(cur_data[cur_base + 2u]),
+                                  uintBitsToFloat(cur_data[cur_base + 3u]));
+            const dvec4 p = dvec4(uintBitsToFloat(prev_data[prev_base + 0u]),
+                                  uintBitsToFloat(prev_data[prev_base + 1u]),
+                                  uintBitsToFloat(prev_data[prev_base + 2u]),
+                                  uintBitsToFloat(prev_data[prev_base + 3u]));
+            if (c.w <= 0.0 || p.w <= 0.0) {
+                continue;
+            }
+            uint k = 0u;
+            for (uint i = 0u; i < 4u; ++i) {
+                for (uint j = i; j < 4u; ++j) {
+                    acc[k++] += c[i] * c[j];
+                }
+            }
+            for (uint r = 0u; r < 4u; ++r) {
+                for (uint j = 0u; j < 4u; ++j) {
+                    acc[10u + r * 4u + j] += p[r] * c[j];
+                }
+            }
+            acc[26] += dot(p, p);
+            acc[27] += 1.0LF;
+        }
+    }
+
+    for (uint i = 0u; i < SumCount; ++i) {
+        partial[lane][i] = acc[i];
+    }
+    barrier();
+    for (uint stride = 32u; stride > 0u; stride >>= 1u) {
+        if (lane < stride) {
+            for (uint i = 0u; i < SumCount; ++i) {
+                partial[lane][i] += partial[lane + stride][i];
+            }
+        }
+        barrier();
+    }
+    if (lane < RegionStride) {
+        sums[region_index * RegionStride + lane] = lane < SumCount ? partial[0][lane] : 0.0LF;
+    }
+}

@@ -401,6 +401,10 @@ void DefineEntryPoint(const Info& info, EmitContext& ctx, Id main) {
     }
     case SwStage::Vertex:
         execution_model = spv::ExecutionModel::Vertex;
+        if (ctx.xfb_capture) {
+            ctx.AddCapability(spv::Capability::TransformFeedback);
+            ctx.AddExecutionMode(main, spv::ExecutionMode::Xfb);
+        }
         break;
     case SwStage::TessellationControl:
         execution_model = spv::ExecutionModel::TessellationControl;

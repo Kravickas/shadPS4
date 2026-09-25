@@ -1,0 +1,200 @@
+// SPDX-FileCopyrightText: Copyright 2026 shadPS4 Emulator Project
+// SPDX-License-Identifier: GPL-2.0-or-later
+
+#version 450
+
+// Least-squares prev = C * cur over static geometry; regions above the mean residual are trimmed
+// each iteration. Doubles because clip z and w are nearly collinear.
+layout(local_size_x = 64) in;
+
+layout(set = 0, binding = 0, std430) buffer Sums {
+    double sums[];
+};
+layout(set = 0, binding = 1, std430) writeonly buffer Camera {
+    vec4 clip_to_prev[4];
+    vec4 stats;
+} camera;
+
+layout(push_constant) uniform Constants {
+    uint region_count;
+} pc;
+
+const uint Threads = 64u;
+const uint Iterations = 4u;
+const uint NormalCount = 26u;
+const uint RegionStride = 32u;
+const uint KeptSlot = 28u;
+const uint ResidualSlot = 29u;
+const uint MinInliers = 4u;
+const double ResidualFloor = 1e-7LF;
+const double PivotEpsilon = 1e-12LF;
+const uint UpperStart[4] = uint[](0u, 4u, 7u, 9u);
+
+shared double reduce_normal[Threads][NormalCount];
+shared dvec2 reduce_residual[Threads];
+shared dvec4 solution[4];
+shared bool solution_valid;
+shared double threshold;
+
+double Sum(uint region, uint slot) {
+    return sums[region * RegionStride + slot];
+}
+
+double Trace(uint region) {
+    return Sum(region, 0u) + Sum(region, 4u) + Sum(region, 7u) + Sum(region, 9u);
+}
+
+double Upper(uint region, uint i, uint j) {
+    const uint lo = min(i, j);
+    const uint hi = max(i, j);
+    return Sum(region, UpperStart[lo] + (hi - lo));
+}
+
+double RelativeResidual(uint region) {
+    double r = Sum(region, 26u);
+    for (uint row = 0u; row < 4u; ++row) {
+        const dvec4 c = solution[row];
+        for (uint i = 0u; i < 4u; ++i) {
+            r -= 2.0LF * c[i] * Sum(region, 10u + row * 4u + i);
+            for (uint j = 0u; j < 4u; ++j) {
+                r += c[i] * Upper(region, i, j) * c[j];
+            }
+        }
+    }
+    return max(r, 0.0LF) / Trace(region);
+}
+
+// Gauss-Jordan with partial pivoting on [A | B^T]; column r of the solution is row r of C.
+void Solve() {
+    double m[4][8];
+    double scale = 0.0LF;
+    for (uint i = 0u; i < 4u; ++i) {
+        for (uint j = 0u; j < 4u; ++j) {
+            const uint lo = min(i, j);
+            const uint hi = max(i, j);
+            m[i][j] = reduce_normal[0][UpperStart[lo] + (hi - lo)];
+        }
+        for (uint r = 0u; r < 4u; ++r) {
+            m[i][4u + r] = reduce_normal[0][10u + r * 4u + i];
+        }
+        scale = max(scale, abs(m[i][i]));
+    }
+    bool ok = scale > 0.0LF;
+    for (uint col = 0u; col < 4u && ok; ++col) {
+        uint pivot = col;
+        double best = abs(m[col][col]);
+        for (uint row = col + 1u; row < 4u; ++row) {
+            if (abs(m[row][col]) > best) {
+                best = abs(m[row][col]);
+                pivot = row;
+            }
+        }
+        if (best <= PivotEpsilon * scale) {
+            ok = false;
+            break;
+        }
+        for (uint k = 0u; k < 8u; ++k) {
+            const double t = m[col][k];
+            m[col][k] = m[pivot][k];
+            m[pivot][k] = t;
+        }
+        for (uint row = 0u; row < 4u; ++row) {
+            if (row != col) {
+                const double f = m[row][col] / m[col][col];
+                for (uint k = 0u; k < 8u; ++k) {
+                    m[row][k] -= f * m[col][k];
+                }
+            }
+        }
+    }
+    for (uint r = 0u; r < 4u; ++r) {
+        solution[r] = ok ? dvec4(m[0][4u + r] / m[0][0], m[1][4u + r] / m[1][1],
+                                 m[2][4u + r] / m[2][2], m[3][4u + r] / m[3][3])
+                         : dvec4(r == 0u ? 1.0LF : 0.0LF, r == 1u ? 1.0LF : 0.0LF,
+                                 r == 2u ? 1.0LF : 0.0LF, r == 3u ? 1.0LF : 0.0LF);
+    }
+    solution_valid = ok;
+}
+
+void main() {
+    const uint lane = gl_LocalInvocationID.x;
+
+    // Each invocation owns regions lane, lane + Threads, ... so its scratch needs no sharing.
+    for (uint i = lane; i < pc.region_count; i += Threads) {
+        const bool usable = Sum(i, 27u) > 0.0LF && Trace(i) > 0.0LF;
+        sums[i * RegionStride + KeptSlot] = usable ? 1.0LF : 0.0LF;
+    }
+
+    for (uint iteration = 0u; iteration < Iterations; ++iteration) {
+        double acc[NormalCount];
+        for (uint k = 0u; k < NormalCount; ++k) {
+            acc[k] = 0.0LF;
+        }
+        for (uint i = lane; i < pc.region_count; i += Threads) {
+            if (Sum(i, KeptSlot) == 0.0LF) {
+                continue;
+            }
+            const double inv_trace = 1.0LF / Trace(i);
+            for (uint k = 0u; k < NormalCount; ++k) {
+                acc[k] += Sum(i, k) * inv_trace;
+            }
+        }
+        for (uint k = 0u; k < NormalCount; ++k) {
+            reduce_normal[lane][k] = acc[k];
+        }
+        barrier();
+        for (uint stride = Threads / 2u; stride > 0u; stride >>= 1u) {
+            if (lane < stride) {
+                for (uint k = 0u; k < NormalCount; ++k) {
+                    reduce_normal[lane][k] += reduce_normal[lane + stride][k];
+                }
+            }
+            barrier();
+        }
+        if (lane == 0u) {
+            Solve();
+        }
+        barrier();
+
+        dvec2 residual = dvec2(0.0LF);
+        for (uint i = lane; i < pc.region_count; i += Threads) {
+            if (Sum(i, KeptSlot) == 0.0LF) {
+                continue;
+            }
+            const double r = RelativeResidual(i);
+            sums[i * RegionStride + ResidualSlot] = r;
+            residual += dvec2(r, 1.0LF);
+        }
+        reduce_residual[lane] = residual;
+        barrier();
+        for (uint stride = Threads / 2u; stride > 0u; stride >>= 1u) {
+            if (lane < stride) {
+                reduce_residual[lane] += reduce_residual[lane + stride];
+            }
+            barrier();
+        }
+        if (lane == 0u) {
+            threshold = max(reduce_residual[0].x / max(reduce_residual[0].y, 1.0LF),
+                            ResidualFloor);
+        }
+        barrier();
+        if (iteration + 1u < Iterations) {
+            for (uint i = lane; i < pc.region_count; i += Threads) {
+                if (Sum(i, KeptSlot) != 0.0LF && Sum(i, ResidualSlot) > threshold) {
+                    sums[i * RegionStride + KeptSlot] = 0.0LF;
+                }
+            }
+        }
+    }
+
+    if (lane == 0u) {
+        const double inliers = reduce_residual[0].y;
+        const bool valid = solution_valid && inliers >= double(MinInliers);
+        for (uint r = 0u; r < 4u; ++r) {
+            camera.clip_to_prev[r] = vec4(solution[r]);
+        }
+        camera.stats = vec4(valid ? 1.0 : 0.0, float(inliers),
+                            float(reduce_residual[0].x / max(inliers, 1.0LF)),
+                            float(pc.region_count));
+    }
+}

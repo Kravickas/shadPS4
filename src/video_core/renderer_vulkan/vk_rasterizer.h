@@ -3,13 +3,16 @@
 
 #pragma once
 
+#include <optional>
 #include "common/recursive_lock.h"
 #include "common/shared_first_mutex.h"
 #include "video_core/buffer_cache/buffer_cache.h"
 #include "video_core/page_manager.h"
+#include "video_core/renderer_vulkan/host_passes/xfb_velocity_pass.h"
 #include "video_core/renderer_vulkan/vk_pipeline_cache.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/texture_cache/texture_cache.h"
+#include "video_core/xfb_capture.h"
 
 namespace AmdGpu {
 struct Liverpool;
@@ -84,6 +87,10 @@ public:
     void OnSubmit();
     void OnFence();
 
+    /// Closes the transform feedback frame at a guest flip: renders motion vectors for the
+    /// draws captured since the previous flip and swaps the capture buffers.
+    void EndXfbFrame(vk::Extent2D output_extent);
+
     PipelineCache& GetPipelineCache() {
         return pipeline_cache;
     }
@@ -148,6 +155,9 @@ private:
     PipelineCache pipeline_cache;
     const bool host_markers_enabled;
     const bool guest_markers_enabled;
+    std::optional<VideoCore::XfbCapture> xfb_capture;
+    std::optional<HostPasses::XfbVelocityPass> xfb_velocity;
+    vk::Extent2D xfb_output_extent{};
 
     using RenderTargetInfo = std::pair<VideoCore::ImageId, VideoCore::TextureCache::ImageDesc>;
     std::array<RenderTargetInfo, AmdGpu::NUM_COLOR_BUFFERS> cb_descs;

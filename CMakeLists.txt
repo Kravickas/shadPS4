@@ -976,6 +976,7 @@ set(SHADER_RECOMPILER src/shader_recompiler/profile.h
                       src/shader_recompiler/params.h
                       src/shader_recompiler/runtime_info.h
                       src/shader_recompiler/specialization.h
+                      src/shader_recompiler/xfb_layout.h
                       src/shader_recompiler/backend/bindings.h
                       src/shader_recompiler/backend/spirv/emit_spirv.cpp
                       src/shader_recompiler/backend/spirv/emit_spirv.h
@@ -1158,6 +1159,8 @@ set(VIDEO_CORE src/video_core/amdgpu/cb_db_extent.h
                src/video_core/renderer_vulkan/host_passes/fsr_pass.h
                src/video_core/renderer_vulkan/host_passes/pp_pass.cpp
                src/video_core/renderer_vulkan/host_passes/pp_pass.h
+               src/video_core/renderer_vulkan/host_passes/xfb_velocity_pass.cpp
+               src/video_core/renderer_vulkan/host_passes/xfb_velocity_pass.h
                src/video_core/texture_cache/blit_helper.cpp
                src/video_core/texture_cache/blit_helper.h
                src/video_core/texture_cache/host_compatibility.cpp
@@ -1182,6 +1185,8 @@ set(VIDEO_CORE src/video_core/amdgpu/cb_db_extent.h
                src/video_core/multi_level_page_table.h
                src/video_core/renderdoc.cpp
                src/video_core/renderdoc.h
+               src/video_core/xfb_capture.cpp
+               src/video_core/xfb_capture.h
 )
 
 set(IMGUI src/imgui/imgui_config.h
