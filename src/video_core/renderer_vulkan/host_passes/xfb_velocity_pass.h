@@ -98,12 +98,16 @@ private:
     vk::UniquePipeline resolve_pipeline;
 
     vk::ShaderModule camera_sums_module;
+    vk::ShaderModule camera_hypotheses_module;
     vk::ShaderModule camera_solve_module;
     vk::UniqueDescriptorSetLayout camera_sums_set_layout;
+    vk::UniqueDescriptorSetLayout camera_hypotheses_set_layout;
     vk::UniqueDescriptorSetLayout camera_solve_set_layout;
     vk::UniquePipelineLayout camera_sums_layout;
+    vk::UniquePipelineLayout camera_hypotheses_layout;
     vk::UniquePipelineLayout camera_solve_layout;
     vk::UniquePipeline camera_sums_pipeline;
+    vk::UniquePipeline camera_hypotheses_pipeline;
     vk::UniquePipeline camera_solve_pipeline;
     bool camera_supported{};
 
@@ -111,6 +115,8 @@ private:
     VideoCore::Buffer region_table;
     // Per-region normal equations for the camera solve, in doubles.
     VideoCore::Buffer camera_sums;
+    // Candidate transforms fitted to random region samples, with their inlier counts.
+    VideoCore::Buffer camera_hypotheses;
     // Solved clip to previous clip transform and its statistics.
     VideoCore::Buffer camera_result;
     std::vector<RegionEntry> entries;

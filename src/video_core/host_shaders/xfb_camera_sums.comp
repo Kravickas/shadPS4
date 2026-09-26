@@ -34,7 +34,7 @@ layout(set = 0, binding = 2, std430) readonly buffer Counters {
 layout(set = 0, binding = 3, std430) readonly buffer Regions {
     Region regions[];
 };
-// Per region: sum(c c^T) upper (10), sum(p c^T) rows (16), sum(|p|^2), count, 4 scratch.
+// Per region: sum(c c^T) upper (10), sum(p c^T) rows (16), sum(|p|^2), count, 4 unused.
 layout(set = 0, binding = 4, std430) writeonly buffer Sums {
     double sums[];
 };

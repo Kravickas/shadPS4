@@ -13,6 +13,7 @@
 #include "common/hash.h"
 #include "common/logging/log.h"
 #include "shader_recompiler/xfb_layout.h"
+#include "video_core/host_shaders/xfb_camera_hypotheses_comp.h"
 #include "video_core/host_shaders/xfb_camera_solve_comp.h"
 #include "video_core/host_shaders/xfb_camera_sums_comp.h"
 #include "video_core/host_shaders/xfb_velocity_frag.h"
@@ -32,8 +33,12 @@ namespace Vulkan::HostPasses {
 // Frames between summary lines.
 constexpr u32 ReportInterval = 300;
 
-// Doubles per region in camera_sums: 28 sums and 4 slots of solver scratch.
+// Doubles per region in camera_sums: 28 sums and 4 unused.
 constexpr u64 CameraSumsStride = 32 * sizeof(double);
+// Random region samples tried per frame; each is one workgroup of xfb_camera_hypotheses.comp.
+constexpr u32 CameraHypothesisCount = 1024;
+// Doubles per hypothesis: C rows (16), inlier count, 3 unused.
+constexpr u64 CameraHypothesisStride = 20 * sizeof(double);
 // clip_to_prev rows and stats.
 constexpr u64 CameraResultSize = 5 * 4 * sizeof(float);
 
@@ -103,6 +108,8 @@ XfbVelocityPass::XfbVelocityPass(const Instance& instance_, Scheduler& scheduler
                    VideoCore::MemoryType::DeviceLocal, "XFB Velocity Regions"},
       camera_sums{instance, 0, CameraSumsStride * VideoCore::XfbCapture::MaxRegions,
                   VideoCore::MemoryType::DeviceLocal, "XFB Camera Sums"},
+      camera_hypotheses{instance, 0, CameraHypothesisStride * CameraHypothesisCount,
+                        VideoCore::MemoryType::DeviceLocal, "XFB Camera Hypotheses"},
       camera_result{instance, 0, CameraResultSize, VideoCore::MemoryType::DeviceLocal,
                     "XFB Camera"},
       motion_image{instance.GetDevice(), instance.GetAllocator()},
@@ -223,11 +230,13 @@ XfbVelocityPass::~XfbVelocityPass() {
     pipelines.clear();
     resolve_pipeline.reset();
     camera_sums_pipeline.reset();
+    camera_hypotheses_pipeline.reset();
     camera_solve_pipeline.reset();
     device.destroyShaderModule(vertex_module);
     device.destroyShaderModule(fragment_module);
     device.destroyShaderModule(resolve_module);
     device.destroyShaderModule(camera_sums_module);
+    device.destroyShaderModule(camera_hypotheses_module);
     device.destroyShaderModule(camera_solve_module);
 }
 
@@ -270,22 +279,38 @@ void XfbVelocityPass::CreateCameraPipelines() {
     camera_sums_module = CompileSPV(XFB_CAMERA_SUMS_COMP, device);
     ASSERT(camera_sums_module);
     SetObjectName(device, camera_sums_module, "xfb_camera_sums.comp");
+    camera_hypotheses_module = CompileSPV(XFB_CAMERA_HYPOTHESES_COMP, device);
+    ASSERT(camera_hypotheses_module);
+    SetObjectName(device, camera_hypotheses_module, "xfb_camera_hypotheses.comp");
     camera_solve_module = CompileSPV(XFB_CAMERA_SOLVE_COMP, device);
     ASSERT(camera_solve_module);
     SetObjectName(device, camera_solve_module, "xfb_camera_solve.comp");
 
     camera_sums_set_layout = create_set_layout(storage_bindings(5));
-    camera_solve_set_layout = create_set_layout(storage_bindings(2));
+    camera_hypotheses_set_layout = create_set_layout(storage_bindings(2));
+    camera_solve_set_layout = create_set_layout(storage_bindings(3));
 
     camera_sums_layout = Check<"create xfb camera sums pipeline layout">(
         device.createPipelineLayoutUnique(vk::PipelineLayoutCreateInfo{
             .setLayoutCount = 1,
             .pSetLayouts = &*camera_sums_set_layout,
         }));
-    const vk::PushConstantRange solve_constants{
+    const vk::PushConstantRange hypotheses_constants{
         .stageFlags = vk::ShaderStageFlagBits::eCompute,
         .offset = 0,
         .size = sizeof(u32),
+    };
+    camera_hypotheses_layout = Check<"create xfb camera hypotheses pipeline layout">(
+        device.createPipelineLayoutUnique(vk::PipelineLayoutCreateInfo{
+            .setLayoutCount = 1,
+            .pSetLayouts = &*camera_hypotheses_set_layout,
+            .pushConstantRangeCount = 1,
+            .pPushConstantRanges = &hypotheses_constants,
+        }));
+    const vk::PushConstantRange solve_constants{
+        .stageFlags = vk::ShaderStageFlagBits::eCompute,
+        .offset = 0,
+        .size = 2 * sizeof(u32),
     };
     camera_solve_layout = Check<"create xfb camera solve pipeline layout">(
         device.createPipelineLayoutUnique(vk::PipelineLayoutCreateInfo{
@@ -297,6 +322,9 @@ void XfbVelocityPass::CreateCameraPipelines() {
 
     camera_sums_pipeline = create_pipeline(camera_sums_module, *camera_sums_layout);
     SetObjectName(device, *camera_sums_pipeline, "xfb camera sums pipeline");
+    camera_hypotheses_pipeline =
+        create_pipeline(camera_hypotheses_module, *camera_hypotheses_layout);
+    SetObjectName(device, *camera_hypotheses_pipeline, "xfb camera hypotheses pipeline");
     camera_solve_pipeline = create_pipeline(camera_solve_module, *camera_solve_layout);
     SetObjectName(device, *camera_solve_pipeline, "xfb camera solve pipeline");
     camera_supported = true;
@@ -349,26 +377,50 @@ void XfbVelocityPass::SolveCamera(vk::CommandBuffer cmdbuf, const VideoCore::Xfb
                                 sums_writes);
     cmdbuf.dispatch(count, 1, 1);
 
-    const vk::BufferMemoryBarrier2 sums_barrier{
-        .srcStageMask = vk::PipelineStageFlagBits2::eComputeShader,
-        .srcAccessMask = vk::AccessFlagBits2::eShaderStorageWrite,
-        .dstStageMask = vk::PipelineStageFlagBits2::eComputeShader,
-        .dstAccessMask =
-            vk::AccessFlagBits2::eShaderStorageRead | vk::AccessFlagBits2::eShaderStorageWrite,
-        .buffer = camera_sums.Handle(),
-        .offset = 0,
-        .size = vk::WholeSize,
+    const auto compute_barrier = [&](vk::Buffer buffer) {
+        const vk::BufferMemoryBarrier2 barrier{
+            .srcStageMask = vk::PipelineStageFlagBits2::eComputeShader,
+            .srcAccessMask = vk::AccessFlagBits2::eShaderStorageWrite,
+            .dstStageMask = vk::PipelineStageFlagBits2::eComputeShader,
+            .dstAccessMask = vk::AccessFlagBits2::eShaderStorageRead,
+            .buffer = buffer,
+            .offset = 0,
+            .size = vk::WholeSize,
+        };
+        cmdbuf.pipelineBarrier2(vk::DependencyInfo{
+            .bufferMemoryBarrierCount = 1,
+            .pBufferMemoryBarriers = &barrier,
+        });
     };
-    cmdbuf.pipelineBarrier2(vk::DependencyInfo{
-        .bufferMemoryBarrierCount = 1,
-        .pBufferMemoryBarriers = &sums_barrier,
-    });
+    compute_barrier(camera_sums.Handle());
+
+    const std::array hypotheses_infos = {
+        vk::DescriptorBufferInfo{camera_sums.Handle(), 0, vk::WholeSize},
+        vk::DescriptorBufferInfo{camera_hypotheses.Handle(), 0, vk::WholeSize},
+    };
+    std::array<vk::WriteDescriptorSet, 2> hypotheses_writes{};
+    for (u32 i = 0; i < hypotheses_writes.size(); ++i) {
+        hypotheses_writes[i] = vk::WriteDescriptorSet{
+            .dstBinding = i,
+            .descriptorCount = 1,
+            .descriptorType = vk::DescriptorType::eStorageBuffer,
+            .pBufferInfo = &hypotheses_infos[i],
+        };
+    }
+    cmdbuf.bindPipeline(vk::PipelineBindPoint::eCompute, *camera_hypotheses_pipeline);
+    cmdbuf.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute, *camera_hypotheses_layout, 0,
+                                hypotheses_writes);
+    cmdbuf.pushConstants(*camera_hypotheses_layout, vk::ShaderStageFlagBits::eCompute, 0,
+                         sizeof(count), &count);
+    cmdbuf.dispatch(CameraHypothesisCount, 1, 1);
+    compute_barrier(camera_hypotheses.Handle());
 
     const std::array solve_infos = {
         vk::DescriptorBufferInfo{camera_sums.Handle(), 0, vk::WholeSize},
+        vk::DescriptorBufferInfo{camera_hypotheses.Handle(), 0, vk::WholeSize},
         vk::DescriptorBufferInfo{camera_result.Handle(), 0, vk::WholeSize},
     };
-    std::array<vk::WriteDescriptorSet, 2> solve_writes{};
+    std::array<vk::WriteDescriptorSet, 3> solve_writes{};
     for (u32 i = 0; i < solve_writes.size(); ++i) {
         solve_writes[i] = vk::WriteDescriptorSet{
             .dstBinding = i,
@@ -377,11 +429,12 @@ void XfbVelocityPass::SolveCamera(vk::CommandBuffer cmdbuf, const VideoCore::Xfb
             .pBufferInfo = &solve_infos[i],
         };
     }
+    const std::array<u32, 2> solve_constants = {count, CameraHypothesisCount};
     cmdbuf.bindPipeline(vk::PipelineBindPoint::eCompute, *camera_solve_pipeline);
     cmdbuf.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute, *camera_solve_layout, 0,
                                 solve_writes);
-    cmdbuf.pushConstants(*camera_solve_layout, vk::ShaderStageFlagBits::eCompute, 0, sizeof(count),
-                         &count);
+    cmdbuf.pushConstants(*camera_solve_layout, vk::ShaderStageFlagBits::eCompute, 0,
+                         sizeof(solve_constants), solve_constants.data());
     cmdbuf.dispatch(1, 1, 1);
     to_fragment();
 }

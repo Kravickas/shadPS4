@@ -1,0 +1,98 @@
+// SPDX-FileCopyrightText: Copyright 2026 shadPS4 Emulator Project
+// SPDX-License-Identifier: GPL-2.0-or-later
+
+#version 450
+#extension GL_GOOGLE_include_directive : require
+
+// One workgroup per hypothesis: fit C to a random sample of regions, count the regions it
+// explains. The static world is the largest set that agrees on one C.
+layout(local_size_x = 64) in;
+
+layout(set = 0, binding = 0, std430) readonly buffer Sums {
+    double sums[];
+};
+// Per hypothesis: C rows (16), inlier count, 3 unused.
+layout(set = 0, binding = 1, std430) writeonly buffer Hypotheses {
+    double hypotheses[];
+};
+
+layout(push_constant) uniform Constants {
+    uint region_count;
+} pc;
+
+#include "xfb_camera_common.glsl"
+
+const uint Threads = 64u;
+const uint SampleSize = 6u;
+const uint MaxTries = 64u;
+const uint HypothesisStride = 20u;
+
+shared dvec4 candidate[4];
+shared bool candidate_valid;
+shared uint inliers;
+
+uint Hash(uint v) {
+    const uint state = v * 747796405u + 2891336453u;
+    const uint word = ((state >> ((state >> 28u) + 4u)) ^ state) * 277803737u;
+    return (word >> 22u) ^ word;
+}
+
+void main() {
+    const uint hypothesis = gl_WorkGroupID.x;
+    const uint lane = gl_LocalInvocationID.x;
+
+    if (lane == 0u) {
+        uint picked[SampleSize];
+        uint count = 0u;
+        for (uint attempt = 0u; attempt < MaxTries && count < SampleSize; ++attempt) {
+            const uint region = Hash(hypothesis * MaxTries + attempt) % max(pc.region_count, 1u);
+            if (!Usable(region)) {
+                continue;
+            }
+            bool duplicate = false;
+            for (uint k = 0u; k < count; ++k) {
+                duplicate = duplicate || picked[k] == region;
+            }
+            if (!duplicate) {
+                picked[count++] = region;
+            }
+        }
+        double normal[NormalCount];
+        for (uint k = 0u; k < NormalCount; ++k) {
+            normal[k] = 0.0LF;
+        }
+        for (uint k = 0u; k < count; ++k) {
+            Accumulate(picked[k], normal);
+        }
+        dvec4 c[4];
+        const bool solved = SolveNormal(normal, c);
+        candidate_valid = count == SampleSize && solved;
+        for (uint r = 0u; r < 4u; ++r) {
+            candidate[r] = c[r];
+        }
+        inliers = 0u;
+    }
+    barrier();
+
+    if (candidate_valid) {
+        const dvec4 c[4] = dvec4[](candidate[0], candidate[1], candidate[2], candidate[3]);
+        uint local_inliers = 0u;
+        for (uint i = lane; i < pc.region_count; i += Threads) {
+            if (Usable(i) && RelativeResidual(i, c) < InlierResidual) {
+                ++local_inliers;
+            }
+        }
+        atomicAdd(inliers, local_inliers);
+    }
+    barrier();
+
+    if (lane == 0u) {
+        const uint base = hypothesis * HypothesisStride;
+        for (uint r = 0u; r < 4u; ++r) {
+            for (uint k = 0u; k < 4u; ++k) {
+                hypotheses[base + r * 4u + k] = candidate[r][k];
+            }
+        }
+        hypotheses[base + 16u] = candidate_valid ? double(inliers) : 0.0LF;
+    }
+}
