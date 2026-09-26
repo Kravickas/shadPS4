@@ -10,6 +10,7 @@
 #include "common/types.h"
 #include "imgui/renderer/imgui_core.h"
 #include "sdl_window.h"
+#include "video_core/renderer_vulkan/host_passes/dlss_nr_pass.h"
 #include "video_core/renderer_vulkan/liverpool_to_vk.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_platform.h"
@@ -228,7 +229,7 @@ bool Instance::CreateDevice() {
         return false;
     }
 
-    boost::container::static_vector<const char*, 32> enabled_extensions;
+    boost::container::static_vector<const char*, 40> enabled_extensions;
     const auto add_extension = [&](std::string_view extension) -> bool {
         const auto result =
             std::find_if(available_extensions.begin(), available_extensions.end(),
@@ -304,6 +305,12 @@ bool Instance::CreateDevice() {
     }
     provoking_vertex = add_extension(VK_EXT_PROVOKING_VERTEX_EXTENSION_NAME);
     transform_feedback = add_extension(VK_EXT_TRANSFORM_FEEDBACK_EXTENSION_NAME);
+    // Fixed at device creation, so requested only when the Neural Rendering model is installed.
+    if (HostPasses::DlssNrPass::ModelPresent()) {
+        const bool binary_import = add_extension("VK_NVX_binary_import");
+        const bool image_view_handle = add_extension("VK_NVX_image_view_handle");
+        neural_rendering = binary_import && image_view_handle;
+    }
     if (transform_feedback) {
         const auto chain =
             physical_device.getProperties2<vk::PhysicalDeviceProperties2,

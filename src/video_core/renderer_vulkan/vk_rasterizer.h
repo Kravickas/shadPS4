@@ -8,6 +8,7 @@
 #include "common/shared_first_mutex.h"
 #include "video_core/buffer_cache/buffer_cache.h"
 #include "video_core/page_manager.h"
+#include "video_core/renderer_vulkan/host_passes/dlss_nr_pass.h"
 #include "video_core/renderer_vulkan/host_passes/xfb_velocity_pass.h"
 #include "video_core/renderer_vulkan/vk_pipeline_cache.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
@@ -91,6 +92,9 @@ public:
     /// draws captured since the previous flip and swaps the capture buffers.
     void EndXfbFrame(vk::Extent2D output_extent);
 
+    /// Runs DLSS Neural Rendering over the presented image when the model is available.
+    void EvaluateNr(VideoCore::Image& color);
+
     PipelineCache& GetPipelineCache() {
         return pipeline_cache;
     }
@@ -157,6 +161,7 @@ private:
     const bool guest_markers_enabled;
     std::optional<VideoCore::XfbCapture> xfb_capture;
     std::optional<HostPasses::XfbVelocityPass> xfb_velocity;
+    std::optional<HostPasses::DlssNrPass> dlss_nr;
     vk::Extent2D xfb_output_extent{};
 
     using RenderTargetInfo = std::pair<VideoCore::ImageId, VideoCore::TextureCache::ImageDesc>;

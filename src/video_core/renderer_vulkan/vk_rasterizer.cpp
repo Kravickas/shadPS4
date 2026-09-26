@@ -127,6 +127,9 @@ Rasterizer::Rasterizer(const Instance& instance_, Scheduler& scheduler_, Runtime
         xfb_capture.emplace(instance);
         if (instance.IsTransformFeedbackDrawSupported()) {
             xfb_velocity.emplace(instance, scheduler, runtime, texture_cache);
+            if (instance.IsNeuralRenderingSupported()) {
+                dlss_nr.emplace(instance, scheduler, runtime);
+            }
         }
     }
     if (!EmulatorSettings.IsNullGPU()) {
@@ -545,6 +548,15 @@ void Rasterizer::EndXfbFrame(vk::Extent2D output_extent) {
     }
     xfb_capture->EndFrame(scheduler.CommandBuffer());
     xfb_output_extent = output_extent;
+}
+
+void Rasterizer::EvaluateNr(VideoCore::Image& color) {
+    if (!dlss_nr || !xfb_velocity) {
+        return;
+    }
+    if (const auto outputs = xfb_velocity->FrameOutputs()) {
+        dlss_nr->Render(color, *outputs);
+    }
 }
 
 void Rasterizer::OnSubmit() {

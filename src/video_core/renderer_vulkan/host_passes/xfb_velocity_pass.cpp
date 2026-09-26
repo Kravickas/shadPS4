@@ -16,6 +16,8 @@
 #include "video_core/host_shaders/xfb_camera_hypotheses_comp.h"
 #include "video_core/host_shaders/xfb_camera_solve_comp.h"
 #include "video_core/host_shaders/xfb_camera_sums_comp.h"
+#include "video_core/host_shaders/xfb_depth_copy_comp.h"
+#include "video_core/host_shaders/xfb_depth_copy_ms_comp.h"
 #include "video_core/host_shaders/xfb_velocity_frag.h"
 #include "video_core/host_shaders/xfb_velocity_resolve_comp.h"
 #include "video_core/host_shaders/xfb_velocity_vert.h"
@@ -115,7 +117,8 @@ XfbVelocityPass::XfbVelocityPass(const Instance& instance_, Scheduler& scheduler
       motion_image{instance.GetDevice(), instance.GetAllocator()},
       mask_image{instance.GetDevice(), instance.GetAllocator()},
       motion_ms_image{instance.GetDevice(), instance.GetAllocator()},
-      mask_ms_image{instance.GetDevice(), instance.GetAllocator()} {
+      mask_ms_image{instance.GetDevice(), instance.GetAllocator()},
+      depth_out{instance.GetDevice(), instance.GetAllocator()} {
     const vk::Device device = instance.GetDevice();
 
     vertex_module = CompileSPV(XFB_VELOCITY_VERT, device);
@@ -219,6 +222,49 @@ XfbVelocityPass::XfbVelocityPass(const Instance& instance_, Scheduler& scheduler
             }));
     SetObjectName(device, *resolve_pipeline, "xfb velocity resolve pipeline");
 
+    depth_copy_module = CompileSPV(XFB_DEPTH_COPY_COMP, device);
+    ASSERT(depth_copy_module);
+    depth_copy_ms_module = CompileSPV(XFB_DEPTH_COPY_MS_COMP, device);
+    ASSERT(depth_copy_ms_module);
+    const std::array depth_copy_bindings = {
+        vk::DescriptorSetLayoutBinding{
+            .binding = 0,
+            .descriptorType = vk::DescriptorType::eSampledImage,
+            .descriptorCount = 1,
+            .stageFlags = vk::ShaderStageFlagBits::eCompute,
+        },
+        vk::DescriptorSetLayoutBinding{
+            .binding = 1,
+            .descriptorType = vk::DescriptorType::eStorageImage,
+            .descriptorCount = 1,
+            .stageFlags = vk::ShaderStageFlagBits::eCompute,
+        },
+    };
+    depth_copy_set_layout = Check<"create xfb depth copy descriptor set layout">(
+        device.createDescriptorSetLayoutUnique(vk::DescriptorSetLayoutCreateInfo{
+            .flags = vk::DescriptorSetLayoutCreateFlagBits::ePushDescriptorKHR,
+            .bindingCount = static_cast<u32>(depth_copy_bindings.size()),
+            .pBindings = depth_copy_bindings.data(),
+        }));
+    depth_copy_layout = Check<"create xfb depth copy pipeline layout">(
+        device.createPipelineLayoutUnique(vk::PipelineLayoutCreateInfo{
+            .setLayoutCount = 1,
+            .pSetLayouts = &*depth_copy_set_layout,
+        }));
+    for (auto [module, pipeline] : {std::pair{depth_copy_module, &depth_copy_pipeline},
+                                    std::pair{depth_copy_ms_module, &depth_copy_ms_pipeline}}) {
+        *pipeline = Check<"create xfb depth copy pipeline">(device.createComputePipelineUnique(
+            {}, vk::ComputePipelineCreateInfo{
+                    .stage =
+                        {
+                            .stage = vk::ShaderStageFlagBits::eCompute,
+                            .module = module,
+                            .pName = "main",
+                        },
+                    .layout = *depth_copy_layout,
+                }));
+    }
+
     // The solve accumulates in doubles; without them there is no camera fallback.
     if (instance.IsShaderFloat64Supported()) {
         CreateCameraPipelines();
@@ -235,6 +281,10 @@ XfbVelocityPass::~XfbVelocityPass() {
     device.destroyShaderModule(vertex_module);
     device.destroyShaderModule(fragment_module);
     device.destroyShaderModule(resolve_module);
+    depth_copy_pipeline.reset();
+    depth_copy_ms_pipeline.reset();
+    device.destroyShaderModule(depth_copy_module);
+    device.destroyShaderModule(depth_copy_ms_module);
     device.destroyShaderModule(camera_sums_module);
     device.destroyShaderModule(camera_hypotheses_module);
     device.destroyShaderModule(camera_solve_module);
@@ -567,6 +617,8 @@ void XfbVelocityPass::ResizeTargets(u32 width, u32 height, vk::SampleCountFlagBi
     mask_image.Destroy();
     motion_ms_image.Destroy();
     mask_ms_image.Destroy();
+    depth_out_view.reset();
+    depth_out.Destroy();
 
     size = vk::Extent2D{width, height};
     samples = samples_;
@@ -610,6 +662,14 @@ void XfbVelocityPass::ResizeTargets(u32 width, u32 height, vk::SampleCountFlagBi
     mask_view = Check<"create xfb mask view">(device.createImageViewUnique(view_ci));
     SetObjectName(device, *mask_view, "XFB Velocity Mask View");
 
+    image_ci.format = vk::Format::eR32Sfloat;
+    image_ci.usage = vk::ImageUsageFlagBits::eStorage | vk::ImageUsageFlagBits::eSampled;
+    depth_out.Create(image_ci);
+    SetObjectName(device, static_cast<vk::Image>(depth_out), "XFB Velocity Depth");
+    view_ci.image = depth_out;
+    view_ci.format = vk::Format::eR32Sfloat;
+    depth_out_view = Check<"create xfb depth view">(device.createImageViewUnique(view_ci));
+
     if (!multisampled) {
         return;
     }
@@ -628,6 +688,65 @@ void XfbVelocityPass::ResizeTargets(u32 width, u32 height, vk::SampleCountFlagBi
     view_ci.image = mask_ms_image;
     view_ci.format = MaskFormat;
     mask_ms_view = Check<"create xfb mask ms view">(device.createImageViewUnique(view_ci));
+}
+
+std::optional<XfbVelocityPass::Outputs> XfbVelocityPass::FrameOutputs() const {
+    if (!outputs_valid) {
+        return std::nullopt;
+    }
+    return Outputs{
+        .motion = motion_image,
+        .motion_view = *motion_view,
+        .depth = depth_out,
+        .depth_view = *depth_out_view,
+        .size = size,
+    };
+}
+
+void XfbVelocityPass::CopyDepth(vk::CommandBuffer cmdbuf, vk::ImageView depth_view,
+                                vk::ImageLayout layout) {
+    const vk::ImageMemoryBarrier2 barrier{
+        .srcStageMask = vk::PipelineStageFlagBits2::eAllCommands,
+        .srcAccessMask = vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite,
+        .dstStageMask = vk::PipelineStageFlagBits2::eComputeShader,
+        .dstAccessMask = vk::AccessFlagBits2::eShaderStorageWrite,
+        .oldLayout = vk::ImageLayout::eUndefined,
+        .newLayout = vk::ImageLayout::eGeneral,
+        .image = depth_out,
+        .subresourceRange{
+            .aspectMask = vk::ImageAspectFlagBits::eColor,
+            .levelCount = 1,
+            .layerCount = 1,
+        },
+    };
+    cmdbuf.pipelineBarrier2(vk::DependencyInfo{
+        .imageMemoryBarrierCount = 1,
+        .pImageMemoryBarriers = &barrier,
+    });
+    const std::array image_infos = {
+        vk::DescriptorImageInfo{.imageView = depth_view, .imageLayout = layout},
+        vk::DescriptorImageInfo{.imageView = *depth_out_view,
+                                .imageLayout = vk::ImageLayout::eGeneral},
+    };
+    const std::array writes = {
+        vk::WriteDescriptorSet{
+            .dstBinding = 0,
+            .descriptorCount = 1,
+            .descriptorType = vk::DescriptorType::eSampledImage,
+            .pImageInfo = &image_infos[0],
+        },
+        vk::WriteDescriptorSet{
+            .dstBinding = 1,
+            .descriptorCount = 1,
+            .descriptorType = vk::DescriptorType::eStorageImage,
+            .pImageInfo = &image_infos[1],
+        },
+    };
+    const bool multisampled = samples != vk::SampleCountFlagBits::e1;
+    cmdbuf.bindPipeline(vk::PipelineBindPoint::eCompute,
+                        multisampled ? *depth_copy_ms_pipeline : *depth_copy_pipeline);
+    cmdbuf.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute, *depth_copy_layout, 0, writes);
+    cmdbuf.dispatch((size.width + 7) / 8, (size.height + 7) / 8, 1);
 }
 
 void XfbVelocityPass::Resolve(vk::CommandBuffer cmdbuf) {
@@ -705,6 +824,7 @@ void XfbVelocityPass::Resolve(vk::CommandBuffer cmdbuf) {
 }
 
 void XfbVelocityPass::Render(const VideoCore::XfbCapture& capture, vk::Extent2D output_extent) {
+    outputs_valid = false;
     const auto cur_regions = capture.CurrentRegions();
     if (cur_regions.empty()) {
         return;
@@ -757,8 +877,10 @@ void XfbVelocityPass::Render(const VideoCore::XfbCapture& capture, vk::Extent2D 
                                              : vk::ImageLayout::eDepthReadOnlyOptimal;
     runtime.Transit(&depth_image, depth_layout,
                     vk::PipelineStageFlagBits2::eEarlyFragmentTests |
-                        vk::PipelineStageFlagBits2::eLateFragmentTests,
-                    vk::AccessFlagBits2::eDepthStencilAttachmentRead);
+                        vk::PipelineStageFlagBits2::eLateFragmentTests |
+                        vk::PipelineStageFlagBits2::eComputeShader,
+                    vk::AccessFlagBits2::eDepthStencilAttachmentRead |
+                        vk::AccessFlagBits2::eShaderSampledRead);
     runtime.FlushBarriers();
 
     // Match each scene draw to its previous-frame counterpart and build its constants.
@@ -986,6 +1108,47 @@ void XfbVelocityPass::Render(const VideoCore::XfbCapture& capture, vk::Extent2D 
     if (multisampled) {
         Resolve(cmdbuf);
     }
+
+    // Sampled as depth: a R32F view of a depth format resolves to the depth aspect.
+    VideoCore::ImageViewInfo depth_view_info{};
+    depth_view_info.format = vk::Format::eR32Sfloat;
+    CopyDepth(cmdbuf, *depth_image.FindView(depth_view_info, false).image_view, depth_layout);
+
+    const vk::ImageSubresourceRange color_range{
+        .aspectMask = vk::ImageAspectFlagBits::eColor,
+        .levelCount = 1,
+        .layerCount = 1,
+    };
+    const std::array outputs_barriers = {
+        vk::ImageMemoryBarrier2{
+            .srcStageMask = multisampled ? vk::PipelineStageFlagBits2::eComputeShader
+                                         : vk::PipelineStageFlagBits2::eColorAttachmentOutput,
+            .srcAccessMask = multisampled ? vk::AccessFlagBits2::eShaderStorageWrite
+                                          : vk::AccessFlagBits2::eColorAttachmentWrite,
+            .dstStageMask = vk::PipelineStageFlagBits2::eAllCommands,
+            .dstAccessMask = vk::AccessFlagBits2::eMemoryRead,
+            .oldLayout =
+                multisampled ? vk::ImageLayout::eGeneral : vk::ImageLayout::eColorAttachmentOptimal,
+            .newLayout = vk::ImageLayout::eGeneral,
+            .image = motion_image,
+            .subresourceRange = color_range,
+        },
+        vk::ImageMemoryBarrier2{
+            .srcStageMask = vk::PipelineStageFlagBits2::eComputeShader,
+            .srcAccessMask = vk::AccessFlagBits2::eShaderStorageWrite,
+            .dstStageMask = vk::PipelineStageFlagBits2::eAllCommands,
+            .dstAccessMask = vk::AccessFlagBits2::eMemoryRead,
+            .oldLayout = vk::ImageLayout::eGeneral,
+            .newLayout = vk::ImageLayout::eGeneral,
+            .image = depth_out,
+            .subresourceRange = color_range,
+        },
+    };
+    cmdbuf.pipelineBarrier2(vk::DependencyInfo{
+        .imageMemoryBarrierCount = static_cast<u32>(outputs_barriers.size()),
+        .pImageMemoryBarriers = outputs_barriers.data(),
+    });
+    outputs_valid = true;
     scheduler.GetDynamicState().Invalidate();
 
     window_draws += scene_draws;

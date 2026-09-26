@@ -4,6 +4,7 @@
 #pragma once
 
 #include <array>
+#include <optional>
 #include <unordered_map>
 #include <vector>
 #include "common/types.h"
@@ -33,6 +34,17 @@ public:
     ~XfbVelocityPass();
 
     void Render(const VideoCore::XfbCapture& capture, vk::Extent2D output_extent);
+
+    // Single-sample motion (RG16F, pixels) and depth (R32F) of the last rendered frame, both in
+    // eGeneral. Empty until a frame was rendered.
+    struct Outputs {
+        vk::Image motion;
+        vk::ImageView motion_view;
+        vk::Image depth;
+        vk::ImageView depth_view;
+        vk::Extent2D size;
+    };
+    std::optional<Outputs> FrameOutputs() const;
 
     [[nodiscard]] vk::Extent2D Size() const noexcept {
         return size;
@@ -78,6 +90,7 @@ private:
     vk::Pipeline GetPipeline(const PipelineKey& key);
     void ResizeTargets(u32 width, u32 height, vk::SampleCountFlagBits samples);
     void Resolve(vk::CommandBuffer cmdbuf);
+    void CopyDepth(vk::CommandBuffer cmdbuf, vk::ImageView depth_view, vk::ImageLayout layout);
     void CreateCameraPipelines();
     void SolveCamera(vk::CommandBuffer cmdbuf, const VideoCore::XfbCapture& capture, u32 count);
 
@@ -131,6 +144,15 @@ private:
     vk::UniqueImageView motion_ms_view;
     VideoCore::UniqueImage mask_ms_image;
     vk::UniqueImageView mask_ms_view;
+    VideoCore::UniqueImage depth_out;
+    vk::UniqueImageView depth_out_view;
+    vk::ShaderModule depth_copy_module;
+    vk::ShaderModule depth_copy_ms_module;
+    vk::UniqueDescriptorSetLayout depth_copy_set_layout;
+    vk::UniquePipelineLayout depth_copy_layout;
+    vk::UniquePipeline depth_copy_pipeline;
+    vk::UniquePipeline depth_copy_ms_pipeline;
+    bool outputs_valid{};
     vk::SampleCountFlagBits samples{vk::SampleCountFlagBits::e1};
     bool targets_initialized{};
 
