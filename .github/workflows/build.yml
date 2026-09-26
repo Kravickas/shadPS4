@@ -184,7 +184,9 @@ jobs:
       uses: actions/upload-artifact@v7
       with:
         name: shadps4-win64-sdl-${{ needs.get-info.outputs.date }}-${{ needs.get-info.outputs.shorthash }}
-        path: ${{github.workspace}}/build/shadPS4.exe
+        path: |
+          ${{github.workspace}}/build/shadPS4.exe
+          ${{github.workspace}}/build/nvngx.dll_dlssnr.dll
 
   macos-sdl:
     runs-on: macos-26
