@@ -91,6 +91,8 @@ void SetGameIcons(std::vector<IconInfo>& gameIcons) {
             if (ImGui::ImageButton(ButtonNameChar, id,
                                    ImVec2(gameImageSize * uiScale, gameImageSize * uiScale))) {
                 done = true;
+                Core::FileSys::MntPoints::ignore_game_patches =
+                    ImGui::IsKeyDown(ImGuiKey::ImGuiKey_LeftCtrl);
                 runEbootPath = gameIcons[i].ebootPath;
             }
         }
@@ -268,7 +270,6 @@ void Launch(char* executableName, bool sameProcess) {
     const int atlas_max = static_cast<int>(std::bit_floor(std::max<u64>(max_dim, 512)));
     io.Fonts->TexMaxWidth = atlas_max;
     io.Fonts->TexMaxHeight = atlas_max;
-    io.Fonts->Build();
 
     ImGui_ImplSDL3_InitForSDLRenderer(window, renderer);
     ImGui_ImplSDLRenderer3_Init(renderer);
