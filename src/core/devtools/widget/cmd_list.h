@@ -1,4 +1,4 @@
-//  SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
+//  SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 //  SPDX-License-Identifier: GPL-2.0-or-later
 
 // Credits to https://github.com/psucien/tlg-emu-tools/
@@ -32,6 +32,7 @@ void ParseBlendControl(u32 value, bool begin_table = true);
 void ParseDepthRenderControl(u32 value, bool begin_table = true);
 void ParseDepthControl(u32 value, bool begin_table = true);
 void ParseEqaa(u32 value, bool begin_table = true);
+void ParseDbAlphaToMask(u32 value, bool begin_table = true);
 void ParseZInfo(u32 value, bool begin_table = true);
 
 struct CmdListFilter {

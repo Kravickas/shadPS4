@@ -403,6 +403,11 @@ void Rasterizer::OnFence() {
     buffer_cache.FlushSyncBatch();
 }
 
+void Rasterizer::EnqueueEopFence(Common::UniqueFunction<void>&& signal) {
+    scheduler.DeferPriorityOperation(std::move(signal));
+    Flush();
+}
+
 bool Rasterizer::BindResources(const Pipeline* pipeline) {
     if (IsComputeImageCopy(pipeline) || IsComputeMetaClear(pipeline) ||
         IsComputeImageClear(pipeline)) {

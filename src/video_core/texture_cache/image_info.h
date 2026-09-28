@@ -52,6 +52,12 @@ struct ImageInfo {
         return Extent2D{pitch >> dim, size.height >> dim};
     }
 
+    /// Tile aligned base level dimensions.
+    Extent2D PaddedDim() const {
+        const auto dim = props.is_block ? 2 : 0;
+        return Extent2D{pitch >> dim, mips_layout[0].height >> dim};
+    }
+
     s32 MipOf(const ImageInfo& info) const;
     s32 SliceOf(const ImageInfo& info, s32 mip) const;
 

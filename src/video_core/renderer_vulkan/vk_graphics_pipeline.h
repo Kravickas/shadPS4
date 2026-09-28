@@ -1,4 +1,4 @@
-// SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
+// SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #pragma once
@@ -47,6 +47,7 @@ struct GraphicsPipelineKey {
         AmdGpu::DepthBuffer::ZFormat z_format : 2;
         AmdGpu::DepthBuffer::StencilFormat stencil_format : 1;
         u32 depth_clamp_enable : 1;
+        u32 alpha_to_mask_enable : 1;
     };
     struct {
         AmdGpu::PrimitiveType prim_type : 5;

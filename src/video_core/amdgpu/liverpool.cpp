@@ -681,15 +681,21 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
             }
             case PM4ItOpcode::EventWriteEop: {
                 const auto* event_eop = reinterpret_cast<const PM4CmdEventWriteEop*>(header);
+                auto signal = [eop = *event_eop] {
+                    eop.SignalFence(
+                        [](void* address, u64 data, u32 num_bytes) {
+                            auto* memory = Core::Memory::Instance();
+                            ASSERT(memory->TryWriteBacking(address, &data, num_bytes));
+                        },
+                        [] { Platform::IrqC::Instance()->Signal(Platform::InterruptId::GfxEop); });
+                };
                 if (rasterizer) {
                     rasterizer->OnFence();
+                    // End of pipe: the fence and interrupt land once the GPU has done the work.
+                    rasterizer->EnqueueEopFence(std::move(signal));
+                } else {
+                    signal();
                 }
-                event_eop->SignalFence(
-                    [](void* address, u64 data, u32 num_bytes) {
-                        auto* memory = Core::Memory::Instance();
-                        ASSERT(memory->TryWriteBacking(address, &data, num_bytes));
-                    },
-                    [] { Platform::IrqC::Instance()->Signal(Platform::InterruptId::GfxEop); });
                 break;
             }
             case PM4ItOpcode::DmaData: {
