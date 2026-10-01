@@ -323,17 +323,18 @@ s32 MemoryManager::Free(PAddr phys_addr, u64 size, bool is_checked) {
     }
 
     // Release any dmem mappings that reference this physical block.
+    const PAddr release_end = phys_addr + std::min<u64>(size, total_direct_size - phys_addr);
     std::vector<std::pair<VAddr, u64>> remove_list;
     for (const auto& [addr, mapping] : vma_map) {
         if (mapping.type != VMAType::Direct) {
             continue;
         }
         for (auto& [offset_in_vma, phys_mapping] : mapping.phys_areas) {
-            if (phys_addr + size > phys_mapping.base &&
+            if (release_end > phys_mapping.base &&
                 phys_addr < phys_mapping.base + phys_mapping.size) {
                 const PAddr overlap_start = std::max<PAddr>(phys_mapping.base, phys_addr);
                 const PAddr overlap_end =
-                    std::min<PAddr>(phys_mapping.base + phys_mapping.size, phys_addr + size);
+                    std::min<PAddr>(phys_mapping.base + phys_mapping.size, release_end);
                 const u64 phys_offset = overlap_start - phys_mapping.base;
                 const VAddr addr_in_vma = mapping.base + offset_in_vma + phys_offset;
                 const u64 unmap_size = overlap_end - overlap_start;
