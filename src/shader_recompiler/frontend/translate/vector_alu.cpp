@@ -866,8 +866,9 @@ IR::U32 SaturateToI32(IR::IREmitter& ir, const IR::F32& src, const IR::F32& valu
 IR::U32 F32ToF16Bits(IR::IREmitter& ir, const IR::U32& bits, bool round_to_zero) {
     const IR::U32 sign{ir.BitwiseAnd(ir.ShiftRightLogical(bits, ir.Imm32(16U)), ir.Imm32(0x8000U))};
     const IR::U32 abs{ir.BitwiseAnd(bits, ir.Imm32(0x7FFFFFFFU))};
+    // NaN: the quiet bit set, the payload's top 10 bits kept
     const IR::U32 nan{
-        ir.BitwiseOr(ir.Imm32(0x7C00U),
+        ir.BitwiseOr(ir.Imm32(0x7E00U),
                      ir.BitwiseAnd(ir.ShiftRightLogical(abs, ir.Imm32(13U)), ir.Imm32(0x3FFU)))};
 
     const IR::U32 rebiased{ir.ISub(abs, ir.Imm32(0x38000000U))};
@@ -1111,9 +1112,20 @@ void Translator::V_CVT_OFF_F32_I4(const GcnInst& inst) {
 void Translator::V_CVT_F32_F64(const GcnInst& inst) {
     const IR::F64 src0{GetSrc64<IR::F64>(inst.src[0])};
     const IR::F32 value{ir.FPConvert(32, src0)};
-    SetDst(inst.dst[0], FlushesDenormOutput(runtime_info.props.fp_denorm_mode32)
-                            ? FlushDenorm32(ir, value)
-                            : value);
+    const IR::F32 result{FlushesDenormOutput(runtime_info.props.fp_denorm_mode32)
+                             ? FlushDenorm32(ir, value)
+                             : value};
+    // NaN: the quiet bit set, the payload's top 22 bits kept
+    const IR::Value halves{ir.UnpackDouble2x32(src0)};
+    const IR::U32 lo{ir.CompositeExtract(halves, 0)};
+    const IR::U32 hi{ir.CompositeExtract(halves, 1)};
+    const IR::U32 payload{ir.BitwiseOr(ir.ShiftLeftLogical(hi, ir.Imm32(3U)),
+                                       ir.ShiftRightLogical(lo, ir.Imm32(29U)))};
+    const IR::U32 nan{
+        ir.BitwiseOr(ir.BitwiseOr(ir.BitwiseAnd(hi, ir.Imm32(0x80000000U)), ir.Imm32(0x7FC00000U)),
+                     ir.BitwiseAnd(payload, ir.Imm32(0x7FFFFFU)))};
+    SetDst(inst.dst[0], ir.BitCast<IR::F32>(IR::U32{
+                            ir.Select(ir.FPIsNan(src0), nan, ir.BitCast<IR::U32>(result))}));
 }
 
 void Translator::V_CVT_F64_F32(const GcnInst& inst) {
@@ -1128,9 +1140,23 @@ void Translator::V_CVT_F64_F32(const GcnInst& inst) {
     const IR::U32 nan_lo{ir.ShiftLeftLogical(bits, ir.Imm32(29U))};
     // Select has no F64: pick each dword.
     const IR::Value converted{ir.UnpackDouble2x32(IR::F64{ir.FPConvert(64, value)})};
+    IR::U32 conv_lo{ir.CompositeExtract(converted, 0)};
+    IR::U32 conv_hi{ir.CompositeExtract(converted, 1)};
+    if (!FlushesDenormInput(runtime_info.props.fp_denorm_mode32)) {
+        // A kept denormal widens exactly: mantissa * 2^-149 is normal in f64
+        const IR::F64 magnitude{ir.FPMul(
+            ir.ConvertUToF(64, 32, ir.BitwiseAnd(bits, ir.Imm32(0x7FFFFFU))), ir.Imm64(0x1p-149))};
+        const IR::Value exact{ir.UnpackDouble2x32(magnitude)};
+        const IR::U1 is_denorm{ir.IEqual(ir.BitwiseAnd(bits, ir.Imm32(0x7F800000U)), ir.Imm32(0U))};
+        conv_lo = IR::U32{ir.Select(is_denorm, IR::U32{ir.CompositeExtract(exact, 0)}, conv_lo)};
+        conv_hi = IR::U32{ir.Select(is_denorm,
+                                    ir.BitwiseOr(IR::U32{ir.CompositeExtract(exact, 1)},
+                                                 ir.BitwiseAnd(bits, ir.Imm32(0x80000000U))),
+                                    conv_hi)};
+    }
     const IR::U1 is_nan{ir.FPIsNan(src0)};
-    const IR::U32 lo{ir.Select(is_nan, nan_lo, IR::U32{ir.CompositeExtract(converted, 0)})};
-    const IR::U32 hi{ir.Select(is_nan, nan_hi, IR::U32{ir.CompositeExtract(converted, 1)})};
+    const IR::U32 lo{ir.Select(is_nan, nan_lo, conv_lo)};
+    const IR::U32 hi{ir.Select(is_nan, nan_hi, conv_hi)};
     SetDst64(inst.dst[0], ir.PackDouble2x32(ir.CompositeConstruct(lo, hi)));
 }
 
