@@ -978,11 +978,8 @@ void Translator::V_CVT_FLR_I32_F32(const GcnInst& inst) {
 
 void Translator::V_CVT_OFF_F32_I4(const GcnInst& inst) {
     const IR::U32 src0{GetSrc(inst.src[0])};
-    ASSERT(src0.IsImmediate());
-    static constexpr std::array IntToFloat = {
-        0.0f,     0.0625f,  0.1250f,  0.1875f,  0.2500f,  0.3125f,  0.3750f,  0.4375f,
-        -0.5000f, -0.4375f, -0.3750f, -0.3125f, -0.2500f, -0.1875f, -0.1250f, -0.0625f};
-    SetDst(inst.dst[0], ir.Imm32(IntToFloat[src0.U32() & 0xF]));
+    const IR::U32 nibble{ir.BitFieldExtract(src0, ir.Imm32(0), ir.Imm32(4), true)};
+    SetDst(inst.dst[0], ir.FPMul(ir.ConvertSToF(32, 32, nibble), ir.Imm32(0.0625f)));
 }
 
 void Translator::V_CVT_F32_F64(const GcnInst& inst) {
