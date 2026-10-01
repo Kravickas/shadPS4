@@ -33,8 +33,10 @@ static vk::ImageUsageFlags ImageUsageFlags(const Vulkan::Instance& instance,
             }
             // Always create images with storage flag to avoid needing re-creation in case of e.g
             // compute clears This sacrifices a bit of performance but is less work. ExtendedUsage
-            // flag is also used.
-            usage |= vk::ImageUsageFlagBits::eStorage;
+            // flag is also used. The exception here is for multisample images when storage is not
+            // supported, where even with ExtendedUsage we may get only one supported sample back.
+            if (info.num_samples == 1 || instance.IsMultisampleStorageImageSupported())
+                usage |= vk::ImageUsageFlagBits::eStorage;
         }
     } else {
         // Similarly to above, we specify storage usage. This is typically not supported by
@@ -50,10 +52,10 @@ static vk::ImageType ConvertImageType(AmdGpu::ImageType type) noexcept {
     switch (type) {
     case AmdGpu::ImageType::Color1D:
     case AmdGpu::ImageType::Color1DArray:
-        return vk::ImageType::e1D;
     case AmdGpu::ImageType::Color2D:
     case AmdGpu::ImageType::Color2DMsaa:
     case AmdGpu::ImageType::Color2DArray:
+    case AmdGpu::ImageType::Cube:
         return vk::ImageType::e2D;
     case AmdGpu::ImageType::Color3D:
         return vk::ImageType::e3D;
@@ -212,7 +214,7 @@ ImageView& Image::FindView(const ImageViewInfo& view_info, bool ensure_guest_sam
         const auto view_id = backing->image_view_ids[std::distance(view_infos.begin(), it)];
         return (*slot_image_views)[view_id];
     }
-    const auto view_id = slot_image_views->insert(runtime->GetInstance(), view_info, *this);
+    const auto view_id = slot_image_views->Insert(runtime->GetInstance(), view_info, *this);
     backing->image_view_infos.emplace_back(view_info);
     backing->image_view_ids.emplace_back(view_id);
     return (*slot_image_views)[view_id];
@@ -298,7 +300,6 @@ void Image::GetBarriers(Barriers& barriers, vk::ImageLayout dst_layout, vk::Acce
         if (last_state.layout == dst_layout && last_state.access_mask == dst_mask && !is_write) {
             return;
         }
-
         barriers.emplace_back(vk::ImageMemoryBarrier2{
             .srcStageMask = last_state.pl_stage,
             .srcAccessMask = last_state.access_mask,

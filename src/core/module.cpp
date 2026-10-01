@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <fmt/format.h>
 #include "common/alignment.h"
 #include "common/arch.h"
 #include "common/assert.h"
@@ -336,9 +337,14 @@ void Module::LoadModuleToMemory(u32& max_tls_index) {
     LOG_INFO(Core_Linker, "program entry addr ..........: {:#018x}", entry_addr);
 
     if (MemoryPatcher::g_eboot_address == 0) {
-        if (name == "eboot.bin") {
+        // TODO: Come up with a more reliable way to detect the main executable.
+        std::string lower_name = name;
+        std::ranges::transform(lower_name, lower_name.begin(),
+                               [](unsigned char c) { return std::tolower(c); });
+        if (lower_name == "eboot.bin" || lower_name.ends_with(".elf")) {
             MemoryPatcher::g_eboot_address = base_virtual_addr;
             MemoryPatcher::g_eboot_image_size = base_size;
+            MemoryPatcher::g_eboot_name = name;
             MemoryPatcher::OnGameLoaded();
         }
     }
@@ -605,7 +611,7 @@ const ModuleInfo* Module::FindModule(std::string_view id) {
         }
         i++;
     }
-    return nullptr;
+    return id.empty() ? &export_modules[0] : nullptr;
 }
 
 const LibraryInfo* Module::FindLibrary(std::string_view id) {
@@ -623,14 +629,14 @@ const LibraryInfo* Module::FindLibrary(std::string_view id) {
         }
         i++;
     }
-    return nullptr;
+    return id.empty() ? &export_libs[0] : nullptr;
 }
 
 void* Module::FindByName(std::string_view name) {
     const auto nid_str = StringToNid(name);
     const auto symbols = export_sym.GetSymbols();
     const auto it = std::ranges::find_if(
-        symbols, [&](const Loader::SymbolRecord& record) { return record.name.contains(nid_str); });
+        symbols, [&](const Loader::SymbolRecord& record) { return record.symbol.name == nid_str; });
     if (it != symbols.end()) {
         return reinterpret_cast<void*>(it->virtual_address);
     }

@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <mutex>
 #include <span>
 #include <type_traits>
 #include <utility>
@@ -662,7 +663,6 @@ std::vector<u32> EmitSPIRV(const Profile& profile, const RuntimeInfo& runtime_in
     SetupCapabilities(program.info, profile, runtime_info, ctx);
     SetupFloatMode(ctx, profile, runtime_info, main);
     PatchPhiNodes(program, ctx);
-    binding.user_data += program.info.ud_mask.NumRegs();
     return ctx.Assemble();
 }
 
@@ -686,10 +686,10 @@ Id EmitConditionRef(EmitContext& ctx, const IR::Value& value) {
     return id;
 }
 
-void EmitReference(EmitContext&) {}
-
-void EmitPhiMove(EmitContext&) {
-    UNREACHABLE_MSG("Unreachable instruction");
+Id EmitGetPcLo(EmitContext& ctx, const IR::Value& value) {
+    const Id id{ctx.Def(value)};
+    ASSERT_MSG(Sirit::ValidId(id), "Forward identity declaration");
+    return id;
 }
 
 void EmitGetScc(EmitContext& ctx) {
@@ -701,10 +701,6 @@ void EmitGetExec(EmitContext& ctx) {
 }
 
 void EmitGetVcc(EmitContext& ctx) {
-    UNREACHABLE_MSG("Unreachable instruction");
-}
-
-void EmitGetSccLo(EmitContext& ctx) {
     UNREACHABLE_MSG("Unreachable instruction");
 }
 

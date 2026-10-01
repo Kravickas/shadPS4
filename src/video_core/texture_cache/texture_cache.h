@@ -3,18 +3,15 @@
 
 #pragma once
 
-#include <condition_variable>
 #include <mutex>
-#include <thread>
 #include <unordered_set>
 #include <boost/container/small_vector.hpp>
-#include <queue>
 #include <tsl/robin_map.h>
 
 #include "common/lru_cache.h"
+#include "common/multi_level_page_table.h"
 #include "common/slot_vector.h"
 #include "shader_recompiler/resource.h"
-#include "video_core/multi_level_page_table.h"
 #include "video_core/texture_cache/blit_helper.h"
 #include "video_core/texture_cache/image.h"
 #include "video_core/texture_cache/image_view.h"
@@ -44,11 +41,12 @@ class TextureCache {
 
     struct Traits {
         using Entry = ImageIds;
-        static constexpr size_t AddressSpaceBits = 40;
-        static constexpr size_t FirstLevelBits = 10;
-        static constexpr size_t PageBits = 20;
+        static constexpr size_t ADDRESS_SPACE_BITS = 40;
+        static constexpr size_t L1_BITS = 10;
+        static constexpr size_t PAGE_BITS = 20;
+        static constexpr bool NULL_CHECK = true;
     };
-    using PageTable = MultiLevelPageTable<Traits>;
+    using PageTable = Common::MultiLevelPageTable<Traits>;
 
 public:
     enum class BindingType : u32 {
@@ -118,7 +116,7 @@ public:
 
     /// Updates image contents if it was modified by CPU.
     void UpdateImage(ImageId image_id) {
-        std::scoped_lock lock{mutex};
+        std::scoped_lock lk{mutex};
         Image& image = slot_images[image_id];
         TrackImage(image_id);
         TouchImage(image);
@@ -163,7 +161,7 @@ public:
         if (!image.depth_id) {
             return {};
         }
-        if (slot_images.is_allocated(image.depth_id)) {
+        if (slot_images.IsAllocated(image.depth_id)) {
             auto& depth_image = slot_images[image.depth_id];
             if (depth_image.image_uid == image.depth_uid &&
                 depth_image.flags & ImageFlagBits::Registered) {
@@ -272,8 +270,8 @@ private:
     template <typename Func>
     static void ForEachPage(PAddr addr, size_t size, Func&& func) {
         static constexpr bool RETURNS_BOOL = std::is_same_v<std::invoke_result<Func, u64>, bool>;
-        const u64 page_end = (addr + size - 1) >> Traits::PageBits;
-        for (u64 page = addr >> Traits::PageBits; page <= page_end; ++page) {
+        const u64 page_end = (addr + size - 1) >> Traits::PAGE_BITS;
+        for (u64 page = addr >> Traits::PAGE_BITS; page <= page_end; ++page) {
             if constexpr (RETURNS_BOOL) {
                 if (func(page)) {
                     break;
@@ -333,10 +331,10 @@ private:
     AmdGpu::Liverpool* liverpool;
     BufferCache& buffer_cache;
     PageManager& tracker;
-    BlitHelper blit_helper;
-    TileManager tile_manager;
     Common::SlotVector<Image> slot_images;
     Common::SlotVector<ImageView> slot_image_views;
+    BlitHelper blit_helper;
+    TileManager tile_manager;
     tsl::robin_map<u64, Sampler> samplers;
     std::unordered_set<ImageId> download_images;
     u64 total_used_memory = 0;

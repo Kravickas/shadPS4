@@ -169,6 +169,10 @@ const Shader::RuntimeInfo& PipelineCache::BuildRuntimeInfo(HwStage stage, SwStag
         info.hw.fs.addr_flags = regs.ps_input_addr;
         info.hw.fs.num_inputs = regs.num_interp;
         info.hw.fs.front_face_all_bits = regs.barycentric_control.front_face_all_bits;
+        info.hw.fs.num_samples =
+            regs.ps_input_addr.sample_coverage_ena && regs.ps_input_ena.sample_coverage_ena
+                ? regs.aa_config.NumSamples()
+                : 1;
         info.hw.fs.z_export_format = regs.z_export_format;
         u8 stencil_ref_export_enable = regs.depth_shader_control.stencil_op_val_export_enable |
                                        regs.depth_shader_control.stencil_test_val_export_enable;
@@ -218,6 +222,10 @@ const Shader::RuntimeInfo& PipelineCache::BuildRuntimeInfo(HwStage stage, SwStag
         const auto& cs_pgm = liverpool->GetCsRegs();
         info.props.num_user_data = cs_pgm.settings.num_user_regs;
         info.props.num_allocated_vgprs = cs_pgm.settings.num_vgprs * 4;
+        info.props.fp_denorm_mode32 = cs_pgm.settings.fp_denorm_mode32;
+        info.props.fp_denorm_mode16_64 = cs_pgm.settings.fp_denorm_mode64;
+        info.props.fp_round_mode32 = cs_pgm.settings.fp_round_mode32;
+        info.props.fp_round_mode16_64 = cs_pgm.settings.fp_round_mode64;
         info.hw.cs.workgroup_size = {cs_pgm.num_thread_x.full, cs_pgm.num_thread_y.full,
                                      cs_pgm.num_thread_z.full};
         info.hw.cs.tgid_enable = {cs_pgm.IsTgidEnabled(0), cs_pgm.IsTgidEnabled(1),
@@ -352,7 +360,6 @@ const GraphicsPipeline* PipelineCache::GetGraphicsPipeline(const DrawIndirectPar
                 }
             }
         }
-        fetch_shader.reset();
     }
     return it->second.get();
 }
@@ -485,7 +492,7 @@ bool PipelineCache::RefreshGraphicsKey() {
 bool PipelineCache::RefreshGraphicsStages() {
     const auto& regs = liverpool->regs;
     auto& key = graphics_key;
-    fetch_shader = std::nullopt;
+    fetch_shader = nullptr;
 
     Shader::Backend::Bindings binding{};
     const auto bind_stage = [&](HwStage stage_in, SwStage stage_out) -> bool {
@@ -505,13 +512,8 @@ bool PipelineCache::RefreshGraphicsStages() {
         }
 
         const auto params = AmdGpu::GetParams(*pgm);
-        std::optional<Shader::Gcn::FetchShaderData> fetch_shader_;
-        std::tie(infos[stage_out_idx], modules[stage_out_idx], fetch_shader_,
-                 key.stage_hashes[stage_out_idx]) =
+        std::tie(infos[stage_out_idx], modules[stage_out_idx], key.stage_hashes[stage_out_idx]) =
             GetProgram(stage_in, stage_out, params, binding);
-        if (fetch_shader_) {
-            fetch_shader = fetch_shader_;
-        }
         return true;
     };
 
@@ -610,7 +612,7 @@ bool PipelineCache::RefreshComputeKey() {
     Shader::Backend::Bindings binding{};
     const auto& cs_pgm = liverpool->GetCsRegs();
     const auto cs_params = AmdGpu::GetParams(cs_pgm);
-    std::tie(infos[0], modules[0], fetch_shader, compute_key.value) =
+    std::tie(infos[0], modules[0], compute_key.value) =
         GetProgram(HwStage::Compute, SwStage::Compute, cs_params, binding);
     return true;
 }
@@ -663,8 +665,10 @@ PipelineCache::Result PipelineCache::GetProgram(HwStage hw_stage, SwStage sw_sta
 
         RegisterShaderMeta(program->info, spec.fetch_shader_data, spec, perm_hash, 0);
         program->AddPermut(module, std::move(spec));
-        return std::make_tuple(&program->info, module, program->modules[0].spec.fetch_shader_data,
-                               perm_hash);
+        if (auto& fetch = program->modules[0].spec.fetch_shader_data; !fetch.Empty()) {
+            fetch_shader = &fetch;
+        }
+        return std::make_tuple(&program->info, module, perm_hash);
     }
 
     auto& program = it_pgm.value();
@@ -692,8 +696,10 @@ PipelineCache::Result PipelineCache::GetProgram(HwStage hw_stage, SwStage sw_sta
         perm_idx = std::distance(program->modules.begin(), it);
         perm_hash = HashCombine(params.hash, perm_idx);
     }
-    return std::make_tuple(&program->info, module,
-                           program->modules[perm_idx].spec.fetch_shader_data, perm_hash);
+    if (auto& fetch = program->modules[perm_idx].spec.fetch_shader_data; !fetch.Empty()) {
+        fetch_shader = &fetch;
+    }
+    return std::make_tuple(&program->info, module, perm_hash);
 }
 
 std::optional<vk::ShaderModule> PipelineCache::ReplaceShader(vk::ShaderModule module,

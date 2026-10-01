@@ -4,6 +4,7 @@
 #include "common/assert.h"
 #include "video_core/amdgpu/tiling.h"
 
+#include <bit>
 #include <magic_enum/magic_enum.hpp>
 
 namespace AmdGpu {
@@ -38,8 +39,9 @@ ArrayMode GetArrayMode(TileMode tile_mode) {
     case TileMode::Thin2DThinPrt:
         return ArrayMode::ArrayPrt2DTiledThin1;
     case TileMode::Thin3DThin:
-    case TileMode::Thin3DThinPrt:
         return ArrayMode::Array3DTiledThin1;
+    case TileMode::Thin3DThinPrt:
+        return ArrayMode::ArrayPrt3DTiledThin1;
     case TileMode::Thick1DThick:
         return ArrayMode::Array1DTiledThick;
     case TileMode::Thick2DThick:
