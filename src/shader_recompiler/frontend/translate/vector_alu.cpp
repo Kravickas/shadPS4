@@ -1126,9 +1126,12 @@ void Translator::V_CVT_F64_F32(const GcnInst& inst) {
         ir.BitwiseOr(ir.BitwiseAnd(bits, ir.Imm32(0x80000000U)), ir.Imm32(0x7FF00000U)),
         ir.BitwiseAnd(ir.ShiftRightLogical(bits, ir.Imm32(3U)), ir.Imm32(0xFFFFFU)))};
     const IR::U32 nan_lo{ir.ShiftLeftLogical(bits, ir.Imm32(29U))};
-    const IR::F64 nan{ir.PackDouble2x32(ir.CompositeConstruct(nan_lo, nan_hi))};
-    SetDst64(inst.dst[0],
-             IR::F64{ir.Select(ir.FPIsNan(src0), nan, IR::F64{ir.FPConvert(64, value)})});
+    // Select has no F64: pick each dword.
+    const IR::Value converted{ir.UnpackDouble2x32(IR::F64{ir.FPConvert(64, value)})};
+    const IR::U1 is_nan{ir.FPIsNan(src0)};
+    const IR::U32 lo{ir.Select(is_nan, nan_lo, IR::U32{ir.CompositeExtract(converted, 0)})};
+    const IR::U32 hi{ir.Select(is_nan, nan_hi, IR::U32{ir.CompositeExtract(converted, 1)})};
+    SetDst64(inst.dst[0], ir.PackDouble2x32(ir.CompositeConstruct(lo, hi)));
 }
 
 void Translator::V_CVT_F32_UBYTE(u32 index, const GcnInst& inst) {
