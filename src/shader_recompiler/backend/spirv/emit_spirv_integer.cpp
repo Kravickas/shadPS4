@@ -266,8 +266,13 @@ Id EmitFindILsb64(EmitContext& ctx, Id value) {
     const Id hi{ctx.OpCompositeExtract(ctx.U32[1], unpacked, 1U)};
     const Id lo_lsb{ctx.OpFindILsb(ctx.U32[1], lo)};
     const Id hi_lsb{ctx.OpFindILsb(ctx.U32[1], hi)};
-    const Id found_lo{ctx.OpINotEqual(ctx.U1[1], lo_lsb, ctx.ConstU32(u32(-1)))};
-    return ctx.OpSelect(ctx.U32[1], found_lo, lo_lsb, hi_lsb);
+    const Id not_found{ctx.ConstU32(u32(-1))};
+    const Id found_lo{ctx.OpINotEqual(ctx.U1[1], lo_lsb, not_found)};
+    const Id found_hi{ctx.OpINotEqual(ctx.U1[1], hi_lsb, not_found)};
+    // The high half holds bits 32..63; -1 when no bit is set at all.
+    const Id hi_pos{ctx.OpSelect(ctx.U32[1], found_hi,
+                                 ctx.OpIAdd(ctx.U32[1], hi_lsb, ctx.ConstU32(32U)), not_found)};
+    return ctx.OpSelect(ctx.U32[1], found_lo, lo_lsb, hi_pos);
 }
 
 Id EmitSMin32(EmitContext& ctx, Id a, Id b) {

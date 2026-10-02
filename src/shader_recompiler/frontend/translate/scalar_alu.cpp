@@ -445,6 +445,7 @@ void Translator::S_BFM_B32(const GcnInst& inst) {
 }
 
 void Translator::S_BFM_B64(const GcnInst& inst) {
+    // 32-bit sources, 6-bit width and offset; SCC is not written.
     const IR::U32 src0{ir.BitwiseAnd(GetSrc(inst.src[0]), ir.Imm32(0x3F))};
     const IR::U32 src1{ir.BitwiseAnd(GetSrc(inst.src[1]), ir.Imm32(0x3F))};
     const IR::U64 mask{ir.ISub(ir.ShiftLeftLogical(ir.Imm64(u64(1)), src0), ir.Imm64(u64(1)))};
@@ -571,8 +572,9 @@ void Translator::S_FF1_I32_B32(const GcnInst& inst) {
 }
 
 void Translator::S_FF1_I32_B64(const GcnInst& inst) {
+    // Integer find-first-one over all 64 bits, -1 when none is set.
     const IR::U64 src0{GetSrc64(inst.src[0])};
-    SetDst(inst.dst[0], ir.BallotFindLsb(src0));
+    SetDst(inst.dst[0], ir.FindILsb(src0));
 }
 
 void Translator::S_FLBIT_I32_B32(const GcnInst& inst) {
