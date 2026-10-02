@@ -1,7 +1,6 @@
 // SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
-#include <algorithm>
 #include "common/assert.h"
 #include "core/libraries/kernel/process.h"
 #include "shader_recompiler/frontend/decode.h"
@@ -423,13 +422,20 @@ void GcnDecodeContext::decodeLiteralConstant(InstEncoding encoding, GcnCodeSlice
         return;
     }
 
-    // Find if the instruction contains a literal constant
-    const auto it = std::ranges::find_if(m_instruction.src, [](InstOperand& src) {
-        return src.field == OperandField::LiteralConst;
-    });
-    if (it != m_instruction.src.end()) {
-        it->code = code.readu32();
-        m_instruction.length += sizeof(u32);
+    // Find if the instruction contains a literal constant. There is one literal dword per
+    // instruction, every operand encoded as a literal reads the same value.
+    bool has_literal = false;
+    u32 literal = 0;
+    for (auto& src : m_instruction.src) {
+        if (src.field != OperandField::LiteralConst) {
+            continue;
+        }
+        if (!has_literal) {
+            literal = code.readu32();
+            m_instruction.length += sizeof(u32);
+            has_literal = true;
+        }
+        src.code = literal;
     }
 }
 
