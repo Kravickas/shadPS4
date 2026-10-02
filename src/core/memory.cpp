@@ -1220,11 +1220,20 @@ s32 MemoryManager::DirectMemoryQuery(PAddr addr, bool find_next,
     out_info->start = dmem_area->second.base;
     out_info->memoryType = dmem_area->second.memory_type;
 
-    // Loop through all sequential mapped or allocated dmem areas
-    // to determine the hardware accurate end.
-    while (dmem_area != dmem_map.end() && dmem_area->second.memory_type == out_info->memoryType &&
-           (dmem_area->second.dma_type == PhysicalMemoryType::Mapped ||
-            dmem_area->second.dma_type == PhysicalMemoryType::Allocated)) {
+    // Sequential mapped or allocated areas of the same type are reported as one region,
+    // in both directions.
+    const auto in_region = [&](const PhysicalMemoryArea& area) {
+        return area.memory_type == out_info->memoryType &&
+               (area.dma_type == PhysicalMemoryType::Mapped ||
+                area.dma_type == PhysicalMemoryType::Allocated);
+    };
+    if (in_region(dmem_area->second)) {
+        for (auto it = dmem_area; it != dmem_map.begin() && in_region(std::prev(it)->second);) {
+            --it;
+            out_info->start = it->second.base;
+        }
+    }
+    while (dmem_area != dmem_map.end() && in_region(dmem_area->second)) {
         out_info->end = dmem_area->second.GetEnd();
         dmem_area++;
     }
