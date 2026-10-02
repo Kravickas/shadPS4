@@ -445,7 +445,6 @@ void Translator::S_BFM_B32(const GcnInst& inst) {
 }
 
 void Translator::S_BFM_B64(const GcnInst& inst) {
-    // 32-bit sources, 6-bit width and offset; SCC is not written.
     const IR::U32 src0{ir.BitwiseAnd(GetSrc(inst.src[0]), ir.Imm32(0x3F))};
     const IR::U32 src1{ir.BitwiseAnd(GetSrc(inst.src[1]), ir.Imm32(0x3F))};
     const IR::U64 mask{ir.ISub(ir.ShiftLeftLogical(ir.Imm64(u64(1)), src0), ir.Imm64(u64(1)))};
