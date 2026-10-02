@@ -291,39 +291,30 @@ s32 MemoryManager::Free(PAddr phys_addr, u64 size, bool is_checked) {
     }
 
     std::scoped_lock lk{unmap_mutex};
-    // If this is a checked free, then all direct memory in range must be allocated.
+    // Release the allocated parts of [phys_addr, release_end). A checked free fails if any part of
+    // the range is not allocated; an unchecked free skips those parts.
+    const PAddr release_end = phys_addr + std::min<u64>(size, total_direct_size - phys_addr);
     std::vector<std::pair<PAddr, u64>> free_list;
-    u64 remaining_size = size;
-    auto phys_handle = FindDmemArea(phys_addr);
-    for (; phys_handle != dmem_map.end(); phys_handle++) {
-        if (remaining_size == 0) {
-            // Done searching
-            break;
+    for (auto phys_handle = FindDmemArea(phys_addr);
+         phys_handle != dmem_map.end() && phys_handle->second.base < release_end; phys_handle++) {
+        const auto& dmem_area = phys_handle->second;
+        const PAddr current_phys_addr = std::max<PAddr>(phys_addr, dmem_area.base);
+        const PAddr area_end = std::min<PAddr>(dmem_area.GetEnd(), release_end);
+        if (area_end <= current_phys_addr) {
+            continue;
         }
-        auto& dmem_area = phys_handle->second;
-        if (dmem_area.dma_type == PhysicalMemoryType::Free) {
+        if (dmem_area.dma_type != PhysicalMemoryType::Allocated &&
+            dmem_area.dma_type != PhysicalMemoryType::Mapped) {
             if (is_checked) {
-                // Checked frees will error if anything in the area isn't allocated.
-                // Unchecked frees will just ignore free areas.
-                LOG_ERROR(Kernel_Vmm, "Attempting to release a free dmem area");
+                LOG_ERROR(Kernel_Vmm, "Attempting to release an unallocated dmem area");
                 return ORBIS_KERNEL_ERROR_ENOENT;
             }
             continue;
         }
-
-        // Store physical address and size to release
-        const PAddr current_phys_addr = std::max<PAddr>(phys_addr, phys_handle->first);
-        const u64 start_in_dma = current_phys_addr - phys_handle->first;
-        const u64 size_in_dma =
-            std::min<u64>(remaining_size, phys_handle->second.size - start_in_dma);
-        free_list.emplace_back(current_phys_addr, size_in_dma);
-
-        // Track remaining size to free
-        remaining_size -= size_in_dma;
+        free_list.emplace_back(current_phys_addr, area_end - current_phys_addr);
     }
 
     // Release any dmem mappings that reference this physical block.
-    const PAddr release_end = phys_addr + std::min<u64>(size, total_direct_size - phys_addr);
     std::vector<std::pair<VAddr, u64>> remove_list;
     for (const auto& [addr, mapping] : vma_map) {
         if (mapping.type != VMAType::Direct) {
@@ -544,7 +535,7 @@ s32 MemoryManager::MapMemory(void** out_addr, VAddr virtual_addr, u64 size, Memo
                 dmem_area->second.dma_type != PhysicalMemoryType::Mapped) {
                 LOG_ERROR(Kernel_Vmm, "Unable to map {:#x} bytes at physical address {:#x}", size,
                           phys_addr);
-                return ORBIS_KERNEL_ERROR_ENOMEM;
+                return ORBIS_KERNEL_ERROR_EACCES;
             }
 
             // If we need to perform extra validation, then check for Mapped dmem areas too.
@@ -1206,13 +1197,16 @@ s32 MemoryManager::DirectMemoryQuery(PAddr addr, bool find_next,
     }
 
     std::shared_lock lk{mutex};
+    const auto is_allocated = [](const PhysicalMemoryArea& area) {
+        return area.dma_type == PhysicalMemoryType::Allocated ||
+               area.dma_type == PhysicalMemoryType::Mapped;
+    };
     auto dmem_area = FindDmemArea(addr);
-    while (dmem_area != dmem_map.end() && dmem_area->second.dma_type == PhysicalMemoryType::Free &&
-           find_next) {
+    while (dmem_area != dmem_map.end() && !is_allocated(dmem_area->second) && find_next) {
         dmem_area++;
     }
 
-    if (dmem_area == dmem_map.end() || dmem_area->second.dma_type == PhysicalMemoryType::Free) {
+    if (dmem_area == dmem_map.end() || !is_allocated(dmem_area->second)) {
         LOG_WARNING(Kernel_Vmm, "Unable to find allocated direct memory region to query!");
         return ORBIS_KERNEL_ERROR_EACCES;
     }

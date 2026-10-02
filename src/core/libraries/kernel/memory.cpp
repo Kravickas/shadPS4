@@ -56,7 +56,7 @@ s32 PS4_SYSV_ABI sceKernelAllocateDirectMemory(s64 searchStart, s64 searchEnd, u
         LOG_ERROR(Kernel_Vmm, "Alignment {:#x} is invalid!", alignment);
         return ORBIS_KERNEL_ERROR_EINVAL;
     }
-    if (memoryType > 10) {
+    if (memoryType < 0 || memoryType > 10) {
         LOG_ERROR(Kernel_Vmm, "Memory type {:#x} is invalid!", memoryType);
         return ORBIS_KERNEL_ERROR_EINVAL;
     }
@@ -103,8 +103,8 @@ s32 PS4_SYSV_ABI sceKernelCheckedReleaseDirectMemory(u64 start, u64 len) {
                   len);
         return ORBIS_KERNEL_ERROR_EINVAL;
     }
-    if (static_cast<s64>(len) < 0) {
-        LOG_ERROR(Kernel_Vmm, "Invalid length {:#x}", len);
+    if (static_cast<s64>(start) < 0 || static_cast<s64>(len) < 0) {
+        LOG_ERROR(Kernel_Vmm, "Invalid range start = {:#x}, len = {:#x}", start, len);
         return ORBIS_KERNEL_ERROR_EINVAL;
     }
     if (len == 0) {
@@ -121,8 +121,8 @@ s32 PS4_SYSV_ABI sceKernelReleaseDirectMemory(u64 start, u64 len) {
                   len);
         return ORBIS_KERNEL_ERROR_EINVAL;
     }
-    if (static_cast<s64>(len) < 0) {
-        LOG_ERROR(Kernel_Vmm, "Invalid length {:#x}", len);
+    if (static_cast<s64>(start) < 0 || static_cast<s64>(len) < 0) {
+        LOG_ERROR(Kernel_Vmm, "Invalid range start = {:#x}, len = {:#x}", start, len);
         return ORBIS_KERNEL_ERROR_EINVAL;
     }
     if (len == 0) {
@@ -138,7 +138,8 @@ s32 PS4_SYSV_ABI sceKernelAvailableDirectMemorySize(u64 searchStart, u64 searchE
     LOG_INFO(Kernel_Vmm, "called searchStart = {:#x}, searchEnd = {:#x}, alignment = {:#x}",
              searchStart, searchEnd, alignment);
 
-    if (physAddrOut == nullptr || sizeOut == nullptr) {
+    if (alignment != 0 && !std::has_single_bit(alignment)) {
+        LOG_ERROR(Kernel_Vmm, "Alignment {:#x} is invalid!", alignment);
         return ORBIS_KERNEL_ERROR_EINVAL;
     }
 
@@ -152,8 +153,12 @@ s32 PS4_SYSV_ABI sceKernelAvailableDirectMemorySize(u64 searchStart, u64 searchE
         return ORBIS_KERNEL_ERROR_ENOMEM;
     }
 
-    *physAddrOut = static_cast<u64>(physAddr);
-    *sizeOut = size;
+    if (physAddrOut != nullptr) {
+        *physAddrOut = static_cast<u64>(physAddr);
+    }
+    if (sizeOut != nullptr) {
+        *sizeOut = size;
+    }
 
     return result;
 }
@@ -462,6 +467,10 @@ s32 PS4_SYSV_ABI sceKernelMtypeprotect(const void* addr, u64 size, s32 mtype, s3
 s32 PS4_SYSV_ABI sceKernelDirectMemoryQuery(u64 offset, s32 flags, OrbisQueryInfo* query_info,
                                             u64 infoSize) {
     LOG_INFO(Kernel_Vmm, "called offset = {:#x}, flags = {:#x}", offset, flags);
+    if (flags != 0 && flags != 1) {
+        LOG_ERROR(Kernel_Vmm, "Invalid flags {:#x}", flags);
+        return ORBIS_KERNEL_ERROR_EINVAL;
+    }
     auto* memory = Core::Memory::Instance();
     return memory->DirectMemoryQuery(offset, flags == 1, query_info);
 }
