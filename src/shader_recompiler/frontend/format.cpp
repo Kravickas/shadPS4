@@ -105,7 +105,7 @@ constexpr std::array<InstFormat, 45> InstructionFormatSOP2 = {{
     {InstClass::ScalarBitField, InstCategory::ScalarALU, 2, 1, ScalarType::Uint32,
      ScalarType::Uint32},
     // 37 = S_BFM_B64
-    {InstClass::ScalarBitField, InstCategory::ScalarALU, 2, 1, ScalarType::Uint64,
+    {InstClass::ScalarBitField, InstCategory::ScalarALU, 2, 1, ScalarType::Uint32,
      ScalarType::Uint64},
     // 38 = S_MUL_I32
     {InstClass::ScalarArith, InstCategory::ScalarALU, 2, 1, ScalarType::Sint32, ScalarType::Sint32},
