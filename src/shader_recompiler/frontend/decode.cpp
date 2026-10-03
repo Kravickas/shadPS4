@@ -412,19 +412,24 @@ void GcnDecodeContext::decodeInstruction64(InstEncoding encoding, GcnCodeSlice& 
 }
 
 void GcnDecodeContext::decodeLiteralConstant(InstEncoding encoding, GcnCodeSlice& code) {
+    // There is one literal dword per instruction; every source encoded as a literal reads it.
     if (HasAdditionalLiteral(encoding, m_instruction.opcode)) {
         u32 encoding_op = mapEncodingOp(encoding, m_instruction.opcode);
         InstFormat instFormat = InstructionFormat(encoding, encoding_op);
+        const u32 literal = code.readu32();
+        for (u32 i = 0; i < m_instruction.src_count; ++i) {
+            if (m_instruction.src[i].field == OperandField::LiteralConst) {
+                m_instruction.src[i].code = literal;
+            }
+        }
         m_instruction.src[m_instruction.src_count].field = OperandField::LiteralConst;
         m_instruction.src[m_instruction.src_count].type = instFormat.src_type;
-        m_instruction.src[m_instruction.src_count].code = code.readu32();
+        m_instruction.src[m_instruction.src_count].code = literal;
         ++m_instruction.src_count;
         m_instruction.length += sizeof(u32);
         return;
     }
 
-    // Find if the instruction contains a literal constant. There is one literal dword per
-    // instruction, every operand encoded as a literal reads the same value.
     bool has_literal = false;
     u32 literal = 0;
     for (auto& src : m_instruction.src) {
