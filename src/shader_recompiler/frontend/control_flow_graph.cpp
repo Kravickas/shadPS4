@@ -38,23 +38,29 @@ static IR::Condition MakeCondition(const GcnInst& inst) {
     case Opcode::S_CBRANCH_VCCNZ:
         return IR::Condition::Vccnz;
     case Opcode::S_CBRANCH_EXECZ:
-        return IR::Condition::Execz;
+        return IR::Condition::ExecWaveZ;
     case Opcode::S_CBRANCH_EXECNZ:
-        return IR::Condition::Execnz;
+        return IR::Condition::ExecWaveNz;
     default:
         return IR::Condition::True;
     }
 }
 
 static bool IgnoresExecMask(const GcnInst& inst) {
-    // EXEC mask does not affect scalar instructions or branches.
+    // EXEC mask does not affect scalar instructions or branches. Exports run in every lane, a
+    // fragment export discards the lanes with EXEC clear.
     switch (inst.category) {
     case InstCategory::ScalarALU:
     case InstCategory::ScalarMemory:
     case InstCategory::FlowControl:
+    case InstCategory::Export:
         return true;
     default:
         break;
+    }
+    // Compares run in every lane, they clear the bits of the lanes with EXEC clear themselves.
+    if (inst.opcode >= Opcode::V_CMP_F_F32 && inst.opcode <= Opcode::V_CMPX_T_U64) {
+        return true;
     }
     // Read/Write Lane instructions are not affected either.
     switch (inst.opcode) {
@@ -160,123 +166,73 @@ void CFG::EmitLabels() {
 }
 
 void CFG::SplitDivergenceScopes() {
-    const auto is_open_scope = [](const GcnInst& inst) {
-        // An open scope instruction is an instruction that modifies EXEC
-        // but also saves the previous value to restore later. This indicates
-        // we are entering a scope.
-        return inst.opcode == Opcode::S_AND_SAVEEXEC_B64 ||
-               // While this instruction does not save EXEC it is often used paired
-               // with SAVEEXEC to mask the threads that didn't pass the condition
-               // of initial branch.
-               (inst.opcode == Opcode::S_ANDN2_B64 && inst.dst[0].field == OperandField::ExecLo) ||
-               inst.IsCmpx();
-    };
-    const auto is_close_scope = [](const GcnInst& inst) {
-        // Closing an EXEC scope can be either a branch instruction
-        // (typical case when S_AND_SAVEEXEC_B64 is right before a branch)
-        // or by a move instruction to EXEC that restores the backup.
-        return (inst.opcode == Opcode::S_MOV_B64 && inst.dst[0].field == OperandField::ExecLo) ||
-               // Sometimes compiler might insert instructions between the SAVEEXEC and the branch.
-               // Those instructions need to be wrapped in the condition as well so allow branch
-               // as end scope instruction.
-               inst.opcode == Opcode::S_CBRANCH_EXECZ || inst.opcode == Opcode::S_ENDPGM ||
-               (inst.opcode == Opcode::S_ANDN2_B64 && inst.dst[0].field == OperandField::ExecLo);
-    };
-
+    // EXEC masks the vector instructions only. Each run of them goes into its own block, which
+    // only the lanes with EXEC set enter; scalar instructions and branches stay outside and run
+    // in every lane.
     for (auto blk = blocks.begin(); blk != blocks.end(); blk++) {
-        auto next_blk = std::next(blk);
-        s32 curr_begin = -1;
-        for (size_t index = blk->begin_index; index <= blk->end_index; index++) {
-            const auto& inst = inst_list[index];
-            const bool is_close = is_close_scope(inst);
-            if ((is_close || index == blk->end_index) && curr_begin != -1) {
-                // If there are no instructions inside scope don't do anything.
-                if (index - curr_begin == 1 && is_close) {
-                    curr_begin = -1;
-                    continue;
-                }
-                // If all instructions in the scope ignore exec masking, we shouldn't insert a
-                // scope.
-                const auto start = inst_list.begin() + curr_begin + 1;
-                if (!std::ranges::all_of(start, inst_list.begin() + index + !is_close,
-                                         IgnoresExecMask)) {
-                    // Determine the first instruction affected by the exec mask.
-                    do {
-                        ++curr_begin;
-                    } while (IgnoresExecMask(inst_list[curr_begin]));
-
-                    // Determine the last instruction affected by the exec mask.
-                    s32 curr_end = index;
-                    while (IgnoresExecMask(inst_list[curr_end])) {
-                        --curr_end;
-                    }
-
-                    // Create a new block for the divergence scope.
-                    Block* block = block_pool.Create();
-                    block->begin = index_to_pc[curr_begin];
-                    block->end = index_to_pc[curr_end];
-                    block->begin_index = curr_begin;
-                    block->end_index = curr_end;
-                    block->end_inst = inst_list[curr_end];
-                    block->num_predecessors = 1;
-                    blocks.insert_before(next_blk, *block);
-
-                    // If we are inside the parent block, make an epilogue block and jump to it.
-                    if (curr_end != blk->end_index) {
-                        Block* epi_block = block_pool.Create();
-                        epi_block->begin = index_to_pc[curr_end + 1];
-                        epi_block->end = blk->end;
-                        epi_block->begin_index = curr_end + 1;
-                        epi_block->end_index = blk->end_index;
-                        epi_block->end_inst = blk->end_inst;
-                        epi_block->cond = blk->cond;
-                        epi_block->end_class = blk->end_class;
-                        epi_block->branch_true = blk->branch_true;
-                        epi_block->branch_false = blk->branch_false;
-                        epi_block->num_predecessors = 2;
-                        blocks.insert_before(next_blk, *epi_block);
-
-                        // Have divergence block always jump to epilogue block.
-                        block->cond = IR::Condition::True;
-                        block->branch_true = epi_block;
-                        block->branch_false = nullptr;
-
-                        // If the parent block fails to enter divergence block make it jump to
-                        // epilogue too
-                        blk->branch_false = epi_block;
-                    } else {
-                        // No epilogue block is needed since the divergence block
-                        // also ends the parent block. Inherit the end condition.
-                        auto& parent_blk = *blk;
-                        ASSERT(blk->cond == IR::Condition::True && blk->branch_true);
-                        block->cond = IR::Condition::True;
-                        block->branch_true = blk->branch_true;
-                        block->branch_false = nullptr;
-
-                        // If the parent block didn't enter the divergence scope
-                        // have it jump directly to the next one
-                        blk->branch_false = blk->branch_true;
-                        blk->branch_true->num_predecessors++;
-                    }
-
-                    // Shrink parent block to end right before curr_begin
-                    // and make it jump to divergence block
-                    --curr_begin;
-                    blk->end = index_to_pc[curr_begin];
-                    blk->end_index = curr_begin;
-                    blk->end_inst = inst_list[curr_begin];
-                    blk->cond = IR::Condition::Execnz;
-                    blk->end_class = EndClass::Branch;
-                    blk->branch_true = block;
-                }
-                // Reset scope begin.
-                curr_begin = -1;
-            }
-            // Mark a potential start of an exec scope.
-            if (is_open_scope(inst)) {
-                curr_begin = index;
-            }
+        if (blk->is_exec_scope) {
+            continue;
         }
+        u32 first = blk->begin_index;
+        while (first <= blk->end_index && IgnoresExecMask(inst_list[first])) {
+            ++first;
+        }
+        if (first > blk->end_index) {
+            continue;
+        }
+        u32 last = first;
+        while (last < blk->end_index && !IgnoresExecMask(inst_list[last + 1])) {
+            ++last;
+        }
+        const auto next_blk = std::next(blk);
+
+        // Create a new block for the run.
+        Block* block = block_pool.Create();
+        block->begin = index_to_pc[first];
+        block->end = index_to_pc[last + 1];
+        block->begin_index = first;
+        block->end_index = last;
+        block->end_inst = inst_list[last];
+        block->num_predecessors = 1;
+        block->is_exec_scope = true;
+        block->cond = IR::Condition::True;
+        block->end_class = EndClass::Branch;
+        blocks.insert_before(next_blk, *block);
+
+        if (last != blk->end_index) {
+            // The rest of the parent block follows the run, the lanes that skipped it join there.
+            Block* epi_block = block_pool.Create();
+            epi_block->begin = index_to_pc[last + 1];
+            epi_block->end = blk->end;
+            epi_block->begin_index = last + 1;
+            epi_block->end_index = blk->end_index;
+            epi_block->end_inst = blk->end_inst;
+            epi_block->cond = blk->cond;
+            epi_block->end_class = blk->end_class;
+            epi_block->branch_true = blk->branch_true;
+            epi_block->branch_false = blk->branch_false;
+            epi_block->num_predecessors = 2;
+            blocks.insert_before(next_blk, *epi_block);
+            block->branch_true = epi_block;
+            blk->branch_false = epi_block;
+        } else {
+            // The run ends the parent block, both paths continue at its successor.
+            ASSERT(blk->cond == IR::Condition::True && blk->branch_true);
+            block->branch_true = blk->branch_true;
+            blk->branch_false = blk->branch_true;
+            blk->branch_true->num_predecessors++;
+        }
+
+        // The parent block ends right before the run (it is empty when the run starts it) and
+        // enters the run with the lane's EXEC bit.
+        blk->end = index_to_pc[first];
+        blk->end_index = first - 1;
+        if (first != blk->begin_index) {
+            blk->end_inst = inst_list[first - 1];
+        }
+        blk->cond = IR::Condition::Execnz;
+        blk->end_class = EndClass::Branch;
+        blk->branch_true = block;
     }
 }
 

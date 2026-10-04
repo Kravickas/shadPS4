@@ -1214,7 +1214,8 @@ void Translator::V_CMP_F32(ConditionOp op, bool set_exec, const GcnInst& inst) {
         SetDst64(inst.dst[1], ir.Ballot(masked));
         return;
     }
-    SetDst64(inst.dst[1], ir.Ballot(result));
+    // Inactive lanes' bits are zero in the destination.
+    SetDst64(inst.dst[1], ir.Ballot(ir.LogicalAnd(ir.GetExec(), result)));
 }
 
 void Translator::V_CMP_F64(ConditionOp op, bool set_exec, const GcnInst& inst) {
@@ -1249,7 +1250,8 @@ void Translator::V_CMP_F64(ConditionOp op, bool set_exec, const GcnInst& inst) {
         SetDst64(inst.dst[1], ir.Ballot(masked));
         return;
     }
-    SetDst64(inst.dst[1], ir.Ballot(result));
+    // Inactive lanes' bits are zero in the destination.
+    SetDst64(inst.dst[1], ir.Ballot(ir.LogicalAnd(ir.GetExec(), result)));
 }
 
 void Translator::V_CMP_U32(ConditionOp op, bool is_signed, bool set_exec, const GcnInst& inst) {
@@ -1284,7 +1286,8 @@ void Translator::V_CMP_U32(ConditionOp op, bool is_signed, bool set_exec, const 
         SetDst64(inst.dst[1], ir.Ballot(masked));
         return;
     }
-    SetDst64(inst.dst[1], ir.Ballot(result));
+    // Inactive lanes' bits are zero in the destination.
+    SetDst64(inst.dst[1], ir.Ballot(ir.LogicalAnd(ir.GetExec(), result)));
 }
 
 void Translator::V_CMP_U64(ConditionOp op, bool is_signed, bool set_exec, const GcnInst& inst) {
@@ -1319,7 +1322,8 @@ void Translator::V_CMP_U64(ConditionOp op, bool is_signed, bool set_exec, const 
         SetDst64(inst.dst[1], ir.Ballot(masked));
         return;
     }
-    SetDst64(inst.dst[1], ir.Ballot(result));
+    // Inactive lanes' bits are zero in the destination.
+    SetDst64(inst.dst[1], ir.Ballot(ir.LogicalAnd(ir.GetExec(), result)));
 }
 
 void Translator::V_CMP_CLASS_F32(const GcnInst& inst) {
@@ -1341,7 +1345,8 @@ void Translator::V_CMP_CLASS_F32(const GcnInst& inst) {
         // We don't know the type yet, delay its resolution.
         value = ir.FPCmpClass32(src0, src1);
     }
-    SetDst64(inst.dst[1], ir.Ballot(value));
+    // Inactive lanes' bits are zero in the destination.
+    SetDst64(inst.dst[1], ir.Ballot(ir.LogicalAnd(ir.GetExec(), value)));
 }
 
 // VOP3a

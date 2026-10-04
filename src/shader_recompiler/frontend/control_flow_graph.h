@@ -34,7 +34,8 @@ struct Block : Hook {
     [[nodiscard]] bool Contains(u32 pc) const noexcept;
 
     bool operator<(const Block& rhs) const noexcept {
-        return begin < rhs.begin;
+        // An empty block ahead of an EXEC scope shares its begin, it sorts first.
+        return begin < rhs.begin || (begin == rhs.begin && end < rhs.end);
     }
 
     u32 begin;
@@ -49,6 +50,7 @@ struct Block : Hook {
     Block* branch_false{};
     IR::Block* ir_block{};
     bool is_dummy{};
+    bool is_exec_scope{};
 };
 
 class CFG {

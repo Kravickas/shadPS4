@@ -307,7 +307,8 @@ void Translator::S_MIN_U32(bool is_signed, const GcnInst& inst) {
     const IR::U32 src1{GetSrc(inst.src[1])};
     const IR::U32 result = ir.IMin(src0, src1, is_signed);
     SetDst(inst.dst[0], result);
-    ir.SetScc(ir.IEqual(result, src0));
+    // SCC is set only when S0 is strictly smaller, equal operands clear it.
+    ir.SetScc(ir.ILessThan(src0, src1, is_signed));
 }
 
 void Translator::S_MAX_U32(bool is_signed, const GcnInst& inst) {
@@ -315,7 +316,8 @@ void Translator::S_MAX_U32(bool is_signed, const GcnInst& inst) {
     const IR::U32 src1{GetSrc(inst.src[1])};
     const IR::U32 result = ir.IMax(src0, src1, is_signed);
     SetDst(inst.dst[0], result);
-    ir.SetScc(ir.IEqual(result, src0));
+    // SCC is set only when S0 is strictly greater, equal operands clear it.
+    ir.SetScc(ir.IGreaterThan(src0, src1, is_signed));
 }
 
 void Translator::S_CSELECT_B32(const GcnInst& inst) {
@@ -355,7 +357,7 @@ void Translator::S_AND_B64(NegateMode negate, const GcnInst& inst) {
     if (negate == NegateMode::Result) {
         result = ir.BitwiseNot(result);
     }
-    ir.SetScc(ir.InverseBallot(result));
+    ir.SetScc(ir.INotEqual(result, ir.Imm64(u64(0))));
     SetDst64(inst.dst[0], result);
 }
 
@@ -377,7 +379,7 @@ void Translator::S_OR_B64(NegateMode negate, bool is_xor, const GcnInst& inst) {
     if (negate == NegateMode::Result) {
         result = ir.BitwiseNot(result);
     }
-    ir.SetScc(ir.InverseBallot(result));
+    ir.SetScc(ir.INotEqual(result, ir.Imm64(u64(0))));
     SetDst64(inst.dst[0], result);
 }
 
@@ -545,7 +547,7 @@ void Translator::S_MOV_B64(const GcnInst& inst) {
 void Translator::S_NOT_B64(const GcnInst& inst) {
     const IR::U64 src0{GetSrc64(inst.src[0])};
     const IR::U64 result = ir.BitwiseNot(src0);
-    ir.SetScc(ir.InverseBallot(result));
+    ir.SetScc(ir.INotEqual(result, ir.Imm64(u64(0))));
     SetDst64(inst.dst[0], result);
 }
 
@@ -627,9 +629,8 @@ void Translator::S_SAVEEXEC_B64(NegateMode negate, bool is_or, const GcnInst& in
     if (negate == NegateMode::Result) {
         result = ir.BitwiseNot(result);
     }
-    const IR::U1 result_u1 = ir.InverseBallot(result);
-    ir.SetExec(result_u1);
-    ir.SetScc(result_u1);
+    ir.SetExec(ir.InverseBallot(result));
+    ir.SetScc(ir.INotEqual(result, ir.Imm64(u64(0))));
 }
 
 void Translator::S_ABS_I32(const GcnInst& inst) {

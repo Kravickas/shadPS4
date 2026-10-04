@@ -1201,9 +1201,7 @@ void Translator::LogMissingOpcode(const GcnInst& inst) {
 
 void Translator::Translate(IR::Block* block, u32 start_pc, IR::Condition cond,
                            std::span<const GcnInst> inst_list) {
-    if (inst_list.empty()) {
-        return;
-    }
+    // A block can be empty when it only enters an EXEC scope; it still needs its condition.
     ir = IR::IREmitter{*block, block->begin()};
     pc = start_pc;
     for (const auto& inst : inst_list) {

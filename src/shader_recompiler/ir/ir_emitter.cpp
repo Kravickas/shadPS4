@@ -175,10 +175,16 @@ U1 IREmitter::Condition(IR::Condition cond) {
         return LogicalNot(GetScc());
     case IR::Condition::Scc1:
         return GetScc();
+    // Branches on VCC and EXEC test the whole wave, as the hardware does.
     case IR::Condition::Vccz:
-        return LogicalNot(InverseBallot(PackUint2x32(CompositeConstruct(GetVccLo(), GetVccHi()))));
+        return IEqual(PackUint2x32(CompositeConstruct(GetVccLo(), GetVccHi())), Imm64(u64(0)));
     case IR::Condition::Vccnz:
-        return InverseBallot(PackUint2x32(CompositeConstruct(GetVccLo(), GetVccHi())));
+        return INotEqual(PackUint2x32(CompositeConstruct(GetVccLo(), GetVccHi())), Imm64(u64(0)));
+    case IR::Condition::ExecWaveZ:
+        return IEqual(Ballot(GetExec()), Imm64(u64(0)));
+    case IR::Condition::ExecWaveNz:
+        return INotEqual(Ballot(GetExec()), Imm64(u64(0)));
+    // The per-invocation EXEC bit guards the EXEC-masked instruction runs.
     case IR::Condition::Execz:
         return LogicalNot(GetExec());
     case IR::Condition::Execnz:
@@ -657,8 +663,8 @@ U32 IREmitter::ShuffleXor(const U32& value, const U32& mask) {
     return Inst<U32>(Opcode::ShuffleXor, value, mask);
 }
 
-U32 IREmitter::ReadFirstLane(const U32& value) {
-    return Inst<U32>(Opcode::ReadFirstLane, value);
+U32 IREmitter::ReadFirstLane(const U32& value, const U1& exec) {
+    return Inst<U32>(Opcode::ReadFirstLane, value, exec);
 }
 
 U32 IREmitter::ReadLane(const U32& value, const U32& lane) {
