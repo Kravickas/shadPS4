@@ -188,7 +188,18 @@ Id EmitBitFieldInsert32(EmitContext& ctx, Id base, Id insert, Id offset, Id coun
 }
 
 Id EmitBitFieldInsert64(EmitContext& ctx, Id base, Id insert, Id offset, Id count) {
-    return ctx.OpBitFieldInsert(ctx.U64, base, insert, offset, count);
+    // Vulkan restricts OpBitFieldInsert to a 32-bit base, so build the field mask with
+    // 64-bit shifts and insert with bitwise operations.
+    const Id all_ones{ctx.Constant(ctx.U64, ~0ULL)};
+    const Id ones{ctx.OpShiftRightLogical(ctx.U64, all_ones,
+                                          ctx.OpISub(ctx.U32[1], ctx.ConstU32(64U), count))};
+    const Id is_empty{ctx.OpIEqual(ctx.U1[1], count, ctx.u32_zero_value)};
+    const Id field{ctx.OpSelect(ctx.U64, is_empty, ctx.u64_zero_value, ones)};
+    const Id mask{ctx.OpShiftLeftLogical(ctx.U64, field, offset)};
+    const Id kept{ctx.OpBitwiseAnd(ctx.U64, base, ctx.OpNot(ctx.U64, mask))};
+    const Id inserted{
+        ctx.OpBitwiseAnd(ctx.U64, ctx.OpShiftLeftLogical(ctx.U64, insert, offset), mask)};
+    return ctx.OpBitwiseOr(ctx.U64, kept, inserted);
 }
 
 Id EmitBitFieldSExtract(EmitContext& ctx, IR::Inst* inst, Id base, Id offset, Id count) {
@@ -266,13 +277,8 @@ Id EmitFindILsb64(EmitContext& ctx, Id value) {
     const Id hi{ctx.OpCompositeExtract(ctx.U32[1], unpacked, 1U)};
     const Id lo_lsb{ctx.OpFindILsb(ctx.U32[1], lo)};
     const Id hi_lsb{ctx.OpFindILsb(ctx.U32[1], hi)};
-    const Id not_found{ctx.ConstU32(u32(-1))};
-    const Id found_lo{ctx.OpINotEqual(ctx.U1[1], lo_lsb, not_found)};
-    const Id found_hi{ctx.OpINotEqual(ctx.U1[1], hi_lsb, not_found)};
-    // The high half holds bits 32..63; -1 when no bit is set at all.
-    const Id hi_pos{ctx.OpSelect(ctx.U32[1], found_hi,
-                                 ctx.OpIAdd(ctx.U32[1], hi_lsb, ctx.ConstU32(32U)), not_found)};
-    return ctx.OpSelect(ctx.U32[1], found_lo, lo_lsb, hi_pos);
+    const Id found_lo{ctx.OpINotEqual(ctx.U1[1], lo_lsb, ctx.ConstU32(u32(-1)))};
+    return ctx.OpSelect(ctx.U32[1], found_lo, lo_lsb, hi_lsb);
 }
 
 Id EmitSMin32(EmitContext& ctx, Id a, Id b) {
