@@ -1,4 +1,4 @@
-// SPDX-FileCopyrightText: Copyright 2025 shadPS4 Emulator Project
+// SPDX-FileCopyrightText: Copyright 2025-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #pragma once
@@ -36,6 +36,16 @@ struct DepthShaderControl {
     u32 alpha_to_mask_disable : 1;
     u32 depth_before_shader : 1;
     ConservativeDepth conservative_z_export : 2;
+};
+
+struct DbAlphaToMask {
+    u32 alpha_to_mask_enable : 1;
+    u32 : 7;
+    u32 alpha_to_mask_offset0 : 2;
+    u32 alpha_to_mask_offset1 : 2;
+    u32 alpha_to_mask_offset2 : 2;
+    u32 alpha_to_mask_offset3 : 2;
+    u32 offset_round : 1;
 };
 
 enum class CompareFunc : u32 {

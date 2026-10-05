@@ -1,4 +1,4 @@
-// SPDX-FileCopyrightText: Copyright 2025 shadPS4 Emulator Project
+// SPDX-FileCopyrightText: Copyright 2025-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #pragma once
@@ -141,7 +141,8 @@ union Regs {
         LsHsConfig ls_hs_config;
         u32 vgt_gs_vert_itemsize[4];
         TessellationConfig tess_config;
-        INSERT_PADDING_WORDS(3);
+        DbAlphaToMask db_alpha_to_mask;
+        INSERT_PADDING_WORDS(2);
         PolygonOffset poly_offset;
         GsInstances vgt_gs_instance_cnt;
         StreamOutConfig vgt_strmout_config;

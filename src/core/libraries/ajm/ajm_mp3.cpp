@@ -29,11 +29,9 @@ static constexpr std::array<std::array<s32, 4>, 4> Mp3SampleRateTable = {
     std::array<s32, 4>{44100, 48000, 32000, 0},
 };
 
-static constexpr std::array<std::array<s32, 16>, 4> Mp3BitRateTable = {
-    std::array<s32, 16>{0, 8, 16, 24, 32, 40, 48, 56, 64, 0, 0, 0, 0, 0, 0, 0},
-    std::array<s32, 16>{0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0},
-    std::array<s32, 16>{0, 8, 16, 24, 32, 40, 48, 56, 64, 80, 96, 112, 128, 144, 160, 0},
+static constexpr std::array<std::array<s32, 16>, 2> Mp3BitRateTable = {
     std::array<s32, 16>{0, 32, 40, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320, 0},
+    std::array<s32, 16>{0, 8, 16, 24, 32, 40, 48, 56, 64, 80, 96, 112, 128, 144, 160, 0},
 };
 
 enum class Mp3AudioVersion : u32 {
@@ -457,7 +455,9 @@ static int ParseMp3HeaderCommon(const u8* p_begin, u32 stream_size, int parse_of
     if (frame->sample_rate == 0) {
         return ORBIS_AJM_ERROR_INVALID_PARAMETER;
     }
-    frame->bitrate = Mp3BitRateTable[u32(header->version)][header->bitrate_idx] * 1000;
+    // Layer III uses one bitrate table for MPEG-2 and MPEG-2.5.
+    frame->bitrate =
+        Mp3BitRateTable[header->version != Mp3AudioVersion::V1][header->bitrate_idx] * 1000;
     if (frame->bitrate == 0) {
         return ORBIS_AJM_ERROR_INVALID_PARAMETER;
     }
