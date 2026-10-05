@@ -1,7 +1,6 @@
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
-#include <algorithm>
 #include <bit>
 #include <cstring>
 
@@ -65,15 +64,6 @@ struct Mp3Header {
     u32 sync : 11;
 };
 static_assert(sizeof(Mp3Header) == sizeof(u32));
-
-static constexpr u32 Mp3LayerIII = 1;
-
-static constexpr u32 Mp3SideInfoSize(Mp3AudioVersion version, u32 num_channels) {
-    if (version == Mp3AudioVersion::V1) {
-        return num_channels == 1 ? 17 : 32;
-    }
-    return num_channels == 1 ? 9 : 17;
-}
 
 static AVSampleFormat AjmToAVSampleFormat(AjmFormatEncoding format) {
     switch (format) {
@@ -166,10 +156,14 @@ DecoderResult AjmMp3Decoder::ProcessData(std::span<u8>& in_buf, SparseOutputBuff
     ASSERT_MSG(ret >= 0, "Error while parsing {}", ret);
     in_buf = in_buf.subspan(ret);
 
-    if (pkt->size) {
-        m_header = std::byteswap(*reinterpret_cast<u32*>(pkt->data));
+    if (pkt->size >= 4) {
+        u32 raw_header = 0;
+        std::memcpy(&raw_header, pkt->data, sizeof(raw_header));
+        m_header = std::byteswap(raw_header);
         AjmDecMp3ParseFrame info{};
-        ASSERT(ParseMp3Header(pkt->data, pkt->size, true, &info) == ORBIS_OK);
+        auto res = ParseMp3Header(pkt->data, pkt->size, true, &info);
+        ASSERT(res == ORBIS_OK);
+
         m_frame_samples = info.samples_per_channel;
         if (info.total_samples != 0 || info.encoder_delay != 0) {
             gapless.init = {
@@ -255,7 +249,7 @@ u32 AjmMp3Decoder::GetNextFrameSize(const AjmInstanceGapless& gapless) const {
 
 class BitReader {
 public:
-    BitReader(const u8* data) : m_data(data) {}
+    BitReader(const u8* data, size_t max_bytes) : m_data(data), m_max_bytes(max_bytes) {}
 
     template <class T>
     T Read(u32 const nbits) {
@@ -270,48 +264,203 @@ public:
         m_bit_offset += nbits;
     }
 
-    size_t GetCurrentOffset() {
+    size_t GetCurrentOffset() const {
         return m_bit_offset;
     }
 
 private:
     u8 GetBit() {
+        if (m_bit_offset / 8 >= m_max_bytes) {
+            m_bit_offset += 1;
+            return 0;
+        }
         const auto bit = (m_data[m_bit_offset / 8] >> (7 - (m_bit_offset % 8))) & 1;
         m_bit_offset += 1;
         return bit;
     }
 
     const u8* m_data;
+    size_t m_max_bytes = 0;
     size_t m_bit_offset = 0;
 };
 
-int AjmMp3Decoder::ParseMp3Header(const u8* p_begin, u32 stream_size, int parse_ofl,
-                                  AjmDecMp3ParseFrame* frame) {
-    LOG_TRACE(Lib_Ajm, "called stream_size = {} parse_ofl = {}", stream_size, parse_ofl);
+static void ParseMp3ExtendedHeader(const u8* p_begin, u32 stream_size, const Mp3Header* header,
+                                   AjmDecMp3ParseFrame* frame) {
+    const auto* p_end = p_begin + std::min<size_t>(stream_size, frame->frame_size);
+    const auto* p_current = p_begin + 4;
+    if (p_current >= p_end) {
+        return;
+    }
 
+    const size_t available_bytes = static_cast<size_t>(p_end - p_current);
+    BitReader reader(p_current, available_bytes);
+    if (header->protection_type == 0) {
+        reader.Skip(16);
+    }
+
+    if (header->version == Mp3AudioVersion::V1) {
+        if (header->channel_mode == Mp3ChannelMode::SingleChannel) {
+            reader.Skip(18);
+        } else {
+            reader.Skip(20);
+        }
+    } else {
+        if (header->channel_mode == Mp3ChannelMode::SingleChannel) {
+            reader.Skip(9);
+        } else {
+            reader.Skip(10);
+        }
+    }
+
+    u32 part2_3_length = 0;
+    const u8 ngr = header->version == Mp3AudioVersion::V1 ? 2 : 1;
+    for (u8 gr = 0; gr < ngr; ++gr) {
+        for (u32 ch = 0; ch < frame->num_channels; ++ch) {
+            part2_3_length += reader.Read<u16>(12);
+            if (header->version == Mp3AudioVersion::V1) {
+                reader.Skip(47);
+            } else {
+                reader.Skip(51);
+            }
+        }
+    }
+    reader.Skip(part2_3_length);
+
+    const size_t byte_offset = (reader.GetCurrentOffset() + 7) / 8;
+    if (byte_offset > available_bytes) {
+        p_current = p_end;
+    } else {
+        p_current += byte_offset;
+    }
+
+    if (p_current + 8 <= p_end &&
+        (std::memcmp(p_current, "Xing", 4) == 0 || std::memcmp(p_current, "Info", 4) == 0)) {
+        const u8 xing_flags = p_current[7];
+        const u8* p_field = p_current + 8;
+        u32 num_frames_xing = 0;
+
+        if (xing_flags & 0x01) {
+            if (p_field + 4 > p_end) {
+                return;
+            }
+            u32 raw = 0;
+            std::memcpy(&raw, p_field, sizeof(raw));
+            num_frames_xing = std::byteswap(raw);
+            frame->num_frames = num_frames_xing;
+            p_field += 4;
+        }
+        if (xing_flags & 0x02) {
+            p_field += 4;
+            if (p_field > p_end) {
+                return;
+            }
+        }
+        if (xing_flags & 0x04) {
+            p_field += 100;
+            if (p_field > p_end) {
+                return;
+            }
+        }
+        if (xing_flags & 0x08) {
+            p_field += 4;
+            if (p_field > p_end) {
+                return;
+            }
+        }
+
+        if (p_field + 0x18 <= p_end && p_field[0] == 'L' && p_field[1] == 'A' &&
+            p_field[2] == 'M' && p_field[3] == 'E') {
+            const u32 enc_delay = (u32(p_field[0x15]) << 4) | (u32(p_field[0x16]) >> 4);
+            const u32 padding = ((u32(p_field[0x16]) & 0x0f) << 8) | u32(p_field[0x17]);
+
+            if ((xing_flags & 0x01) && num_frames_xing > 0) {
+                frame->total_samples =
+                    (num_frames_xing * frame->samples_per_channel) - (enc_delay + padding);
+            }
+
+            frame->encoder_delay = frame->samples_per_channel + enc_delay + 529;
+            frame->ofl_type = AjmDecMp3OflType::Lame;
+        }
+    } else if (p_current + 26 <= p_end && std::memcmp(p_current, "VBRI", 4) == 0) {
+        u16 vbri_delay = 0;
+        std::memcpy(&vbri_delay, p_current + 6, sizeof(vbri_delay));
+        frame->encoder_delay = std::byteswap(vbri_delay);
+        frame->ofl_type = AjmDecMp3OflType::Vbri;
+
+        if (frame->frame_size <= stream_size) {
+            const u8* next_frame = p_begin + frame->frame_size;
+            const u32 remaining = stream_size - static_cast<u32>(frame->frame_size);
+            AjmDecMp3ParseFrame next_info{};
+            if (AjmMp3Decoder::ParseMp3Header(next_frame, remaining, 1, &next_info) == ORBIS_OK &&
+                next_info.ofl_type == AjmDecMp3OflType::Fgh) {
+                frame->encoder_delay += next_info.encoder_delay;
+                frame->total_samples = next_info.total_samples;
+                frame->ofl_type = AjmDecMp3OflType::VbriAndFgh;
+            }
+        }
+    } else {
+        const u8* p_fgh_end = p_begin + std::min<size_t>(stream_size, frame->frame_size);
+        if (p_current + 10 <= p_fgh_end) {
+            constexpr auto fgh_indicator = 0xB4;
+            while ((p_current + 9) < p_fgh_end && *p_current != fgh_indicator) {
+                ++p_current;
+            }
+            auto p_fgh = p_current;
+            if ((p_current + 9) < p_fgh_end && *p_current == fgh_indicator) {
+                u8 crc = 0xFF;
+                auto crc_func = [](u8 c, u8 v, u8 s) {
+                    if (((c >> 7) & 1) != ((v >> s) & 1)) {
+                        return c * 2;
+                    }
+                    return (c * 2) ^ 0x45;
+                };
+                for (u8 i = 0; i < 9; ++i, ++p_current) {
+                    for (u8 j = 0; j < 8; ++j) {
+                        crc = crc_func(crc, *p_current, 7 - j);
+                    }
+                }
+                if (p_fgh[9] == crc) {
+                    u16 encoder_delay = 0;
+                    u32 total_samples = 0;
+                    std::memcpy(&encoder_delay, p_fgh + 1, sizeof(encoder_delay));
+                    std::memcpy(&total_samples, p_fgh + 3, sizeof(total_samples));
+                    frame->encoder_delay = std::byteswap(encoder_delay);
+                    frame->total_samples = std::byteswap(total_samples);
+                    frame->ofl_type = AjmDecMp3OflType::Fgh;
+                }
+            }
+        }
+    }
+}
+
+static int ParseMp3HeaderCommon(const u8* p_begin, u32 stream_size, int parse_ofl,
+                                AjmDecMp3ParseFrame* frame, bool enforce_layer3) {
     if (p_begin == nullptr || stream_size < 4 || frame == nullptr) {
         return ORBIS_AJM_ERROR_INVALID_PARAMETER;
     }
 
-    const auto* p_current = p_begin;
-
     u32 raw_header = 0;
-    std::memcpy(&raw_header, p_current, sizeof(raw_header));
+    std::memcpy(&raw_header, p_begin, sizeof(raw_header));
     auto bytes = std::byteswap(raw_header);
-    p_current += 4;
     auto header = reinterpret_cast<const Mp3Header*>(&bytes);
     if (header->sync != 0x7FF) {
         return ORBIS_AJM_ERROR_INVALID_PARAMETER;
     }
 
-    if (header->layer_type != Mp3LayerIII || header->version == Mp3AudioVersion::Reserved ||
-        header->bitrate_idx == 0xF || header->sampling_rate_idx == 3) {
+    if (enforce_layer3 && header->layer_type != 1) {
         return ORBIS_AJM_ERROR_INVALID_PARAMETER;
     }
 
     frame->sample_rate = Mp3SampleRateTable[u32(header->version)][header->sampling_rate_idx];
+    if (frame->sample_rate == 0) {
+        return ORBIS_AJM_ERROR_INVALID_PARAMETER;
+    }
+    // Layer III uses one bitrate table for MPEG-2 and MPEG-2.5.
     frame->bitrate =
         Mp3BitRateTable[header->version != Mp3AudioVersion::V1][header->bitrate_idx] * 1000;
+    if (frame->bitrate == 0) {
+        return ORBIS_AJM_ERROR_INVALID_PARAMETER;
+    }
     frame->num_channels = header->channel_mode == Mp3ChannelMode::SingleChannel ? 1 : 2;
     if (header->version == Mp3AudioVersion::V1) {
         frame->frame_size = (144 * frame->bitrate) / frame->sample_rate + header->padding;
@@ -326,144 +475,23 @@ int AjmMp3Decoder::ParseMp3Header(const u8* p_begin, u32 stream_size, int parse_
     frame->total_samples = 0;
     frame->ofl_type = AjmDecMp3OflType::None;
 
-    if (!parse_ofl) {
-        return ORBIS_OK;
-    }
-
-    if (stream_size < 4 + Mp3SideInfoSize(header->version, frame->num_channels)) {
-        return ORBIS_OK;
-    }
-
-    BitReader reader(p_current);
-
-    if (header->version == Mp3AudioVersion::V1) {
-        // main_data_begin = reader.Read<u16>(9);
-        // if (header->channel_mode == Mp3ChannelMode::SingleChannel) {
-        //     private_bits = reader.Read<u8>(5);
-        // } else {
-        //     private_bits = reader.Read<u8>(3);
-        // }
-        // for (u32 ch = 0; ch < frame->num_channels; ++ch) {
-        //     for (u8 band = 0; band < 4; ++band) {
-        //         scfsi[ch][band] = reader.Read<bool>(1);
-        //     }
-        // }
-        if (header->channel_mode == Mp3ChannelMode::SingleChannel) {
-            reader.Skip(18);
-        } else {
-            reader.Skip(20);
-        }
-    } else {
-        // main_data_begin = reader.Read<u16>(8);
-        // if (header->channel_mode == Mp3ChannelMode::SingleChannel) {
-        //     private_bits = reader.Read<u8>(1);
-        // } else {
-        //     private_bits = reader.Read<u8>(2);
-        // }
-        if (header->channel_mode == Mp3ChannelMode::SingleChannel) {
-            reader.Skip(9);
-        } else {
-            reader.Skip(10);
-        }
-    }
-
-    u32 part2_3_length = 0;
-    // Number of granules (18x32 sub-band samples)
-    const u8 ngr = header->version == Mp3AudioVersion::V1 ? 2 : 1;
-    for (u8 gr = 0; gr < ngr; ++gr) {
-        for (u32 ch = 0; ch < frame->num_channels; ++ch) {
-            // part2_3_length[gr][ch] = reader.Read<u16>(12);
-            part2_3_length += reader.Read<u16>(12);
-            // big_values[gr][ch] = reader.Read<u16>(9);
-            // global_main[gr][ch] = reader.Read<u8>(8);
-            // if (header->version == Mp3AudioVersion::V1) {
-            //     scalefac_compress[gr][ch] = reader.Read<u16>(4);
-            // } else {
-            //     scalefac_compress[gr][ch] = reader.Read<u16>(9);
-            // }
-            // window_switching_flag = reader.Read<bool>(1);
-            // if (window_switching_flag) {
-            //     block_type[gr][ch] = reader.Read<u8>(2);
-            //     mixed_block_flag[gr][ch] = reader.Read<bool>(1);
-            //     for (u8 region = 0; region < 2; ++region) {
-            //         table_select[gr][ch][region] = reader.Read<u8>(5);
-            //     }
-            //     for (u8 window = 0; window < 3; ++window) {
-            //         subblock_gain[gr][ch][window] = reader.Read<u8>(3);
-            //     }
-            // } else {
-            //     for (u8 region = 0; region < 3; ++region) {
-            //         table_select[gr][ch][region] = reader.Read<u8>(5);
-            //     }
-            //     region0_count[gr][ch] = reader.Read<u8>(4);
-            //     region1_count[gr][ch] = reader.Read<u8>(3);
-            // }
-            // if (header->version == Mp3AudioVersion::V1) {
-            //     preflag[gr][ch] = reader.Read<bool>(1);
-            // }
-            // scalefac_scale[gr][ch] = reader.Read<bool>(1);
-            // count1table_select[gr][ch] = reader.Read<bool>(1);
-            if (header->version == Mp3AudioVersion::V1) {
-                reader.Skip(47);
-            } else {
-                reader.Skip(51);
-            }
-        }
-    }
-    reader.Skip(part2_3_length);
-
-    p_current += ((reader.GetCurrentOffset() + 7) / 8);
-
-    const auto* p_buffer_end = p_begin + stream_size;
-    const u64 limit = std::min<u64>(frame->frame_size, stream_size);
-    const u64 ancillary_offset = static_cast<u64>(p_current - p_begin);
-
-    const bool xing_in_bounds = p_current + 8 < p_buffer_end;
-    const bool vbri_in_bounds =
-        frame->frame_size <= stream_size && frame->frame_size >= ancillary_offset + 26;
-
-    if (xing_in_bounds &&
-        (memcmp(p_current, "Xing", 4) == 0 || memcmp(p_current, "Info", 4) == 0)) {
-        // TODO: Parse Xing/Lame header
-        LOG_ERROR(Lib_Ajm, "Xing/Lame header is not implemented.");
-    } else if (vbri_in_bounds && memcmp(p_current, "VBRI", 4) == 0) {
-        // TODO: Parse VBRI header
-        LOG_ERROR(Lib_Ajm, "VBRI header is not implemented.");
-    } else if (ancillary_offset + 10 <= limit) {
-        // Parse FGH header
-        constexpr u8 fgh_indicator = 0xB4;
-        constexpr auto crc_step = [](u8 c, u8 v, u8 s) -> u8 {
-            if (((c >> 7) & 1) != ((v >> s) & 1)) {
-                return static_cast<u8>(c * 2);
-            }
-            return static_cast<u8>((c * 2) ^ 0x45);
-        };
-        for (const u8* p_fgh = p_current;; ++p_fgh) {
-            if (*p_fgh == fgh_indicator) {
-                u8 crc = 0xFF;
-                for (u8 i = 0; i < 9; ++i) {
-                    for (u8 j = 0; j < 8; ++j) {
-                        crc = crc_step(crc, p_fgh[i], 7 - j);
-                    }
-                }
-                if (p_fgh[9] == crc) {
-                    u16 raw_delay = 0;
-                    u32 raw_samples = 0;
-                    std::memcpy(&raw_delay, p_fgh + 1, sizeof(raw_delay));
-                    std::memcpy(&raw_samples, p_fgh + 3, sizeof(raw_samples));
-                    frame->encoder_delay = std::byteswap(raw_delay);
-                    frame->total_samples = std::byteswap(raw_samples);
-                    frame->ofl_type = AjmDecMp3OflType::Fgh;
-                    break;
-                }
-            }
-            if (static_cast<u64>(p_fgh - p_begin) + 11 > limit) {
-                break;
-            }
-        }
+    if (parse_ofl) {
+        ParseMp3ExtendedHeader(p_begin, stream_size, header, frame);
     }
 
     return ORBIS_OK;
+}
+
+int AjmMp3Decoder::ParseMp3Header(const u8* p_begin, u32 stream_size, int parse_ofl,
+                                  AjmDecMp3ParseFrame* frame) {
+    LOG_TRACE(Lib_Ajm, "called stream_size = {} parse_ofl = {}", stream_size, parse_ofl);
+    return ParseMp3HeaderCommon(p_begin, stream_size, parse_ofl, frame, false);
+}
+
+int AjmMp3Decoder::ParseMp3Frame(const u8* p_begin, u32 stream_size, int parse_ofl,
+                                 AjmDecMp3ParseFrame* frame) {
+    LOG_TRACE(Lib_Ajm, "called stream_size = {} parse_ofl = {}", stream_size, parse_ofl);
+    return ParseMp3HeaderCommon(p_begin, stream_size, parse_ofl, frame, true);
 }
 
 AjmSidebandFormat AjmMp3Decoder::GetFormat() const {
