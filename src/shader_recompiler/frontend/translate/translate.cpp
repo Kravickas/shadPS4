@@ -447,12 +447,17 @@ T Translator::GetSrc(const InstOperand& operand) {
         UNREACHABLE_MSG("Unexpected operand: {}", std::to_underlying(operand.field));
     }
 
+    // abs / neg act on the sign bit alone, as on hardware: NaN payloads and denormals pass.
     if constexpr (is_float) {
-        if (operand.input_modifier.abs) {
-            value = ir.FPAbs(value);
-        }
-        if (operand.input_modifier.neg) {
-            value = ir.FPNeg(value);
+        if (operand.input_modifier.abs || operand.input_modifier.neg) {
+            IR::U32 bits{ir.BitCast<IR::U32>(value)};
+            if (operand.input_modifier.abs) {
+                bits = ir.BitwiseAnd(bits, ir.Imm32(0x7FFFFFFFu));
+            }
+            if (operand.input_modifier.neg) {
+                bits = ir.BitwiseXor(bits, ir.Imm32(0x80000000u));
+            }
+            value = ir.BitCast<IR::F32>(bits);
         }
     } else {
         if (operand.input_modifier.abs) {
@@ -805,11 +810,18 @@ T Translator::GetSrc64(const InstOperand& operand) {
     }
 
     if constexpr (is_float) {
-        if (operand.input_modifier.abs) {
-            value = ir.FPAbs(value);
-        }
-        if (operand.input_modifier.neg) {
-            value = ir.FPNeg(value);
+        // abs / neg act on bit 63 alone, as on hardware: NaN payloads and denormals pass.
+        if (operand.input_modifier.abs || operand.input_modifier.neg) {
+            const IR::Value unpacked{ir.UnpackDouble2x32(value)};
+            const IR::U32 lo{ir.CompositeExtract(unpacked, 0)};
+            IR::U32 hi{ir.CompositeExtract(unpacked, 1)};
+            if (operand.input_modifier.abs) {
+                hi = ir.BitwiseAnd(hi, ir.Imm32(0x7FFFFFFFu));
+            }
+            if (operand.input_modifier.neg) {
+                hi = ir.BitwiseXor(hi, ir.Imm32(0x80000000u));
+            }
+            value = ir.PackDouble2x32(ir.CompositeConstruct(lo, hi));
         }
     } else {
         // GCN VOP3 abs/neg modifier bits operate on the sign bit (bit 63 for
@@ -965,17 +977,58 @@ template pk_type<IR::U32> Translator::GetSrcPk<IR::U32, true>(const InstOperand&
 template pk_type<IR::U32> Translator::GetSrcPk<IR::U32, false>(const InstOperand&);
 template pk_type<IR::F32> Translator::GetSrcPk<IR::F32, false>(const InstOperand&);
 
+namespace {
+
+bool FlushesDenormOutputMode(AmdGpu::FpDenormMode mode) {
+    return mode == AmdGpu::FpDenormMode::InOutFlush ||
+           mode == AmdGpu::FpDenormMode::InAllowOutFlush;
+}
+
+// Instructions whose output modifier (omod) the hardware skips while the result's precision keeps
+// denormal outputs (PS4 hardware test). Others apply it in every mode (V_MAD_F32, V_RCP_F32 and
+// V_SQRT_F32 tested so).
+bool OmodFollowsDenormMode(Opcode opcode) {
+    switch (opcode) {
+    case Opcode::V_ADD_F32:
+    case Opcode::V_MUL_F32:
+    case Opcode::V_MAX_F32:
+    case Opcode::V_MIN_F32:
+    case Opcode::V_MUL_LEGACY_F32:
+    case Opcode::V_FMA_F32:
+    case Opcode::V_FRACT_F32:
+    case Opcode::V_CVT_F32_U32:
+    case Opcode::V_CVT_F32_F16:
+    case Opcode::V_CVT_F32_F64:
+    case Opcode::V_ADD_F64:
+    case Opcode::V_MUL_F64:
+    case Opcode::V_FMA_F64:
+        return true;
+    default:
+        return false;
+    }
+}
+
+} // Anonymous namespace
+
 void Translator::SetDst(const InstOperand& operand, const IR::U32F32& value) {
     IR::U32F32 result = value;
     if (value.Type() == IR::Type::F32) {
-        if (operand.output_modifier.multiplier != 0.f) {
-            result = ir.FPMul(result, ir.Imm32(operand.output_modifier.multiplier));
+        const bool omod = operand.output_modifier.multiplier != 0.f &&
+                          (!OmodFollowsDenormMode(cur_opcode) ||
+                           FlushesDenormOutputMode(runtime_info.props.fp_denorm_mode32));
+        if (omod) {
+            const IR::F32 scaled{ir.FPMul(result, ir.Imm32(operand.output_modifier.multiplier))};
+            // A zero leaves the output modifier positive.
+            result = IR::F32{ir.Select(ir.FPEqual(scaled, ir.Imm32(0.f)), ir.Imm32(0.f), scaled)};
         }
         if (operand.output_modifier.clamp) {
             if (runtime_info.props.dx10_clamp) {
                 result = ir.FPSaturate(result);
             } else {
-                result = ir.FPClamp(result, ir.Imm32(0.f), ir.Imm32(1.f));
+                // Without DX10_CLAMP a NaN passes the clamp.
+                const IR::F32 r{result};
+                result = IR::F32{ir.Select(ir.FPIsNan(r), r,
+                                           IR::F32{ir.FPClamp(r, ir.Imm32(0.f), ir.Imm32(1.f))})};
             }
         }
     }
@@ -1059,14 +1112,31 @@ void Translator::SetDst64(const InstOperand& operand, const IR::U64F64& value_ra
     IR::U64F64 value_untyped = value_raw;
 
     const bool is_float = value_raw.Type() == IR::Type::F64 || value_raw.Type() == IR::Type::F32;
+    const bool is_f64 = value_raw.Type() == IR::Type::F64;
     if (is_float) {
-        if (operand.output_modifier.multiplier != 0.f) {
+        const auto mode =
+            is_f64 ? runtime_info.props.fp_denorm_mode16_64 : runtime_info.props.fp_denorm_mode32;
+        const bool omod = operand.output_modifier.multiplier != 0.f &&
+                          (!OmodFollowsDenormMode(cur_opcode) || FlushesDenormOutputMode(mode));
+        if (omod) {
             value_untyped =
                 ir.FPMul(value_untyped, ir.Imm64(f64(operand.output_modifier.multiplier)));
+            if (is_f64) { // a zero leaves the output modifier positive (Select has no F64)
+                const IR::F64 r{value_untyped};
+                const IR::U1 zero{ir.FPEqual(r, ir.Imm64(0.0))};
+                const IR::Value halves{ir.UnpackDouble2x32(r)};
+                const IR::U32 lo{
+                    ir.Select(zero, ir.Imm32(0U), IR::U32{ir.CompositeExtract(halves, 0)})};
+                const IR::U32 hi{
+                    ir.Select(zero, ir.Imm32(0U), IR::U32{ir.CompositeExtract(halves, 1)})};
+                value_untyped = ir.PackDouble2x32(ir.CompositeConstruct(lo, hi));
+            }
         }
         if (operand.output_modifier.clamp) {
             if (runtime_info.props.dx10_clamp) {
                 value_untyped = ir.FPSaturate(value_untyped);
+            } else if (is_f64) {
+                value_untyped = ir.FPClamp(value_untyped, ir.Imm64(0.0), ir.Imm64(1.0));
             } else {
                 value_untyped = ir.FPClamp(value_untyped, ir.Imm32(0.f), ir.Imm32(1.f));
             }
@@ -1241,6 +1311,7 @@ void Translator::Translate(IR::Block* block, u32 start_pc, IR::Condition cond,
 }
 
 void Translator::TranslateInstruction(const GcnInst& inst) {
+    cur_opcode = inst.opcode;
     // Emit instructions for each category.
     switch (inst.category) {
     case InstCategory::DataShare:

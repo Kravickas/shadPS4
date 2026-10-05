@@ -389,6 +389,7 @@ private:
 
 private:
     IR::IREmitter ir;
+    Opcode cur_opcode{}; ///< The instruction being translated (output modifier rules).
     Info& info;
     const RuntimeInfo& runtime_info;
     const Profile& profile;

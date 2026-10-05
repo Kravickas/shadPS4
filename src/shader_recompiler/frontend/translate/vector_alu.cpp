@@ -1071,7 +1071,17 @@ void Translator::V_CVT_F16_F32(const GcnInst& inst) {
 }
 
 void Translator::V_CVT_F32_F16(const GcnInst& inst) {
-    const IR::U32 src0{GetSrc(inst.src[0])};
+    // abs / neg act on the half's sign, bit 15.
+    InstOperand operand{inst.src[0]};
+    operand.input_modifier.abs = false;
+    operand.input_modifier.neg = false;
+    IR::U32 src0{GetSrc(operand)};
+    if (inst.src[0].input_modifier.abs) {
+        src0 = ir.BitwiseAnd(src0, ir.Imm32(0xFFFF7FFFU));
+    }
+    if (inst.src[0].input_modifier.neg) {
+        src0 = ir.BitwiseXor(src0, ir.Imm32(0x8000U));
+    }
     const IR::U32 sign{ir.ShiftLeftLogical(ir.BitwiseAnd(src0, ir.Imm32(0x8000U)), ir.Imm32(16U))};
     const IR::U32 exponent{
         ir.BitwiseAnd(ir.ShiftRightLogical(src0, ir.Imm32(10U)), ir.Imm32(0x1FU))};
@@ -1182,8 +1192,11 @@ void Translator::V_FLOOR_F64(const GcnInst& inst) {
 }
 
 void Translator::V_FRACT_F32(const GcnInst& inst) {
+    // An infinity gives the default NaN 0xFFC00000.
     const IR::F32 src0{GetSrc<IR::F32>(inst.src[0])};
-    SetDst(inst.dst[0], ir.FPFract(src0));
+    SetDst(inst.dst[0],
+           IR::F32{ir.Select(ir.FPIsInf(src0), ir.BitCast<IR::F32>(ir.Imm32(0xFFC00000U)),
+                             IR::F32{ir.FPFract(src0)})});
 }
 
 void Translator::V_TRUNC_F32(const GcnInst& inst) {
@@ -1217,8 +1230,9 @@ void Translator::V_LOG_F32(const GcnInst& inst) {
 }
 
 void Translator::V_RCP_F32(const GcnInst& inst) {
-    const IR::F32 src0{GetSrc<IR::F32>(inst.src[0])};
-    SetDst(inst.dst[0], ir.FPRecip(src0));
+    // No denormals in any float mode: input and result flushed.
+    const IR::F32 src0{FlushDenorm32(ir, GetSrc<IR::F32>(inst.src[0]))};
+    SetDst(inst.dst[0], FlushDenorm32(ir, IR::F32{ir.FPRecip(src0)}));
 }
 
 void Translator::V_RCP_LEGACY_F32(const GcnInst& inst) {
@@ -1246,8 +1260,10 @@ void Translator::V_RSQ_F32(const GcnInst& inst) {
 }
 
 void Translator::V_SQRT_F32(const GcnInst& inst) {
-    const IR::F32 src0{GetSrc<IR::F32>(inst.src[0])};
-    SetDst(inst.dst[0], ir.FPSqrt(src0));
+    // A denormal input flushes in any float mode; the root of -0 is +0.
+    const IR::F32 src0{FlushDenorm32(ir, GetSrc<IR::F32>(inst.src[0]))};
+    const IR::F32 root{ir.FPSqrt(src0)};
+    SetDst(inst.dst[0], IR::F32{ir.Select(ir.FPEqual(src0, ir.Imm32(0.f)), ir.Imm32(0.f), root)});
 }
 
 void Translator::V_SIN_F32(const GcnInst& inst) {
@@ -1517,10 +1533,11 @@ void Translator::V_CMP_CLASS_F32(const GcnInst& inst) {
 // VOP3a
 
 void Translator::V_MAD_F32(const GcnInst& inst) {
-    const IR::F32 src0{GetSrc<IR::F32>(inst.src[0])};
-    const IR::F32 src1{GetSrc<IR::F32>(inst.src[1])};
-    const IR::F32 src2{GetSrc<IR::F32>(inst.src[2])};
-    SetDst(inst.dst[0], ir.FPAdd(ir.FPMul(src0, src1), src2));
+    // No denormals in any float mode: inputs and result flushed.
+    const IR::F32 src0{FlushDenorm32(ir, GetSrc<IR::F32>(inst.src[0]))};
+    const IR::F32 src1{FlushDenorm32(ir, GetSrc<IR::F32>(inst.src[1]))};
+    const IR::F32 src2{FlushDenorm32(ir, GetSrc<IR::F32>(inst.src[2]))};
+    SetDst(inst.dst[0], FlushDenorm32(ir, IR::F32{ir.FPAdd(ir.FPMul(src0, src1), src2)}));
 }
 
 void Translator::V_MAD_I32_I24(const GcnInst& inst, bool is_signed) {
