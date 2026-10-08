@@ -211,8 +211,8 @@ PAddr MemoryManager::PoolExpand(PAddr search_start, PAddr search_end, u64 size, 
     auto mapping_end = mapping_start + size;
 
     // Find the first free, large enough dmem area in the range.
-    while (dmem_area->second.dma_type != PhysicalMemoryType::Free ||
-           dmem_area->second.GetEnd() < mapping_end) {
+    while (mapping_end <= search_end && (dmem_area->second.dma_type != PhysicalMemoryType::Free ||
+                                         dmem_area->second.GetEnd() < mapping_end)) {
         // The current dmem_area isn't suitable, move to the next one.
         dmem_area++;
         if (dmem_area == dmem_map.end()) {
@@ -224,7 +224,7 @@ PAddr MemoryManager::PoolExpand(PAddr search_start, PAddr search_end, u64 size, 
         mapping_end = mapping_start + size;
     }
 
-    if (dmem_area == dmem_map.end()) {
+    if (dmem_area == dmem_map.end() || mapping_end > search_end) {
         // There are no suitable mappings in this range
         LOG_ERROR(Kernel_Vmm, "Unable to find free direct memory area: size = {:#x}", size);
         return -1;
@@ -281,6 +281,12 @@ PAddr MemoryManager::Allocate(PAddr search_start, PAddr search_end, u64 size, u6
 }
 
 s32 MemoryManager::Free(PAddr phys_addr, u64 size, bool is_checked) {
+    // Measured on hardware: a checked release starting at or above this address returns success.
+    constexpr PAddr CheckedReleaseSuccessStart = 0x5000000000;
+    if (is_checked && phys_addr >= CheckedReleaseSuccessStart) {
+        return ORBIS_OK;
+    }
+
     // Basic bounds checking
     if (phys_addr > total_direct_size || (is_checked && phys_addr + size > total_direct_size)) {
         LOG_ERROR(Kernel_Vmm, "phys_addr {:#x}, size {:#x} goes outside dmem map", phys_addr, size);
@@ -291,35 +297,27 @@ s32 MemoryManager::Free(PAddr phys_addr, u64 size, bool is_checked) {
     }
 
     std::scoped_lock lk{unmap_mutex};
-    // If this is a checked free, then all direct memory in range must be allocated.
+    // Release the allocated parts of [phys_addr, release_end). A checked free fails if any part of
+    // the range is not allocated; an unchecked free skips those parts.
+    const PAddr release_end = phys_addr + std::min<u64>(size, total_direct_size - phys_addr);
     std::vector<std::pair<PAddr, u64>> free_list;
-    u64 remaining_size = size;
-    auto phys_handle = FindDmemArea(phys_addr);
-    for (; phys_handle != dmem_map.end(); phys_handle++) {
-        if (remaining_size == 0) {
-            // Done searching
-            break;
+    for (auto phys_handle = FindDmemArea(phys_addr);
+         phys_handle != dmem_map.end() && phys_handle->second.base < release_end; phys_handle++) {
+        const auto& dmem_area = phys_handle->second;
+        const PAddr current_phys_addr = std::max<PAddr>(phys_addr, dmem_area.base);
+        const PAddr area_end = std::min<PAddr>(dmem_area.GetEnd(), release_end);
+        if (area_end <= current_phys_addr) {
+            continue;
         }
-        auto& dmem_area = phys_handle->second;
-        if (dmem_area.dma_type == PhysicalMemoryType::Free) {
+        if (dmem_area.dma_type != PhysicalMemoryType::Allocated &&
+            dmem_area.dma_type != PhysicalMemoryType::Mapped) {
             if (is_checked) {
-                // Checked frees will error if anything in the area isn't allocated.
-                // Unchecked frees will just ignore free areas.
-                LOG_ERROR(Kernel_Vmm, "Attempting to release a free dmem area");
+                LOG_ERROR(Kernel_Vmm, "Attempting to release an unallocated dmem area");
                 return ORBIS_KERNEL_ERROR_ENOENT;
             }
             continue;
         }
-
-        // Store physical address and size to release
-        const PAddr current_phys_addr = std::max<PAddr>(phys_addr, phys_handle->first);
-        const u64 start_in_dma = current_phys_addr - phys_handle->first;
-        const u64 size_in_dma =
-            std::min<u64>(remaining_size, phys_handle->second.size - start_in_dma);
-        free_list.emplace_back(current_phys_addr, size_in_dma);
-
-        // Track remaining size to free
-        remaining_size -= size_in_dma;
+        free_list.emplace_back(current_phys_addr, area_end - current_phys_addr);
     }
 
     // Release any dmem mappings that reference this physical block.
@@ -329,12 +327,14 @@ s32 MemoryManager::Free(PAddr phys_addr, u64 size, bool is_checked) {
             continue;
         }
         for (auto& [offset_in_vma, phys_mapping] : mapping.phys_areas) {
-            if (phys_addr + size > phys_mapping.base &&
+            if (release_end > phys_mapping.base &&
                 phys_addr < phys_mapping.base + phys_mapping.size) {
-                const u64 phys_offset =
-                    std::max<u64>(phys_mapping.base, phys_addr) - phys_mapping.base;
+                const PAddr overlap_start = std::max<PAddr>(phys_mapping.base, phys_addr);
+                const PAddr overlap_end =
+                    std::min<PAddr>(phys_mapping.base + phys_mapping.size, release_end);
+                const u64 phys_offset = overlap_start - phys_mapping.base;
                 const VAddr addr_in_vma = mapping.base + offset_in_vma + phys_offset;
-                const u64 unmap_size = std::min<u64>(phys_mapping.size - phys_offset, size);
+                const u64 unmap_size = overlap_end - overlap_start;
 
                 // Unmapping might erase from vma_map. We can't do it here.
                 remove_list.emplace_back(addr_in_vma, unmap_size);
@@ -541,7 +541,7 @@ s32 MemoryManager::MapMemory(void** out_addr, VAddr virtual_addr, u64 size, Memo
                 dmem_area->second.dma_type != PhysicalMemoryType::Mapped) {
                 LOG_ERROR(Kernel_Vmm, "Unable to map {:#x} bytes at physical address {:#x}", size,
                           phys_addr);
-                return ORBIS_KERNEL_ERROR_ENOMEM;
+                return ORBIS_KERNEL_ERROR_EACCES;
             }
 
             // If we need to perform extra validation, then check for Mapped dmem areas too.
@@ -936,8 +936,12 @@ u64 MemoryManager::UnmapBytesFromEntry(VAddr virtual_addr, VirtualMemoryArea vma
     const auto start_in_vma = virtual_addr - vma_base.base;
     const auto size_in_vma = std::min<u64>(vma_base.size - start_in_vma, size);
     const auto vma_type = vma_base.type;
-    if (vma_base.type == VMAType::Free || vma_base.type == VMAType::Pooled) {
+    if (vma_base.type == VMAType::Free) {
         return size_in_vma;
+    }
+    if (vma_type == VMAType::Pooled) {
+        // Unmapping committed pool memory returns it to the pool.
+        pool_budget += size_in_vma;
     }
 
     VAddr current_addr = virtual_addr;
@@ -957,6 +961,10 @@ u64 MemoryManager::UnmapBytesFromEntry(VAddr virtual_addr, VirtualMemoryArea vma
                 new_dmem_area.dma_type = PhysicalMemoryType::Allocated;
 
                 // Coalesce with nearby direct memory areas.
+                MergeAdjacent(dmem_map, new_dmem_handle);
+            } else if (vma_type == VMAType::Pooled) {
+                const auto new_dmem_handle = CarvePhysArea(dmem_map, phys_addr, size_in_dma);
+                new_dmem_handle->second.dma_type = PhysicalMemoryType::Pooled;
                 MergeAdjacent(dmem_map, new_dmem_handle);
             } else if (vma_type == VMAType::Flexible) {
                 // Update fmem_map
@@ -1203,13 +1211,26 @@ s32 MemoryManager::DirectMemoryQuery(PAddr addr, bool find_next,
     }
 
     std::shared_lock lk{mutex};
+    const auto is_allocated = [](const PhysicalMemoryArea& area) {
+        return area.dma_type == PhysicalMemoryType::Allocated ||
+               area.dma_type == PhysicalMemoryType::Mapped;
+    };
     auto dmem_area = FindDmemArea(addr);
-    while (dmem_area != dmem_map.end() && dmem_area->second.dma_type == PhysicalMemoryType::Free &&
-           find_next) {
-        dmem_area++;
+    if (find_next) {
+        // The first area ending at or after addr: one ending exactly at addr counts and free space
+        // is skipped. Any other area that is not an allocation ends the search.
+        if (dmem_area->second.dma_type == PhysicalMemoryType::Free &&
+            dmem_area->second.base == addr && dmem_area != dmem_map.begin() &&
+            std::prev(dmem_area)->second.dma_type != PhysicalMemoryType::Free) {
+            --dmem_area;
+        }
+        while (dmem_area != dmem_map.end() &&
+               dmem_area->second.dma_type == PhysicalMemoryType::Free) {
+            ++dmem_area;
+        }
     }
 
-    if (dmem_area == dmem_map.end() || dmem_area->second.dma_type == PhysicalMemoryType::Free) {
+    if (dmem_area == dmem_map.end() || !is_allocated(dmem_area->second)) {
         LOG_WARNING(Kernel_Vmm, "Unable to find allocated direct memory region to query!");
         return ORBIS_KERNEL_ERROR_EACCES;
     }
@@ -1217,11 +1238,20 @@ s32 MemoryManager::DirectMemoryQuery(PAddr addr, bool find_next,
     out_info->start = dmem_area->second.base;
     out_info->memoryType = dmem_area->second.memory_type;
 
-    // Loop through all sequential mapped or allocated dmem areas
-    // to determine the hardware accurate end.
-    while (dmem_area != dmem_map.end() && dmem_area->second.memory_type == out_info->memoryType &&
-           (dmem_area->second.dma_type == PhysicalMemoryType::Mapped ||
-            dmem_area->second.dma_type == PhysicalMemoryType::Allocated)) {
+    // Sequential mapped or allocated areas of the same type are reported as one region,
+    // in both directions.
+    const auto in_region = [&](const PhysicalMemoryArea& area) {
+        return area.memory_type == out_info->memoryType &&
+               (area.dma_type == PhysicalMemoryType::Mapped ||
+                area.dma_type == PhysicalMemoryType::Allocated);
+    };
+    if (in_region(dmem_area->second)) {
+        for (auto it = dmem_area; it != dmem_map.begin() && in_region(std::prev(it)->second);) {
+            --it;
+            out_info->start = it->second.base;
+        }
+    }
+    while (dmem_area != dmem_map.end() && in_region(dmem_area->second)) {
         out_info->end = dmem_area->second.GetEnd();
         dmem_area++;
     }
