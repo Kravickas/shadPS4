@@ -15,10 +15,8 @@ enum class Condition : u32 {
     Scc1,
     Vccz,
     Vccnz,
-    Execz,      // This invocation's EXEC bit is clear
-    Execnz,     // This invocation's EXEC bit is set
-    ExecWaveZ,  // EXEC is zero in every lane (S_CBRANCH_EXECZ)
-    ExecWaveNz, // EXEC is set in any lane (S_CBRANCH_EXECNZ)
+    Execz,
+    Execnz,
 };
 
 constexpr std::string_view NameOf(Condition condition) {
@@ -39,10 +37,6 @@ constexpr std::string_view NameOf(Condition condition) {
         return "Execz";
     case Condition::Execnz:
         return "Execnz";
-    case Condition::ExecWaveZ:
-        return "ExecWaveZ";
-    case Condition::ExecWaveNz:
-        return "ExecWaveNz";
     default:
         UNREACHABLE();
     }

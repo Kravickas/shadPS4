@@ -175,16 +175,13 @@ U1 IREmitter::Condition(IR::Condition cond) {
         return LogicalNot(GetScc());
     case IR::Condition::Scc1:
         return GetScc();
-    // Branches on VCC and EXEC test the whole wave, as the hardware does.
+    // Branches on VCC test the whole wave, as the hardware does.
     case IR::Condition::Vccz:
         return IEqual(PackUint2x32(CompositeConstruct(GetVccLo(), GetVccHi())), Imm64(u64(0)));
     case IR::Condition::Vccnz:
         return INotEqual(PackUint2x32(CompositeConstruct(GetVccLo(), GetVccHi())), Imm64(u64(0)));
-    case IR::Condition::ExecWaveZ:
-        return IEqual(Ballot(GetExec()), Imm64(u64(0)));
-    case IR::Condition::ExecWaveNz:
-        return INotEqual(Ballot(GetExec()), Imm64(u64(0)));
-    // The per-invocation EXEC bit guards the EXEC-masked instruction runs.
+    // EXEC branches are taken per lane: the lanes with EXEC clear skip the code the hardware
+    // masks for them.
     case IR::Condition::Execz:
         return LogicalNot(GetExec());
     case IR::Condition::Execnz:

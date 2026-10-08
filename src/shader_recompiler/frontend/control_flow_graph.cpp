@@ -2,6 +2,9 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
+#include <map>
+#include <optional>
+#include <unordered_map>
 #include "common/assert.h"
 #include "common/logging/log.h"
 #include "shader_recompiler/frontend/control_flow_graph.h"
@@ -38,9 +41,9 @@ static IR::Condition MakeCondition(const GcnInst& inst) {
     case Opcode::S_CBRANCH_VCCNZ:
         return IR::Condition::Vccnz;
     case Opcode::S_CBRANCH_EXECZ:
-        return IR::Condition::ExecWaveZ;
+        return IR::Condition::Execz;
     case Opcode::S_CBRANCH_EXECNZ:
-        return IR::Condition::ExecWaveNz;
+        return IR::Condition::Execnz;
     default:
         return IR::Condition::True;
     }
@@ -165,24 +168,284 @@ void CFG::EmitLabels() {
     std::ranges::sort(labels);
 }
 
+// Instructions without any effect, they can stay inside an EXEC scope.
+static bool IsExecNeutral(const GcnInst& inst) {
+    switch (inst.opcode) {
+    case Opcode::S_NOP:
+    case Opcode::S_WAITCNT:
+    case Opcode::S_SETPRIO:
+        return true;
+    default:
+        return false;
+    }
+}
+
+static bool IsSaveExec(const GcnInst& inst) {
+    return inst.opcode >= Opcode::S_AND_SAVEEXEC_B64 && inst.opcode <= Opcode::S_XNOR_SAVEEXEC_B64;
+}
+
+static bool WritesExec(const GcnInst& inst) {
+    // S_WQM_B64 is translated as a no-op, it does not change the EXEC of an invocation.
+    if (inst.opcode == Opcode::S_WQM_B64) {
+        return false;
+    }
+    return IsSaveExec(inst) || inst.IsCmpx() ||
+           (inst.dst_count > 0 && (inst.dst[0].field == OperandField::ExecLo ||
+                                   inst.dst[0].field == OperandField::ExecHi));
+}
+
+// Registers written by a scalar memory instruction.
+static u32 ScalarLoadWidth(Opcode opcode) {
+    switch (opcode) {
+    case Opcode::S_LOAD_DWORD:
+    case Opcode::S_BUFFER_LOAD_DWORD:
+        return 1;
+    case Opcode::S_LOAD_DWORDX2:
+    case Opcode::S_BUFFER_LOAD_DWORDX2:
+    case Opcode::S_MEMTIME:
+        return 2;
+    case Opcode::S_LOAD_DWORDX4:
+    case Opcode::S_BUFFER_LOAD_DWORDX4:
+        return 4;
+    case Opcode::S_LOAD_DWORDX8:
+    case Opcode::S_BUFFER_LOAD_DWORDX8:
+        return 8;
+    default:
+        return 16;
+    }
+}
+
+namespace {
+// What is known about EXEC at a program point: whether every lane that executes it has its EXEC
+// bit set, and which registers hold a half of a copy of such a full mask. A tag is
+// (copy id << 1) | half; the copy id is the index of the instruction that saved it.
+struct ExecState {
+    bool full{};
+    std::array<u32, 128> sgpr_tag{}; // SGPRs and VCC (106, 107)
+    std::map<u32, u32> lane_tag{};   // VGPR lanes holding a spilled half: vgpr * 64 + lane
+
+    bool operator==(const ExecState&) const = default;
+
+    bool HoldsFullCopy(u32 reg) const {
+        return reg + 1 < sgpr_tag.size() && sgpr_tag[reg] != 0 && (sgpr_tag[reg] & 1) == 0 &&
+               sgpr_tag[reg + 1] == sgpr_tag[reg] + 1;
+    }
+
+    static ExecState Merge(const ExecState& a, const ExecState& b) {
+        ExecState merged{.full = a.full && b.full};
+        for (u32 i = 0; i < merged.sgpr_tag.size(); ++i) {
+            merged.sgpr_tag[i] = a.sgpr_tag[i] == b.sgpr_tag[i] ? a.sgpr_tag[i] : 0;
+        }
+        for (const auto& [key, tag] : a.lane_tag) {
+            const auto it = b.lane_tag.find(key);
+            if (it != b.lane_tag.end() && it->second == tag) {
+                merged.lane_tag.emplace(key, tag);
+            }
+        }
+        return merged;
+    }
+};
+} // Anonymous namespace
+
+// The value of an inline integer constant operand, if it is one.
+static std::optional<u32> InlineInt(const InstOperand& op) {
+    if (op.field == OperandField::ConstZero) {
+        return 0;
+    }
+    if (op.field == OperandField::SignedConstIntPos) {
+        return op.code - static_cast<u32>(OperandField::ConstZero);
+    }
+    return std::nullopt;
+}
+
+static void ExecTransfer(const GcnInst& inst, u32 index, ExecState& state) {
+    const bool full_before = state.full;
+    const auto is_full_copy = [&](const InstOperand& op) {
+        return (op.field == OperandField::ScalarGPR || op.field == OperandField::VccLo) &&
+               state.HoldsFullCopy(op.code);
+    };
+    if (WritesExec(inst)) {
+        // Restoring a copy of the full mask, s_mov_b64 exec, -1 and the s_or_b64 exec, exec, copy
+        // that ends an if/else make EXEC full again; any other write can leave lanes off.
+        bool full = false;
+        if (inst.opcode == Opcode::S_MOV_B64) {
+            full =
+                is_full_copy(inst.src[0]) ||
+                (inst.src[0].field == OperandField::SignedConstIntNeg && inst.src[0].code == 193);
+        } else if (inst.opcode == Opcode::S_OR_B64) {
+            full = is_full_copy(inst.src[0]) || is_full_copy(inst.src[1]);
+        } else if (inst.opcode == Opcode::S_ORN2_SAVEEXEC_B64) {
+            // EXEC = src | ~EXEC: with src = EXEC every lane is on.
+            full = inst.src[0].field == OperandField::ExecLo || is_full_copy(inst.src[0]);
+        } else if (inst.opcode == Opcode::S_AND_B64) {
+            // Ending whole quad mode: a full EXEC and a copy of the full mask stay full.
+            const auto is_exec = [](const InstOperand& op) {
+                return op.field == OperandField::ExecLo;
+            };
+            full = full_before && ((is_exec(inst.src[0]) && is_full_copy(inst.src[1])) ||
+                                   (is_exec(inst.src[1]) && is_full_copy(inst.src[0])));
+        }
+        state.full = full;
+    }
+
+    // A half of a copy moved through a VGPR lane: v_writelane / v_readlane with a constant lane.
+    if (inst.opcode == Opcode::V_READLANE_B32 && inst.dst[0].field == OperandField::ScalarGPR &&
+        inst.dst[0].code < 128) {
+        const auto lane = InlineInt(inst.src[1]);
+        u32 tag = 0;
+        if (lane && inst.src[0].field == OperandField::VectorGPR) {
+            const auto it = state.lane_tag.find(inst.src[0].code * 64 + *lane);
+            tag = it != state.lane_tag.end() ? it->second : 0;
+        }
+        state.sgpr_tag[inst.dst[0].code] = tag;
+        return;
+    }
+    if (inst.opcode == Opcode::V_WRITELANE_B32 && inst.dst[0].field == OperandField::VectorGPR) {
+        const auto lane = InlineInt(inst.src[1]);
+        if (!lane) {
+            std::erase_if(state.lane_tag,
+                          [&](const auto& entry) { return entry.first / 64 == inst.dst[0].code; });
+            return;
+        }
+        const u32 key = inst.dst[0].code * 64 + *lane;
+        const bool from_sgpr = inst.src[0].field == OperandField::ScalarGPR ||
+                               inst.src[0].field == OperandField::VccLo ||
+                               inst.src[0].field == OperandField::VccHi;
+        const u32 tag = from_sgpr && inst.src[0].code < 128 ? state.sgpr_tag[inst.src[0].code] : 0;
+        if (tag != 0) {
+            state.lane_tag[key] = tag;
+        } else {
+            state.lane_tag.erase(key);
+        }
+        return;
+    }
+
+    // Registers written here no longer hold a half of a copy. Every destination slot is checked:
+    // an implicit VCC write is stored in dst[1] without being counted in dst_count.
+    for (const InstOperand& dst : inst.dst) {
+        if (dst.field == OperandField::VccLo || dst.field == OperandField::VccHi) {
+            state.sgpr_tag[static_cast<u32>(OperandField::VccLo)] = 0;
+            state.sgpr_tag[static_cast<u32>(OperandField::VccHi)] = 0;
+            continue;
+        }
+        if (dst.field == OperandField::VectorGPR) {
+            // Vector memory writes up to four VGPRs (dwordx4, four image components, read2_b64).
+            u32 vwidth = 1;
+            if (inst.category == InstCategory::VectorMemory ||
+                inst.category == InstCategory::DataShare) {
+                vwidth = 4;
+            } else if (dst.type == ScalarType::Uint64 || dst.type == ScalarType::Sint64 ||
+                       dst.type == ScalarType::Float64) {
+                vwidth = 2;
+            }
+            std::erase_if(state.lane_tag, [&](const auto& entry) {
+                return entry.first / 64 >= dst.code && entry.first / 64 < dst.code + vwidth;
+            });
+            continue;
+        }
+        if (dst.field != OperandField::ScalarGPR) {
+            continue;
+        }
+        u32 width = 2;
+        if (inst.category == InstCategory::ScalarMemory) {
+            width = ScalarLoadWidth(inst.opcode);
+        } else if (dst.type == ScalarType::Uint32 || dst.type == ScalarType::Sint32 ||
+                   dst.type == ScalarType::Float32 || dst.type == ScalarType::Uint16 ||
+                   dst.type == ScalarType::Sint16 || dst.type == ScalarType::Float16) {
+            width = 1;
+        }
+        for (u32 reg = dst.code; reg < std::min<u32>(dst.code + width, 128); ++reg) {
+            state.sgpr_tag[reg] = 0;
+        }
+    }
+    // A save of the full mask: saveexec stores the old EXEC, as does s_mov_b64 sdst, exec.
+    if (full_before && inst.dst_count > 0 &&
+        (inst.dst[0].field == OperandField::ScalarGPR ||
+         inst.dst[0].field == OperandField::VccLo) &&
+        inst.dst[0].code + 1 < 128 &&
+        (IsSaveExec(inst) ||
+         (inst.opcode == Opcode::S_MOV_B64 && inst.src[0].field == OperandField::ExecLo))) {
+        state.sgpr_tag[inst.dst[0].code] = (index + 1) << 1;
+        state.sgpr_tag[inst.dst[0].code + 1] = ((index + 1) << 1) | 1;
+    }
+}
+
 void CFG::SplitDivergenceScopes() {
-    // EXEC masks the vector instructions only. Each run of them goes into its own block, which
-    // only the lanes with EXEC set enter; scalar instructions and branches stay outside and run
-    // in every lane.
+    // Which instructions can run with lanes off in EXEC: forward over the CFG from the entry,
+    // where EXEC is full; paths merge to "partial" when any of them is.
+    std::unordered_map<const Block*, ExecState> block_in;
+    block_in[&*blocks.begin()] = ExecState{.full = true};
+    for (bool changed = true; changed;) {
+        changed = false;
+        for (const Block& blk : blocks) {
+            const auto it = block_in.find(&blk);
+            if (it == block_in.end()) {
+                continue;
+            }
+            ExecState state = it->second;
+            for (u32 i = blk.begin_index; i <= blk.end_index; ++i) {
+                ExecTransfer(inst_list[i], i, state);
+            }
+            for (const Block* succ : {blk.branch_true, blk.branch_false}) {
+                if (!succ) {
+                    continue;
+                }
+                // A per-lane EXEC branch sends the lanes with EXEC set one way: EXEC is set in
+                // every lane on that edge, and clear in every lane on the other.
+                ExecState edge = state;
+                if (blk.cond == IR::Condition::Execz || blk.cond == IR::Condition::Execnz) {
+                    const bool exec_set_edge =
+                        (blk.cond == IR::Condition::Execnz) == (succ == blk.branch_true);
+                    edge.full = exec_set_edge;
+                }
+                const auto [succ_it, inserted] = block_in.try_emplace(succ, edge);
+                if (inserted) {
+                    changed = true;
+                    continue;
+                }
+                const ExecState merged = ExecState::Merge(succ_it->second, edge);
+                if (merged != succ_it->second) {
+                    succ_it->second = merged;
+                    changed = true;
+                }
+            }
+        }
+    }
+    std::vector<bool> exec_partial(inst_list.size(), false);
+    for (const Block& blk : blocks) {
+        const auto it = block_in.find(&blk);
+        if (it == block_in.end()) {
+            continue;
+        }
+        ExecState state = it->second;
+        for (u32 i = blk.begin_index; i <= blk.end_index; ++i) {
+            exec_partial[i] = !state.full;
+            ExecTransfer(inst_list[i], i, state);
+        }
+    }
+    const auto is_masked = [&](u32 i) { return exec_partial[i] && !IgnoresExecMask(inst_list[i]); };
+
+    // EXEC masks the vector instructions only. Each run of them that can execute with lanes off
+    // goes into its own block, which only the lanes with EXEC set enter; scalar instructions and
+    // branches stay outside and run in every lane.
     for (auto blk = blocks.begin(); blk != blocks.end(); blk++) {
         if (blk->is_exec_scope) {
             continue;
         }
         u32 first = blk->begin_index;
-        while (first <= blk->end_index && IgnoresExecMask(inst_list[first])) {
+        while (first <= blk->end_index && !is_masked(first)) {
             ++first;
         }
         if (first > blk->end_index) {
             continue;
         }
         u32 last = first;
-        while (last < blk->end_index && !IgnoresExecMask(inst_list[last + 1])) {
+        while (last < blk->end_index &&
+               (is_masked(last + 1) || IsExecNeutral(inst_list[last + 1]))) {
             ++last;
+        }
+        while (IsExecNeutral(inst_list[last])) {
+            --last;
         }
         const auto next_blk = std::next(blk);
 
