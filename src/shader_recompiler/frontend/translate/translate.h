@@ -181,6 +181,7 @@ public:
     void V_BFM_B32(const GcnInst& inst);
     void V_MAC_F32(const GcnInst& inst);
     void V_MADMK_F32(const GcnInst& inst);
+    void V_MADAK_F32(const GcnInst& inst);
     void V_BCNT_U32_B32(const GcnInst& inst);
     void V_MBCNT_U32_B32(bool hi, const GcnInst& inst);
     void V_ADD_I32(const GcnInst& inst);

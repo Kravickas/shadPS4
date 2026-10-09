@@ -43,8 +43,29 @@ Sampler::Sampler(const Vulkan::Instance& instance, const AmdGpu::Sampler& sample
         }
     }();
 
-    const vk::SamplerCreateInfo sampler_ci = {
+    // GCN FILTER_MODE min / max. A compare sampler only allows the weighted average
+    // (VUID-VkSamplerCreateInfo-compareEnable-01423).
+    const auto reduction_mode = LiverpoolToVK::FilterMode(sampler.filter_mode);
+    const bool use_reduction =
+        reduction_mode != vk::SamplerReductionMode::eWeightedAverage && !is_depth;
+    if (use_reduction && !instance.IsSamplerFilterMinmaxSupported()) {
+        LOG_WARNING(Render_Vulkan, "Min/max sampler filtering is not supported, using average");
+    }
+    const vk::SamplerReductionModeCreateInfo reduction_ci = {
         .pNext = custom_color ? &*custom_color : nullptr,
+        .reductionMode = reduction_mode,
+    };
+    const void* const next =
+        use_reduction && instance.IsSamplerFilterMinmaxSupported()
+            ? static_cast<const void*>(&reduction_ci)
+            : (custom_color ? static_cast<const void*>(&*custom_color) : nullptr);
+
+    // GCN MIP_FILTER none samples the base level only: nearest mip mode with LOD clamped to
+    // [0, 0.25], the Vulkan spec's emulation of a non-mipmapped minification filter.
+    const bool base_level_only = sampler.mip_filter == AmdGpu::MipFilter::None;
+
+    const vk::SamplerCreateInfo sampler_ci = {
+        .pNext = next,
         .magFilter = LiverpoolToVK::Filter(sampler.xy_mag_filter),
         .minFilter = LiverpoolToVK::Filter(sampler.xy_min_filter),
         .mipmapMode = LiverpoolToVK::MipFilter(sampler.mip_filter),
@@ -57,8 +78,8 @@ Sampler::Sampler(const Vulkan::Instance& instance, const AmdGpu::Sampler& sample
         // GCN compares per instruction; a plain read of a compare sampler is undefined in Vulkan.
         .compareEnable = is_depth,
         .compareOp = LiverpoolToVK::DepthCompare(sampler.depth_compare_func),
-        .minLod = sampler.MinLod(),
-        .maxLod = sampler.MaxLod(),
+        .minLod = base_level_only ? 0.f : sampler.MinLod(),
+        .maxLod = base_level_only ? 0.25f : sampler.MaxLod(),
         .borderColor = border_color,
         .unnormalizedCoordinates = false, // Handled in shader due to Vulkan limitations.
     };

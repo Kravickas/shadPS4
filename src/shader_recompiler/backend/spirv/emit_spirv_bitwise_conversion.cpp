@@ -231,7 +231,10 @@ Id EmitUnpackSnorm2_10_10_10(EmitContext& ctx, Id value) {
     const auto as_float{ctx.OpConvertSToF(ctx.F32[4], unpacked)};
     const auto snorm_div{ctx.ConstantComposite(ctx.F32[4], ctx.ConstF32(511.f), ctx.ConstF32(511.f),
                                                ctx.ConstF32(511.f), ctx.ConstF32(1.f))};
-    return ctx.OpFDiv(ctx.F32[4], as_float, snorm_div);
+    // -512 and the 2-bit -2 map to -1.0, as for every SNORM format.
+    const auto snorm_min{ctx.ConstantComposite(ctx.F32[4], ctx.ConstF32(-1.f), ctx.ConstF32(-1.f),
+                                               ctx.ConstF32(-1.f), ctx.ConstF32(-1.f))};
+    return ctx.OpFMax(ctx.F32[4], ctx.OpFDiv(ctx.F32[4], as_float, snorm_div), snorm_min);
 }
 
 Id EmitPackUint2_10_10_10(EmitContext& ctx, Id value) {

@@ -94,6 +94,11 @@ public:
         return vk12_features.shaderFloat16;
     }
 
+    /// Returns true if min / max reduction samplers are supported
+    bool IsSamplerFilterMinmaxSupported() const {
+        return vk12_features.samplerFilterMinmax;
+    }
+
     /// Returns true if 64-bit floats are supported in shaders
     bool IsShaderFloat64Supported() const {
         return features.shaderFloat64;
