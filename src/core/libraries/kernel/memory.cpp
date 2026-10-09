@@ -678,6 +678,15 @@ s32 PS4_SYSV_ABI sceKernelMemoryPoolCommit(void* addr, u64 len, s32 type, s32 pr
         LOG_ERROR(Kernel_Vmm, "Executable permissions are not allowed.");
         return ORBIS_KERNEL_ERROR_EINVAL;
     }
+    // Measured on hardware: pooled memory can be committed as type 0 or 3 only.
+    if (type == 10) {
+        LOG_ERROR(Kernel_Vmm, "Memory type {} is not allowed", type);
+        return ORBIS_KERNEL_ERROR_EACCES;
+    }
+    if (type != 0 && type != 3) {
+        LOG_ERROR(Kernel_Vmm, "Memory type {} is invalid", type);
+        return ORBIS_KERNEL_ERROR_EINVAL;
+    }
 
     LOG_INFO(Kernel_Vmm, "addr = {}, len = {:#x}, type = {:#x}, prot = {:#x}, flags = {:#x}",
              fmt::ptr(addr), len, type, prot, flags);
