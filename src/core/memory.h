@@ -346,6 +346,7 @@ private:
     void TakePoolBlocks(u64 count, bool cached);
     void ReturnPoolBlocks(u64 count, bool cached);
     void ReturnCommittedPoolBlocks(PAddr base, u64 size);
+    void SetCommittedPoolBlockType(PAddr base, u64 size, s32 memory_type);
 
     u64 UnmapBytesFromEntry(VAddr virtual_addr, VirtualMemoryArea vma_base, u64 size);
 

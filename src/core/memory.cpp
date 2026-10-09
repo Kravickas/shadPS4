@@ -267,6 +267,29 @@ void MemoryManager::ReturnCommittedPoolBlocks(PAddr base, u64 size) {
     ReturnPoolBlocks(size / 64_KB - flushed, true);
 }
 
+void MemoryManager::SetCommittedPoolBlockType(PAddr base, u64 size, s32 memory_type) {
+    // A committed block counts as flushed while its type is 3 and as cached while it is 0.
+    // Other types were not measured, so they leave the counters unchanged.
+    if (memory_type != 0 && memory_type != 3) {
+        return;
+    }
+    const bool flushed = memory_type == 3;
+    for (PAddr block = base; block < base + size; block += 64_KB) {
+        if (pool_flushed_blocks.contains(block) == flushed) {
+            continue;
+        }
+        if (flushed) {
+            pool_flushed_blocks.insert(block);
+            --pool_alloc_cached;
+            ++pool_alloc_flushed;
+        } else {
+            pool_flushed_blocks.erase(block);
+            --pool_alloc_flushed;
+            ++pool_alloc_cached;
+        }
+    }
+}
+
 s32 MemoryManager::PoolReserve(void** out_addr, VAddr virtual_addr, u64 size, MemoryMapFlags flags,
                                u64 alignment) {
     {
@@ -1405,6 +1428,11 @@ s32 MemoryManager::SetDirectMemoryType(VAddr addr, u64 size, s32 memory_type) {
             vma_handle = CarveVMA(current_addr, size_in_vma);
             auto phys_handle = vma_handle->second.phys_areas.begin();
             while (phys_handle != vma_handle->second.phys_areas.end()) {
+                if (vma_handle->second.type == VMAType::Pooled) {
+                    SetCommittedPoolBlockType(phys_handle->second.base, phys_handle->second.size,
+                                              memory_type);
+                }
+
                 // Update internal physical areas
                 phys_handle->second.memory_type = memory_type;
 
