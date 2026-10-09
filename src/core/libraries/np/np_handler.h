@@ -19,8 +19,10 @@
 
 #include "common/types.h"
 #include "core/libraries/np/np_manager.h"
+#include "core/libraries/np/np_matching2/np_matching2_cache.h"
 #include "core/libraries/np/np_score/np_score.h"
 #include "core/libraries/np/np_score/np_score_ctx.h"
+#include "core/libraries/np/np_signaling/np_signaling_state.h"
 #include "core/libraries/np/np_tus/np_tus.h"
 #include "core/libraries/np/np_tus/np_tus_ctx.h"
 #include "core/libraries/np/np_types.h"
@@ -30,8 +32,42 @@
 
 namespace Libraries::Np {
 
+namespace NpMatching2 {
+class ContextManager;
+struct NpMatching2State;
+} // namespace NpMatching2
+
 class NpHandler {
 public:
+    class Matching2CacheGuard {
+    public:
+        Matching2CacheGuard(Matching2CacheGuard&&) noexcept = default;
+        Matching2CacheGuard& operator=(Matching2CacheGuard&&) noexcept = default;
+        Matching2CacheGuard(const Matching2CacheGuard&) = delete;
+        Matching2CacheGuard& operator=(const Matching2CacheGuard&) = delete;
+
+        NpMatching2::Matching2ContextCache* operator->() {
+            return m_cache.get();
+        }
+
+        const NpMatching2::Matching2ContextCache* operator->() const {
+            return m_cache.get();
+        }
+
+        NpMatching2::Matching2ContextCache& operator*() {
+            return *m_cache;
+        }
+
+    private:
+        friend class NpHandler;
+
+        explicit Matching2CacheGuard(std::shared_ptr<NpMatching2::Matching2ContextCache> cache)
+            : m_cache(std::move(cache)), m_lock(m_cache->mutex) {}
+
+        std::shared_ptr<NpMatching2::Matching2ContextCache> m_cache;
+        std::unique_lock<std::recursive_mutex> m_lock;
+    };
+
     static NpHandler& GetInstance();
 
     NpHandler(const NpHandler&) = delete;
@@ -82,16 +118,20 @@ public:
 
     // Raises ORBIS_SYSTEM_SERVICE_EVENT_SESSION_INVITATION (0x10000002) so titles that watch the
     // system-service event learn about the invite.
-    void PostSessionInvitationEvent(const std::string& session_id, const std::string& invitation_id,
-                                    const std::string& accepter_online_id);
+    void PostSessionInvitationEvent(s32 user_id, const std::string& session_id,
+                                    const std::string& invitation_id,
+                                    const std::string& accepter_online_id,
+                                    const std::string& inviter_online_id,
+                                    OrbisNpAccountId inviter_account_id);
 
     // A session invitation surfaced from a shadNet push, stashed until the user acts on it.
     struct PendingInvitation {
         std::string session_id;
         std::string invitation_id;
-        std::string from_npid;   // sender (for display)
-        std::string to_npid;     // local recipient / accepter
-        int64_t valid_until = 0; // ms since epoch; 0 = never expires
+        std::string from_npid;                // sender (for display)
+        std::string to_npid;                  // local recipient / accepter
+        int64_t valid_until = 0;              // ms since epoch; 0 = never expires
+        OrbisNpAccountId from_account_id = 0; // sender account id (0 = unknown)
     };
     // Pending invitations stashed for a local user (newest last), populated on arrival.
     std::vector<PendingInvitation> GetPendingInvitations(s32 user_id) const;
@@ -318,9 +358,23 @@ public:
     s32 RegisterStateCallback(StateCallback cb, void* userdata);
     void UnregisterStateCallback(s32 handle);
 
+    Matching2CacheGuard LockMatching2Cache(NpMatching2::OrbisNpMatching2ContextId ctx_id);
+    void ResetMatching2Cache(NpMatching2::OrbisNpMatching2ContextId ctx_id);
+    void ResetMatching2Caches();
+    NpMatching2::ContextManager& GetMatching2ContextManager();
+    NpMatching2::NpMatching2State& GetMatching2State();
+
+    NpSignaling::NpSignalingState& GetSignalingState() {
+        return m_signaling_state;
+    }
+
+    const NpSignaling::NpSignalingState& GetSignalingState() const {
+        return m_signaling_state;
+    }
+
 private:
-    NpHandler() = default;
-    ~NpHandler() = default;
+    NpHandler();
+    ~NpHandler();
 
     /// Connect one user.  Blocks until connected+authenticated or failed.
     bool ConnectUser(s32 user_id, const std::string& host, u16 port, const std::string& npid,
@@ -472,6 +526,14 @@ private:
     // Friend state per user, seeded from LoginReply and updated by notifications/actions.
     mutable std::mutex m_mutex_friend_state;
     std::map<s32, FriendListSnapshot> m_friend_state;
+
+    mutable std::mutex m_mutex_matching2_cache;
+    std::map<NpMatching2::OrbisNpMatching2ContextId,
+             std::shared_ptr<NpMatching2::Matching2ContextCache>>
+        m_matching2_cache;
+    std::unique_ptr<NpMatching2::ContextManager> m_matching2_contexts;
+    std::unique_ptr<NpMatching2::NpMatching2State> m_matching2_state;
+    NpSignaling::NpSignalingState m_signaling_state;
 };
 
 } // namespace Libraries::Np

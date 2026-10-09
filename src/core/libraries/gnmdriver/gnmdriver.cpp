@@ -1223,7 +1223,7 @@ int PS4_SYSV_ABI sceGnmMapComputeQueue(u32 pipe_id, u32 queue_id, VAddr ring_bas
     }
 
     const auto vqid =
-        liverpool->asc_queues.insert(VAddr(ring_base_addr), read_ptr_addr, ring_size_dw, pipe_id);
+        liverpool->asc_queues.Insert(VAddr(ring_base_addr), read_ptr_addr, ring_size_dw, pipe_id);
     // We need to offset index as `dingDong` assumes it to be from the range [1..64]
     const auto gnm_vqid = vqid.index + 1;
     LOG_INFO(Lib_GnmDriver, "ASC pipe {} queue {} mapped to vqueue {}", pipe_id, queue_id,
@@ -1469,7 +1469,7 @@ s32 PS4_SYSV_ABI sceGnmSetEmbeddedPsShader(u32* cmdbuf, u32 size, u32 shader_id,
 
     constexpr static std::array ps1_code alignas(256) = {
         0xbeeb03ffu, 0x00000003u, // s_mov_b32     vcc_hi, $0x00000003
-        0x7e040280u,              // v_mov_b32     v2, 0 
+        0x7e040280u,              // v_mov_b32     v2, 0
         0xf8001803u, 0x02020202u, // exp           mrt0, v2, v2, off, off vm done
         0xbf810000u,              // s_endpgm
 
@@ -1591,8 +1591,22 @@ s32 PS4_SYSV_ABI sceGnmSetEsShader(u32* cmdbuf, u32 size, const u32* es_regs, u3
     return ORBIS_OK;
 }
 
-int PS4_SYSV_ABI sceGnmSetGsRingSizes() {
-    LOG_ERROR(Lib_GnmDriver, "(STUBBED) called");
+s32 PS4_SYSV_ABI sceGnmSetGsRingSizes(u32 esgs_ring_size, u32 gsvs_ring_size) {
+    LOG_TRACE(Lib_GnmDriver, "esgs_ring_size = {:#x}, gsvs_ring_size = {:#x}", esgs_ring_size,
+              gsvs_ring_size);
+    // Sony libSceGnmDriver validates 1 MB alignment and [4 MB, 8 MB] range.
+    constexpr u32 MinRingSize = 0x400000;   // 4 MB
+    constexpr u32 MaxRingSize = 0x800000;   // 8 MB
+    constexpr u32 RingAlignment = 0x100000; // 1 MB
+    if (esgs_ring_size < MinRingSize || esgs_ring_size > MaxRingSize ||
+        ((esgs_ring_size & (RingAlignment - 1)) != 0) || gsvs_ring_size < MinRingSize ||
+        gsvs_ring_size > MaxRingSize || ((gsvs_ring_size & (RingAlignment - 1)) != 0)) {
+        return 0x08000000;
+    }
+    if (liverpool) {
+        liverpool->regs.vgt_esgs_ring_size = esgs_ring_size >> 8;
+        liverpool->regs.vgt_gsvs_ring_size = gsvs_ring_size >> 8;
+    }
     return ORBIS_OK;
 }
 
@@ -1786,8 +1800,24 @@ int PS4_SYSV_ABI sceGnmSetSpiEnableSqCountersForUnitInstance() {
     return ORBIS_GNM_ERROR_FAILURE;
 }
 
-int PS4_SYSV_ABI sceGnmSetupMipStatsReport() {
-    LOG_ERROR(Lib_GnmDriver, "(STUBBED) called");
+s32 PS4_SYSV_ABI sceGnmSetupMipStatsReport(void* output_buffer, u32 size_in_bytes,
+                                           u8 intervals_between_reports,
+                                           u8 num_reports_before_reset, u32 mip_stats_reset_force) {
+    LOG_DEBUG(
+        Lib_GnmDriver,
+        "(STUBBED) output_buffer = {}, size_in_bytes = {:#x}, intervals = {}, num_reports = {}, "
+        "force_reset = {}",
+        output_buffer, size_in_bytes, intervals_between_reports, num_reports_before_reset,
+        mip_stats_reset_force);
+    if (!output_buffer ||
+        (reinterpret_cast<uintptr_t>(output_buffer) & 0xffffff000000003fULL) != 0) {
+        return 0x80000001;
+    }
+    if (size_in_bytes < 0x1040 || (size_in_bytes & 0x7ff) != 0x40) {
+        return 0x80000002;
+    }
+    std::memset(output_buffer, 0, size_in_bytes);
+    *static_cast<u32*>(output_buffer) = 0x40u;
     return ORBIS_OK;
 }
 
@@ -2368,7 +2398,7 @@ s32 PS4_SYSV_ABI sceGnmSubmitDone() {
 }
 
 int PS4_SYSV_ABI sceGnmUnmapComputeQueue(u32 vqid) {
-    liverpool->asc_queues.erase(Common::SlotId{vqid - 1});
+    liverpool->asc_queues.Erase(Common::SlotId{vqid - 1});
     return ORBIS_OK;
 }
 

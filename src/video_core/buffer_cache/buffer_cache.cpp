@@ -3,12 +3,15 @@
 
 #include <algorithm>
 #include <magic_enum/magic_enum.hpp>
+
 #include "common/alignment.h"
+#include "core/debug_state.h"
 #include "core/memory.h"
 #include "video_core/amdgpu/liverpool.h"
 #include "video_core/buffer_cache/buffer.h"
 #include "video_core/buffer_cache/buffer_cache.h"
 #include "video_core/buffer_cache/memory_tracker.h"
+#include "video_core/buffer_cache/region_definitions.h"
 #include "video_core/renderer_vulkan/vk_graphics_pipeline.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_runtime.h"
@@ -20,6 +23,7 @@
 namespace VideoCore {
 
 static constexpr size_t GDS_BUFFER_SIZE = 64_KB;
+static constexpr size_t NULL_INDEX_BUFFER_SIZE = 16;
 static constexpr size_t STREAM_BUFFER_SIZE = 128_MB;
 
 static constexpr auto ARENA_USAGE =
@@ -82,17 +86,29 @@ BufferCache::BufferCache(const Vulkan::Instance& instance_, Vulkan::Scheduler& s
     bda_pagetable_buffer = std::make_unique<Buffer>(
         instance, 0, bda_pagetable_size, MemoryType::DeviceLocal, "BDA Page Table Buffer");
     runtime.FillBuffer(bda_pagetable_buffer.get(), 0u, bda_pagetable_size, 0u);
+    if (!instance.IsMaintenance6Supported()) {
+        null_index_buffer = std::make_unique<Buffer>(instance, 0, NULL_INDEX_BUFFER_SIZE,
+                                                     MemoryType::DeviceLocal, "Null Index Buffer");
+        runtime.FillBuffer(null_index_buffer.get(), 0u, NULL_INDEX_BUFFER_SIZE, 0u);
+    }
 }
 
 BufferCache::~BufferCache() = default;
 
-void BufferCache::InvalidateMemory(VAddr device_addr, u64 size) {
-    memory_tracker->InvalidateRegion(
-        device_addr, size, [this, device_addr, size] { ReadMemory(device_addr, size, true); });
+void BufferCache::TickFrame() {
+    if (std::exchange(fault_process_pending, false)) {
+        fault_manager->ProcessFaultBuffer();
+    }
 }
 
-void BufferCache::ReadMemory(VAddr device_addr, u64 size, bool is_write) {
-    liverpool->SendCommand<true>([this, device_addr, size, is_write] {
+void BufferCache::InvalidateMemory(VAddr device_addr, u64 size, bool assume_locks) {
+    memory_tracker->InvalidateRegion(device_addr, size, [this, device_addr, size, assume_locks] {
+        ReadMemory(device_addr, size, true, assume_locks);
+    });
+}
+
+void BufferCache::ReadMemory(VAddr device_addr, u64 size, bool is_write, bool assume_locks) {
+    const auto flush_request = [this, device_addr, size, is_write] {
         const u32 first_block = device_addr >> block_shift;
         const u32 last_block = (device_addr + size - 1) >> block_shift;
         const auto* arena = GetArena(first_block, last_block);
@@ -109,7 +125,12 @@ void BufferCache::ReadMemory(VAddr device_addr, u64 size, bool is_write) {
         if (is_write) {
             memory_tracker->MarkRegionAsCpuModified(device_addr, size);
         }
-    });
+    };
+    if (assume_locks) {
+        flush_request();
+    } else {
+        liverpool->SendCommand<true>(std::move(flush_request));
+    }
 }
 
 void BufferCache::DownloadMemory(const Buffer* arena, VAddr device_addr, u64 size) {
@@ -149,7 +170,7 @@ void BufferCache::DownloadMemory(const Buffer* arena, VAddr device_addr, u64 siz
         memory->TryWriteBacking(dst_addr, download.mapped + (copy.dstOffset - download.offset),
                                 copy.size);
     }
-    memory_tracker->UnmarkRegionAsGpuModified(device_addr, size);
+    memory_tracker->UnmarkRegionAsGpuModified(device_addr, size, false);
 }
 
 std::pair<const Buffer*, u64> BufferCache::ObtainBuffer(VAddr device_addr, u32 size,
@@ -191,11 +212,8 @@ bool BufferCache::IsRegionGpuModified(VAddr addr, size_t size) {
     return memory_tracker->IsRegionGpuModified(addr, size);
 }
 
-void BufferCache::ProcessFaultBuffer() {
-    fault_manager->ProcessFaultBuffer();
-}
-
 void BufferCache::SynchronizeDmaBuffers() {
+    fault_process_pending = true;
     for (const auto& range : resident_ranges) {
         const u64 page = range.start >> (ARENA_PAGE_BITS - block_shift);
         const VAddr device_addr = range.start << block_shift;
@@ -243,7 +261,7 @@ const Buffer* BufferCache::GetArena(u64 first_block, u64 last_block) {
             .resourceOffset = (start - base_block) << block_shift,
             .size = (end - start) << block_shift,
             .memory = backing.memory,
-            .memoryOffset = backing.offset + ((start - backing.start) << block_shift),
+            .memoryOffset = (backing.offset + start - backing.start) << block_shift,
         });
     });
 
@@ -270,7 +288,11 @@ void BufferCache::EnsureResident(const Buffer* arena, u64 first_block, u64 last_
         return;
     }
 
+    const vk::MemoryAllocateFlagsInfo alloc_flags = {
+        .flags = vk::MemoryAllocateFlagBits::eDeviceAddress,
+    };
     const vk::MemoryAllocateInfo alloc_info = {
+        .pNext = &alloc_flags,
         .allocationSize = resident_blocks << block_shift,
         .memoryTypeIndex = arena_memory_type_index,
     };
@@ -289,7 +311,7 @@ void BufferCache::EnsureResident(const Buffer* arena, u64 first_block, u64 last_
         backing.start = range.start;
         backing.end = range.end;
         backing.memory = device_memory;
-        backing.offset = memory_offset;
+        backing.offset = memory_offset >> block_shift;
         resident_ranges.Add(backing);
 
         LOG_INFO(Render, "Making range start={}, end={} resident", backing.start, backing.end);
@@ -318,37 +340,24 @@ bool BufferCache::SynchronizeMemory(const Buffer* arena, VAddr device_addr, u32 
                                     bool is_written, bool is_texel_buffer) {
     boost::container::small_vector<vk::BufferCopy, 4> copies;
     size_t total_size_bytes{};
-    const Buffer* src_buffer{};
-    memory_tracker->ForEachUploadRange(
-        device_addr, size, is_written,
-        [&](u64 addr, u64 size) {
-            copies.emplace_back(total_size_bytes, addr, size);
-            total_size_bytes += size;
-        },
-        [&] { src_buffer = UploadCopies(arena, copies, total_size_bytes); });
-
-    if (src_buffer) {
-        runtime.CopyBuffer(src_buffer, arena, copies);
+    memory_tracker->ForEachUploadRange(device_addr, size, is_written, [&](u64 addr, u64 size) {
+        copies.emplace_back(total_size_bytes, addr, size);
+        total_size_bytes += size;
+    });
+    if (!copies.empty()) {
+        const auto staging = staging_pool.Request(total_size_bytes, MemoryType::HostUncached);
+        for (auto& copy : copies) {
+            memory->CopySparseMemory(copy.dstOffset, staging.mapped + copy.srcOffset, copy.size);
+            copy.srcOffset += staging.offset;
+            copy.dstOffset -= arena->cpu_addr;
+        }
+        staging.Flush();
+        runtime.CopyBuffer(staging.buffer, arena, copies);
     }
     if (is_texel_buffer && !is_written) {
         return SynchronizeMemoryFromImage(arena, device_addr, size);
     }
     return false;
-}
-
-const Buffer* BufferCache::UploadCopies(const Buffer* arena, std::span<vk::BufferCopy> copies,
-                                        size_t total_size_bytes) {
-    if (copies.empty()) {
-        return nullptr;
-    }
-    const auto staging = staging_pool.Request(total_size_bytes, MemoryType::HostUncached);
-    for (auto& copy : copies) {
-        memory->CopySparseMemory(copy.dstOffset, staging.mapped + copy.srcOffset, copy.size);
-        copy.srcOffset += staging.offset;
-        copy.dstOffset -= arena->cpu_addr;
-    }
-    staging.Flush();
-    return staging.buffer;
 }
 
 bool BufferCache::SynchronizeMemoryFromImage(const Buffer* arena, VAddr device_addr, u32 size) {

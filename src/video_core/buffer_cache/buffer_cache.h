@@ -53,6 +53,10 @@ public:
         return &gds_buffer;
     }
 
+    [[nodiscard]] const Buffer* GetNullIndexBuffer() const noexcept {
+        return null_index_buffer.get();
+    }
+
     /// Retrieves the device local DBA page table buffer.
     [[nodiscard]] Buffer* GetBdaPageTableBuffer() noexcept {
         return bda_pagetable_buffer.get();
@@ -64,7 +68,7 @@ public:
     }
 
     /// Retrieves the stream buffer.
-    StreamBuffer& GetStreamBuffer() noexcept {
+    [[nodiscard]] StreamBuffer& GetStreamBuffer() noexcept {
         return stream_buffer;
     }
 
@@ -73,11 +77,13 @@ public:
         return block_shift;
     }
 
+    void TickFrame();
+
     /// Invalidates any buffer in the logical page range.
-    void InvalidateMemory(VAddr device_addr, u64 size);
+    void InvalidateMemory(VAddr device_addr, u64 size, bool assume_locks = false);
 
     /// Flushes any GPU modified buffer in the logical page range back to CPU memory.
-    void ReadMemory(VAddr device_addr, u64 size, bool is_write = false);
+    void ReadMemory(VAddr device_addr, u64 size, bool is_write = false, bool assume_locks = false);
 
     /// Finds a buffer for the specified region.
     [[nodiscard]] std::pair<const Buffer*, u64> ObtainBuffer(VAddr device_addr, u32 size,
@@ -92,9 +98,6 @@ public:
 
     /// Return true when a region is modified from the GPU
     [[nodiscard]] bool IsRegionGpuModified(VAddr addr, size_t size);
-
-    /// Processes the fault buffer.
-    void ProcessFaultBuffer();
 
     /// Synchronizes all buffers needed for DMA.
     void SynchronizeDmaBuffers();
@@ -125,9 +128,6 @@ private:
     bool SynchronizeMemory(const Buffer* arena, VAddr device_addr, u32 size, bool is_written,
                            bool is_texel_buffer);
 
-    const Buffer* UploadCopies(const Buffer* arena, std::span<vk::BufferCopy> copies,
-                               size_t total_size_bytes);
-
     bool SynchronizeMemoryFromImage(const Buffer* arena, VAddr device_addr, u32 size);
 
     const Vulkan::Instance& instance;
@@ -141,10 +141,12 @@ private:
 
     StreamBuffer stream_buffer;
     Buffer gds_buffer;
+    std::unique_ptr<Buffer> null_index_buffer;
     RangeSet gpu_modified_ranges;
 
     std::unique_ptr<FaultManager> fault_manager;
     std::unique_ptr<Buffer> bda_pagetable_buffer;
+    bool fault_process_pending{};
 
     std::array<const Buffer*, NUM_ARENA_PAGES> address_space{};
     std::deque<Buffer> arenas;

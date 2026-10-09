@@ -18,6 +18,7 @@
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
+#include <fmt/format.h>
 #include <nlohmann/json.hpp>
 #include <zlib.h>
 #include "common/elf_info.h"
@@ -2582,6 +2583,10 @@ int PS4_SYSV_ABI sceHttpsDisableOptionPrivate(int id, u32 sslFlags) {
 
 int PS4_SYSV_ABI sceHttpsEnableOption(int id, u32 sslFlags) {
     LOG_INFO(Lib_Http, "called id={}, sslFlags={:#x}", id, sslFlags);
+    if (EmulatorSettings.IsForcedHttpsDisabled()) {
+        LOG_INFO(Lib_Http, "HTTPS is forced disabled, disabling options for id={}", id);
+        return sceHttpsDisableOption(id, sslFlags);
+    }
     std::lock_guard<std::mutex> lock(g_state.m_mutex);
     if (!g_state.inited) {
         LOG_ERROR(Lib_Http, "Not initialized");
