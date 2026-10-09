@@ -237,8 +237,56 @@ PAddr MemoryManager::PoolExpand(PAddr search_start, PAddr search_end, u64 size, 
 
     // Track how much dmem was allocated for pools.
     pool_budget += size;
+    pool_avail_flushed += size / 64_KB;
 
     return mapping_start;
+}
+
+void MemoryManager::TakePoolBlocks(u64 count, bool cached) {
+    // Type 0 commits and reservations draw cached blocks first, type 3 commits flushed blocks.
+    u64& first = cached ? pool_avail_cached : pool_avail_flushed;
+    u64& second = cached ? pool_avail_flushed : pool_avail_cached;
+    const u64 from_first = std::min<u64>(count, first);
+    first -= from_first;
+    second -= count - from_first;
+    (cached ? pool_alloc_cached : pool_alloc_flushed) += count;
+}
+
+void MemoryManager::ReturnPoolBlocks(u64 count, bool cached) {
+    (cached ? pool_alloc_cached : pool_alloc_flushed) -= count;
+    (cached ? pool_avail_cached : pool_avail_flushed) += count;
+}
+
+void MemoryManager::ReturnCommittedPoolBlocks(PAddr base, u64 size) {
+    // Blocks committed as type 3 return flushed, type 0 blocks return cached.
+    u64 flushed = 0;
+    for (PAddr block = base; block < base + size; block += 64_KB) {
+        flushed += pool_flushed_blocks.erase(block);
+    }
+    ReturnPoolBlocks(flushed, false);
+    ReturnPoolBlocks(size / 64_KB - flushed, true);
+}
+
+s32 MemoryManager::PoolReserve(void** out_addr, VAddr virtual_addr, u64 size, MemoryMapFlags flags,
+                               u64 alignment) {
+    {
+        // Every reservation holds one pool block until it is unmapped.
+        std::scoped_lock lk{mutex};
+        if (pool_avail_flushed + pool_avail_cached == 0) {
+            LOG_ERROR(Kernel_Vmm, "No pool block available for a reservation");
+            return ORBIS_KERNEL_ERROR_ENOMEM;
+        }
+        TakePoolBlocks(1, true);
+    }
+    const s32 result = MapMemory(out_addr, virtual_addr, size, MemoryProt::NoAccess, flags,
+                                 VMAType::PoolReserved, "anon", false, -1, alignment);
+    std::scoped_lock lk{mutex};
+    if (result != ORBIS_OK) {
+        ReturnPoolBlocks(1, true);
+        return result;
+    }
+    pool_reservations[reinterpret_cast<VAddr>(*out_addr)] = size;
+    return ORBIS_OK;
 }
 
 PAddr MemoryManager::Allocate(PAddr search_start, PAddr search_end, u64 size, u64 alignment,
@@ -397,14 +445,15 @@ s32 MemoryManager::PoolCommit(VAddr virtual_addr, u64 size, MemoryProt prot, s32
         return ORBIS_KERNEL_ERROR_EINVAL;
     }
 
-    if (pool_budget <= size) {
-        // If there isn't enough pooled memory to perform the mapping, return ENOMEM
+    const u64 blocks = size / 64_KB;
+    if (blocks > pool_avail_flushed + pool_avail_cached) {
+        // If there aren't enough pool blocks to perform the mapping, return ENOMEM
         LOG_ERROR(Kernel_Vmm, "Not enough pooled memory to perform mapping");
         return ORBIS_KERNEL_ERROR_ENOMEM;
-    } else {
-        // Track how much pooled memory this commit will take
-        pool_budget -= size;
     }
+    // Track how much pooled memory this commit will take
+    pool_budget -= size;
+    TakePoolBlocks(blocks, mtype != 3);
 
     if (True(prot & MemoryProt::CpuWrite)) {
         // On PS4, read is appended to write mappings.
@@ -439,6 +488,12 @@ s32 MemoryManager::PoolCommit(VAddr virtual_addr, u64 size, MemoryProt prot, s32
         auto& new_dmem_area = new_dmem_handle->second;
         new_dmem_area.dma_type = PhysicalMemoryType::Committed;
         new_dmem_area.memory_type = mtype;
+        if (mtype == 3) {
+            for (PAddr block = new_dmem_area.base; block < new_dmem_area.base + size_to_map;
+                 block += 64_KB) {
+                pool_flushed_blocks.insert(block);
+            }
+        }
 
         // Add the dmem area to this vma, merge it with any similar tracked areas.
         new_vma.phys_areas[current_addr - mapped_addr] = new_dmem_handle->second;
@@ -868,6 +923,7 @@ s32 MemoryManager::PoolDecommit(VAddr virtual_addr, u64 size) {
                     std::min<u64>(size_to_free, phys_handle->second.size - dma_offset);
 
                 // Create a new dmem area reflecting the pooled region
+                ReturnCommittedPoolBlocks(phys_addr, size_in_dma);
                 const auto new_dmem_handle = CarvePhysArea(dmem_map, phys_addr, size_in_dma);
                 auto& new_dmem_area = new_dmem_handle->second;
                 new_dmem_area.dma_type = PhysicalMemoryType::Pooled;
@@ -922,6 +978,19 @@ s32 MemoryManager::UnmapMemory(VAddr virtual_addr, u64 size) {
         return ORBIS_KERNEL_ERROR_EINVAL;
     }
 
+    const VAddr end_addr = virtual_addr + size;
+    {
+        // A pool reservation can only be unmapped as a whole.
+        std::shared_lock lk_check{mutex};
+        for (const auto& [base, length] : pool_reservations) {
+            if (base < end_addr && virtual_addr < base + length &&
+                (base < virtual_addr || base + length > end_addr)) {
+                LOG_ERROR(Kernel_Vmm, "Unmap of part of pool reservation {:#x}", base);
+                return ORBIS_KERNEL_ERROR_EINVAL;
+            }
+        }
+    }
+
     // If the requested range has GPU access, unmap from GPU.
     if (IsValidGpuMapping(virtual_addr, size)) {
         rasterizer->UnmapMemory(virtual_addr, size);
@@ -929,7 +998,13 @@ s32 MemoryManager::UnmapMemory(VAddr virtual_addr, u64 size) {
 
     // Acquire writer lock.
     std::scoped_lock lk2{mutex};
-    return UnmapMemoryImpl(virtual_addr, size);
+    const s32 result = UnmapMemoryImpl(virtual_addr, size);
+    for (auto it = pool_reservations.lower_bound(virtual_addr);
+         it != pool_reservations.end() && it->first < end_addr;) {
+        ReturnPoolBlocks(1, true);
+        it = pool_reservations.erase(it);
+    }
+    return result;
 }
 
 u64 MemoryManager::UnmapBytesFromEntry(VAddr virtual_addr, VirtualMemoryArea vma_base, u64 size) {
@@ -963,6 +1038,7 @@ u64 MemoryManager::UnmapBytesFromEntry(VAddr virtual_addr, VirtualMemoryArea vma
                 // Coalesce with nearby direct memory areas.
                 MergeAdjacent(dmem_map, new_dmem_handle);
             } else if (vma_type == VMAType::Pooled) {
+                ReturnCommittedPoolBlocks(phys_addr, size_in_dma);
                 const auto new_dmem_handle = CarvePhysArea(dmem_map, phys_addr, size_in_dma);
                 new_dmem_handle->second.dma_type = PhysicalMemoryType::Pooled;
                 MergeAdjacent(dmem_map, new_dmem_handle);
@@ -1404,7 +1480,8 @@ s32 MemoryManager::GetDirectMemoryType(PAddr addr, s32* directMemoryTypeOut,
 
     std::shared_lock lk{mutex};
     const auto& dmem_area = FindDmemArea(addr)->second;
-    if (dmem_area.dma_type == PhysicalMemoryType::Free) {
+    if (dmem_area.dma_type != PhysicalMemoryType::Allocated &&
+        dmem_area.dma_type != PhysicalMemoryType::Mapped) {
         LOG_ERROR(Kernel_Vmm, "Unable to find allocated direct memory region to check type!");
         return ORBIS_KERNEL_ERROR_ENOENT;
     }
@@ -1442,25 +1519,10 @@ s32 MemoryManager::IsStack(VAddr addr, void** start, void** end) {
 
 s32 MemoryManager::GetMemoryPoolStats(::Libraries::Kernel::OrbisKernelMemoryPoolBlockStats* stats) {
     std::shared_lock lk{mutex};
-
-    // Run through dmem_map, determine how much physical memory is currently committed
-    constexpr u64 block_size = 64_KB;
-    u64 committed_size = 0;
-
-    auto dma_handle = dmem_map.begin();
-    while (dma_handle != dmem_map.end()) {
-        if (dma_handle->second.dma_type == PhysicalMemoryType::Committed) {
-            committed_size += dma_handle->second.size;
-        }
-        dma_handle++;
-    }
-
-    stats->allocated_flushed_blocks = committed_size / block_size;
-    stats->available_flushed_blocks = committed_size / block_size;
-    // TODO: Determine how "cached blocks" work
-    stats->allocated_cached_blocks = 0;
-    stats->available_cached_blocks = 0;
-
+    stats->available_flushed_blocks = static_cast<s32>(pool_avail_flushed);
+    stats->available_cached_blocks = static_cast<s32>(pool_avail_cached);
+    stats->allocated_flushed_blocks = static_cast<s32>(pool_alloc_flushed);
+    stats->allocated_cached_blocks = static_cast<s32>(pool_alloc_cached);
     return ORBIS_OK;
 }
 

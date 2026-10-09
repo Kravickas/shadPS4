@@ -5,6 +5,7 @@
 
 #include <map>
 #include <mutex>
+#include <set>
 #include <string>
 #include <string_view>
 #include "common/enum.h"
@@ -302,6 +303,9 @@ public:
 
     s32 GetMemoryPoolStats(::Libraries::Kernel::OrbisKernelMemoryPoolBlockStats* stats);
 
+    s32 PoolReserve(void** out_addr, VAddr virtual_addr, u64 size, MemoryMapFlags flags,
+                    u64 alignment);
+
     void InvalidateMemory(VAddr addr, u64 size) const;
 
 private:
@@ -339,6 +343,10 @@ private:
 
     PhysHandle Split(PhysMap& map, PhysHandle dmem_handle, u64 offset_in_area);
 
+    void TakePoolBlocks(u64 count, bool cached);
+    void ReturnPoolBlocks(u64 count, bool cached);
+    void ReturnCommittedPoolBlocks(PAddr base, u64 size);
+
     u64 UnmapBytesFromEntry(VAddr virtual_addr, VirtualMemoryArea vma_base, u64 size);
 
     s32 UnmapMemoryImpl(VAddr virtual_addr, u64 size);
@@ -354,6 +362,13 @@ private:
     u64 total_flexible_size{};
     u64 flexible_usage{};
     u64 pool_budget{};
+    // Pool block counters (64 KiB blocks) as reported by sceKernelMemoryPoolGetBlockStats.
+    u64 pool_avail_flushed{};
+    u64 pool_avail_cached{};
+    u64 pool_alloc_flushed{};
+    u64 pool_alloc_cached{};
+    std::set<PAddr> pool_flushed_blocks;
+    std::map<VAddr, u64> pool_reservations;
     s32 sdk_version{};
     Vulkan::Rasterizer* rasterizer{};
 
