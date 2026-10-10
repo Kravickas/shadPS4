@@ -353,7 +353,8 @@ PAddr MemoryManager::Allocate(PAddr search_start, PAddr search_end, u64 size, u6
 }
 
 s32 MemoryManager::Free(PAddr phys_addr, u64 size, bool is_checked) {
-    // Measured on hardware: a checked release starting at or above this address returns success.
+    // Measured on hardware (FW 12.02): a checked release starting at or above this address
+    // returns success.
     constexpr PAddr CheckedReleaseSuccessStart = 0x5000000000;
     if (is_checked && phys_addr >= CheckedReleaseSuccessStart) {
         return ORBIS_OK;
@@ -655,6 +656,18 @@ s32 MemoryManager::MapMemory(void** out_addr, VAddr virtual_addr, u64 size, Memo
         if (virtual_addr == -1) {
             // No suitable memory areas to map to
             return ORBIS_KERNEL_ERROR_ENOMEM;
+        }
+    }
+
+    if (True(flags & MemoryMapFlags::Fixed)) {
+        // A fixed mapping cannot replace any part of a pool reservation.
+        std::shared_lock lk_check{mutex};
+        for (const auto& [base, length] : pool_reservations) {
+            if (base < virtual_addr + size && virtual_addr < base + length) {
+                LOG_ERROR(Kernel_Vmm, "Fixed mapping at {:#x} overlaps pool reservation {:#x}",
+                          virtual_addr, base);
+                return ORBIS_KERNEL_ERROR_ENOMEM;
+            }
         }
     }
 

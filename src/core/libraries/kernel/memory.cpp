@@ -453,6 +453,15 @@ s32 PS4_SYSV_ABI sceKernelMtypeprotect(const void* addr, u64 size, s32 mtype, s3
         // Nothing to do.
         return ORBIS_OK;
     }
+    // Measured on hardware: types 0 to 9 are accepted, type 10 is not allowed.
+    if (mtype == 10) {
+        LOG_ERROR(Kernel_Vmm, "Memory type {} is not allowed", mtype);
+        return ORBIS_KERNEL_ERROR_EACCES;
+    }
+    if (mtype < 0 || mtype > 10) {
+        LOG_ERROR(Kernel_Vmm, "Memory type {} is invalid", mtype);
+        return ORBIS_KERNEL_ERROR_EINVAL;
+    }
 
     Core::MemoryManager* memory_manager = Core::Memory::Instance();
     Core::MemoryProt protection_flags = static_cast<Core::MemoryProt>(prot);
@@ -481,10 +490,18 @@ s32 PS4_SYSV_ABI sceKernelDirectMemoryQuery(u64 offset, s32 flags, OrbisQueryInf
     if (result != ORBIS_OK || copy_size == 0) {
         return result;
     }
-    if (query_info == nullptr) {
+    // The destination must be mapped; the copy is done through the backing so it cannot fault.
+    const VAddr dest = reinterpret_cast<VAddr>(query_info);
+    void* map_start;
+    void* map_end;
+    u32 map_prot;
+    if (query_info == nullptr ||
+        memory->QueryProtection(dest, &map_start, &map_end, &map_prot) != ORBIS_OK ||
+        memory->QueryProtection(dest + copy_size - 1, &map_start, &map_end, &map_prot) !=
+            ORBIS_OK ||
+        !memory->TryWriteBacking(query_info, &info, copy_size)) {
         return ORBIS_KERNEL_ERROR_EFAULT;
     }
-    std::memcpy(query_info, &info, copy_size);
     return result;
 }
 
