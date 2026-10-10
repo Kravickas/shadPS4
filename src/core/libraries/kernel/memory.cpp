@@ -453,9 +453,10 @@ s32 PS4_SYSV_ABI sceKernelMtypeprotect(const void* addr, u64 size, s32 mtype, s3
         // Nothing to do.
         return ORBIS_OK;
     }
-    // Measured on hardware: types 0 to 10 are valid; type 10 is refused with CPU write access.
-    if (mtype == 10 && True(static_cast<Core::MemoryProt>(prot) & Core::MemoryProt::CpuWrite)) {
-        LOG_ERROR(Kernel_Vmm, "Memory type {} is not allowed with CPU write access", mtype);
+    // Measured on hardware: types 0 to 10 are valid; type 10 is refused with CPU or GPU write.
+    if (mtype == 10 && True(static_cast<Core::MemoryProt>(prot) &
+                            (Core::MemoryProt::CpuWrite | Core::MemoryProt::GpuWrite))) {
+        LOG_ERROR(Kernel_Vmm, "Memory type {} is not allowed with write access", mtype);
         return ORBIS_KERNEL_ERROR_EACCES;
     }
     if (mtype < 0 || mtype > 10) {
@@ -694,12 +695,13 @@ s32 PS4_SYSV_ABI sceKernelMemoryPoolCommit(void* addr, u64 len, s32 type, s32 pr
         LOG_ERROR(Kernel_Vmm, "Executable permissions are not allowed.");
         return ORBIS_KERNEL_ERROR_EINVAL;
     }
-    // Measured on hardware: pooled memory can be committed as type 0 or 3 only.
-    if (type == 10) {
+    // Measured on hardware: pooled memory can be committed as type 0 or 3, or as type 10 without
+    // write access.
+    if (type == 10 && True(mem_prot & (Core::MemoryProt::CpuWrite | Core::MemoryProt::GpuWrite))) {
         LOG_ERROR(Kernel_Vmm, "Memory type {} is not allowed", type);
         return ORBIS_KERNEL_ERROR_EACCES;
     }
-    if (type != 0 && type != 3) {
+    if (type != 0 && type != 3 && type != 10) {
         LOG_ERROR(Kernel_Vmm, "Memory type {} is invalid", type);
         return ORBIS_KERNEL_ERROR_EINVAL;
     }
