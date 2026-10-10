@@ -161,6 +161,25 @@ void MemoryManager::CopySparseMemory(VAddr virtual_addr, u8* dest, u64 size) {
     }
 }
 
+bool MemoryManager::IsGuestUnwritable(VAddr virtual_addr, u64 size) {
+    // Addresses outside every guest area belong to the host, such as a thread stack.
+    std::shared_lock lk{mutex};
+    for (const VAddr addr : {virtual_addr, virtual_addr + size - 1}) {
+        auto it = vma_map.upper_bound(addr);
+        if (it == vma_map.begin()) {
+            continue;
+        }
+        const auto& vma = std::prev(it)->second;
+        if (addr >= vma.base + vma.size) {
+            continue;
+        }
+        if (vma.IsFree() || False(vma.prot & MemoryProt::CpuWrite)) {
+            return true;
+        }
+    }
+    return false;
+}
+
 bool MemoryManager::TryWriteBacking(void* address, const void* data, u64 size) {
     const VAddr virtual_addr = std::bit_cast<VAddr>(address);
     std::shared_lock lk{mutex};
@@ -269,9 +288,9 @@ void MemoryManager::ReturnCommittedPoolBlocks(PAddr base, u64 size) {
 }
 
 void MemoryManager::SetCommittedPoolBlockType(PAddr base, u64 size, s32 memory_type) {
-    // A committed block counts as flushed while its type is 3 and as cached while it is 0, 1 or 2.
-    // Other types were not measured, so they leave the counters unchanged.
-    if (memory_type < 0 || memory_type > 3) {
+    // A committed block counts as flushed while its type is 3 and as cached for types 0 to 9.
+    // Type 10 was not measured, so it leaves the counters unchanged.
+    if (memory_type < 0 || memory_type > 9) {
         return;
     }
     const bool flushed = memory_type == 3;
@@ -660,10 +679,11 @@ s32 MemoryManager::MapMemory(void** out_addr, VAddr virtual_addr, u64 size, Memo
     }
 
     if (True(flags & MemoryMapFlags::Fixed)) {
-        // A fixed mapping cannot replace any part of a pool reservation.
+        // A fixed mapping can replace a pool reservation only as a whole.
         std::shared_lock lk_check{mutex};
         for (const auto& [base, length] : pool_reservations) {
-            if (base < virtual_addr + size && virtual_addr < base + length) {
+            if (base < virtual_addr + size && virtual_addr < base + length &&
+                (base < virtual_addr || base + length > virtual_addr + size)) {
                 LOG_ERROR(Kernel_Vmm, "Fixed mapping at {:#x} overlaps pool reservation {:#x}",
                           virtual_addr, base);
                 return ORBIS_KERNEL_ERROR_ENOMEM;
@@ -678,6 +698,15 @@ s32 MemoryManager::MapMemory(void** out_addr, VAddr virtual_addr, u64 size, Memo
 
     // Acquire writer lock.
     std::unique_lock lk2{mutex};
+
+    if (True(flags & MemoryMapFlags::Fixed)) {
+        // Pool reservations covered by a fixed mapping are replaced and give back their block.
+        for (auto it = pool_reservations.lower_bound(virtual_addr);
+             it != pool_reservations.end() && it->first < virtual_addr + size;) {
+            ReturnPoolBlocks(1, true);
+            it = pool_reservations.erase(it);
+        }
+    }
 
     // Create VMA representing this mapping.
     auto new_vma_handle = CreateArea(virtual_addr, size, prot, flags, type, name, alignment);
