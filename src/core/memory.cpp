@@ -702,9 +702,13 @@ s32 MemoryManager::MapMemory(void** out_addr, VAddr virtual_addr, u64 size, Memo
     } else if (False(flags & MemoryMapFlags::Fixed)) {
         // Find a free virtual addr to map
         alignment = alignment > 0 ? alignment : 16_KB;
+        const bool default_search = virtual_addr == 0;
         virtual_addr = virtual_addr == 0 ? DEFAULT_MAPPING_BASE : virtual_addr;
         virtual_addr = SearchFree(virtual_addr, size, alignment);
-        if (virtual_addr == -1) {
+        // Measured on hardware (FW 12.02): a search without an address hint only uses the space
+        // below the main thread stack area, which sits here when the process has no ASLR offset.
+        constexpr VAddr DefaultSearchEnd = 0x7EEC00000;
+        if (virtual_addr == -1 || (default_search && virtual_addr + size > DefaultSearchEnd)) {
             // No suitable memory areas to map to
             return ORBIS_KERNEL_ERROR_ENOMEM;
         }
