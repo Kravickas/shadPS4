@@ -345,7 +345,7 @@ private:
 
     PhysHandle Split(PhysMap& map, PhysHandle dmem_handle, u64 offset_in_area);
 
-    void TakePoolBlocks(u64 count, bool cached);
+    void TakePoolBlocks(u64 count, bool cached, bool draw_cached_first);
     void ReturnPoolBlocks(u64 count, bool cached);
     void ReturnCommittedPoolBlocks(PAddr base, u64 size);
     void SetCommittedPoolBlockType(PAddr base, u64 size, s32 memory_type);

@@ -164,7 +164,8 @@ void MemoryManager::CopySparseMemory(VAddr virtual_addr, u8* dest, u64 size) {
 bool MemoryManager::IsGuestUnwritable(VAddr virtual_addr, u64 size) {
     // Addresses outside every guest area belong to the host, such as a thread stack.
     std::shared_lock lk{mutex};
-    for (const VAddr addr : {virtual_addr, virtual_addr + size - 1}) {
+    const VAddr last_addr = virtual_addr + size - 1;
+    for (const VAddr addr : {virtual_addr, last_addr}) {
         auto it = vma_map.upper_bound(addr);
         if (it == vma_map.begin()) {
             continue;
@@ -262,10 +263,11 @@ PAddr MemoryManager::PoolExpand(PAddr search_start, PAddr search_end, u64 size, 
     return mapping_start;
 }
 
-void MemoryManager::TakePoolBlocks(u64 count, bool cached) {
-    // Type 0 commits and reservations draw cached blocks first, type 3 commits flushed blocks.
-    u64& first = cached ? pool_avail_cached : pool_avail_flushed;
-    u64& second = cached ? pool_avail_flushed : pool_avail_cached;
+void MemoryManager::TakePoolBlocks(u64 count, bool cached, bool draw_cached_first) {
+    // Reservations and type 0 commits draw cached blocks first; type 3 and type 10 commits draw
+    // flushed blocks first. Either way the other kind is used once the first runs out.
+    u64& first = draw_cached_first ? pool_avail_cached : pool_avail_flushed;
+    u64& second = draw_cached_first ? pool_avail_flushed : pool_avail_cached;
     const u64 from_first = std::min<u64>(count, first);
     first -= from_first;
     second -= count - from_first;
@@ -311,6 +313,11 @@ void MemoryManager::SetCommittedPoolBlockType(PAddr base, u64 size, s32 memory_t
 
 s32 MemoryManager::PoolReserve(void** out_addr, VAddr virtual_addr, u64 size, MemoryMapFlags flags,
                                u64 alignment) {
+    // Measured on hardware: a single pool reservation must be smaller than 16 GiB.
+    if (size >= 16_GB) {
+        LOG_ERROR(Kernel_Vmm, "Pool reservation of {:#x} bytes is too large", size);
+        return ORBIS_KERNEL_ERROR_ENOMEM;
+    }
     {
         // Every reservation holds one pool block until it is unmapped.
         std::scoped_lock lk{mutex};
@@ -318,7 +325,7 @@ s32 MemoryManager::PoolReserve(void** out_addr, VAddr virtual_addr, u64 size, Me
             LOG_ERROR(Kernel_Vmm, "No pool block available for a reservation");
             return ORBIS_KERNEL_ERROR_ENOMEM;
         }
-        TakePoolBlocks(1, true);
+        TakePoolBlocks(1, true, true);
     }
     const s32 result = MapMemory(out_addr, virtual_addr, size, MemoryProt::NoAccess, flags,
                                  VMAType::PoolReserved, "anon", false, -1, alignment);
@@ -496,7 +503,7 @@ s32 MemoryManager::PoolCommit(VAddr virtual_addr, u64 size, MemoryProt prot, s32
     }
     // Track how much pooled memory this commit will take
     pool_budget -= size;
-    TakePoolBlocks(blocks, mtype != 3);
+    TakePoolBlocks(blocks, mtype != 3, mtype != 3 && mtype != 10);
 
     if (True(prot & MemoryProt::CpuWrite)) {
         // On PS4, read is appended to write mappings.
