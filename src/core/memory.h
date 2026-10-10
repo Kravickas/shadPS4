@@ -30,6 +30,9 @@ class MemoryMapViewer;
 namespace Core {
 
 constexpr u64 DEFAULT_MAPPING_BASE = 0x200000000;
+// Measured on hardware (FW 12.02): a search without an address hint only uses the space below the
+// main thread stack area, which sits here when the process has no ASLR offset.
+constexpr u64 DEFAULT_MAPPING_END = 0x7EEC00000;
 
 enum class MemoryProt : u32 {
     NoAccess = 0,

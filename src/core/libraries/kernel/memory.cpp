@@ -495,11 +495,14 @@ s32 PS4_SYSV_ABI sceKernelDirectMemoryQuery(u64 offset, s32 flags, OrbisQueryInf
     if (query_info == nullptr) {
         return ORBIS_KERNEL_ERROR_EFAULT;
     }
-    // As on hardware, the copy stops at guest memory that is unmapped or not CPU writable.
+    // As on hardware, the copy runs in 8-byte words and then single bytes, and stops at the first
+    // word or byte that reaches guest memory that is unmapped or not CPU writable.
     const u64 writable =
         memory->GuestWritablePrefix(reinterpret_cast<VAddr>(query_info), copy_size);
-    std::memcpy(query_info, &info, writable);
-    if (writable < copy_size) {
+    const u64 word_bytes = copy_size & ~7ULL;
+    const u64 copied = writable < word_bytes ? writable & ~7ULL : writable;
+    std::memcpy(query_info, &info, copied);
+    if (copied < copy_size) {
         return ORBIS_KERNEL_ERROR_EFAULT;
     }
     return result;
