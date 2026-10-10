@@ -257,7 +257,7 @@ public:
 
     bool TryWriteBacking(void* address, const void* data, u64 size);
 
-    bool IsGuestUnwritable(VAddr virtual_addr, u64 size);
+    u64 GuestWritablePrefix(VAddr virtual_addr, u64 size);
 
     void SetupMemoryRegions(u64 flexible_size, bool use_extended_mem1, bool use_extended_mem2);
 
@@ -331,7 +331,7 @@ private:
     VMAHandle CreateArea(VAddr virtual_addr, u64 size, MemoryProt prot, MemoryMapFlags flags,
                          VMAType type, std::string_view name, u64 alignment);
 
-    VAddr SearchFree(VAddr virtual_addr, u64 size, u32 alignment);
+    VAddr SearchFree(VAddr virtual_addr, u64 size, u64 alignment);
 
     VMAHandle MergeAdjacent(VMAMap& map, VMAHandle iter);
 

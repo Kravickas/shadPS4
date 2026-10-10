@@ -161,24 +161,31 @@ void MemoryManager::CopySparseMemory(VAddr virtual_addr, u8* dest, u64 size) {
     }
 }
 
-bool MemoryManager::IsGuestUnwritable(VAddr virtual_addr, u64 size) {
-    // Addresses outside every guest area belong to the host, such as a thread stack.
+u64 MemoryManager::GuestWritablePrefix(VAddr virtual_addr, u64 size) {
+    // Bytes from virtual_addr that can be written before reaching guest memory that is unmapped
+    // or not CPU writable. Addresses outside every guest area belong to the host, such as a thread
+    // stack.
     std::shared_lock lk{mutex};
-    const VAddr last_addr = virtual_addr + size - 1;
-    for (const VAddr addr : {virtual_addr, last_addr}) {
-        auto it = vma_map.upper_bound(addr);
-        if (it == vma_map.begin()) {
+    u64 done = 0;
+    while (done < size) {
+        const VAddr addr = virtual_addr + done;
+        const auto next = vma_map.upper_bound(addr);
+        const u64 to_next = next == vma_map.end() ? size - done : next->first - addr;
+        if (next == vma_map.begin()) {
+            done += std::min<u64>(size - done, to_next);
             continue;
         }
-        const auto& vma = std::prev(it)->second;
+        const auto& vma = std::prev(next)->second;
         if (addr >= vma.base + vma.size) {
+            done += std::min<u64>(size - done, to_next);
             continue;
         }
         if (vma.IsFree() || False(vma.prot & MemoryProt::CpuWrite)) {
-            return true;
+            break;
         }
+        done += std::min<u64>(size - done, vma.base + vma.size - addr);
     }
-    return false;
+    return done;
 }
 
 bool MemoryManager::TryWriteBacking(void* address, const void* data, u64 size) {
@@ -1636,7 +1643,7 @@ void MemoryManager::InvalidateMemory(const VAddr addr, const u64 size) const {
     }
 }
 
-VAddr MemoryManager::SearchFree(VAddr virtual_addr, u64 size, u32 alignment) {
+VAddr MemoryManager::SearchFree(VAddr virtual_addr, u64 size, u64 alignment) {
     // Calculate the minimum and maximum addresses present in our address space.
     auto min_search_address = impl.SystemManagedVirtualBase();
     auto max_search_address = impl.UserVirtualBase() + impl.UserVirtualSize();

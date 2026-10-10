@@ -444,15 +444,6 @@ s32 PS4_SYSV_ABI posix_mprotect(const void* addr, u64 size, s32 prot) {
 s32 PS4_SYSV_ABI sceKernelMtypeprotect(const void* addr, u64 size, s32 mtype, s32 prot) {
     LOG_INFO(Kernel_Vmm, "called addr = {}, size = {:#x}, prot = {:#x}", fmt::ptr(addr), size,
              prot);
-    // Align addr and size to the nearest page boundary.
-    const VAddr in_addr = reinterpret_cast<VAddr>(addr);
-    auto aligned_addr = Common::AlignDown(in_addr, 16_KB);
-    auto aligned_size = Common::AlignUp(size + in_addr - aligned_addr, 16_KB);
-
-    if (aligned_size == 0) {
-        // Nothing to do.
-        return ORBIS_OK;
-    }
     // Measured on hardware: types 0 to 10 are valid; type 10 is refused with CPU or GPU write.
     if (mtype == 10 && True(static_cast<Core::MemoryProt>(prot) &
                             (Core::MemoryProt::CpuWrite | Core::MemoryProt::GpuWrite))) {
@@ -464,6 +455,15 @@ s32 PS4_SYSV_ABI sceKernelMtypeprotect(const void* addr, u64 size, s32 mtype, s3
         return ORBIS_KERNEL_ERROR_EINVAL;
     }
 
+    // Align addr and size to the nearest page boundary.
+    const VAddr in_addr = reinterpret_cast<VAddr>(addr);
+    auto aligned_addr = Common::AlignDown(in_addr, 16_KB);
+    auto aligned_size = Common::AlignUp(size + in_addr - aligned_addr, 16_KB);
+
+    if (aligned_size == 0) {
+        // Nothing to do.
+        return ORBIS_OK;
+    }
     Core::MemoryManager* memory_manager = Core::Memory::Instance();
     Core::MemoryProt protection_flags = static_cast<Core::MemoryProt>(prot);
 
@@ -494,11 +494,13 @@ s32 PS4_SYSV_ABI sceKernelDirectMemoryQuery(u64 offset, s32 flags, OrbisQueryInf
     if (query_info == nullptr) {
         return ORBIS_KERNEL_ERROR_EFAULT;
     }
-    // Guest memory that is unmapped or not CPU writable faults, as on hardware.
-    if (memory->IsGuestUnwritable(reinterpret_cast<VAddr>(query_info), copy_size)) {
+    // As on hardware, the copy stops at guest memory that is unmapped or not CPU writable.
+    const u64 writable =
+        memory->GuestWritablePrefix(reinterpret_cast<VAddr>(query_info), copy_size);
+    std::memcpy(query_info, &info, writable);
+    if (writable < copy_size) {
         return ORBIS_KERNEL_ERROR_EFAULT;
     }
-    std::memcpy(query_info, &info, copy_size);
     return result;
 }
 
@@ -661,15 +663,19 @@ s32 PS4_SYSV_ABI sceKernelMemoryPoolReserve(void* addr_in, u64 len, u64 alignmen
     LOG_INFO(Kernel_Vmm, "addr_in = {}, len = {:#x}, alignment = {:#x}, flags = {:#x}",
              fmt::ptr(addr_in), len, alignment, flags);
 
+    // libkernel accepts only the fixed and no-overwrite flags, and an alignment that is a power of
+    // two of at most 2 GiB.
+    if ((flags & ~0x90) != 0) {
+        LOG_ERROR(Kernel_Vmm, "Flags {:#x} are invalid!", flags);
+        return ORBIS_KERNEL_ERROR_EINVAL;
+    }
+    if (alignment != 0 && (!std::has_single_bit(alignment) || alignment > 2_GB)) {
+        LOG_ERROR(Kernel_Vmm, "Alignment value is invalid!");
+        return ORBIS_KERNEL_ERROR_EINVAL;
+    }
     if (len == 0 || !Common::Is2MBAligned(len)) {
         LOG_ERROR(Kernel_Vmm, "Map size is either zero or not 2MB aligned!");
         return ORBIS_KERNEL_ERROR_EINVAL;
-    }
-    if (alignment != 0) {
-        if ((!std::has_single_bit(alignment) && !Common::Is2MBAligned(alignment))) {
-            LOG_ERROR(Kernel_Vmm, "Alignment value is invalid!");
-            return ORBIS_KERNEL_ERROR_EINVAL;
-        }
     }
 
     auto* memory = Core::Memory::Instance();
