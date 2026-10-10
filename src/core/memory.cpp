@@ -268,9 +268,9 @@ void MemoryManager::ReturnCommittedPoolBlocks(PAddr base, u64 size) {
 }
 
 void MemoryManager::SetCommittedPoolBlockType(PAddr base, u64 size, s32 memory_type) {
-    // A committed block counts as flushed while its type is 3 and as cached while it is 0.
+    // A committed block counts as flushed while its type is 3 and as cached while it is 0, 1 or 2.
     // Other types were not measured, so they leave the counters unchanged.
-    if (memory_type != 0 && memory_type != 3) {
+    if (memory_type < 0 || memory_type > 3) {
         return;
     }
     const bool flushed = memory_type == 3;

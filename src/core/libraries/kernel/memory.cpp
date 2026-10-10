@@ -477,9 +477,14 @@ s32 PS4_SYSV_ABI sceKernelDirectMemoryQuery(u64 offset, s32 flags, OrbisQueryInf
     std::memset(&info, 0, sizeof(info));
     auto* memory = Core::Memory::Instance();
     const s32 result = memory->DirectMemoryQuery(offset, flags == 1, &info);
-    if (result == ORBIS_OK && query_info != nullptr) {
-        std::memcpy(query_info, &info, std::min<u64>(infoSize, sizeof(info)));
+    const u64 copy_size = std::min<u64>(infoSize, sizeof(info));
+    if (result != ORBIS_OK || copy_size == 0) {
+        return result;
     }
+    if (query_info == nullptr) {
+        return ORBIS_KERNEL_ERROR_EFAULT;
+    }
+    std::memcpy(query_info, &info, copy_size);
     return result;
 }
 
