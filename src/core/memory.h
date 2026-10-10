@@ -259,6 +259,8 @@ public:
 
     u64 GuestWritablePrefix(VAddr virtual_addr, u64 size);
 
+    bool IsInGuestAreas(VAddr virtual_addr, u64 size);
+
     void SetupMemoryRegions(u64 flexible_size, bool use_extended_mem1, bool use_extended_mem2);
 
     PAddr PoolExpand(PAddr search_start, PAddr search_end, u64 size, u64 alignment);

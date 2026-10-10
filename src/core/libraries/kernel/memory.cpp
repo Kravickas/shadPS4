@@ -226,11 +226,12 @@ s32 PS4_SYSV_ABI sceKernelMapNamedDirectMemory(void** addr, u64 len, s32 prot, s
         return ORBIS_KERNEL_ERROR_EINVAL;
     }
 
-    if (alignment != 0) {
-        if ((!std::has_single_bit(alignment) && !Common::Is16KBAligned(alignment))) {
-            LOG_ERROR(Kernel_Vmm, "Alignment value is invalid!");
-            return ORBIS_KERNEL_ERROR_EINVAL;
-        }
+    // libkernel requires a power of two that is a multiple of 16 KiB; alignments of 2 GiB and above
+    // were measured to fail.
+    if (alignment != 0 && (!std::has_single_bit(alignment) || !Common::Is16KBAligned(alignment) ||
+                           alignment >= 2_GB)) {
+        LOG_ERROR(Kernel_Vmm, "Alignment value is invalid!");
+        return ORBIS_KERNEL_ERROR_EINVAL;
     }
 
     if (std::strlen(name) >= ORBIS_KERNEL_MAXIMUM_NAME_LENGTH) {
@@ -669,8 +670,16 @@ s32 PS4_SYSV_ABI sceKernelMemoryPoolReserve(void* addr_in, u64 len, u64 alignmen
         LOG_ERROR(Kernel_Vmm, "Flags {:#x} are invalid!", flags);
         return ORBIS_KERNEL_ERROR_EINVAL;
     }
-    if (alignment != 0 && (!std::has_single_bit(alignment) || alignment > 2_GB)) {
+    // Measured on hardware: a non-zero alignment must be a power of two from 2 MiB to 1 GiB, and a
+    // fixed reservation needs a non-zero, 2 MiB aligned address.
+    if (alignment != 0 &&
+        (!std::has_single_bit(alignment) || alignment < 2_MB || alignment > 1_GB)) {
         LOG_ERROR(Kernel_Vmm, "Alignment value is invalid!");
+        return ORBIS_KERNEL_ERROR_EINVAL;
+    }
+    if ((flags & 0x10) != 0 &&
+        (addr_in == nullptr || !Common::Is2MBAligned(reinterpret_cast<VAddr>(addr_in)))) {
+        LOG_ERROR(Kernel_Vmm, "Fixed reservation address {} is invalid!", fmt::ptr(addr_in));
         return ORBIS_KERNEL_ERROR_EINVAL;
     }
     if (len == 0 || !Common::Is2MBAligned(len)) {

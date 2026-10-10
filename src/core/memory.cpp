@@ -161,6 +161,25 @@ void MemoryManager::CopySparseMemory(VAddr virtual_addr, u8* dest, u64 size) {
     }
 }
 
+bool MemoryManager::IsInGuestAreas(VAddr virtual_addr, u64 size) {
+    // True when every byte of the range lies inside an area of the guest address space.
+    std::shared_lock lk{mutex};
+    VAddr addr = virtual_addr;
+    const VAddr end_addr = virtual_addr + size;
+    while (addr < end_addr) {
+        const auto next = vma_map.upper_bound(addr);
+        if (next == vma_map.begin()) {
+            return false;
+        }
+        const auto& vma = std::prev(next)->second;
+        if (addr >= vma.base + vma.size) {
+            return false;
+        }
+        addr = vma.base + vma.size;
+    }
+    return true;
+}
+
 u64 MemoryManager::GuestWritablePrefix(VAddr virtual_addr, u64 size) {
     // Bytes from virtual_addr that can be written before reaching guest memory that is unmapped
     // or not CPU writable. Addresses outside every guest area belong to the host, such as a thread
@@ -689,6 +708,13 @@ s32 MemoryManager::MapMemory(void** out_addr, VAddr virtual_addr, u64 size, Memo
             // No suitable memory areas to map to
             return ORBIS_KERNEL_ERROR_ENOMEM;
         }
+    }
+
+    if (True(flags & MemoryMapFlags::Fixed) && !IsInGuestAreas(virtual_addr, size)) {
+        // The result on hardware for this case was not measured.
+        LOG_ERROR(Kernel_Vmm, "Fixed mapping at {:#x} is outside the guest address space",
+                  virtual_addr);
+        return ORBIS_KERNEL_ERROR_ENOMEM;
     }
 
     if (True(flags & MemoryMapFlags::Fixed)) {
