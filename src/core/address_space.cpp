@@ -104,6 +104,7 @@ struct MemoryRegion {
     u32 prot;
     s32 fd;
     bool is_mapped;
+    bool file_read_in = false;
 };
 
 struct AddressSpace::Impl {
@@ -247,7 +248,9 @@ struct AddressSpace::Impl {
             HANDLE backing = fd != -1 ? reinterpret_cast<HANDLE>(fd) : backing_handle;
             // A file opened without write access has no section: its handle is the file itself, so
             // the contents are read in. A file opened for writing is mapped through its section.
-            if (fd != -1 && prot == PAGE_READONLY && GetFileType(backing) == FILE_TYPE_DISK) {
+            region->file_read_in =
+                fd != -1 && prot == PAGE_READONLY && GetFileType(backing) == FILE_TYPE_DISK;
+            if (region->file_read_in) {
                 // Allocate the memory for the mapping
                 DWORD resultvar;
                 ptr = VirtualAlloc2(process, reinterpret_cast<PVOID>(virtual_addr), size,
@@ -334,11 +337,12 @@ struct AddressSpace::Impl {
         VAddr virtual_addr = region->base;
         PAddr phys_base = region->phys_base;
         u64 size = region->size;
-        ULONG prot = region->prot;
         s32 fd = region->fd;
 
         bool ret = false;
-        if ((fd != -1 && prot != PAGE_READONLY) || (fd == -1 && phys_base != -1)) {
+        // File contents that were read in sit in plain memory; everything else backed by a file or
+        // by direct memory is a view.
+        if ((fd != -1 && !region->file_read_in) || (fd == -1 && phys_base != -1)) {
             ret = UnmapViewOfFile2(process, reinterpret_cast<PVOID>(virtual_addr),
                                    MEM_PRESERVE_PLACEHOLDER);
         } else {
@@ -535,6 +539,7 @@ struct AddressSpace::Impl {
             // Update region data
             region.is_mapped = false;
             region.fd = -1;
+            region.file_read_in = false;
             region.phys_base = -1;
             region.prot = PAGE_NOACCESS;
 
