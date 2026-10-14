@@ -886,6 +886,14 @@ s32 MemoryManager::MapFile(void** out_addr, VAddr virtual_addr, u64 size, Memory
         // Non-host backends are read-only
         prot &= ~MemoryProt::CpuWrite;
     } else {
+        // Measured on hardware: a mapping that reaches past the end of the file fails. The end is
+        // taken in whole pages; mapping the rest of a partial last page was not measured.
+        const u64 file_end = Common::AlignUp(host_file->GetSize(), 16_KB);
+        if (phys_addr < 0 || static_cast<u64>(phys_addr) + size > file_end) {
+            LOG_ERROR(Kernel_Vmm, "Mapping {:#x} bytes at offset {:#x} reaches past the file end",
+                      size, phys_addr);
+            return ORBIS_KERNEL_ERROR_EACCES;
+        }
         handle = host_file->GetFileMapping();
 
         if (False(host_file->GetAccessMode() & Common::FS::FileAccessMode::Write) &&
