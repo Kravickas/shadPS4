@@ -245,7 +245,9 @@ struct AddressSpace::Impl {
         void* ptr = nullptr;
         if (phys_addr != -1) {
             HANDLE backing = fd != -1 ? reinterpret_cast<HANDLE>(fd) : backing_handle;
-            if (fd != -1 && prot == PAGE_READONLY) {
+            // A file opened without write access has no section: its handle is the file itself, so
+            // the contents are read in. A file opened for writing is mapped through its section.
+            if (fd != -1 && prot == PAGE_READONLY && GetFileType(backing) == FILE_TYPE_DISK) {
                 // Allocate the memory for the mapping
                 DWORD resultvar;
                 ptr = VirtualAlloc2(process, reinterpret_cast<PVOID>(virtual_addr), size,
