@@ -886,15 +886,15 @@ s32 MemoryManager::MapFile(void** out_addr, VAddr virtual_addr, u64 size, Memory
         // Non-host backends are read-only
         prot &= ~MemoryProt::CpuWrite;
     } else {
-        // Measured on hardware: a mapping that reaches past the end of the file fails. The end is
-        // taken in whole pages; mapping the rest of a partial last page was not measured.
-        const u64 file_end = Common::AlignUp(host_file->GetSize(), 16_KB);
-        if (phys_addr < 0 || static_cast<u64>(phys_addr) + size > file_end) {
+        // Measured on hardware: a mapping may reach into the rest of the file's last page, but not
+        // past it.
+        const u64 file_size = host_file->GetSize();
+        if (phys_addr < 0 ||
+            static_cast<u64>(phys_addr) + size > Common::AlignUp(file_size, 16_KB)) {
             LOG_ERROR(Kernel_Vmm, "Mapping {:#x} bytes at offset {:#x} reaches past the file end",
                       size, phys_addr);
             return ORBIS_KERNEL_ERROR_EACCES;
         }
-        handle = host_file->GetFileMapping();
 
         if (False(host_file->GetAccessMode() & Common::FS::FileAccessMode::Write) &&
             False(host_file->GetAccessMode() & Common::FS::FileAccessMode::Append)) {
@@ -903,6 +903,12 @@ s32 MemoryManager::MapFile(void** out_addr, VAddr virtual_addr, u64 size, Memory
             // written to.
             prot &= ~MemoryProt::CpuWrite;
         }
+
+        // A view of a file's section cannot reach past the end of the file, so a read-only mapping
+        // into a partly filled last page reads the file in instead.
+        const bool past_file_end = static_cast<u64>(phys_addr) + size > file_size;
+        handle = past_file_end && False(prot & MemoryProt::CpuWrite) ? host_file->GetNativeHandle()
+                                                                     : host_file->GetFileMapping();
     }
 
     if (prot >= MemoryProt::GpuRead) {

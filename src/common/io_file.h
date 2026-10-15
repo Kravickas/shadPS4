@@ -115,6 +115,7 @@ public:
     }
 
     uintptr_t GetFileMapping();
+    uintptr_t GetNativeHandle() const;
 
     int Open(const std::filesystem::path& path, FileAccessMode mode,
              FileType type = FileType::BinaryFile,

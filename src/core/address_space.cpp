@@ -257,7 +257,13 @@ struct AddressSpace::Impl {
                                     MEM_RESERVE | MEM_COMMIT | MEM_REPLACE_PLACEHOLDER,
                                     PAGE_READWRITE, nullptr, 0);
 
-                // Use ReadFile to read file contents into the memory area.
+                // ReadFile moves the file pointer; remember it so the mapping leaves it unchanged.
+                LARGE_INTEGER file_pos{};
+                SetFilePointerEx(backing, LARGE_INTEGER{}, &file_pos, FILE_CURRENT);
+
+                // Use ReadFile to read file contents into the memory area. A range that reaches
+                // into the last, partly filled page of the file reads what the file has; the rest
+                // stays zero.
                 // Create an OVERLAPPED with the file offset, then supply that to ReadFile
                 OVERLAPPED param{};
                 // Offset is the least-significant 32 bits, OffsetHigh is the most-significant.
@@ -266,11 +272,7 @@ struct AddressSpace::Impl {
                 bool ret = ReadFile(backing, ptr, size, &resultvar, &param);
                 ASSERT_MSG(ret, "ReadFile failed. {}", Common::GetLastErrorMsg());
 
-                // ReadFile moves the file pointer, restore it with SetFilePointer
-                s64 size_to_move = -size;
-                LONG size_low = size_to_move & 0xffffffffull;
-                LONG size_high = (size_to_move & 0xffffffff00000000ull) >> 32;
-                ret = SetFilePointer(backing, size_low, &size_high, FILE_CURRENT);
+                ret = SetFilePointerEx(backing, file_pos, nullptr, FILE_BEGIN);
 
                 // Protect the memory area appropriately
                 ret = VirtualProtect(ptr, size, prot, &resultvar);
