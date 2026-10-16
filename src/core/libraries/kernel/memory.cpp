@@ -699,12 +699,16 @@ s32 PS4_SYSV_ABI sceKernelMemoryPoolReserve(void* addr_in, u64 len, u64 alignmen
 }
 
 s32 PS4_SYSV_ABI sceKernelMemoryPoolCommit(void* addr, u64 len, s32 type, s32 prot, s32 flags) {
-    if (addr == nullptr) {
+    // Measured on hardware: the address must be 64 KB aligned, and a length of 0 succeeds.
+    if (addr == nullptr || !Common::Is64KBAligned(reinterpret_cast<VAddr>(addr))) {
         LOG_ERROR(Kernel_Vmm, "Address is invalid!");
         return ORBIS_KERNEL_ERROR_EINVAL;
     }
-    if (len == 0 || !Common::Is64KBAligned(len)) {
-        LOG_ERROR(Kernel_Vmm, "Map size is either zero or not 64KB aligned!");
+    if (len == 0) {
+        return ORBIS_OK;
+    }
+    if (!Common::Is64KBAligned(len)) {
+        LOG_ERROR(Kernel_Vmm, "Map size is not 64KB aligned!");
         return ORBIS_KERNEL_ERROR_EINVAL;
     }
 

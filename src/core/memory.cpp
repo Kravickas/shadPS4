@@ -1090,9 +1090,14 @@ s32 MemoryManager::UnmapMemory(VAddr virtual_addr, u64 size) {
     }
 
     std::scoped_lock lk{unmap_mutex};
-    // Align address and size appropriately
+    // Measured on hardware: the range runs from the page holding the start to the page holding the
+    // last byte; a range that wraps around the address space is invalid.
+    if (virtual_addr + size < virtual_addr) {
+        return ORBIS_KERNEL_ERROR_EINVAL;
+    }
+    const VAddr end = Common::AlignUp(virtual_addr + size, 16_KB);
     virtual_addr = Common::AlignDown(virtual_addr, 16_KB);
-    size = Common::AlignUp(size, 16_KB);
+    size = end - virtual_addr;
     if (!IsValidMapping(virtual_addr, size)) {
         LOG_ERROR(Kernel_Vmm, "addr = {:#x} size = {:#x} is outside the memory map", virtual_addr,
                   size);
