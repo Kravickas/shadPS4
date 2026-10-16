@@ -360,6 +360,9 @@ s32 MemoryManager::PoolReserve(void** out_addr, VAddr virtual_addr, u64 size, Me
         ReturnPoolBlocks(1, true);
         return result;
     }
+    // Measured on hardware: a reservation is one object, its parts report their offset in it.
+    FindVMA(reinterpret_cast<VAddr>(*out_addr))->second.pool_base =
+        reinterpret_cast<VAddr>(*out_addr);
     pool_reservations[reinterpret_cast<VAddr>(*out_addr)] = size;
     return ORBIS_OK;
 }
@@ -1192,6 +1195,7 @@ u64 MemoryManager::UnmapBytesFromEntry(VAddr virtual_addr, VirtualMemoryArea vma
     vma.phys_areas.clear();
     vma.disallow_merge = false;
     vma.name = "";
+    vma.pool_base = 0;
     MergeAdjacent(vma_map, new_it);
 
     if (vma_type != VMAType::Reserved && vma_type != VMAType::PoolReserved) {
@@ -1413,6 +1417,14 @@ s32 MemoryManager::VirtualQuery(VAddr addr, s32 flags,
         ASSERT_MSG(vma.phys_areas.size() > 0, "No physical backing for direct mapping?");
         info->offset = vma.phys_areas.begin()->second.base;
         info->memory_type = vma.phys_areas.begin()->second.memory_type;
+    }
+    if (vma.type == VMAType::PoolReserved || vma.type == VMAType::Pooled) {
+        // Measured on hardware: pool memory reports its offset in its reservation, and committed
+        // pool memory its memory type.
+        info->offset = vma.base - vma.pool_base;
+        if (vma.type == VMAType::Pooled && !vma.phys_areas.empty()) {
+            info->memory_type = vma.phys_areas.begin()->second.memory_type;
+        }
     }
     if (vma.type == VMAType::Reserved || vma.type == VMAType::PoolReserved) {
         // Protection is hidden from reserved mappings.

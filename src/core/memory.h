@@ -115,6 +115,8 @@ struct VirtualMemoryArea {
     VMAType type = VMAType::Free;
     MemoryProt prot = MemoryProt::NoAccess;
     std::string name = "";
+    // For pool memory: the start of the reservation this area belongs to.
+    VAddr pool_base = 0;
     s32 fd = 0;
     bool disallow_merge = false;
 
@@ -150,6 +152,11 @@ struct VirtualMemoryArea {
             }
         }
         if (prot != next.prot || type != next.type) {
+            return false;
+        }
+        // Measured on hardware: each pool reservation stays its own area.
+        if ((type == VMAType::PoolReserved || type == VMAType::Pooled) &&
+            pool_base != next.pool_base) {
             return false;
         }
         if (name.compare(next.name) != 0) {
