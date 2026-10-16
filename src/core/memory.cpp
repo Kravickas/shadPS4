@@ -882,13 +882,14 @@ s32 MemoryManager::MapFile(void** out_addr, VAddr virtual_addr, u64 size, Memory
     Common::FS::IOFile* host_file = file->handle ? file->handle->GetHostFile() : nullptr;
     const bool non_host_backed = file->handle && host_file == nullptr;
 
+    u64 file_size = 0;
     if (non_host_backed) {
         // Non-host backends are read-only
         prot &= ~MemoryProt::CpuWrite;
     } else {
         // Measured on hardware: a mapping may reach into the rest of the file's last page, but not
         // past it.
-        const u64 file_size = host_file->GetSize();
+        file_size = host_file->GetSize();
         if (phys_addr < 0 ||
             static_cast<u64>(phys_addr) + size > Common::AlignUp(file_size, 16_KB)) {
             LOG_ERROR(Kernel_Vmm, "Mapping {:#x} bytes at offset {:#x} reaches past the file end",
@@ -963,7 +964,7 @@ s32 MemoryManager::MapFile(void** out_addr, VAddr virtual_addr, u64 size, Memory
     Core::FileSys::FileMapContext map_ctx{};
     map_ctx.mapping_handle = handle;
     map_ctx.map_native = [&](u8* addr, u64 sz, u64 off, u32 p, uintptr_t map_handle) {
-        impl.MapFile(reinterpret_cast<VAddr>(addr), sz, off, p, map_handle);
+        impl.MapFile(reinterpret_cast<VAddr>(addr), sz, off, p, map_handle, file_size);
     };
     map_ctx.map_anonymous = [&](u8* addr, u64 sz) {
         constexpr auto kAnonMarker = static_cast<u64>(-1);

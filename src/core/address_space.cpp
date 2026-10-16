@@ -104,7 +104,12 @@ struct MemoryRegion {
     u32 prot;
     s32 fd;
     bool is_mapped;
+    // Size of the backing file, when fd is a file.
+    u64 file_size = 0;
     bool file_read_in = false;
+    // Bytes at the start of the region that are a view of the file, when the region reaches past
+    // the end of the file and the rest of it is zeroed memory. 0 when the region is one piece.
+    u64 file_view_size = 0;
 };
 
 struct AddressSpace::Impl {
@@ -278,7 +283,41 @@ struct AddressSpace::Impl {
                 ret = VirtualProtect(ptr, size, prot, &resultvar);
                 ASSERT_MSG(ret, "VirtualProtect failed. {}", Common::GetLastErrorMsg());
             } else {
-                if (prot == PAGE_NOACCESS) {
+                // A view of a file's section cannot reach past the file's last byte. When the
+                // mapping reaches past the end of the file, the view covers the file's bytes (the
+                // host rounds it up to whole pages, zero past the end) and the rest of the mapping
+                // is zeroed memory.
+                constexpr u64 HostPageSize = 4_KB;
+                const u64 file_bytes = fd != -1 && region->file_size > static_cast<u64>(phys_addr)
+                                           ? region->file_size - phys_addr
+                                           : 0;
+                const u64 view_size = Common::AlignUp(file_bytes, HostPageSize);
+                region->file_view_size = view_size != 0 && view_size < size ? view_size : 0;
+                if (region->file_view_size != 0) {
+                    const VAddr rest_addr = virtual_addr + view_size;
+                    const u64 rest_size = size - view_size;
+                    // Split the placeholder into one for the view and one for the rest.
+                    if (!VirtualFreeEx(process, reinterpret_cast<PVOID>(virtual_addr), view_size,
+                                       MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER)) {
+                        UNREACHABLE_MSG("Splitting the file view placeholder failed: {}",
+                                        Common::GetLastErrorMsg());
+                    }
+                    const ULONG map_prot = prot == PAGE_NOACCESS ? PAGE_READWRITE : prot;
+                    ptr = MapViewOfFile3(backing, process, reinterpret_cast<PVOID>(virtual_addr),
+                                         phys_addr, file_bytes, MEM_REPLACE_PLACEHOLDER, map_prot,
+                                         nullptr, 0);
+                    ASSERT_MSG(ptr, "MapViewOfFile3 failed. {}", Common::GetLastErrorMsg());
+                    void* rest = VirtualAlloc2(
+                        process, reinterpret_cast<PVOID>(rest_addr), rest_size,
+                        MEM_RESERVE | MEM_COMMIT | MEM_REPLACE_PLACEHOLDER, map_prot, nullptr, 0);
+                    ASSERT_MSG(rest, "VirtualAlloc2 failed. {}", Common::GetLastErrorMsg());
+                    if (prot == PAGE_NOACCESS) {
+                        DWORD resultvar;
+                        bool ret = VirtualProtect(ptr, view_size, prot, &resultvar) &&
+                                   VirtualProtect(rest, rest_size, prot, &resultvar);
+                        ASSERT_MSG(ret, "VirtualProtect failed. {}", Common::GetLastErrorMsg());
+                    }
+                } else if (prot == PAGE_NOACCESS) {
                     DWORD resultvar;
                     ptr = MapViewOfFile3(backing, process, reinterpret_cast<PVOID>(virtual_addr),
                                          phys_addr, size, MEM_REPLACE_PLACEHOLDER, PAGE_READWRITE,
@@ -344,7 +383,17 @@ struct AddressSpace::Impl {
         bool ret = false;
         // File contents that were read in sit in plain memory; everything else backed by a file or
         // by direct memory is a view.
-        if ((fd != -1 && !region->file_read_in) || (fd == -1 && phys_base != -1)) {
+        if (region->file_view_size != 0) {
+            // A view followed by zeroed memory: release both, then join their placeholders again.
+            const u64 view_size = region->file_view_size;
+            ret = UnmapViewOfFile2(process, reinterpret_cast<PVOID>(virtual_addr),
+                                   MEM_PRESERVE_PLACEHOLDER) &&
+                  VirtualFreeEx(process, reinterpret_cast<PVOID>(virtual_addr + view_size),
+                                size - view_size, MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER) &&
+                  VirtualFreeEx(process, reinterpret_cast<PVOID>(virtual_addr), size,
+                                MEM_RELEASE | MEM_COALESCE_PLACEHOLDERS);
+            region->file_view_size = 0;
+        } else if ((fd != -1 && !region->file_read_in) || (fd == -1 && phys_base != -1)) {
             ret = UnmapViewOfFile2(process, reinterpret_cast<PVOID>(virtual_addr),
                                    MEM_PRESERVE_PLACEHOLDER);
         } else {
@@ -401,7 +450,7 @@ struct AddressSpace::Impl {
             it = regions.emplace_hint(std::next(it), virtual_addr,
                                       MemoryRegion(virtual_addr, next_region_phys_base,
                                                    next_region_size, region.prot, region.fd,
-                                                   region.is_mapped));
+                                                   region.is_mapped, region.file_size));
         }
 
         // At this point, the region's base will match virtual_addr.
@@ -423,7 +472,7 @@ struct AddressSpace::Impl {
             regions.emplace_hint(std::next(it), next_region_addr,
                                  MemoryRegion(next_region_addr, next_region_phys_base,
                                               next_region_size, region.prot, region.fd,
-                                              region.is_mapped));
+                                              region.is_mapped, region.file_size));
 
             // Use VirtualFreeEx to create the split.
             if (!VirtualFreeEx(process, LPVOID(region.base), region.size,
@@ -443,7 +492,8 @@ struct AddressSpace::Impl {
         }
     }
 
-    void* Map(VAddr virtual_addr, PAddr phys_addr, u64 size, ULONG prot, s32 fd = -1) {
+    void* Map(VAddr virtual_addr, PAddr phys_addr, u64 size, ULONG prot, s32 fd = -1,
+              u64 file_size = 0) {
         std::scoped_lock lk{mutex};
         // Get a pointer to the region containing virtual_addr
         auto it = std::prev(regions.upper_bound(virtual_addr));
@@ -463,6 +513,7 @@ struct AddressSpace::Impl {
         region.phys_base = phys_addr;
         region.prot = prot;
         region.fd = fd;
+        region.file_size = file_size;
         return MapRegion(&region);
     }
 
@@ -603,13 +654,24 @@ struct AddressSpace::Impl {
             }
             const auto& region = it->second;
             const u64 range_addr = std::max(region.base, virtual_addr);
-            const u64 range_size = std::min(region.base + region.size, virtual_end) - range_addr;
-            DWORD old_flags{};
-            if (!VirtualProtectEx(process, LPVOID(range_addr), range_size, new_flags, &old_flags)) {
-                UNREACHABLE_MSG(
-                    "Failed to change virtual memory protection for address {:#x}, size "
-                    "{:#x}, error {}",
-                    virtual_addr, size, Common::GetLastErrorMsg());
+            const u64 range_end = std::min(region.base + region.size, virtual_end);
+            // A file view followed by zeroed memory is two allocations; protect each part.
+            const u64 split =
+                region.file_view_size != 0 ? region.base + region.file_view_size : range_end;
+            for (const auto& [part_addr, part_end] :
+                 {std::pair{range_addr, std::min(split, range_end)},
+                  std::pair{std::max(split, range_addr), range_end}}) {
+                if (part_addr >= part_end) {
+                    continue;
+                }
+                DWORD old_flags{};
+                if (!VirtualProtectEx(process, LPVOID(part_addr), part_end - part_addr, new_flags,
+                                      &old_flags)) {
+                    UNREACHABLE_MSG(
+                        "Failed to change virtual memory protection for address {:#x}, size "
+                        "{:#x}, error {}",
+                        virtual_addr, size, Common::GetLastErrorMsg());
+                }
             }
         }
     }
@@ -870,11 +932,14 @@ void* AddressSpace::Map(VAddr virtual_addr, u64 size, PAddr phys_addr, bool is_e
     return impl->Map(virtual_addr, phys_addr, size, prot);
 }
 
-void* AddressSpace::MapFile(VAddr virtual_addr, u64 size, u64 offset, u32 prot, uintptr_t fd) {
+void* AddressSpace::MapFile(VAddr virtual_addr, u64 size, u64 offset, u32 prot, uintptr_t fd,
+                            u64 file_size) {
 #ifdef _WIN32
     return impl->Map(virtual_addr, offset, size,
-                     ToWindowsProt(std::bit_cast<Core::MemoryProt>(prot)), fd);
+                     ToWindowsProt(std::bit_cast<Core::MemoryProt>(prot)), fd, file_size);
 #else
+    // POSIX maps the partly filled last page of a file natively.
+    (void)file_size;
     return impl->Map(virtual_addr, offset, size, ToPosixProt(std::bit_cast<Core::MemoryProt>(prot)),
                      fd);
 #endif
