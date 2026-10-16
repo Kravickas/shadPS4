@@ -296,6 +296,8 @@ struct AddressSpace::Impl {
                                            : 0;
                 const u64 view_size = Common::AlignUp(file_bytes, HostPageSize);
                 region->file_view_size = view_size != 0 && view_size < size ? view_size : 0;
+                // Bytes to map as the view: the file's bytes when the file ends inside the region.
+                const u64 map_bytes = file_bytes != 0 && file_bytes < size ? file_bytes : size;
                 if (region->file_view_size != 0) {
                     const VAddr rest_addr = virtual_addr + view_size;
                     const u64 rest_size = size - view_size;
@@ -323,15 +325,15 @@ struct AddressSpace::Impl {
                 } else if (prot == PAGE_NOACCESS) {
                     DWORD resultvar;
                     ptr = MapViewOfFile3(backing, process, reinterpret_cast<PVOID>(virtual_addr),
-                                         phys_addr, size, MEM_REPLACE_PLACEHOLDER, PAGE_READWRITE,
-                                         nullptr, 0);
+                                         phys_addr, map_bytes, MEM_REPLACE_PLACEHOLDER,
+                                         PAGE_READWRITE, nullptr, 0);
                     ASSERT_MSG(ptr, "MapViewOfFile3 failed. {}", Common::GetLastErrorMsg());
                     bool ret = VirtualProtect(ptr, size, prot, &resultvar);
                     ASSERT_MSG(ret, "VirtualProtect failed. {}", Common::GetLastErrorMsg());
                 } else {
-                    ptr =
-                        MapViewOfFile3(backing, process, reinterpret_cast<PVOID>(virtual_addr),
-                                       phys_addr, size, MEM_REPLACE_PLACEHOLDER, prot, nullptr, 0);
+                    ptr = MapViewOfFile3(backing, process, reinterpret_cast<PVOID>(virtual_addr),
+                                         phys_addr, map_bytes, MEM_REPLACE_PLACEHOLDER, prot,
+                                         nullptr, 0);
                     ASSERT_MSG(ptr, "MapViewOfFile3 failed. {}", Common::GetLastErrorMsg());
                 }
             }
