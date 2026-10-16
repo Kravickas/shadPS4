@@ -905,11 +905,7 @@ s32 MemoryManager::MapFile(void** out_addr, VAddr virtual_addr, u64 size, Memory
             prot &= ~MemoryProt::CpuWrite;
         }
 
-        // A view of a file's section cannot reach past the end of the file, so a read-only mapping
-        // into a partly filled last page reads the file in instead.
-        const bool past_file_end = static_cast<u64>(phys_addr) + size > file_size;
-        handle = past_file_end && False(prot & MemoryProt::CpuWrite) ? host_file->GetNativeHandle()
-                                                                     : host_file->GetFileMapping();
+        handle = host_file->GetFileMapping();
     }
 
     if (prot >= MemoryProt::GpuRead) {

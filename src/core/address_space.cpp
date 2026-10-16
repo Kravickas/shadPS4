@@ -287,6 +287,9 @@ struct AddressSpace::Impl {
                 // mapping reaches past the end of the file, the view covers the file's bytes (the
                 // host rounds it up to whole pages, zero past the end) and the rest of the mapping
                 // is zeroed memory.
+                // Known difference: on hardware the whole last page is shared page cache, so bytes
+                // written past the end of the file stay visible to later mappings while the page
+                // is cached (the file does not grow). Here the rest of the mapping is private.
                 constexpr u64 HostPageSize = 4_KB;
                 const u64 file_bytes = fd != -1 && region->file_size > static_cast<u64>(phys_addr)
                                            ? region->file_size - phys_addr

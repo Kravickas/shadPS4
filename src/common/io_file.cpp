@@ -261,14 +261,6 @@ void IOFile::Unlink() {
 #endif
 }
 
-uintptr_t IOFile::GetNativeHandle() const {
-#ifdef _WIN64
-    return static_cast<uintptr_t>(_get_osfhandle(fileno(file)));
-#else
-    return fileno(file);
-#endif
-}
-
 uintptr_t IOFile::GetFileMapping() {
     if (file_mapping) {
         return file_mapping;
