@@ -338,26 +338,29 @@ void MemoryManager::SetCommittedPoolBlockType(PAddr base, u64 size, s32 memory_t
 }
 
 s32 MemoryManager::PoolReserve(void** out_addr, VAddr virtual_addr, u64 size, MemoryMapFlags flags,
-                               u64 alignment) {
+                               u64 alignment, std::string_view name) {
     // Measured on hardware: a single pool reservation must be smaller than 16 GiB.
     if (size >= 16_GB) {
         LOG_ERROR(Kernel_Vmm, "Pool reservation of {:#x} bytes is too large", size);
         return ORBIS_KERNEL_ERROR_ENOMEM;
     }
+    const u64 blocks = PoolReservationBlocks(size);
     {
-        // Every reservation holds one pool block until it is unmapped.
+        // Measured on hardware: a reservation holds one pool block per started GiB until it is
+        // unmapped. Not measured: what happens when fewer blocks are available than it needs.
         std::scoped_lock lk{mutex};
-        if (pool_avail_flushed + pool_avail_cached == 0) {
-            LOG_ERROR(Kernel_Vmm, "No pool block available for a reservation");
+        if (pool_avail_flushed + pool_avail_cached < blocks) {
+            LOG_ERROR(Kernel_Vmm, "Not enough pool blocks for a reservation");
             return ORBIS_KERNEL_ERROR_ENOMEM;
         }
-        TakePoolBlocks(1, true, true);
+        TakePoolBlocks(blocks, true, true);
     }
     const s32 result = MapMemory(out_addr, virtual_addr, size, MemoryProt::NoAccess, flags,
-                                 VMAType::PoolReserved, "anon", false, -1, alignment);
+                                 VMAType::PoolReserved, name, false, -1, alignment);
     std::scoped_lock lk{mutex};
     if (result != ORBIS_OK) {
-        ReturnPoolBlocks(1, true);
+        // Measured on hardware: the blocks of a failed reservation come back as cached.
+        ReturnPoolBlocks(blocks, true);
         return result;
     }
     // Measured on hardware: a reservation is one object, its parts report their offset in it.
@@ -510,6 +513,11 @@ s32 MemoryManager::PoolCommit(VAddr virtual_addr, u64 size, MemoryProt prot, s32
     VAddr mapped_addr = Common::AlignUp(virtual_addr, alignment);
 
     auto& vma = FindVMA(mapped_addr)->second;
+    if (vma.type == VMAType::Pooled) {
+        // Measured on hardware: committing pool memory that is already committed is EBUSY.
+        LOG_ERROR(Kernel_Vmm, "Pool memory at {:#x} is already committed", mapped_addr);
+        return ORBIS_KERNEL_ERROR_EBUSY;
+    }
     if (vma.type != VMAType::PoolReserved) {
         // If we're attempting to commit non-pooled memory, return EINVAL
         LOG_ERROR(Kernel_Vmm, "Attempting to commit non-pooled memory at {:#x}", mapped_addr);
@@ -532,7 +540,15 @@ s32 MemoryManager::PoolCommit(VAddr virtual_addr, u64 size, MemoryProt prot, s32
     }
     // Track how much pooled memory this commit will take
     pool_budget -= size;
+    // Measured on hardware: when a type 10 commit has to take cached blocks because the flushed
+    // ones ran out, all remaining available cached blocks become flushed. Measured for a one
+    // block commit with no flushed blocks left.
+    const bool type10_short = mtype == 10 && pool_avail_flushed < blocks;
     TakePoolBlocks(blocks, mtype != 3, mtype != 3 && mtype != 10);
+    if (type10_short) {
+        pool_avail_flushed += pool_avail_cached;
+        pool_avail_cached = 0;
+    }
 
     if (True(prot & MemoryProt::CpuWrite)) {
         // On PS4, read is appended to write mappings.
@@ -743,10 +759,10 @@ s32 MemoryManager::MapMemory(void** out_addr, VAddr virtual_addr, u64 size, Memo
     std::unique_lock lk2{mutex};
 
     if (True(flags & MemoryMapFlags::Fixed)) {
-        // Pool reservations covered by a fixed mapping are replaced and give back their block.
+        // Pool reservations covered by a fixed mapping are replaced and give back their blocks.
         for (auto it = pool_reservations.lower_bound(virtual_addr);
              it != pool_reservations.end() && it->first < virtual_addr + size;) {
-            ReturnPoolBlocks(1, true);
+            ReturnPoolBlocks(PoolReservationBlocks(it->second), true);
             it = pool_reservations.erase(it);
         }
     }
@@ -1127,7 +1143,7 @@ s32 MemoryManager::UnmapMemory(VAddr virtual_addr, u64 size) {
     const s32 result = UnmapMemoryImpl(virtual_addr, size);
     for (auto it = pool_reservations.lower_bound(virtual_addr);
          it != pool_reservations.end() && it->first < end_addr;) {
-        ReturnPoolBlocks(1, true);
+        ReturnPoolBlocks(PoolReservationBlocks(it->second), true);
         it = pool_reservations.erase(it);
     }
     return result;
@@ -1548,6 +1564,14 @@ s32 MemoryManager::SetDirectMemoryType(VAddr addr, u64 size, s32 memory_type) {
     std::scoped_lock lk{mutex, unmap_mutex};
 
     ASSERT_MSG(IsValidMapping(addr, size), "Attempted to access invalid address {:#x}", addr);
+
+    // Measured on hardware: flexible memory has no memory type to change. Measured for a range of
+    // flexible memory only.
+    for (auto it = FindVMA(addr); it != vma_map.end() && it->second.base < addr + size; ++it) {
+        if (it->second.type == VMAType::Flexible) {
+            return ORBIS_KERNEL_ERROR_EOPNOTSUPP;
+        }
+    }
 
     // Search through all VMAs covered by the provided range.
     // We aren't modifying these VMAs, so it's safe to iterate through them.

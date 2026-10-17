@@ -424,7 +424,11 @@ s32 PS4_SYSV_ABI sceKernelMprotect(const void* addr, u64 size, s32 prot) {
     }
 
     Core::MemoryManager* memory_manager = Core::Memory::Instance();
-    Core::MemoryProt protection_flags = static_cast<Core::MemoryProt>(prot);
+    // Measured on hardware: bits other than CPU read/write/execute and GPU read/write are dropped.
+    Core::MemoryProt protection_flags =
+        static_cast<Core::MemoryProt>(prot) &
+        (Core::MemoryProt::CpuRead | Core::MemoryProt::CpuWrite | Core::MemoryProt::CpuExec |
+         Core::MemoryProt::GpuRead | Core::MemoryProt::GpuWrite);
 
     s32 result = memory_manager->Protect(aligned_addr, aligned_size, protection_flags);
     if (result == ORBIS_OK) {
@@ -662,8 +666,8 @@ s32 PS4_SYSV_ABI sceKernelMemoryPoolExpand(u64 searchStart, u64 searchEnd, u64 l
     return ORBIS_OK;
 }
 
-s32 PS4_SYSV_ABI sceKernelMemoryPoolReserve(void* addr_in, u64 len, u64 alignment, s32 flags,
-                                            void** addr_out) {
+static s32 MemoryPoolReserve(void* addr_in, u64 len, u64 alignment, s32 flags, void** addr_out,
+                             std::string_view name) {
     LOG_INFO(Kernel_Vmm, "addr_in = {}, len = {:#x}, alignment = {:#x}, flags = {:#x}",
              fmt::ptr(addr_in), len, alignment, flags);
 
@@ -695,7 +699,20 @@ s32 PS4_SYSV_ABI sceKernelMemoryPoolReserve(void* addr_in, u64 len, u64 alignmen
     const auto map_flags = static_cast<Core::MemoryMapFlags>(flags);
     u64 map_alignment = alignment == 0 ? 2_MB : alignment;
 
-    return memory->PoolReserve(addr_out, in_addr, len, map_flags, map_alignment);
+    return memory->PoolReserve(addr_out, in_addr, len, map_flags, map_alignment, name);
+}
+
+s32 PS4_SYSV_ABI sceKernelMemoryPoolReserve(void* addr_in, u64 len, u64 alignment, s32 flags,
+                                            void** addr_out) {
+    return MemoryPoolReserve(addr_in, len, alignment, flags, addr_out, "anon");
+}
+
+// Guest entry. Measured on hardware: a reservation is named "anon:" and the return address of the
+// call that made it, in 12 hex digits.
+static s32 PS4_SYSV_ABI MemoryPoolReserveFromGuest(VAddr caller, void* addr_in, u64 len,
+                                                   u64 alignment, s32 flags, void** addr_out) {
+    return MemoryPoolReserve(addr_in, len, alignment, flags, addr_out,
+                             fmt::format("anon:{:012x}", caller));
 }
 
 s32 PS4_SYSV_ABI sceKernelMemoryPoolCommit(void* addr, u64 len, s32 type, s32 prot, s32 flags) {
@@ -703,9 +720,6 @@ s32 PS4_SYSV_ABI sceKernelMemoryPoolCommit(void* addr, u64 len, s32 type, s32 pr
     if (addr == nullptr || !Common::Is64KBAligned(reinterpret_cast<VAddr>(addr))) {
         LOG_ERROR(Kernel_Vmm, "Address is invalid!");
         return ORBIS_KERNEL_ERROR_EINVAL;
-    }
-    if (len == 0) {
-        return ORBIS_OK;
     }
     if (!Common::Is64KBAligned(len)) {
         LOG_ERROR(Kernel_Vmm, "Map size is not 64KB aligned!");
@@ -727,6 +741,10 @@ s32 PS4_SYSV_ABI sceKernelMemoryPoolCommit(void* addr, u64 len, s32 type, s32 pr
         LOG_ERROR(Kernel_Vmm, "Memory type {} is invalid", type);
         return ORBIS_KERNEL_ERROR_EINVAL;
     }
+    // Measured on hardware: a length of 0 succeeds once type and protection are valid.
+    if (len == 0) {
+        return ORBIS_OK;
+    }
 
     LOG_INFO(Kernel_Vmm, "addr = {}, len = {:#x}, type = {:#x}, prot = {:#x}, flags = {:#x}",
              fmt::ptr(addr), len, type, prot, flags);
@@ -737,12 +755,16 @@ s32 PS4_SYSV_ABI sceKernelMemoryPoolCommit(void* addr, u64 len, s32 type, s32 pr
 }
 
 s32 PS4_SYSV_ABI sceKernelMemoryPoolDecommit(void* addr, u64 len, s32 flags) {
-    if (addr == nullptr) {
+    // Measured on hardware: the address must be 64 KB aligned, and a length of 0 succeeds.
+    if (addr == nullptr || !Common::Is64KBAligned(reinterpret_cast<VAddr>(addr))) {
         LOG_ERROR(Kernel_Vmm, "Address is invalid!");
         return ORBIS_KERNEL_ERROR_EINVAL;
     }
-    if (len == 0 || !Common::Is64KBAligned(len)) {
-        LOG_ERROR(Kernel_Vmm, "Map size is either zero or not 64KB aligned!");
+    if (len == 0) {
+        return ORBIS_OK;
+    }
+    if (!Common::Is64KBAligned(len)) {
+        LOG_ERROR(Kernel_Vmm, "Map size is not 64KB aligned!");
         return ORBIS_KERNEL_ERROR_EINVAL;
     }
 
@@ -1102,7 +1124,8 @@ void RegisterMemory(Core::Loader::SymbolsResolver* sym) {
 
     // Memory pool
     LIB_FUNCTION("qCSfqDILlns", "libkernel", 1, "libkernel", sceKernelMemoryPoolExpand);
-    LIB_FUNCTION("pU-QydtGcGY", "libkernel", 1, "libkernel", sceKernelMemoryPoolReserve);
+    LIB_FUNCTION_WITH_CALLER("pU-QydtGcGY", "libkernel", 1, "libkernel",
+                             MemoryPoolReserveFromGuest);
     LIB_FUNCTION("Vzl66WmfLvk", "libkernel", 1, "libkernel", sceKernelMemoryPoolCommit);
     LIB_FUNCTION("LXo1tpFqJGs", "libkernel", 1, "libkernel", sceKernelMemoryPoolDecommit);
     LIB_FUNCTION("YN878uKRBbE", "libkernel", 1, "libkernel", sceKernelMemoryPoolBatch);

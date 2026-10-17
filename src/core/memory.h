@@ -318,7 +318,7 @@ public:
     s32 GetMemoryPoolStats(::Libraries::Kernel::OrbisKernelMemoryPoolBlockStats* stats);
 
     s32 PoolReserve(void** out_addr, VAddr virtual_addr, u64 size, MemoryMapFlags flags,
-                    u64 alignment);
+                    u64 alignment, std::string_view name = "anon");
 
     void InvalidateMemory(VAddr addr, u64 size) const;
 
@@ -356,6 +356,11 @@ private:
     VMAHandle Split(VMAHandle vma_handle, u64 offset_in_vma);
 
     PhysHandle Split(PhysMap& map, PhysHandle dmem_handle, u64 offset_in_area);
+
+    // Measured on hardware: a pool reservation holds one block per started GiB.
+    static constexpr u64 PoolReservationBlocks(u64 size) {
+        return (size + 1_GB - 1) / 1_GB;
+    }
 
     void TakePoolBlocks(u64 count, bool cached, bool draw_cached_first);
     void ReturnPoolBlocks(u64 count, bool cached);
