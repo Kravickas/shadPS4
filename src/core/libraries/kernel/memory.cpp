@@ -472,6 +472,11 @@ s32 PS4_SYSV_ABI sceKernelMtypeprotect(const void* addr, u64 size, s32 mtype, s3
     Core::MemoryManager* memory_manager = Core::Memory::Instance();
     Core::MemoryProt protection_flags = static_cast<Core::MemoryProt>(prot);
 
+    // Measured on hardware: flexible memory has no memory type to change (measured for a range of
+    // flexible memory). The call is refused before anything changes.
+    if (memory_manager->ContainsFlexibleMemory(aligned_addr, aligned_size)) {
+        return ORBIS_KERNEL_ERROR_EOPNOTSUPP;
+    }
     s32 result = memory_manager->Protect(aligned_addr, aligned_size, protection_flags);
     if (result == ORBIS_OK) {
         memory_manager->SetDirectMemoryType(aligned_addr, aligned_size, mtype);
@@ -707,12 +712,17 @@ s32 PS4_SYSV_ABI sceKernelMemoryPoolReserve(void* addr_in, u64 len, u64 alignmen
     return MemoryPoolReserve(addr_in, len, alignment, flags, addr_out, "anon");
 }
 
+// Measured on hardware: anonymous mappings are named "anon:" and the return address of the call
+// that made them, in 12 hex digits.
+static std::string CallerName(VAddr caller) {
+    return fmt::format("anon:{:012x}", caller);
+}
+
 // Guest entry. Measured on hardware: a reservation is named "anon:" and the return address of the
 // call that made it, in 12 hex digits.
 static s32 PS4_SYSV_ABI MemoryPoolReserveFromGuest(VAddr caller, void* addr_in, u64 len,
                                                    u64 alignment, s32 flags, void** addr_out) {
-    return MemoryPoolReserve(addr_in, len, alignment, flags, addr_out,
-                             fmt::format("anon:{:012x}", caller));
+    return MemoryPoolReserve(addr_in, len, alignment, flags, addr_out, CallerName(caller));
 }
 
 s32 PS4_SYSV_ABI sceKernelMemoryPoolCommit(void* addr, u64 len, s32 type, s32 prot, s32 flags) {
@@ -846,7 +856,8 @@ s32 PS4_SYSV_ABI sceKernelMemoryPoolGetBlockStats(OrbisKernelMemoryPoolBlockStat
     return ORBIS_OK;
 }
 
-void* PS4_SYSV_ABI posix_mmap(void* addr, u64 len, s32 prot, s32 flags, s32 fd, s64 phys_addr) {
+static void* PosixMmap(void* addr, u64 len, s32 prot, s32 flags, s32 fd, s64 phys_addr,
+                       std::string_view name) {
     LOG_INFO(
         Kernel_Vmm,
         "called addr = {}, len = {:#x}, prot = {:#x}, flags = {:#x}, fd = {}, phys_addr = {:#x}",
@@ -883,7 +894,7 @@ void* PS4_SYSV_ABI posix_mmap(void* addr, u64 len, s32 prot, s32 flags, s32 fd, 
                                                ? Core::VMAType::System
                                                : Core::VMAType::Flexible;
         result = memory->MapMemory(&addr_out, aligned_addr, aligned_size, mem_prot, mem_flags,
-                                   mapping_type, "anon", false);
+                                   mapping_type, name, false);
     } else if (True(mem_flags & Core::MemoryMapFlags::Stack)) {
         // Maps stack memory
         result = memory->MapMemory(&addr_out, aligned_addr, aligned_size, mem_prot, mem_flags,
@@ -896,7 +907,7 @@ void* PS4_SYSV_ABI posix_mmap(void* addr, u64 len, s32 prot, s32 flags, s32 fd, 
     } else {
         // Default to file mapping
         result = memory->MapFile(&addr_out, aligned_addr, aligned_size, mem_prot, mem_flags, fd,
-                                 phys_addr);
+                                 phys_addr, name);
     }
 
     if (result != ORBIS_OK) {
@@ -911,9 +922,13 @@ void* PS4_SYSV_ABI posix_mmap(void* addr, u64 len, s32 prot, s32 flags, s32 fd, 
     return addr_out;
 }
 
-s32 PS4_SYSV_ABI sceKernelMmap(void* addr, u64 len, s32 prot, s32 flags, s32 fd, s64 phys_addr,
-                               void** res) {
-    void* addr_out = posix_mmap(addr, len, prot, flags, fd, phys_addr);
+void* PS4_SYSV_ABI posix_mmap(void* addr, u64 len, s32 prot, s32 flags, s32 fd, s64 phys_addr) {
+    return PosixMmap(addr, len, prot, flags, fd, phys_addr, "anon");
+}
+
+static s32 KernelMmap(void* addr, u64 len, s32 prot, s32 flags, s32 fd, s64 phys_addr, void** res,
+                      std::string_view name) {
+    void* addr_out = PosixMmap(addr, len, prot, flags, fd, phys_addr, name);
 
     if (addr_out == reinterpret_cast<void*>(-1)) {
         // posix_mmap failed, calculate and return the appropriate kernel error code using errno.
@@ -923,6 +938,11 @@ s32 PS4_SYSV_ABI sceKernelMmap(void* addr, u64 len, s32 prot, s32 flags, s32 fd,
     // Set the outputted address
     *res = addr_out;
     return ORBIS_OK;
+}
+
+s32 PS4_SYSV_ABI sceKernelMmap(void* addr, u64 len, s32 prot, s32 flags, s32 fd, s64 phys_addr,
+                               void** res) {
+    return KernelMmap(addr, len, prot, flags, fd, phys_addr, res, "anon");
 }
 
 s32 PS4_SYSV_ABI sceKernelConfiguredFlexibleMemorySize(u64* sizeOut) {
@@ -1079,6 +1099,22 @@ s32 PS4_SYSV_ABI sceKernelGetPrtAperture(s32 id, VAddr* address, u64* size) {
     return ORBIS_OK;
 }
 
+// Guest entries for the calls measured on hardware.
+static s32 PS4_SYSV_ABI MapFlexibleMemoryFromGuest(VAddr caller, void** addr_in_out, u64 len,
+                                                   s32 prot, s32 flags) {
+    return sceKernelMapNamedFlexibleMemory(addr_in_out, len, prot, flags,
+                                           CallerName(caller).c_str());
+}
+static s32 PS4_SYSV_ABI MapDirectMemoryFromGuest(VAddr caller, void** addr, u64 len, s32 prot,
+                                                 s32 flags, s64 phys_addr, u64 alignment) {
+    return sceKernelMapNamedDirectMemory(addr, len, prot, flags, phys_addr, alignment,
+                                         CallerName(caller).c_str());
+}
+static s32 PS4_SYSV_ABI MmapFromGuest(VAddr caller, void* addr, u64 len, s32 prot, s32 flags,
+                                      s32 fd, s64 phys_addr, void** res) {
+    return KernelMmap(addr, len, prot, flags, fd, phys_addr, res, CallerName(caller));
+}
+
 void RegisterMemory(Core::Loader::SymbolsResolver* sym) {
     ASSERT_MSG(sceKernelGetCompiledSdkVersion(&g_sdk_version) == ORBIS_OK,
                "Failed to get compiled SDK verision.");
@@ -1097,19 +1133,20 @@ void RegisterMemory(Core::Loader::SymbolsResolver* sym) {
     LIB_FUNCTION("yDBwVAolDgg", "libkernel", 1, "libkernel", sceKernelIsStack);
     LIB_FUNCTION("jh+8XiK4LeE", "libkernel", 1, "libkernel", sceKernelIsAddressSanitizerEnabled);
     LIB_FUNCTION("NcaWUxfMNIQ", "libkernel", 1, "libkernel", sceKernelMapNamedDirectMemory);
-    LIB_FUNCTION("L-Q3LEjIbgA", "libkernel", 1, "libkernel", sceKernelMapDirectMemory);
+    LIB_FUNCTION_WITH_CALLER("L-Q3LEjIbgA", "libkernel", 1, "libkernel", MapDirectMemoryFromGuest);
     LIB_FUNCTION("BQQniolj9tQ", "libkernel", 1, "libkernel", sceKernelMapDirectMemory2);
     LIB_FUNCTION("WFcfL2lzido", "libkernel", 1, "libkernel", sceKernelQueryMemoryProtection);
     LIB_FUNCTION("BHouLQzh0X0", "libkernel", 1, "libkernel", sceKernelDirectMemoryQuery);
     LIB_FUNCTION("MBuItvba6z8", "libkernel", 1, "libkernel", sceKernelReleaseDirectMemory);
-    LIB_FUNCTION("PGhQHd-dzv8", "libkernel", 1, "libkernel", sceKernelMmap);
+    LIB_FUNCTION_WITH_CALLER("PGhQHd-dzv8", "libkernel", 1, "libkernel", MmapFromGuest);
     LIB_FUNCTION("cQke9UuBQOk", "libkernel", 1, "libkernel", sceKernelMunmap);
     LIB_FUNCTION("mL8NDH86iQI", "libkernel", 1, "libkernel", sceKernelMapNamedFlexibleMemory);
     LIB_FUNCTION("kc+LEEIYakc", "libkernel", 1, "libkernel", sceKernelMapNamedSystemFlexibleMemory);
     LIB_FUNCTION("aNz11fnnzi4", "libkernel", 1, "libkernel", sceKernelAvailableFlexibleMemorySize);
     LIB_FUNCTION("aNz11fnnzi4", "libkernel_avlfmem", 1, "libkernel",
                  sceKernelAvailableFlexibleMemorySize);
-    LIB_FUNCTION("IWIBBdTHit4", "libkernel", 1, "libkernel", sceKernelMapFlexibleMemory);
+    LIB_FUNCTION_WITH_CALLER("IWIBBdTHit4", "libkernel", 1, "libkernel",
+                             MapFlexibleMemoryFromGuest);
     LIB_FUNCTION("p5EcQeEeJAE", "libkernel", 1, "libkernel", _sceKernelRtldSetApplicationHeapAPI);
     LIB_FUNCTION("2SKEx6bSq-4", "libkernel", 1, "libkernel", sceKernelBatchMap);
     LIB_FUNCTION("kBJzF8x4SyE", "libkernel", 1, "libkernel", sceKernelBatchMap2);

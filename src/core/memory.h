@@ -286,7 +286,7 @@ public:
                   bool validate_dmem = false, PAddr phys_addr = -1, u64 alignment = 0);
 
     s32 MapFile(void** out_addr, VAddr virtual_addr, u64 size, MemoryProt prot,
-                MemoryMapFlags flags, s32 fd, s64 phys_addr);
+                MemoryMapFlags flags, s32 fd, s64 phys_addr, std::string_view name = "anon");
 
     s32 PoolDecommit(VAddr virtual_addr, u64 size);
 
@@ -310,6 +310,8 @@ public:
                             void** directMemoryEndOut);
 
     s32 IsStack(VAddr addr, void** start, void** end);
+
+    bool ContainsFlexibleMemory(VAddr addr, u64 size);
 
     s32 SetDirectMemoryType(VAddr addr, u64 size, s32 memory_type);
 

@@ -347,7 +347,7 @@ s32 MemoryManager::PoolReserve(void** out_addr, VAddr virtual_addr, u64 size, Me
     const u64 blocks = PoolReservationBlocks(size);
     {
         // Measured on hardware: a reservation holds one pool block per started GiB until it is
-        // unmapped. Not measured: what happens when fewer blocks are available than it needs.
+        // unmapped; with fewer blocks available it fails without changing any.
         std::scoped_lock lk{mutex};
         if (pool_avail_flushed + pool_avail_cached < blocks) {
             LOG_ERROR(Kernel_Vmm, "Not enough pool blocks for a reservation");
@@ -876,7 +876,7 @@ s32 MemoryManager::MapMemory(void** out_addr, VAddr virtual_addr, u64 size, Memo
 }
 
 s32 MemoryManager::MapFile(void** out_addr, VAddr virtual_addr, u64 size, MemoryProt prot,
-                           MemoryMapFlags flags, s32 fd, s64 phys_addr) {
+                           MemoryMapFlags flags, s32 fd, s64 phys_addr, std::string_view name) {
     uintptr_t handle = 0;
     std::scoped_lock lk{unmap_mutex};
     // Get the file to map
@@ -969,7 +969,7 @@ s32 MemoryManager::MapFile(void** out_addr, VAddr virtual_addr, u64 size, Memory
     std::scoped_lock lk2{mutex};
 
     // Update VMA map and map to address space.
-    auto new_vma_handle = CreateArea(virtual_addr, size, prot, flags, VMAType::File, "anon", 0);
+    auto new_vma_handle = CreateArea(virtual_addr, size, prot, flags, VMAType::File, name, 0);
 
     auto& new_vma = new_vma_handle->second;
     new_vma.fd = fd;
@@ -1081,7 +1081,7 @@ s32 MemoryManager::PoolDecommit(VAddr virtual_addr, u64 size) {
         vma.type = VMAType::PoolReserved;
         vma.prot = MemoryProt::NoAccess;
         vma.disallow_merge = false;
-        vma.name = "anon";
+        // Measured on hardware: decommitted memory keeps the name of its reservation.
         vma.phys_areas.clear();
         MergeAdjacent(vma_map, new_it);
 
@@ -1560,18 +1560,20 @@ s32 MemoryManager::DirectQueryAvailable(PAddr search_start, PAddr search_end, u6
     return ORBIS_OK;
 }
 
+bool MemoryManager::ContainsFlexibleMemory(VAddr addr, u64 size) {
+    std::shared_lock lk{mutex};
+    for (auto it = FindVMA(addr); it != vma_map.end() && it->second.base < addr + size; ++it) {
+        if (it->second.type == VMAType::Flexible) {
+            return true;
+        }
+    }
+    return false;
+}
+
 s32 MemoryManager::SetDirectMemoryType(VAddr addr, u64 size, s32 memory_type) {
     std::scoped_lock lk{mutex, unmap_mutex};
 
     ASSERT_MSG(IsValidMapping(addr, size), "Attempted to access invalid address {:#x}", addr);
-
-    // Measured on hardware: flexible memory has no memory type to change. Measured for a range of
-    // flexible memory only.
-    for (auto it = FindVMA(addr); it != vma_map.end() && it->second.base < addr + size; ++it) {
-        if (it->second.type == VMAType::Flexible) {
-            return ORBIS_KERNEL_ERROR_EOPNOTSUPP;
-        }
-    }
 
     // Search through all VMAs covered by the provided range.
     // We aren't modifying these VMAs, so it's safe to iterate through them.
