@@ -69,6 +69,7 @@ void VideoOutDriver::Close(s32 handle) {
 
     // Clear port information
     std::memset(main_port.buffer_labels.data(), 0, sizeof(main_port.buffer_labels));
+    main_port.buffer_executed.fill(0);
     std::memset(main_port.groups.data(), 0, sizeof(main_port.groups));
     std::memset(&main_port.vblank_status, 0, sizeof(main_port.vblank_status));
     main_port.flip_status = FlipStatus{};
@@ -250,9 +251,6 @@ void VideoOutDriver::Flip(const Request& req) {
         flip_status.tsc = Libraries::Kernel::sceKernelReadTsc();
         flip_status.flip_arg = req.flip_arg;
         flip_status.current_buffer = req.index;
-        if (req.eop) {
-            --flip_status.gc_queue_num;
-        }
         --flip_status.flip_pending_num;
     }
 
@@ -268,10 +266,20 @@ void VideoOutDriver::Flip(const Request& req) {
         }
     }
 
-    // Reset prev flip label
+    // The previous buffer leaves the screen. Its label is cleared once no flip of it finished by
+    // the GPU is still waiting to be shown.
     if (port->prev_index != -1) {
-        port->buffer_labels[port->prev_index] = 0;
-        port->SignalVoLabel();
+        bool released;
+        {
+            std::unique_lock lock{port->port_mutex};
+            released = --port->buffer_executed[port->prev_index] == 0;
+            if (released) {
+                port->buffer_labels[port->prev_index] = 0;
+            }
+        }
+        if (released) {
+            port->SignalVoLabel();
+        }
     }
     // save to prev buf index
     port->prev_index = req.index;
@@ -293,15 +301,19 @@ bool VideoOutDriver::SubmitFlip(VideoOutPort* port, s32 index, s64 flip_arg,
                                 bool is_eop /*= false*/) {
     {
         std::unique_lock lock{port->port_mutex};
-        if (index != -1 && port->flip_status.flip_pending_num > 16) {
-            LOG_ERROR(Lib_VideoOut, "Flip queue is full");
-            return false;
+        // An EOP flip was admitted and counted when it was submitted.
+        if (!is_eop) {
+            if (index != -1 && port->flip_status.flip_pending_num > 16) {
+                LOG_ERROR(Lib_VideoOut, "Flip queue is full");
+                return false;
+            }
+            ++port->flip_status.flip_pending_num;
+            // An immediate flip marks its buffer in use and finished at submission.
+            if (index != -1) {
+                port->buffer_labels[index] = 1;
+                ++port->buffer_executed[index];
+            }
         }
-
-        if (is_eop) {
-            ++port->flip_status.gc_queue_num;
-        }
-        ++port->flip_status.flip_pending_num; // integral GPU and CPU pending flips counter
         port->flip_status.submit_tsc = Libraries::Kernel::sceKernelReadTsc();
     }
 

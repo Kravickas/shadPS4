@@ -348,6 +348,17 @@ s32 sceVideoOutSubmitEopFlip(s32 handle, u32 buf_id, u32 mode, s64 flip_arg, voi
         return ORBIS_VIDEO_OUT_ERROR_INVALID_HANDLE;
     }
 
+    // The flip is pending, and pending on the GPU, from submission.
+    {
+        std::unique_lock lock{port->port_mutex};
+        if (static_cast<s32>(buf_id) != -1 && port->flip_status.flip_pending_num > 16) {
+            LOG_ERROR(Lib_VideoOut, "Flip queue is full");
+            return ORBIS_VIDEO_OUT_ERROR_FLIP_QUEUE_FULL;
+        }
+        ++port->flip_status.flip_pending_num;
+        ++port->flip_status.gc_queue_num;
+    }
+
     Platform::IrqC::Instance()->RegisterOnce(
         Platform::InterruptId::GfxFlip, [=](Platform::InterruptId irq) {
             ASSERT_MSG(irq == Platform::InterruptId::GfxFlip, "An unexpected IRQ occured");
