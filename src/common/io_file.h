@@ -270,6 +270,7 @@ private:
     FileType file_type{};
 
     uintptr_t file_mapping = 0;
+    bool owns_file_mapping = false;
 };
 
 u64 GetDirectorySize(const std::filesystem::path& path);

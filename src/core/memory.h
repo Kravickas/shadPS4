@@ -5,6 +5,7 @@
 
 #include <map>
 #include <mutex>
+#include <set>
 #include <string>
 #include <string_view>
 #include "common/enum.h"
@@ -29,6 +30,9 @@ class MemoryMapViewer;
 namespace Core {
 
 constexpr u64 DEFAULT_MAPPING_BASE = 0x200000000;
+// Measured on hardware (FW 12.02): a search without an address hint only uses the space below the
+// main thread stack area, which sits here when the process has no ASLR offset.
+constexpr u64 DEFAULT_MAPPING_END = 0x7EEC00000;
 constexpr u64 GUEST_PAGE_BITS = 14;
 constexpr u64 GUEST_PAGE_SIZE = 1ULL << GUEST_PAGE_BITS;
 
@@ -113,6 +117,8 @@ struct VirtualMemoryArea {
     VMAType type = VMAType::Free;
     MemoryProt prot = MemoryProt::NoAccess;
     std::string name = "";
+    // For pool memory: the start of the reservation this area belongs to.
+    VAddr pool_base = 0;
     s32 fd = 0;
     bool disallow_merge = false;
 
@@ -132,7 +138,13 @@ struct VirtualMemoryArea {
         return type != VMAType::Free && type != VMAType::Reserved && type != VMAType::PoolReserved;
     }
 
-    bool CanMergeWith(VirtualMemoryArea& next) {
+    static bool IsAnonName(const std::string& n) {
+        return n == "anon" || n.starts_with("anon:");
+    }
+
+    // ignore_anon_names: from SDK 5.50 on, mappings made from different call sites merge; anon
+    // names do not keep them apart, other names still do.
+    bool CanMergeWith(VirtualMemoryArea& next, bool ignore_anon_names = false) {
         if (disallow_merge || next.disallow_merge) {
             return false;
         }
@@ -150,7 +162,13 @@ struct VirtualMemoryArea {
         if (prot != next.prot || type != next.type) {
             return false;
         }
-        if (name.compare(next.name) != 0) {
+        // Measured on hardware: each pool reservation stays its own area.
+        if ((type == VMAType::PoolReserved || type == VMAType::Pooled) &&
+            pool_base != next.pool_base) {
+            return false;
+        }
+        if (name.compare(next.name) != 0 &&
+            !(ignore_anon_names && IsAnonName(name) && IsAnonName(next.name))) {
             return false;
         }
 
@@ -258,6 +276,10 @@ public:
 
     bool TryWriteBacking(void* address, const void* data, u64 size);
 
+    u64 GuestWritablePrefix(VAddr virtual_addr, u64 size);
+
+    bool IsInGuestAreas(VAddr virtual_addr, u64 size);
+
     void SetupMemoryRegions(u64 flexible_size, bool use_extended_mem1, bool use_extended_mem2);
 
     PAddr PoolExpand(PAddr search_start, PAddr search_end, u64 size, u64 alignment);
@@ -273,7 +295,7 @@ public:
                   bool validate_dmem = false, PAddr phys_addr = -1, u64 alignment = 0);
 
     s32 MapFile(void** out_addr, VAddr virtual_addr, u64 size, MemoryProt prot,
-                MemoryMapFlags flags, s32 fd, s64 phys_addr);
+                MemoryMapFlags flags, s32 fd, s64 phys_addr, std::string_view name = "anon");
 
     s32 PoolDecommit(VAddr virtual_addr, u64 size);
 
@@ -298,11 +320,18 @@ public:
 
     s32 IsStack(VAddr addr, void** start, void** end);
 
+    bool ContainsFlexibleMemory(VAddr addr, u64 size);
+
+    bool IsRangeMapped(VAddr addr, u64 size);
+
     s32 SetDirectMemoryType(VAddr addr, u64 size, s32 memory_type);
 
     void NameVirtualRange(VAddr virtual_addr, u64 size, std::string_view name);
 
     s32 GetMemoryPoolStats(::Libraries::Kernel::OrbisKernelMemoryPoolBlockStats* stats);
+
+    s32 PoolReserve(void** out_addr, VAddr virtual_addr, u64 size, MemoryMapFlags flags,
+                    u64 alignment, std::string_view name = "anon");
 
     void InvalidateMemory(VAddr addr, u64 size) const;
 
@@ -327,7 +356,7 @@ private:
     VMAHandle CreateArea(VAddr virtual_addr, u64 size, MemoryProt prot, MemoryMapFlags flags,
                          VMAType type, std::string_view name, u64 alignment);
 
-    VAddr SearchFree(VAddr virtual_addr, u64 size, u32 alignment);
+    VAddr SearchFree(VAddr virtual_addr, u64 size, u64 alignment);
 
     VMAHandle MergeAdjacent(VMAMap& map, VMAHandle iter);
 
@@ -340,6 +369,16 @@ private:
     VMAHandle Split(VMAHandle vma_handle, u64 offset_in_vma);
 
     PhysHandle Split(PhysMap& map, PhysHandle dmem_handle, u64 offset_in_area);
+
+    // Measured on hardware: a pool reservation holds one block per started GiB.
+    static constexpr u64 PoolReservationBlocks(u64 size) {
+        return (size + 1_GB - 1) / 1_GB;
+    }
+
+    void TakePoolBlocks(u64 count, bool cached, bool draw_cached_first);
+    void ReturnPoolBlocks(u64 count, bool cached);
+    void ReturnCommittedPoolBlocks(PAddr base, u64 size);
+    void SetCommittedPoolBlockType(PAddr base, u64 size, s32 memory_type);
 
     u64 UnmapBytesFromEntry(VAddr virtual_addr, VirtualMemoryArea vma_base, u64 size);
 
@@ -356,6 +395,13 @@ private:
     u64 total_flexible_size{};
     u64 flexible_usage{};
     u64 pool_budget{};
+    // Pool block counters (64 KiB blocks) as reported by sceKernelMemoryPoolGetBlockStats.
+    u64 pool_avail_flushed{};
+    u64 pool_avail_cached{};
+    u64 pool_alloc_flushed{};
+    u64 pool_alloc_cached{};
+    std::set<PAddr> pool_flushed_blocks;
+    std::map<VAddr, u64> pool_reservations;
     s32 sdk_version{};
     Vulkan::Rasterizer* rasterizer{};
 

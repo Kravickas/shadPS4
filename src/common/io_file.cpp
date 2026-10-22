@@ -225,6 +225,8 @@ IOFile::IOFile(IOFile&& other) noexcept {
     std::swap(file_access_mode, other.file_access_mode);
     std::swap(file_type, other.file_type);
     std::swap(file, other.file);
+    std::swap(file_mapping, other.file_mapping);
+    std::swap(owns_file_mapping, other.owns_file_mapping);
 }
 
 IOFile& IOFile::operator=(IOFile&& other) noexcept {
@@ -232,6 +234,8 @@ IOFile& IOFile::operator=(IOFile&& other) noexcept {
     std::swap(file_access_mode, other.file_access_mode);
     std::swap(file_type, other.file_type);
     std::swap(file, other.file);
+    std::swap(file_mapping, other.file_mapping);
+    std::swap(owns_file_mapping, other.owns_file_mapping);
     return *this;
 }
 
@@ -284,10 +288,12 @@ void IOFile::Close() {
     file = nullptr;
 
 #ifdef _WIN64
-    if (file_mapping && file_access_mode == FileAccessMode::ReadWrite) {
+    if (file_mapping && owns_file_mapping) {
         CloseHandle(std::bit_cast<HANDLE>(file_mapping));
     }
 #endif
+    file_mapping = 0;
+    owns_file_mapping = false;
 }
 
 void IOFile::Unlink() {
@@ -327,10 +333,18 @@ uintptr_t IOFile::GetFileMapping() {
     HANDLE mapping = nullptr;
 
     if (file_access_mode == FileAccessMode::ReadWrite) {
-        mapping = CreateFileMapping2(hfile, NULL, FILE_MAP_WRITE, PAGE_READWRITE, SEC_COMMIT, 0,
-                                     NULL, NULL, 0);
+        mapping = CreateFileMapping2(hfile, NULL, FILE_MAP_READ | FILE_MAP_WRITE, PAGE_READWRITE,
+                                     SEC_COMMIT, 0, NULL, NULL, 0);
+        owns_file_mapping = mapping != nullptr;
     } else {
-        mapping = hfile;
+        // A read-only section keeps a file mapping a shared view of the file, as on hardware.
+        // A file that has no section (an empty file) is mapped by reading its contents in.
+        mapping = CreateFileMapping2(hfile, NULL, FILE_MAP_READ, PAGE_READONLY, SEC_COMMIT, 0, NULL,
+                                     NULL, 0);
+        owns_file_mapping = mapping != nullptr;
+        if (mapping == nullptr) {
+            mapping = hfile;
+        }
     }
 
     file_mapping = std::bit_cast<uintptr_t>(mapping);
