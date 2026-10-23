@@ -325,6 +325,10 @@ public:
 
     bool ContainsFlexibleMemory(VAddr addr, u64 size);
 
+    bool ContainsVmaType(VAddr addr, u64 size, VMAType type);
+
+    bool HasDirectMemoryType(VAddr addr, u64 size, s32 memory_type);
+
     bool IsRangeMapped(VAddr addr, u64 size);
 
     s32 SetDirectMemoryType(VAddr addr, u64 size, s32 memory_type);

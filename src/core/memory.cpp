@@ -889,6 +889,11 @@ s32 MemoryManager::MapFile(void** out_addr, VAddr virtual_addr, u64 size, Memory
         return ORBIS_KERNEL_ERROR_EBADF;
     }
 
+    // Measured on hardware: mapping a directory is EINVAL.
+    if (file->type == Core::FileSys::FileType::Directory) {
+        LOG_WARNING(Kernel_Vmm, "Cannot mmap a directory, fd {}", fd);
+        return ORBIS_KERNEL_ERROR_EINVAL;
+    }
     if (file->type != Core::FileSys::FileType::Regular) {
         LOG_WARNING(Kernel_Vmm, "Unsupported file type for mmap, fd {}", fd);
         return ORBIS_KERNEL_ERROR_EBADF;
@@ -926,6 +931,11 @@ s32 MemoryManager::MapFile(void** out_addr, VAddr virtual_addr, u64 size, Memory
             // If the file does not have write access, ensure prot does not contain write
             // permissions. On real hardware, these mappings succeed, but the memory cannot be
             // written to.
+            // Measured on hardware: a shared mapping with write access is EACCES.
+            if (True(flags & MemoryMapFlags::Shared) && True(prot & MemoryProt::CpuWrite)) {
+                LOG_ERROR(Kernel_Vmm, "Shared writable mapping of a file without write access");
+                return ORBIS_KERNEL_ERROR_EACCES;
+            }
             prot &= ~MemoryProt::CpuWrite;
             read_only_file = true;
         }
@@ -1314,9 +1324,9 @@ s64 MemoryManager::ProtectBytes(VAddr addr, VirtualMemoryArea& vma_base, u64 siz
     if (vma_base.type == VMAType::Pooled) {
         prot &= ~MemoryProt::CpuExec;
     }
-    // A mapping of a file that cannot be written does not become writable, as when it was mapped
-    // (MapFile). The PS4's result for mprotect on such a shared mapping is still to be measured
-    // (DmemTest TF4); the host view cannot be made writable either way.
+    // Measured on hardware: a shared mapping of a file that cannot be written does not become
+    // writable (mprotect succeeds, the protection reads back read-only). A private one becomes
+    // writable as a copy on the PS4; without copy-on-write views here it stays read-only.
     if (vma_base.type == VMAType::File && vma_base.file_read_only) {
         prot &= ~MemoryProt::CpuWrite;
     }
@@ -1609,6 +1619,34 @@ bool MemoryManager::IsRangeMapped(VAddr addr, u64 size) {
         }
     }
     return true;
+}
+
+bool MemoryManager::ContainsVmaType(VAddr addr, u64 size, VMAType type) {
+    std::shared_lock lk{mutex};
+    for (auto it = FindVMA(addr); it != vma_map.end() && it->second.base < addr + size; ++it) {
+        if (it->second.type == type) {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool MemoryManager::HasDirectMemoryType(VAddr addr, u64 size, s32 memory_type) {
+    std::shared_lock lk{mutex};
+    for (auto it = FindVMA(addr); it != vma_map.end() && it->second.base < addr + size; ++it) {
+        const auto& vma = it->second;
+        if (vma.type != VMAType::Direct) {
+            continue;
+        }
+        for (const auto& [offset, area] : vma.phys_areas) {
+            const VAddr start = vma.base + offset;
+            if (start < addr + size && start + area.size > addr &&
+                area.memory_type == memory_type) {
+                return true;
+            }
+        }
+    }
+    return false;
 }
 
 bool MemoryManager::ContainsFlexibleMemory(VAddr addr, u64 size) {

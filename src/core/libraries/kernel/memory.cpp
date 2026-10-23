@@ -273,6 +273,19 @@ s32 PS4_SYSV_ABI sceKernelMapNamedDirectMemory(void** addr, u64 len, s32 prot, s
         LOG_ERROR(Kernel_Vmm, "Invalid protection {:#x}", prot);
         return ORBIS_KERNEL_ERROR_EINVAL;
     }
+    // Measured on hardware (DmemTest DT6): direct memory of type 10 refuses CPU or GPU write.
+    {
+        s32 phys_type = -1;
+        void* type_start = nullptr;
+        void* type_end = nullptr;
+        if (True(mem_prot & (Core::MemoryProt::CpuWrite | Core::MemoryProt::GpuWrite)) &&
+            Core::Memory::Instance()->GetDirectMemoryType(phys_addr, &phys_type, &type_start,
+                                                          &type_end) == ORBIS_OK &&
+            phys_type == 10) {
+            LOG_ERROR(Kernel_Vmm, "Memory type 10 is not allowed with write access");
+            return ORBIS_KERNEL_ERROR_EACCES;
+        }
+    }
     constexpr auto ValidDirectFlags =
         Core::MemoryMapFlags::Fixed | Core::MemoryMapFlags::NoOverwrite |
         Core::MemoryMapFlags::Stack | Core::MemoryMapFlags::NoCoalesce;
@@ -330,11 +343,33 @@ s32 PS4_SYSV_ABI sceKernelMapDirectMemory2(void** addr, u64 len, s32 type, s32 p
         return ORBIS_KERNEL_ERROR_EINVAL;
     }
 
-    if (alignment != 0) {
-        if ((!std::has_single_bit(alignment) && !Common::Is16KBAligned(alignment))) {
-            LOG_ERROR(Kernel_Vmm, "Alignment value is invalid!");
-            return ORBIS_KERNEL_ERROR_EINVAL;
-        }
+    // Measured on hardware (DmemTest SF6, BT8, SF7, DT6): the alignment, address and flags are
+    // checked as for MapDirectMemory, which uses this call from SDK 2.50 on; type -1 keeps the
+    // memory type, other types must be 0 to 10, and type 10 refuses CPU or GPU write.
+    if (alignment != 0 && (!std::has_single_bit(alignment) || !Common::Is16KBAligned(alignment) ||
+                           alignment >= 2_GB)) {
+        LOG_ERROR(Kernel_Vmm, "Alignment value is invalid!");
+        return ORBIS_KERNEL_ERROR_EINVAL;
+    }
+    if (!Common::Is16KBAligned(reinterpret_cast<VAddr>(*addr))) {
+        LOG_ERROR(Kernel_Vmm, "Address is not 16KB aligned!");
+        return ORBIS_KERNEL_ERROR_EINVAL;
+    }
+    constexpr auto ValidDirectFlags =
+        Core::MemoryMapFlags::Fixed | Core::MemoryMapFlags::NoOverwrite |
+        Core::MemoryMapFlags::Stack | Core::MemoryMapFlags::NoCoalesce;
+    if (True(static_cast<Core::MemoryMapFlags>(flags) & ~ValidDirectFlags)) {
+        LOG_ERROR(Kernel_Vmm, "Invalid flags {:#x}", flags);
+        return ORBIS_KERNEL_ERROR_EINVAL;
+    }
+    if (type < -1 || type > 10) {
+        LOG_ERROR(Kernel_Vmm, "Memory type {} is invalid", type);
+        return ORBIS_KERNEL_ERROR_EINVAL;
+    }
+    if (type == 10 && True(static_cast<Core::MemoryProt>(prot) &
+                           (Core::MemoryProt::CpuWrite | Core::MemoryProt::GpuWrite))) {
+        LOG_ERROR(Kernel_Vmm, "Memory type 10 is not allowed with write access");
+        return ORBIS_KERNEL_ERROR_EACCES;
     }
 
     const auto mem_prot = static_cast<Core::MemoryProt>(prot);
@@ -355,7 +390,9 @@ s32 PS4_SYSV_ABI sceKernelMapDirectMemory2(void** addr, u64 len, s32 type, s32 p
         // If the map call succeeds, set the direct memory type using the output address.
         auto* memory = Core::Memory::Instance();
         const auto out_addr = reinterpret_cast<VAddr>(*addr);
-        memory->SetDirectMemoryType(out_addr, len, type);
+        if (type != -1) {
+            memory->SetDirectMemoryType(out_addr, len, type);
+        }
         LOG_INFO(Kernel_Vmm, "out_addr = {:#x}", out_addr);
     }
     return ret;
@@ -483,6 +520,12 @@ s32 PS4_SYSV_ABI sceKernelMprotect(const void* addr, u64 size, s32 prot) {
                               Core::MemoryProt::GpuWrite;
     Core::MemoryProt protection_flags = static_cast<Core::MemoryProt>(prot) & KeptProt;
 
+    // Measured on hardware (DmemTest TP1): write access to direct memory of type 10 is EACCES.
+    if (True(protection_flags & (Core::MemoryProt::CpuWrite | Core::MemoryProt::GpuWrite)) &&
+        memory_manager->HasDirectMemoryType(aligned_addr, aligned_size, 10)) {
+        LOG_ERROR(Kernel_Vmm, "Memory type 10 is not allowed with write access");
+        return ORBIS_KERNEL_ERROR_EACCES;
+    }
     s32 result = memory_manager->Protect(aligned_addr, aligned_size, protection_flags);
     if (result == ORBIS_OK) {
         memory_manager->InvalidateMemory(aligned_addr, aligned_size);
@@ -541,6 +584,10 @@ s32 PS4_SYSV_ABI sceKernelMtypeprotect(const void* addr, u64 size, s32 mtype, s3
     // flexible memory). The call is refused before anything changes.
     if (memory_manager->ContainsFlexibleMemory(aligned_addr, aligned_size)) {
         return ORBIS_KERNEL_ERROR_EOPNOTSUPP;
+    }
+    // Measured on hardware (DmemTest TP3): a range from ReserveVirtualRange is EACCES.
+    if (memory_manager->ContainsVmaType(aligned_addr, aligned_size, Core::VMAType::Reserved)) {
+        return ORBIS_KERNEL_ERROR_EACCES;
     }
     s32 result = memory_manager->Protect(aligned_addr, aligned_size, protection_flags);
     if (result == ORBIS_OK) {
@@ -625,6 +672,13 @@ s32 PS4_SYSV_ABI sceKernelBatchMap(OrbisKernelBatchMapEntry* entries, s32 numEnt
 
 s32 PS4_SYSV_ABI sceKernelBatchMap2(OrbisKernelBatchMapEntry* entries, s32 numEntries,
                                     s32* numEntriesOut, s32 flags) {
+    // Measured on hardware for each of the 32 bits (DmemTest BT26): fixed, no-overwrite, 0x400,
+    // no-coalesce and bits 24 to 28 are accepted, every other bit is EINVAL.
+    constexpr s32 ValidBatchFlags = 0x10 | 0x80 | 0x400 | 0x400000 | 0x1F000000;
+    if ((flags & ~ValidBatchFlags) != 0) {
+        LOG_ERROR(Kernel_Vmm, "Invalid flags {:#x}", flags);
+        return ORBIS_KERNEL_ERROR_EINVAL;
+    }
     s32 result = ORBIS_OK;
     s32 processed = 0;
     for (s32 i = 0; i < numEntries; i++, processed++) {
@@ -976,6 +1030,34 @@ static void* PosixMmapImpl(void* addr, u64 len, s32 prot, s32 flags, s32 fd, s64
         ErrSceToPosix(ORBIS_KERNEL_ERROR_EINVAL);
         LOG_ERROR(Kernel_Vmm, "Misaligned input address");
         return reinterpret_cast<void*>(-1);
+    }
+
+    // Measured on hardware (memory_test findings, DmemTest SF2/SF3/FW1/BT9):
+    // a null address with Fixed, and the sanitizer flag (0x200000), are EINVAL.
+    if ((True(mem_flags & Core::MemoryMapFlags::Fixed) && vaddr == 0) || (flags & 0x200000) != 0) {
+        ErrSceToPosix(ORBIS_KERNEL_ERROR_EINVAL);
+        return reinterpret_cast<void*>(-1);
+    }
+    // an anonymous mapping with an offset or a file, and a void mapping with an offset, are EINVAL.
+    if ((True(mem_flags & Core::MemoryMapFlags::Anon) && (phys_addr != 0 || fd != -1)) ||
+        (True(mem_flags & Core::MemoryMapFlags::Void) && phys_addr != 0)) {
+        ErrSceToPosix(ORBIS_KERNEL_ERROR_EINVAL);
+        return reinterpret_cast<void*>(-1);
+    }
+    if (True(mem_flags & Core::MemoryMapFlags::Stack)) {
+        // a stack mapping needs CPU read/write and no file; without an address it is ENOMEM, and so
+        // is a fixed one over a mapped range.
+        if ((mem_prot & Core::MemoryProt::CpuReadWrite) != Core::MemoryProt::CpuReadWrite ||
+            fd != -1) {
+            ErrSceToPosix(ORBIS_KERNEL_ERROR_EINVAL);
+            return reinterpret_cast<void*>(-1);
+        }
+        if ((False(mem_flags & Core::MemoryMapFlags::Fixed) && vaddr == 0) ||
+            (True(mem_flags & Core::MemoryMapFlags::Fixed) &&
+             memory->IsRangeMapped(aligned_addr, aligned_size))) {
+            ErrSceToPosix(ORBIS_KERNEL_ERROR_ENOMEM);
+            return reinterpret_cast<void*>(-1);
+        }
     }
 
     s32 result = ORBIS_OK;
