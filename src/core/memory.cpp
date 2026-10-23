@@ -905,9 +905,11 @@ s32 MemoryManager::MapFile(void** out_addr, VAddr virtual_addr, u64 size, Memory
 
     u64 file_size = 0;
     bool write_only = false;
+    bool read_only_file = false;
     if (non_host_backed) {
         // Non-host backends are read-only
         prot &= ~MemoryProt::CpuWrite;
+        read_only_file = true;
     } else {
         // Measured on hardware: a mapping may reach into the rest of the file's last page, but not
         // past it.
@@ -925,6 +927,7 @@ s32 MemoryManager::MapFile(void** out_addr, VAddr virtual_addr, u64 size, Memory
             // permissions. On real hardware, these mappings succeed, but the memory cannot be
             // written to.
             prot &= ~MemoryProt::CpuWrite;
+            read_only_file = true;
         }
 
         // Measured on hardware: a file opened without read access can only be mapped without CPU
@@ -995,6 +998,7 @@ s32 MemoryManager::MapFile(void** out_addr, VAddr virtual_addr, u64 size, Memory
 
     auto& new_vma = new_vma_handle->second;
     new_vma.fd = fd;
+    new_vma.file_read_only = read_only_file;
     auto mapped_addr = new_vma.base;
 
     // Delegate the actual mapping to the file backend.
@@ -1309,6 +1313,12 @@ s64 MemoryManager::ProtectBytes(VAddr addr, VirtualMemoryArea& vma_base, u64 siz
     // while hiding execute from the queries, which the code below handles.
     if (vma_base.type == VMAType::Pooled) {
         prot &= ~MemoryProt::CpuExec;
+    }
+    // A mapping of a file that cannot be written does not become writable, as when it was mapped
+    // (MapFile). The PS4's result for mprotect on such a shared mapping is still to be measured
+    // (DmemTest TF4); the host view cannot be made writable either way.
+    if (vma_base.type == VMAType::File && vma_base.file_read_only) {
+        prot &= ~MemoryProt::CpuWrite;
     }
     const MemoryProt new_prot = prot;
 

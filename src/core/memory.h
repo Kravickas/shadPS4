@@ -121,6 +121,9 @@ struct VirtualMemoryArea {
     VAddr pool_base = 0;
     s32 fd = 0;
     bool disallow_merge = false;
+    // A file mapping whose file cannot be written (opened without write access, or a read-only
+    // backend).
+    bool file_read_only = false;
 
     bool Contains(VAddr addr, u64 size) const {
         return addr >= base && (addr + size) <= (base + this->size);
