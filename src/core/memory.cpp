@@ -904,6 +904,7 @@ s32 MemoryManager::MapFile(void** out_addr, VAddr virtual_addr, u64 size, Memory
     const bool non_host_backed = file->handle && host_file == nullptr;
 
     u64 file_size = 0;
+    bool write_only = false;
     if (non_host_backed) {
         // Non-host backends are read-only
         prot &= ~MemoryProt::CpuWrite;
@@ -924,6 +925,16 @@ s32 MemoryManager::MapFile(void** out_addr, VAddr virtual_addr, u64 size, Memory
             // permissions. On real hardware, these mappings succeed, but the memory cannot be
             // written to.
             prot &= ~MemoryProt::CpuWrite;
+        }
+
+        // Measured on hardware: a file opened without read access can only be mapped without CPU
+        // access; an mprotect of that mapping then succeeds without granting any.
+        if (False(host_file->GetAccessMode() & Common::FS::FileAccessMode::Read)) {
+            if (True(prot & MemoryProt::CpuReadWrite)) {
+                LOG_ERROR(Kernel_Vmm, "File without read access cannot be mapped with CPU access");
+                return ORBIS_KERNEL_ERROR_EACCES;
+            }
+            write_only = true;
         }
 
         handle = host_file->GetFileMapping();
@@ -969,6 +980,15 @@ s32 MemoryManager::MapFile(void** out_addr, VAddr virtual_addr, u64 size, Memory
 
     // Aquire writer lock
     std::scoped_lock lk2{mutex};
+
+    // A file without read access has nothing the host could map; the area behaves like a reserved
+    // one, which keeps mprotect from granting access (see above).
+    if (write_only) {
+        auto area =
+            CreateArea(virtual_addr, size, MemoryProt::NoAccess, flags, VMAType::Reserved, name, 0);
+        *out_addr = std::bit_cast<void*>(area->second.base);
+        return ORBIS_OK;
+    }
 
     // Update VMA map and map to address space.
     auto new_vma_handle = CreateArea(virtual_addr, size, prot, flags, VMAType::File, name, 0);
@@ -1284,9 +1304,10 @@ s64 MemoryManager::ProtectBytes(VAddr addr, VirtualMemoryArea& vma_base, u64 siz
     const auto start_in_vma = addr - vma_base.base;
     const auto adjusted_size = std::min<u64>(vma_base.size - start_in_vma, size);
     const MemoryProt old_prot = vma_base.prot;
-    // Measured on hardware: direct and pool memory never become executable; the bit is dropped and
-    // the call still succeeds.
-    if (vma_base.type == VMAType::Direct || vma_base.type == VMAType::Pooled) {
+    // Measured on hardware by running code: pool memory given execute does not run it (the process
+    // is killed), so the bit is dropped and the call still succeeds. Direct memory does run it
+    // while hiding execute from the queries, which the code below handles.
+    if (vma_base.type == VMAType::Pooled) {
         prot &= ~MemoryProt::CpuExec;
     }
     const MemoryProt new_prot = prot;

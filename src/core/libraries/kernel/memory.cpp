@@ -584,7 +584,10 @@ s32 PS4_SYSV_ABI sceKernelDirectMemoryQuery(u64 offset, s32 flags, OrbisQueryInf
 
 s32 PS4_SYSV_ABI sceKernelAvailableFlexibleMemorySize(u64* out_size) {
     auto* memory = Core::Memory::Instance();
-    *out_size = memory->GetAvailableFlexibleSize();
+    // Measured on hardware: the size is reported rounded up to 1 MiB, so it only drops once the
+    // flexible memory in use crosses a 1 MiB boundary (64 KiB: 0, 16 x 64 KiB: 1 MiB, 17 x 64 KiB:
+    // 1 MiB, 2 MiB + 16 KiB: 2 MiB).
+    *out_size = Common::AlignUp(memory->GetAvailableFlexibleSize(), 1_MB);
     LOG_INFO(Kernel_Vmm, "called size = {:#x}", *out_size);
     return ORBIS_OK;
 }
