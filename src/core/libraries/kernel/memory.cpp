@@ -53,7 +53,8 @@ s32 PS4_SYSV_ABI sceKernelAllocateDirectMemory(s64 searchStart, s64 searchEnd, u
         LOG_ERROR(Kernel_Vmm, "Length {:#x} is invalid!", len);
         return ORBIS_KERNEL_ERROR_EINVAL;
     }
-    if (alignment != 0 && !Common::Is16KBAligned(alignment)) {
+    // Measured on hardware: a non-zero alignment must be a power of two of at least 16 KiB.
+    if (alignment != 0 && (!std::has_single_bit(alignment) || !Common::Is16KBAligned(alignment))) {
         LOG_ERROR(Kernel_Vmm, "Alignment {:#x} is invalid!", alignment);
         return ORBIS_KERNEL_ERROR_EINVAL;
     }
@@ -185,7 +186,7 @@ static s32 ReserveVirtualRangeImpl(void** addr, u64 len, s32 flags, u64 alignmen
     }
     if (alignment != 0) {
         if (!std::has_single_bit(alignment) || !Common::Is16KBAligned(alignment) ||
-            alignment > 0x8000'0000ULL) {
+            alignment >= 0x8000'0000ULL) {
             LOG_ERROR(Kernel_Vmm, "Alignment value is invalid!");
             return ORBIS_KERNEL_ERROR_EINVAL;
         }
@@ -193,11 +194,12 @@ static s32 ReserveVirtualRangeImpl(void** addr, u64 len, s32 flags, u64 alignmen
 
     auto* memory = Core::Memory::Instance();
     const VAddr in_addr = reinterpret_cast<VAddr>(*addr);
-    // Measured on hardware: flags 0x1, 0x2, 0x4, 0x8, 0x20, 0x40, 0x100, 0x400, 0x1000 and 0x2000
-    // are refused. Other flags (such as 0x400000, no-coalesce, used by games) are accepted.
-    constexpr s32 RefusedReserveFlags =
-        0x1 | 0x2 | 0x4 | 0x8 | 0x20 | 0x40 | 0x100 | 0x400 | 0x1000 | 0x2000;
-    if ((flags & RefusedReserveFlags) != 0) {
+    // Measured on hardware for each of the 32 flag bits: only fixed, no-overwrite and no-coalesce
+    // are accepted.
+    constexpr auto ValidReserveFlags = Core::MemoryMapFlags::Fixed |
+                                       Core::MemoryMapFlags::NoOverwrite |
+                                       Core::MemoryMapFlags::NoCoalesce;
+    if (True(static_cast<Core::MemoryMapFlags>(flags) & ~ValidReserveFlags)) {
         LOG_ERROR(Kernel_Vmm, "Invalid flags {:#x}", flags);
         return ORBIS_KERNEL_ERROR_EINVAL;
     }
@@ -261,6 +263,22 @@ s32 PS4_SYSV_ABI sceKernelMapNamedDirectMemory(void** addr, u64 len, s32 prot, s
     if (True(mem_prot & Core::MemoryProt::CpuExec)) {
         LOG_ERROR(Kernel_Vmm, "Executable permissions are not allowed.");
         return ORBIS_KERNEL_ERROR_EACCES;
+    }
+    // Measured on hardware for each of the 32 bits: other protection bits are refused, and the
+    // flags are limited to fixed, no-overwrite, DmemCompat (0x400) and no-coalesce.
+    constexpr auto ValidProt = Core::MemoryProt::CpuRead | Core::MemoryProt::CpuWrite |
+                               Core::MemoryProt::CpuExec | Core::MemoryProt::GpuRead |
+                               Core::MemoryProt::GpuWrite;
+    if (True(mem_prot & ~ValidProt)) {
+        LOG_ERROR(Kernel_Vmm, "Invalid protection {:#x}", prot);
+        return ORBIS_KERNEL_ERROR_EINVAL;
+    }
+    constexpr auto ValidDirectFlags =
+        Core::MemoryMapFlags::Fixed | Core::MemoryMapFlags::NoOverwrite |
+        Core::MemoryMapFlags::Stack | Core::MemoryMapFlags::NoCoalesce;
+    if (True(static_cast<Core::MemoryMapFlags>(flags) & ~ValidDirectFlags)) {
+        LOG_ERROR(Kernel_Vmm, "Invalid flags {:#x}", flags);
+        return ORBIS_KERNEL_ERROR_EINVAL;
     }
 
     auto map_flags = static_cast<Core::MemoryMapFlags>(flags);
@@ -365,6 +383,22 @@ s32 PS4_SYSV_ABI sceKernelMapNamedFlexibleMemory(void** addr_in_out, u64 len, s3
     const VAddr in_addr = reinterpret_cast<VAddr>(*addr_in_out);
     const auto mem_prot = static_cast<Core::MemoryProt>(prot);
     auto map_flags = static_cast<Core::MemoryMapFlags>(flags);
+    // Measured on hardware for each of the 32 bits: other protection bits are refused, and the
+    // flags are limited to fixed, no-overwrite and no-coalesce.
+    constexpr auto ValidProt = Core::MemoryProt::CpuRead | Core::MemoryProt::CpuWrite |
+                               Core::MemoryProt::CpuExec | Core::MemoryProt::GpuRead |
+                               Core::MemoryProt::GpuWrite;
+    if (True(mem_prot & ~ValidProt)) {
+        LOG_ERROR(Kernel_Vmm, "Invalid protection {:#x}", prot);
+        return ORBIS_KERNEL_ERROR_EINVAL;
+    }
+    constexpr auto ValidFlexibleFlags = Core::MemoryMapFlags::Fixed |
+                                        Core::MemoryMapFlags::NoOverwrite |
+                                        Core::MemoryMapFlags::NoCoalesce;
+    if (True(map_flags & ~ValidFlexibleFlags)) {
+        LOG_ERROR(Kernel_Vmm, "Invalid flags {:#x}", flags);
+        return ORBIS_KERNEL_ERROR_EINVAL;
+    }
     auto* memory = Core::Memory::Instance();
 
     if (True(map_flags & Core::MemoryMapFlags::Fixed) && in_addr == 0) {
@@ -442,9 +476,12 @@ s32 PS4_SYSV_ABI sceKernelMprotect(const void* addr, u64 size, s32 prot) {
     }
 
     Core::MemoryManager* memory_manager = Core::Memory::Instance();
-    // Measured on hardware: bits 0x8, 0x40, 0x80, 0x100, 0x200 and 0x400 are dropped.
-    constexpr s32 DroppedProtBits = 0x8 | 0x40 | 0x80 | 0x100 | 0x200 | 0x400;
-    Core::MemoryProt protection_flags = static_cast<Core::MemoryProt>(prot & ~DroppedProtBits);
+    // Measured on hardware for each of the 32 bits: CPU read/write/execute and GPU read/write are
+    // kept, every other bit is dropped and the call still succeeds.
+    constexpr auto KeptProt = Core::MemoryProt::CpuRead | Core::MemoryProt::CpuWrite |
+                              Core::MemoryProt::CpuExec | Core::MemoryProt::GpuRead |
+                              Core::MemoryProt::GpuWrite;
+    Core::MemoryProt protection_flags = static_cast<Core::MemoryProt>(prot) & KeptProt;
 
     s32 result = memory_manager->Protect(aligned_addr, aligned_size, protection_flags);
     if (result == ORBIS_OK) {
@@ -475,6 +512,16 @@ s32 PS4_SYSV_ABI sceKernelMtypeprotect(const void* addr, u64 size, s32 mtype, s3
         LOG_ERROR(Kernel_Vmm, "Memory type {} is invalid", mtype);
         return ORBIS_KERNEL_ERROR_EINVAL;
     }
+    // Measured on hardware for each of the 32 bits: 0x8, 0x40 and 0x80 are refused, execute is
+    // EACCES, and bits from 0x100 up are dropped.
+    if ((prot & (0x8 | 0x40 | 0x80)) != 0) {
+        LOG_ERROR(Kernel_Vmm, "Invalid protection {:#x}", prot);
+        return ORBIS_KERNEL_ERROR_EINVAL;
+    }
+    if (True(static_cast<Core::MemoryProt>(prot) & Core::MemoryProt::CpuExec)) {
+        LOG_ERROR(Kernel_Vmm, "Executable permissions are not allowed.");
+        return ORBIS_KERNEL_ERROR_EACCES;
+    }
 
     // Align addr and size to the nearest page boundary.
     const VAddr in_addr = reinterpret_cast<VAddr>(addr);
@@ -486,7 +533,9 @@ s32 PS4_SYSV_ABI sceKernelMtypeprotect(const void* addr, u64 size, s32 mtype, s3
         return ORBIS_OK;
     }
     Core::MemoryManager* memory_manager = Core::Memory::Instance();
-    Core::MemoryProt protection_flags = static_cast<Core::MemoryProt>(prot);
+    Core::MemoryProt protection_flags =
+        static_cast<Core::MemoryProt>(prot) &
+        (Core::MemoryProt::CpuReadWrite | Core::MemoryProt::GpuReadWrite);
 
     // Measured on hardware: flexible memory has no memory type to change (measured for a range of
     // flexible memory). The call is refused before anything changes.
@@ -700,7 +749,8 @@ static s32 MemoryPoolReserveImpl(void* addr_in, u64 len, u64 alignment, s32 flag
     }
     // Measured on hardware: a non-zero alignment must be a power of two from 2 MiB to 1 GiB, and a
     // fixed reservation needs a non-zero, 2 MiB aligned address.
-    if (alignment != 0 &&
+    // Measured on hardware: an alignment of 1 is accepted too.
+    if (alignment > 1 &&
         (!std::has_single_bit(alignment) || alignment < 2_MB || alignment > 1_GB)) {
         LOG_ERROR(Kernel_Vmm, "Alignment value is invalid!");
         return ORBIS_KERNEL_ERROR_EINVAL;
@@ -718,7 +768,7 @@ static s32 MemoryPoolReserveImpl(void* addr_in, u64 len, u64 alignment, s32 flag
     auto* memory = Core::Memory::Instance();
     const VAddr in_addr = reinterpret_cast<VAddr>(addr_in);
     const auto map_flags = static_cast<Core::MemoryMapFlags>(flags);
-    u64 map_alignment = alignment == 0 ? 2_MB : alignment;
+    u64 map_alignment = alignment <= 1 ? 2_MB : alignment;
 
     return memory->PoolReserve(addr_out, in_addr, len, map_flags, map_alignment, name);
 }
@@ -753,6 +803,17 @@ s32 PS4_SYSV_ABI sceKernelMemoryPoolCommit(void* addr, u64 len, s32 type, s32 pr
     }
 
     const auto mem_prot = static_cast<Core::MemoryProt>(prot);
+    // Measured on hardware for each of the 32 bits: no flag is accepted, and protection bits other
+    // than CPU and GPU read/write are refused.
+    if (flags != 0) {
+        LOG_ERROR(Kernel_Vmm, "Invalid flags {:#x}", flags);
+        return ORBIS_KERNEL_ERROR_EINVAL;
+    }
+    if (True(mem_prot & ~(Core::MemoryProt::CpuReadWrite | Core::MemoryProt::GpuReadWrite |
+                          Core::MemoryProt::CpuExec))) {
+        LOG_ERROR(Kernel_Vmm, "Invalid protection {:#x}", prot);
+        return ORBIS_KERNEL_ERROR_EINVAL;
+    }
     if (True(mem_prot & Core::MemoryProt::CpuExec)) {
         LOG_ERROR(Kernel_Vmm, "Executable permissions are not allowed.");
         return ORBIS_KERNEL_ERROR_EINVAL;
@@ -786,6 +847,11 @@ s32 PS4_SYSV_ABI sceKernelMemoryPoolDecommit(void* addr, u64 len, s32 flags) {
         LOG_ERROR(Kernel_Vmm, "Address is invalid!");
         return ORBIS_KERNEL_ERROR_EINVAL;
     }
+    // Measured on hardware for each of the 32 bits: no flag is accepted.
+    if (flags != 0) {
+        LOG_ERROR(Kernel_Vmm, "Invalid flags {:#x}", flags);
+        return ORBIS_KERNEL_ERROR_EINVAL;
+    }
     if (len == 0) {
         return ORBIS_OK;
     }
@@ -805,6 +871,11 @@ s32 PS4_SYSV_ABI sceKernelMemoryPoolDecommit(void* addr, u64 len, s32 flags) {
 s32 PS4_SYSV_ABI sceKernelMemoryPoolBatch(const OrbisKernelMemoryPoolBatchEntry* entries, s32 count,
                                           s32* num_processed, s32 flags) {
     if (entries == nullptr) {
+        return ORBIS_KERNEL_ERROR_EINVAL;
+    }
+    // Measured on hardware for each of the 32 bits: no flag is accepted.
+    if (flags != 0) {
+        LOG_ERROR(Kernel_Vmm, "Invalid flags {:#x}", flags);
         return ORBIS_KERNEL_ERROR_EINVAL;
     }
     s32 result = ORBIS_OK;
@@ -906,12 +977,17 @@ static void* PosixMmapImpl(void* addr, u64 len, s32 prot, s32 flags, s32 fd, s64
 
     s32 result = ORBIS_OK;
     if (True(mem_flags & Core::MemoryMapFlags::Anon)) {
+        // Measured on hardware for each of the 32 bits: an anonymous mapping keeps CPU
+        // read/write/execute and GPU read/write and drops every other protection bit.
+        constexpr auto KeptProt = Core::MemoryProt::CpuRead | Core::MemoryProt::CpuWrite |
+                                  Core::MemoryProt::CpuExec | Core::MemoryProt::GpuRead |
+                                  Core::MemoryProt::GpuWrite;
         // Maps flexible or system memory
         const Core::VMAType mapping_type = True(mem_flags & Core::MemoryMapFlags::System)
                                                ? Core::VMAType::System
                                                : Core::VMAType::Flexible;
-        result = memory->MapMemory(&addr_out, aligned_addr, aligned_size, mem_prot, mem_flags,
-                                   mapping_type, name, false);
+        result = memory->MapMemory(&addr_out, aligned_addr, aligned_size, mem_prot & KeptProt,
+                                   mem_flags, mapping_type, name, false);
     } else if (True(mem_flags & Core::MemoryMapFlags::Stack)) {
         // Maps stack memory
         result = memory->MapMemory(&addr_out, aligned_addr, aligned_size, mem_prot, mem_flags,

@@ -1548,26 +1548,12 @@ s32 MemoryManager::DirectQueryAvailable(PAddr search_start, PAddr search_end, u6
             continue;
         }
 
-        auto aligned_base = alignment > 0 ? Common::AlignUp(dmem_area->second.base, alignment)
-                                          : dmem_area->second.base;
-        const auto alignment_size = aligned_base - dmem_area->second.base;
-        auto remaining_size =
-            dmem_area->second.size >= alignment_size ? dmem_area->second.size - alignment_size : 0;
-
-        if (dmem_area->second.base < search_start) {
-            // We need to trim remaining_size to ignore addresses before search_start
-            remaining_size = remaining_size > (search_start - dmem_area->second.base)
-                                 ? remaining_size - (search_start - dmem_area->second.base)
-                                 : 0;
-            aligned_base = alignment > 0 ? Common::AlignUp(search_start, alignment) : search_start;
-        }
-
-        if (dmem_area->second.GetEnd() > search_end) {
-            // We need to trim remaining_size to ignore addresses beyond search_end
-            remaining_size = remaining_size > (dmem_area->second.GetEnd() - search_end)
-                                 ? remaining_size - (dmem_area->second.GetEnd() - search_end)
-                                 : 0;
-        }
+        // Measured on hardware: the free part inside the search window, from its start aligned up
+        // to the alignment (at least 16 KiB) to its unaligned end.
+        const PAddr start = std::max<PAddr>(dmem_area->second.base, search_start);
+        const PAddr end = std::min<PAddr>(dmem_area->second.GetEnd(), search_end);
+        const PAddr aligned_base = Common::AlignUp(start, std::max<u64>(alignment, 16_KB));
+        const u64 remaining_size = end > aligned_base ? end - aligned_base : 0;
 
         if (remaining_size > max_size) {
             paddr = aligned_base;
