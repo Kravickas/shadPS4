@@ -169,7 +169,16 @@ s32 PS4_SYSV_ABI sceKernelVirtualQuery(const void* addr, s32 flags, OrbisVirtual
                                        u64 infoSize) {
     LOG_INFO(Kernel_Vmm, "called addr = {}, flags = {:#x}", fmt::ptr(addr), flags);
     auto* memory = Core::Memory::Instance();
-    return memory->VirtualQuery(std::bit_cast<VAddr>(addr), flags, info);
+    // Measured on hardware (DmemTest VQ9-VQ14): addresses from 0x7F0000000 up to 0xFF0000000 are
+    // refused with EACCES, mapped or not, with either flag (0x7EFFFC000 and 0xFF0000000 are
+    // answered). On the PS4 every module but the executable (system and game-bundled), the main
+    // thread's TLS and the GnmDriver area at 0xFE0000000 are in this range; what is placed here
+    // (system modules, the GnmDriver area) has its PS4 counterpart in it as well.
+    const VAddr query_addr = std::bit_cast<VAddr>(addr);
+    if (query_addr >= 0x7F0000000ULL && query_addr < 0xFF0000000ULL) {
+        return ORBIS_KERNEL_ERROR_EACCES;
+    }
+    return memory->VirtualQuery(query_addr, flags, info);
 }
 
 static s32 ReserveVirtualRangeImpl(void** addr, u64 len, s32 flags, u64 alignment,
