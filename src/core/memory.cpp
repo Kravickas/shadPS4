@@ -494,6 +494,7 @@ s32 MemoryManager::Free(PAddr phys_addr, u64 size, bool is_checked) {
         auto& new_dmem_area = dmem_handle->second;
         new_dmem_area.dma_type = PhysicalMemoryType::Free;
         new_dmem_area.memory_type = 0;
+        new_dmem_area.type_from_map2 = false;
 
         // Merge the new dmem_area with dmem_map
         MergeAdjacent(dmem_map, dmem_handle);
@@ -928,16 +929,17 @@ s32 MemoryManager::MapFile(void** out_addr, VAddr virtual_addr, u64 size, Memory
 
         if (False(host_file->GetAccessMode() & Common::FS::FileAccessMode::Write) &&
             False(host_file->GetAccessMode() & Common::FS::FileAccessMode::Append)) {
-            // If the file does not have write access, ensure prot does not contain write
-            // permissions. On real hardware, these mappings succeed, but the memory cannot be
-            // written to.
-            // Measured on hardware: a shared mapping with write access is EACCES.
-            if (True(flags & MemoryMapFlags::Shared) && True(prot & MemoryProt::CpuWrite)) {
-                LOG_ERROR(Kernel_Vmm, "Shared writable mapping of a file without write access");
-                return ORBIS_KERNEL_ERROR_EACCES;
+            // Measured on hardware (DmemTest TF4, TF5) for a file without write access: a shared
+            // mapping with write access is EACCES, and a shared read-only one cannot be made
+            // writable later; a private mapping is a writable copy (see below), read-write from
+            // the start or after mprotect.
+            if (True(flags & MemoryMapFlags::Shared)) {
+                if (True(prot & MemoryProt::CpuWrite)) {
+                    LOG_ERROR(Kernel_Vmm, "Shared writable mapping of a file without write access");
+                    return ORBIS_KERNEL_ERROR_EACCES;
+                }
+                read_only_file = true;
             }
-            prot &= ~MemoryProt::CpuWrite;
-            read_only_file = true;
         }
 
         // Measured on hardware: a file opened without read access can only be mapped without CPU
@@ -1008,8 +1010,9 @@ s32 MemoryManager::MapFile(void** out_addr, VAddr virtual_addr, u64 size, Memory
 
     auto& new_vma = new_vma_handle->second;
     new_vma.fd = fd;
-    // Only a shared mapping stays tied to the file; a private one is a copy (below).
-    new_vma.file_read_only = read_only_file && True(flags & MemoryMapFlags::Shared);
+    // Set for a shared mapping of a host file without write access, and for non-host backends
+    // (read-only); a private mapping of a host file is a writable copy (below).
+    new_vma.file_read_only = read_only_file;
     auto mapped_addr = new_vma.base;
 
     // Delegate the actual mapping to the file backend.
@@ -1324,9 +1327,11 @@ s32 MemoryManager::QueryProtection(VAddr addr, void** start, void** end, u32* pr
     if (prot != nullptr) {
         // Measured on hardware: this query reports committed pool memory as CPU and GPU read/write.
         // The protection it really has, which VirtualQuery reports, is the one it was given.
+        // A range from ReserveVirtualRange reads back 0 whatever mprotect gave it (RV4).
         *prot = vma.type == VMAType::Pooled
                     ? static_cast<u32>(MemoryProt::CpuReadWrite | MemoryProt::GpuReadWrite)
-                    : static_cast<u32>(vma.prot);
+                : vma.type == VMAType::Reserved ? 0u
+                                                : static_cast<u32>(vma.prot);
     }
 
     return ORBIS_OK;
@@ -1351,10 +1356,10 @@ s64 MemoryManager::ProtectBytes(VAddr addr, VirtualMemoryArea& vma_base, u64 siz
     }
     const MemoryProt new_prot = prot;
 
-    // Measured on hardware: protecting a range from ReserveVirtualRange succeeds and leaves it
-    // inaccessible.
-    if (vma_base.type == VMAType::Free || vma_base.type == VMAType::PoolReserved ||
-        vma_base.type == VMAType::Reserved) {
+    // Measured on hardware (DmemTest RV4, PT1): protecting a range from ReserveVirtualRange
+    // succeeds and leaves it inaccessible, but splits and merges its areas by the requested
+    // protection (handled below; QueryProtection reports it as 0).
+    if (vma_base.type == VMAType::Free || vma_base.type == VMAType::PoolReserved) {
         // On PS4, protecting freed memory does nothing.
         return adjusted_size;
     }
@@ -1397,7 +1402,11 @@ s64 MemoryManager::ProtectBytes(VAddr addr, VirtualMemoryArea& vma_base, u64 siz
     const auto new_it = CarveVMA(addr, adjusted_size);
     auto& new_vma = new_it->second;
     new_vma.prot = prot;
-    MergeAdjacent(vma_map, new_it);
+    // Measured on hardware (DmemTest FW2, TP2): direct mappings split by a protection change do not
+    // merge again.
+    if (vma_base.type != VMAType::Direct) {
+        MergeAdjacent(vma_map, new_it);
+    }
 
     if (vma_base.type == VMAType::Reserved) {
         // On PS4, protections change vma_map, but don't apply.
@@ -1501,7 +1510,8 @@ s32 MemoryManager::VirtualQuery(VAddr addr, s32 flags,
     info->end = vma.base + vma.size;
     info->offset = 0;
     info->protection = static_cast<s32>(vma.prot);
-    info->is_flexible = vma.type == VMAType::Flexible ? 1 : 0;
+    // Measured on hardware (DmemTest SF5): an anonymous mapping with MAP_SYSTEM reports flexible.
+    info->is_flexible = vma.type == VMAType::Flexible || vma.type == VMAType::System ? 1 : 0;
     info->is_direct = vma.type == VMAType::Direct ? 1 : 0;
     info->is_stack = vma.type == VMAType::Stack ? 1 : 0;
     info->is_pooled = vma.type == VMAType::PoolReserved || vma.type == VMAType::Pooled ? 1 : 0;
@@ -1678,7 +1688,8 @@ bool MemoryManager::ContainsFlexibleMemory(VAddr addr, u64 size) {
     return false;
 }
 
-s32 MemoryManager::SetDirectMemoryType(VAddr addr, u64 size, s32 memory_type) {
+s32 MemoryManager::SetDirectMemoryType(VAddr addr, u64 size, s32 memory_type,
+                                       bool from_map_direct2) {
     std::scoped_lock lk{mutex, unmap_mutex};
 
     ASSERT_MSG(IsValidMapping(addr, size), "Attempted to access invalid address {:#x}", addr);
@@ -1734,6 +1745,14 @@ s32 MemoryManager::SetDirectMemoryType(VAddr addr, u64 size, s32 memory_type) {
                     CarvePhysArea(dmem_map, phys_handle->second.base, phys_handle->second.size);
                 auto& dmem_area = dmem_handle->second;
                 dmem_area.memory_type = reported_type;
+                // Measured on hardware: a type set by MapDirectMemory2 keeps the area apart from
+                // its neighbours (DT5, DT7, DT8); a type set by mtypeprotect lets direct memory
+                // areas of the same type merge (TP2).
+                if (from_map_direct2) {
+                    dmem_area.type_from_map2 = true;
+                } else if (vma_handle->second.type == VMAType::Direct) {
+                    MergeAdjacent(dmem_map, dmem_handle);
+                }
 
                 // Increment phys_handle
                 phys_handle++;
@@ -1743,7 +1762,11 @@ s32 MemoryManager::SetDirectMemoryType(VAddr addr, u64 size, s32 memory_type) {
         remaining_size -= size_in_vma;
 
         // Check if VMA can be merged with adjacent areas after modifications.
-        vma_handle = MergeAdjacent(vma_map, vma_handle);
+        // Measured on hardware (DmemTest TP2, FW2): direct mappings split by a type change do not
+        // merge again.
+        if (vma_handle->second.type != VMAType::Direct) {
+            vma_handle = MergeAdjacent(vma_map, vma_handle);
+        }
         if (vma_handle->second.base + vma_handle->second.size <= current_addr) {
             // If we're now in the next VMA, then go to the next handle.
             vma_handle++;
@@ -1783,8 +1806,8 @@ void MemoryManager::NameVirtualRange(VAddr virtual_addr, u64 size, std::string_v
         remaining_size -= size_in_vma;
         current_addr += size_in_vma;
 
-        // Check if VMA can be merged with adjacent areas after modifications.
-        it = MergeAdjacent(vma_map, it);
+        // Measured on hardware (DmemTest CO1-CO8, FW6): a rename never merges areas, for any kind
+        // of mapping.
         if (it->second.base + it->second.size <= current_addr) {
             // If we're now in the next VMA, then go to the next handle.
             it++;

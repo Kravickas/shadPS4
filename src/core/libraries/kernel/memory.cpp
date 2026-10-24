@@ -222,6 +222,13 @@ static s32 ReserveVirtualRangeImpl(void** addr, u64 len, s32 flags, u64 alignmen
         LOG_ERROR(Kernel_Vmm, "Invalid flags {:#x}", flags);
         return ORBIS_KERNEL_ERROR_EINVAL;
     }
+    // Measured on hardware (DmemTest M4): a fixed reservation over a direct mapping is EINVAL, with
+    // or without no-overwrite.
+    if ((flags & static_cast<s32>(Core::MemoryMapFlags::Fixed)) != 0 &&
+        memory->ContainsVmaType(in_addr, len, Core::VMAType::Direct)) {
+        LOG_ERROR(Kernel_Vmm, "Fixed reservation over a direct mapping");
+        return ORBIS_KERNEL_ERROR_EINVAL;
+    }
     auto map_flags = static_cast<Core::MemoryMapFlags>(flags);
 
     if (True(map_flags & Core::MemoryMapFlags::Fixed) && in_addr == 0) {
@@ -410,7 +417,7 @@ s32 PS4_SYSV_ABI sceKernelMapDirectMemory2(void** addr, u64 len, s32 type, s32 p
         auto* memory = Core::Memory::Instance();
         const auto out_addr = reinterpret_cast<VAddr>(*addr);
         if (type != -1) {
-            memory->SetDirectMemoryType(out_addr, len, type);
+            memory->SetDirectMemoryType(out_addr, len, type, true);
         }
         LOG_INFO(Kernel_Vmm, "out_addr = {:#x}", out_addr);
     }
@@ -1103,8 +1110,15 @@ static void* PosixMmapImpl(void* addr, u64 len, s32 prot, s32 flags, s32 fd, s64
                               mem_flags, Core::VMAType::Reserved, "anon", false);
     } else {
         // Default to file mapping
-        result = memory->MapFile(&addr_out, aligned_addr, aligned_size, mem_prot, mem_flags, fd,
-                                 phys_addr, name);
+        // Measured on hardware (DmemTest FM2): an offset inside a page maps from the start of that
+        // page, the size grows by the offset within the page, and the address returned points at
+        // the requested offset.
+        const u64 page_offset = static_cast<u64>(phys_addr) & (16_KB - 1);
+        result = memory->MapFile(&addr_out, aligned_addr, Common::AlignUp(len + page_offset, 16_KB),
+                                 mem_prot, mem_flags, fd, phys_addr - page_offset, name);
+        if (result == ORBIS_OK) {
+            addr_out = static_cast<u8*>(addr_out) + page_offset;
+        }
     }
 
     if (result != ORBIS_OK) {

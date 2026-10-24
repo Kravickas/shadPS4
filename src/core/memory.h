@@ -78,6 +78,9 @@ struct PhysicalMemoryArea {
     u64 size = 0;
     s32 memory_type = 0;
     PhysicalMemoryType dma_type = PhysicalMemoryType::Free;
+    // The memory type was set by MapDirectMemory2. Measured on hardware (DmemTest DT5, DT7, DT8):
+    // such an area never merges with its neighbours again, until it is released.
+    bool type_from_map2 = false;
 
     PAddr GetEnd() const {
         return base + size;
@@ -85,6 +88,9 @@ struct PhysicalMemoryArea {
 
     bool CanMergeWith(const PhysicalMemoryArea& next) const {
         if (base + size != next.base) {
+            return false;
+        }
+        if (type_from_map2 || next.type_from_map2) {
             return false;
         }
         if (memory_type != next.memory_type) {
@@ -331,7 +337,7 @@ public:
 
     bool IsRangeMapped(VAddr addr, u64 size);
 
-    s32 SetDirectMemoryType(VAddr addr, u64 size, s32 memory_type);
+    s32 SetDirectMemoryType(VAddr addr, u64 size, s32 memory_type, bool from_map_direct2 = false);
 
     void NameVirtualRange(VAddr virtual_addr, u64 size, std::string_view name);
 
