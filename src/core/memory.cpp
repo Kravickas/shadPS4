@@ -1008,7 +1008,8 @@ s32 MemoryManager::MapFile(void** out_addr, VAddr virtual_addr, u64 size, Memory
 
     auto& new_vma = new_vma_handle->second;
     new_vma.fd = fd;
-    new_vma.file_read_only = read_only_file;
+    // Only a shared mapping stays tied to the file; a private one is a copy (below).
+    new_vma.file_read_only = read_only_file && True(flags & MemoryMapFlags::Shared);
     auto mapped_addr = new_vma.base;
 
     // Delegate the actual mapping to the file backend.
@@ -1038,8 +1039,26 @@ s32 MemoryManager::MapFile(void** out_addr, VAddr virtual_addr, u64 size, Memory
         impl.Protect(reinterpret_cast<VAddr>(addr), sz, perms);
     };
 
-    file->handle->Map(reinterpret_cast<u8*>(mapped_addr), size, phys_addr, std::bit_cast<u32>(prot),
-                      map_ctx);
+    // Measured on hardware (DmemTest FM1, TF2, TF4): a private mapping is a copy of the file taken
+    // when it is mapped. Writes to the file afterwards do not show in it (even in pages never
+    // touched), writes to it do not reach the file, and it can be made writable even when the file
+    // cannot be written. Host files are copied in the way other backends populate mappings.
+    if (host_file != nullptr && False(flags & MemoryMapFlags::Shared)) {
+        u8* const dst = reinterpret_cast<u8*>(mapped_addr);
+        map_ctx.map_anonymous(dst, size);
+        const u64 offset = static_cast<u64>(phys_addr);
+        const u64 to_read = file_size > offset ? std::min<u64>(size, file_size - offset) : 0;
+        if (to_read != 0) {
+            const u64 position = file->handle->Tell();
+            file->handle->Seek(phys_addr, Common::FS::SeekOrigin::SetOrigin);
+            file->handle->Read(dst, to_read);
+            file->handle->Seek(static_cast<s64>(position), Common::FS::SeekOrigin::SetOrigin);
+        }
+        map_ctx.protect(dst, size, std::bit_cast<u32>(prot));
+    } else {
+        file->handle->Map(reinterpret_cast<u8*>(mapped_addr), size, phys_addr,
+                          std::bit_cast<u32>(prot), map_ctx);
+    }
     if (prot != Core::MemoryProt::CpuRead) {
         // read-only mappings cannot be registered with userfaultfd in writeprotect mode
         rasterizer->RegisterMemory(mapped_addr, size);
