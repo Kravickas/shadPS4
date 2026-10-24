@@ -174,11 +174,21 @@ s32 PS4_SYSV_ABI sceKernelVirtualQuery(const void* addr, s32 flags, OrbisVirtual
     // answered). On the PS4 every module but the executable (system and game-bundled), the main
     // thread's TLS and the GnmDriver area at 0xFE0000000 are in this range; what is placed here
     // (system modules, the GnmDriver area) has its PS4 counterpart in it as well.
+    // A search for the next mapping (flag 1) from below the range is refused too when the mapping
+    // it finds starts in the range (DmemTest VQ15: a system module, and a page of the process's
+    // own at 0x7F0000000).
+    constexpr VAddr RefusedStart = 0x7F0000000ULL;
+    constexpr VAddr RefusedEnd = 0xFF0000000ULL;
     const VAddr query_addr = std::bit_cast<VAddr>(addr);
-    if (query_addr >= 0x7F0000000ULL && query_addr < 0xFF0000000ULL) {
+    if (query_addr >= RefusedStart && query_addr < RefusedEnd) {
         return ORBIS_KERNEL_ERROR_EACCES;
     }
-    return memory->VirtualQuery(query_addr, flags, info);
+    const s32 result = memory->VirtualQuery(query_addr, flags, info);
+    if (result == ORBIS_OK && flags == 1 && info->start >= RefusedStart &&
+        info->start < RefusedEnd) {
+        return ORBIS_KERNEL_ERROR_EACCES;
+    }
+    return result;
 }
 
 static s32 ReserveVirtualRangeImpl(void** addr, u64 len, s32 flags, u64 alignment,
