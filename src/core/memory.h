@@ -130,6 +130,11 @@ struct VirtualMemoryArea {
     // A file mapping whose file cannot be written (opened without write access, or a read-only
     // backend).
     bool file_read_only = false;
+    // File mappings: the file offset of the area's start, and whether it merges with neighbouring
+    // mappings of the same file. Measured on hardware (DmemTest CO5-CO7): shared and read-only
+    // private mappings merge when mapped; read-write private ones never merge.
+    u64 file_offset = 0;
+    bool file_merges = false;
 
     bool Contains(VAddr addr, u64 size) const {
         return addr >= base && (addr + size) <= (base + this->size);
@@ -169,6 +174,15 @@ struct VirtualMemoryArea {
             }
         }
         if (prot != next.prot || type != next.type) {
+            return false;
+        }
+        // Measured on hardware at SDK 4.508 (DmemTest CO1, CO9, FW6): anonymous flexible mappings
+        // never merge. From SDK 5.50 on, test_550 documents merging (ignore_anon_names).
+        if (type == VMAType::Flexible && !ignore_anon_names) {
+            return false;
+        }
+        if (type == VMAType::File && (!file_merges || !next.file_merges || fd != next.fd ||
+                                      next.file_offset != file_offset + size)) {
             return false;
         }
         // Measured on hardware: each pool reservation stays its own area.
@@ -307,6 +321,8 @@ public:
                 MemoryMapFlags flags, s32 fd, s64 phys_addr, std::string_view name = "anon");
 
     s32 PoolDecommit(VAddr virtual_addr, u64 size);
+
+    s32 PoolMove(VAddr dest_addr, VAddr src_addr, u64 size);
 
     s32 UnmapMemory(VAddr virtual_addr, u64 size);
 

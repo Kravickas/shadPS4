@@ -1013,6 +1013,9 @@ s32 MemoryManager::MapFile(void** out_addr, VAddr virtual_addr, u64 size, Memory
     // Set for a shared mapping of a host file without write access, and for non-host backends
     // (read-only); a private mapping of a host file is a writable copy (below).
     new_vma.file_read_only = read_only_file;
+    new_vma.file_offset = static_cast<u64>(phys_addr);
+    new_vma.file_merges =
+        True(flags & MemoryMapFlags::Shared) || False(prot & MemoryProt::CpuWrite);
     auto mapped_addr = new_vma.base;
 
     // Delegate the actual mapping to the file backend.
@@ -1066,6 +1069,10 @@ s32 MemoryManager::MapFile(void** out_addr, VAddr virtual_addr, u64 size, Memory
         // read-only mappings cannot be registered with userfaultfd in writeprotect mode
         rasterizer->RegisterMemory(mapped_addr, size);
     }
+
+    // Measured on hardware (DmemTest CO6, CO7): such mappings merge with their neighbours as they
+    // are mapped.
+    MergeAdjacent(vma_map, new_vma_handle);
 
     *out_addr = std::bit_cast<void*>(mapped_addr);
     return ORBIS_OK;
@@ -1155,6 +1162,93 @@ s32 MemoryManager::PoolDecommit(VAddr virtual_addr, u64 size) {
     // Tracy memory tracking breaks from merging memory areas. Disabled for now.
     // TRACK_FREE(virtual_addr, "VMEM");
 
+    return ORBIS_OK;
+}
+
+s32 MemoryManager::PoolMove(VAddr dest_addr, VAddr src_addr, u64 size) {
+    std::scoped_lock lk{unmap_mutex};
+    ASSERT_MSG(IsValidMapping(src_addr, size) && IsValidMapping(dest_addr, size),
+               "Attempted to access invalid address {:#x} or {:#x}", src_addr, dest_addr);
+    // The source must be committed and the destination reserved, both in pool memory. The PS4's
+    // error codes for other states are not measured yet (DmemTest PB5).
+    for (VAddr addr = src_addr; addr < src_addr + size;) {
+        const auto it = FindVMA(addr);
+        if (it == vma_map.end() || it->second.type != VMAType::Pooled) {
+            LOG_ERROR(Kernel_Vmm, "Move source {:#x} is not committed pool memory", addr);
+            return ORBIS_KERNEL_ERROR_EINVAL;
+        }
+        addr = it->second.base + it->second.size;
+    }
+    for (VAddr addr = dest_addr; addr < dest_addr + size;) {
+        const auto it = FindVMA(addr);
+        if (it == vma_map.end() || it->second.type != VMAType::PoolReserved) {
+            LOG_ERROR(Kernel_Vmm, "Move destination {:#x} is not reserved pool memory", addr);
+            return ORBIS_KERNEL_ERROR_EINVAL;
+        }
+        addr = it->second.base + it->second.size;
+    }
+    if (IsValidGpuMapping(src_addr, size)) {
+        rasterizer->UnmapMemory(src_addr, size);
+    }
+    std::unique_lock lk2{mutex};
+
+    // Measured on hardware (DmemTest PB3, PB4): the destination is committed with the source's
+    // physical memory (so its data), protection and type; the source is reserved again and reads
+    // back as CPU and GPU read/write; the pool block counters do not change.
+    struct Piece {
+        u64 offset;
+        u64 size;
+        PhysicalMemoryArea area;
+        MemoryProt prot;
+    };
+    std::vector<Piece> pieces;
+    u64 done = 0;
+    while (done < size) {
+        const auto handle = FindVMA(src_addr + done);
+        const auto& vma = handle->second;
+        const u64 start_in_vma = src_addr + done - vma.base;
+        const u64 size_in_vma = std::min<u64>(size - done, vma.size - start_in_vma);
+        auto phys = std::prev(vma.phys_areas.upper_bound(start_in_vma));
+        u64 pos = start_in_vma;
+        while (pos < start_in_vma + size_in_vma && phys != vma.phys_areas.end()) {
+            const u64 offset_in_area = pos - phys->first;
+            const u64 piece_size =
+                std::min<u64>(start_in_vma + size_in_vma - pos, phys->second.size - offset_in_area);
+            PhysicalMemoryArea area = phys->second;
+            area.base += offset_in_area;
+            area.size = piece_size;
+            pieces.push_back({done + (pos - start_in_vma), piece_size, area, vma.prot});
+            pos += piece_size;
+            ++phys;
+        }
+        const auto src_handle = CarveVMA(src_addr + done, size_in_vma);
+        auto& src_vma = src_handle->second;
+        src_vma.type = VMAType::PoolReserved;
+        src_vma.prot = MemoryProt::CpuReadWrite | MemoryProt::GpuReadWrite;
+        src_vma.phys_areas.clear();
+        done += size_in_vma;
+    }
+    u64 size_to_unmap = size;
+    const VAddr unmapped_addr = impl.Unmap(src_addr, &size_to_unmap);
+    rasterizer->RegisterMemory(unmapped_addr, size_to_unmap);
+
+    for (const auto& piece : pieces) {
+        const VAddr addr = dest_addr + piece.offset;
+        const auto dest_handle = CarveVMA(addr, piece.size);
+        auto& dest_vma = dest_handle->second;
+        dest_vma.type = VMAType::Pooled;
+        dest_vma.prot = piece.prot;
+        dest_vma.disallow_merge = false;
+        dest_vma.phys_areas.clear();
+        dest_vma.phys_areas[0] = piece.area;
+        impl.Map(addr, piece.size, piece.area.base);
+        rasterizer->RegisterMemory(addr, piece.size);
+    }
+
+    lk2.unlock();
+    if (IsValidGpuMapping(dest_addr, size)) {
+        rasterizer->MapMemory(dest_addr, size);
+    }
     return ORBIS_OK;
 }
 
@@ -1346,6 +1440,11 @@ s64 MemoryManager::ProtectBytes(VAddr addr, VirtualMemoryArea& vma_base, u64 siz
     // is killed), so the bit is dropped and the call still succeeds. Direct memory does run it
     // while hiding execute from the queries, which the code below handles.
     if (vma_base.type == VMAType::Pooled) {
+        prot &= ~MemoryProt::CpuExec;
+    }
+    // Measured on hardware by running code (DmemTest XR6, PT3): a file mapping given execute does
+    // not run it either; execute is dropped here too, also on the host.
+    if (vma_base.type == VMAType::File) {
         prot &= ~MemoryProt::CpuExec;
     }
     // Measured on hardware: a shared mapping of a file that cannot be written does not become

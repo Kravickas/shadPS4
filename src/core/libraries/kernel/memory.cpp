@@ -990,7 +990,17 @@ s32 PS4_SYSV_ABI sceKernelMemoryPoolBatch(const OrbisKernelMemoryPoolBatchEntry*
             break;
         }
         case OrbisKernelMemoryPoolOpcode::Move: {
-            UNREACHABLE_MSG("Unimplemented sceKernelMemoryPoolBatch opcode Move");
+            // Addresses and length are checked as for a commit (64 KiB).
+            const VAddr dest = reinterpret_cast<VAddr>(entry.move_params.dest_addr);
+            const VAddr src = reinterpret_cast<VAddr>(entry.move_params.src_addr);
+            const u64 len = entry.move_params.len;
+            if (!Common::Is64KBAligned(dest) || !Common::Is64KBAligned(src) ||
+                !Common::Is64KBAligned(len)) {
+                result = ORBIS_KERNEL_ERROR_EINVAL;
+            } else {
+                result = Core::Memory::Instance()->PoolMove(dest, src, len);
+            }
+            break;
         }
         default: {
             // Measured on hardware: an unknown opcode is EOPNOTSUPP.
@@ -1197,8 +1207,10 @@ s32 PS4_SYSV_ABI posix_mlock(const void* addr, u64 len) {
         return -1;
     }
 
-    // Measured on hardware: a range that is not all mapped is ENOMEM.
-    if (!Core::Memory::Instance()->IsRangeMapped(raw_addr, len)) {
+    // Measured on hardware: a range that is not all mapped is ENOMEM, and so is one with reserved
+    // memory in it (DmemTest CO2, CO3, CO8).
+    if (!Core::Memory::Instance()->IsRangeMapped(raw_addr, len) ||
+        Core::Memory::Instance()->ContainsVmaType(raw_addr, len, Core::VMAType::Reserved)) {
         *__Error() = POSIX_ENOMEM;
         return -1;
     }
