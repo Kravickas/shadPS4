@@ -1066,7 +1066,7 @@ void Translator::SetDst64(const InstOperand& operand, const IR::U64F64& value_ra
             if (runtime_info.props.dx10_clamp) {
                 value_untyped = ir.FPSaturate(value_untyped);
             } else {
-                value_untyped = ir.FPClamp(value_untyped, ir.Imm32(0.f), ir.Imm32(1.f));
+                value_untyped = ir.FPClamp(value_untyped, ir.Imm64(0.0), ir.Imm64(1.0));
             }
         }
     }
