@@ -384,8 +384,6 @@ private:
     void SetCarryOut(const GcnInst& inst, const IR::U1& carry);
     IR::F32 LegacyMul(const IR::F32& a, const IR::F32& b);
     IR::U32 VMovRelSHelper(u32 src_vgprno, const IR::U32 m0);
-    IR::U32 ConvertF32ToNorm16(const IR::F32& value, bool is_signed);
-    IR::U32 ConvertF32ToF16Rtz(const IR::F32& value);
     void VMovRelDHelper(u32 dst_vgprno, const IR::U32 src_val, const IR::U32 m0);
 
     void ExportRenderTarget(const GcnInst& inst);

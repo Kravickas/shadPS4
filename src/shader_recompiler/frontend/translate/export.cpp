@@ -137,7 +137,6 @@ void Translator::ExportRenderTarget(const GcnInst& inst) {
     }
 
     if (mrt == IR::Attribute::RenderTarget0 && runtime_info.hw.fs.alpha_to_mask_enable) {
-        // Compressed exports enable B and A together with bit 2
         IR::U32 level = ir.Imm32(0u);
         if (exp.compr ? (exp.en & 4) : (exp.en & 8)) {
             level =
@@ -209,7 +208,6 @@ void Translator::ExportRenderTarget(const GcnInst& inst) {
     }
 }
 
-// The low 2^MASK_EXPORT_NUM_SAMPLES bits of the exported mask repeat over the MSAA samples.
 IR::U32 Translator::ExportedSampleMask(const IR::U32& mask) {
     const auto& fs = runtime_info.hw.fs;
     if (fs.mask_export_num_samples >= fs.msaa_num_samples) {
@@ -260,7 +258,6 @@ void Translator::ExportDepth(const GcnInst& inst) {
         }
     }
 
-    // With DEPTH_BEFORE_SHADER the depth test ignores the Z and stencil exports
     if (!runtime_info.hw.fs.depth_before_shader) {
         if (!components[0].IsEmpty()) {
             ir.SetAttribute(IR::Attribute::Depth, components[0]);

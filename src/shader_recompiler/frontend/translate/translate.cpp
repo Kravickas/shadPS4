@@ -179,8 +179,6 @@ void Translator::EmitPrologue(IR::Block* first_block) {
             });
         const auto addr_flags = runtime_info.hw.fs.addr_flags;
         const auto en_flags = runtime_info.hw.fs.en_flags;
-        // PA_SC_AA_MASK differs per quad pixel: the pipeline keeps the samples any pixel uses,
-        // pixels without samples don't run the shader
         std::optional<IR::U32> aa_mask;
         if (runtime_info.hw.fs.aa_mask_per_pixel) {
             const auto& masks = runtime_info.hw.fs.aa_mask;

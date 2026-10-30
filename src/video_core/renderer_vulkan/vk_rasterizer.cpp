@@ -1347,7 +1347,6 @@ void Rasterizer::UpdateViewportScissorState() const {
     boost::container::static_vector<vk::Viewport, AmdGpu::NUM_VIEWPORTS> viewports;
     boost::container::static_vector<vk::Rect2D, AmdGpu::NUM_VIEWPORTS> scissors;
 
-    // VTX_WINDOW_OFFSET_ENABLE adds PA_SC_WINDOW_OFFSET to the vertex screen positions
     const bool window_offset = regs.polygon_control.enable_window_offset;
     const float window_x = window_offset ? float(regs.window_offset.window_x_offset) : 0.f;
     const float window_y = window_offset ? float(regs.window_offset.window_y_offset) : 0.f;
