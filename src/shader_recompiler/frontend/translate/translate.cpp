@@ -242,6 +242,18 @@ void Translator::EmitPrologue(IR::Block* first_block) {
                 ir.SetVectorReg(dst_vreg++, ir.Imm32(0));
             }
         }
+        if (runtime_info.hw.fs.aa_mask_per_pixel) {
+            // PA_SC_AA_MASK differs per quad pixel: the pipeline keeps the samples any pixel uses
+            const auto& aa_mask = runtime_info.hw.fs.aa_mask;
+            const IR::U32 x{ir.ConvertFToU(32, ir.GetAttribute(IR::Attribute::FragCoord, 0))};
+            const IR::U32 y{ir.ConvertFToU(32, ir.GetAttribute(IR::Attribute::FragCoord, 1))};
+            const IR::U32 row{ir.Select(ir.IEqual(ir.BitwiseAnd(y, ir.Imm32(1u)), ir.Imm32(0u)),
+                                        ir.Imm32(u32{aa_mask[0]} | (u32{aa_mask[1]} << 16)),
+                                        ir.Imm32(u32{aa_mask[2]} | (u32{aa_mask[3]} << 16)))};
+            const IR::U32 offset{ir.ShiftLeftLogical(ir.BitwiseAnd(x, ir.Imm32(1u)), ir.Imm32(4u))};
+            const IR::U32 mask{ir.BitFieldExtract(row, offset, ir.Imm32(16u))};
+            ir.SetAttribute(IR::Attribute::SampleMask, ir.BitCast<IR::F32>(mask));
+        }
         break;
     }
     case SwStage::TessellationControl: {

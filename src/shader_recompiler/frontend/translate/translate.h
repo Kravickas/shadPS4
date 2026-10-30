@@ -1,4 +1,4 @@
-// SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
+// SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #pragma once
@@ -388,6 +388,9 @@ private:
 
     void ExportRenderTarget(const GcnInst& inst);
     void ExportDepth(const GcnInst& inst);
+    IR::U32 AlphaToMaskLevel(const IR::F32& alpha);
+    IR::U32 AlphaToMaskLevel(const IR::U32& packed, AmdGpu::ShaderExportFormat format);
+    void ExportAlphaToMask(const IR::U32& level);
     void LogMissingOpcode(const GcnInst& inst);
 
     IR::VectorReg GetScratchVgpr(u32 offset);
