@@ -219,7 +219,8 @@ struct HwFragmentRuntimeInfo {
     u32 alpha_to_mask_offsets : 12; // 3 bits per quad pixel
     AmdGpu::ShaderExportFormat mrt0_export_format : 4;
     u32 aa_mask_per_pixel : 1;
-    u32 : 6;
+    u32 mask_export_num_samples : 3;
+    u32 : 3;
     std::array<u16, 4> aa_mask;
 
     bool operator==(const HwFragmentRuntimeInfo& other) const noexcept {
@@ -239,6 +240,7 @@ struct HwFragmentRuntimeInfo {
                alpha_to_mask_offsets == other.alpha_to_mask_offsets &&
                mrt0_export_format == other.mrt0_export_format &&
                aa_mask_per_pixel == other.aa_mask_per_pixel && aa_mask == other.aa_mask &&
+               mask_export_num_samples == other.mask_export_num_samples &&
                std::ranges::equal(inputs.begin(), inputs.begin() + num_inputs, other.inputs.begin(),
                                   other.inputs.begin() + num_inputs);
     }

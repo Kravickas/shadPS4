@@ -1347,11 +1347,10 @@ void Rasterizer::UpdateViewportScissorState() const {
     boost::container::static_vector<vk::Viewport, AmdGpu::NUM_VIEWPORTS> viewports;
     boost::container::static_vector<vk::Rect2D, AmdGpu::NUM_VIEWPORTS> scissors;
 
-    if (regs.polygon_control.enable_window_offset &&
-        (regs.window_offset.window_x_offset != 0 || regs.window_offset.window_y_offset != 0)) {
-        LOG_ERROR(Render_Vulkan,
-                  "PA_SU_SC_MODE_CNTL.VTX_WINDOW_OFFSET_ENABLE support is not yet implemented.");
-    }
+    // VTX_WINDOW_OFFSET_ENABLE adds PA_SC_WINDOW_OFFSET to the vertex screen positions
+    const bool window_offset = regs.polygon_control.enable_window_offset;
+    const float window_x = window_offset ? float(regs.window_offset.window_x_offset) : 0.f;
+    const float window_y = window_offset ? float(regs.window_offset.window_y_offset) : 0.f;
 
     const auto& vp_ctl = regs.viewport_control;
     for (u32 i = 0; i < AmdGpu::NUM_VIEWPORTS; i++) {
@@ -1388,8 +1387,8 @@ void Rasterizer::UpdateViewportScissorState() const {
             // In case if clipping is disabled we patch the shader to convert vertex position
             // from screen space coordinates to NDC by defining a render space as full hardware
             // window range [0..16383, 0..16383] and setting the viewport to its size.
-            viewport.x = 0.f;
-            viewport.y = 0.f;
+            viewport.x = window_x;
+            viewport.y = window_y;
             viewport.width = float(std::min<u32>(instance.GetMaxViewportWidth(), 16_KB));
             viewport.height = float(std::min<u32>(instance.GetMaxViewportHeight(), 16_KB));
         } else {
@@ -1398,8 +1397,8 @@ void Rasterizer::UpdateViewportScissorState() const {
             const auto yoffset = vp_ctl.yoffset_enable ? vp.yoffset : 0.f;
             const auto yscale = vp_ctl.yscale_enable ? vp.yscale : 1.f;
 
-            viewport.x = xoffset - xscale;
-            viewport.y = yoffset - yscale;
+            viewport.x = xoffset - xscale + window_x;
+            viewport.y = yoffset - yscale + window_y;
             viewport.width = xscale * 2.0f;
             viewport.height = yscale * 2.0f;
         }

@@ -209,6 +209,20 @@ void Translator::ExportRenderTarget(const GcnInst& inst) {
     }
 }
 
+// The low 2^MASK_EXPORT_NUM_SAMPLES bits of the exported mask repeat over the MSAA samples.
+IR::U32 Translator::ExportedSampleMask(const IR::U32& mask) {
+    const auto& fs = runtime_info.hw.fs;
+    if (fs.mask_export_num_samples >= fs.msaa_num_samples) {
+        return mask;
+    }
+    const u32 num_samples = 1u << fs.mask_export_num_samples;
+    u32 repeat = 0;
+    for (u32 s = 0; s < (1u << fs.msaa_num_samples); s += num_samples) {
+        repeat |= 1u << s;
+    }
+    return ir.IMul(ir.BitwiseAnd(mask, ir.Imm32((1u << num_samples) - 1)), ir.Imm32(repeat));
+}
+
 void Translator::ExportDepth(const GcnInst& inst) {
     const auto& exp = inst.control.exp;
     if (exp.en == 0) {
@@ -246,13 +260,18 @@ void Translator::ExportDepth(const GcnInst& inst) {
         }
     }
 
-    static constexpr std::array MrtzBuiltins = {IR::Attribute::Depth, IR::Attribute::StencilRef,
-                                                IR::Attribute::SampleMask};
-    for (u32 i = 0; i < 3; ++i) {
-        if (components[i].IsEmpty()) {
-            continue;
+    // With DEPTH_BEFORE_SHADER the depth test ignores the Z and stencil exports
+    if (!runtime_info.hw.fs.depth_before_shader) {
+        if (!components[0].IsEmpty()) {
+            ir.SetAttribute(IR::Attribute::Depth, components[0]);
         }
-        ir.SetAttribute(MrtzBuiltins[i], components[i]);
+        if (!components[1].IsEmpty()) {
+            ir.SetAttribute(IR::Attribute::StencilRef, components[1]);
+        }
+    }
+    if (!components[2].IsEmpty()) {
+        const IR::U32 mask{ExportedSampleMask(ir.BitCast<IR::U32>(components[2]))};
+        ir.SetAttribute(IR::Attribute::SampleMask, ir.BitCast<IR::F32>(mask));
     }
     if (!components[3].IsEmpty() && runtime_info.hw.fs.coverage_to_mask_enable) {
         ExportAlphaToMask(AlphaToMaskLevel(components[3]));

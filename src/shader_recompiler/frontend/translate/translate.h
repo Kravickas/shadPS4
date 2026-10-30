@@ -384,6 +384,8 @@ private:
     void SetCarryOut(const GcnInst& inst, const IR::U1& carry);
     IR::F32 LegacyMul(const IR::F32& a, const IR::F32& b);
     IR::U32 VMovRelSHelper(u32 src_vgprno, const IR::U32 m0);
+    IR::U32 ConvertF32ToNorm16(const IR::F32& value, bool is_signed);
+    IR::U32 ConvertF32ToF16Rtz(const IR::F32& value);
     void VMovRelDHelper(u32 dst_vgprno, const IR::U32 src_val, const IR::U32 m0);
 
     void ExportRenderTarget(const GcnInst& inst);
@@ -391,6 +393,7 @@ private:
     IR::U32 AlphaToMaskLevel(const IR::F32& alpha);
     IR::U32 AlphaToMaskLevel(const IR::U32& packed, AmdGpu::ShaderExportFormat format);
     void ExportAlphaToMask(const IR::U32& level);
+    IR::U32 ExportedSampleMask(const IR::U32& mask);
     void LogMissingOpcode(const GcnInst& inst);
 
     IR::VectorReg GetScratchVgpr(u32 offset);

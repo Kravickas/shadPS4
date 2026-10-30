@@ -196,8 +196,14 @@ const Shader::RuntimeInfo& PipelineCache::BuildRuntimeInfo(HwStage stage, SwStag
             mrt0_alpha &&
             (regs.color_shader_mask.GetMask(0) & AmdGpu::ColorBufferMask::ComponentA) != 0;
         info.hw.fs.coverage_to_mask_enable = regs.depth_shader_control.coverage_to_mask_enable;
-        if (info.hw.fs.alpha_to_mask_enable || info.hw.fs.coverage_to_mask_enable) {
+        if (info.hw.fs.alpha_to_mask_enable || info.hw.fs.coverage_to_mask_enable ||
+            regs.depth_shader_control.mask_export_enable || info.hw.fs.aa_mask_per_pixel) {
             info.hw.fs.msaa_num_samples = regs.aa_config.msaa_num_samples;
+        }
+        if (regs.depth_shader_control.mask_export_enable) {
+            info.hw.fs.mask_export_num_samples = regs.depth_eqaa.mask_export_num_samples;
+        }
+        if (info.hw.fs.alpha_to_mask_enable || info.hw.fs.coverage_to_mask_enable) {
             // 32 to 128 samples act as 16
             info.hw.fs.alpha_to_mask_num_samples =
                 std::min<u32>(regs.depth_eqaa.alpha_to_mask_num_samples, 4);

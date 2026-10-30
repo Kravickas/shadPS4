@@ -1,6 +1,8 @@
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <optional>
+
 #include "common/io_file.h"
 #include "common/path_util.h"
 #include "core/emulator_settings.h"
@@ -177,6 +179,22 @@ void Translator::EmitPrologue(IR::Block* first_block) {
             });
         const auto addr_flags = runtime_info.hw.fs.addr_flags;
         const auto en_flags = runtime_info.hw.fs.en_flags;
+        // PA_SC_AA_MASK differs per quad pixel: the pipeline keeps the samples any pixel uses,
+        // pixels without samples don't run the shader
+        std::optional<IR::U32> aa_mask;
+        if (runtime_info.hw.fs.aa_mask_per_pixel) {
+            const auto& masks = runtime_info.hw.fs.aa_mask;
+            const IR::U32 x{ir.ConvertFToU(32, ir.GetAttribute(IR::Attribute::FragCoord, 0))};
+            const IR::U32 y{ir.ConvertFToU(32, ir.GetAttribute(IR::Attribute::FragCoord, 1))};
+            const IR::U32 row{ir.Select(ir.IEqual(ir.BitwiseAnd(y, ir.Imm32(1u)), ir.Imm32(0u)),
+                                        ir.Imm32(u32{masks[0]} | (u32{masks[1]} << 16)),
+                                        ir.Imm32(u32{masks[2]} | (u32{masks[3]} << 16)))};
+            const IR::U32 offset{ir.ShiftLeftLogical(ir.BitwiseAnd(x, ir.Imm32(1u)), ir.Imm32(4u))};
+            const u32 valid_samples = (1u << (1u << runtime_info.hw.fs.msaa_num_samples)) - 1u;
+            aa_mask = ir.BitwiseAnd(ir.BitFieldExtract(row, offset, ir.Imm32(16u)),
+                                    ir.Imm32(valid_samples));
+            ir.Discard(ir.IEqual(*aa_mask, ir.Imm32(0u)));
+        }
         if (addr_flags.pos_x_float_ena) {
             if (en_flags.pos_x_float_ena) {
                 ir.SetVectorReg(dst_vreg++, ir.GetAttribute(IR::Attribute::FragCoord, 0));
@@ -236,23 +254,17 @@ void Translator::EmitPrologue(IR::Block* first_block) {
                     coverage = ir.BitwiseAnd(ir.GetAttributeU32(IR::Attribute::SampleMask),
                                              ir.Imm32(valid_samples));
                 }
+                if (aa_mask) {
+                    coverage = ir.BitwiseAnd(coverage, *aa_mask);
+                }
                 const IR::U1 is_helper = ir.GetAttributeU1(IR::Attribute::IsHelperInvocation);
                 ir.SetVectorReg(dst_vreg++, IR::U32{ir.Select(is_helper, ir.Imm32(0U), coverage)});
             } else {
                 ir.SetVectorReg(dst_vreg++, ir.Imm32(0));
             }
         }
-        if (runtime_info.hw.fs.aa_mask_per_pixel) {
-            // PA_SC_AA_MASK differs per quad pixel: the pipeline keeps the samples any pixel uses
-            const auto& aa_mask = runtime_info.hw.fs.aa_mask;
-            const IR::U32 x{ir.ConvertFToU(32, ir.GetAttribute(IR::Attribute::FragCoord, 0))};
-            const IR::U32 y{ir.ConvertFToU(32, ir.GetAttribute(IR::Attribute::FragCoord, 1))};
-            const IR::U32 row{ir.Select(ir.IEqual(ir.BitwiseAnd(y, ir.Imm32(1u)), ir.Imm32(0u)),
-                                        ir.Imm32(u32{aa_mask[0]} | (u32{aa_mask[1]} << 16)),
-                                        ir.Imm32(u32{aa_mask[2]} | (u32{aa_mask[3]} << 16)))};
-            const IR::U32 offset{ir.ShiftLeftLogical(ir.BitwiseAnd(x, ir.Imm32(1u)), ir.Imm32(4u))};
-            const IR::U32 mask{ir.BitFieldExtract(row, offset, ir.Imm32(16u))};
-            ir.SetAttribute(IR::Attribute::SampleMask, ir.BitCast<IR::F32>(mask));
+        if (aa_mask) {
+            ir.SetAttribute(IR::Attribute::SampleMask, ir.BitCast<IR::F32>(*aa_mask));
         }
         break;
     }
