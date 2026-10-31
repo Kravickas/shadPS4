@@ -2080,7 +2080,6 @@ void Translator::VMovRelDHelper(u32 dst_vgprno, const IR::U32 src_val, const IR:
     }
 }
 
-// A denormal (or zero) becomes the zero of its sign.
 IR::F32 Translator::FlushDenorm32(const IR::F32& value) {
     const IR::U32 bits{ir.BitCast<IR::U32>(value)};
     const IR::U1 is_denorm{ir.IEqual(ir.BitwiseAnd(bits, ir.Imm32(ExponentMask32)), ir.Imm32(0U))};
@@ -2088,12 +2087,11 @@ IR::F32 Translator::FlushDenorm32(const IR::F32& value) {
     return ir.BitCast<IR::F32>(IR::U32{ir.Select(is_denorm, zero, bits)});
 }
 
-// The f32 source as the instruction reads it in this shader's denorm mode.
 IR::F32 Translator::DenormInput32(const IR::F32& value) {
     return FlushesDenormInput(runtime_info.props.fp_denorm_mode32) ? FlushDenorm32(value) : value;
 }
 
-// value is integral or infinite. A NaN source gives 0, or with nan_by_sign the limit of its sign.
+// value: integral or inf. NaN source: 0, or the limit of its sign with nan_by_sign.
 IR::U32 Translator::SaturateToI32(const IR::F32& src, const IR::F32& value, bool nan_by_sign) {
     const IR::U32 converted{ir.ConvertFToS(32, value)};
     const IR::U32 high{ir.Select(ir.FPGreaterThanEqual(value, ir.Imm32(2147483648.f)),
@@ -2107,8 +2105,7 @@ IR::U32 Translator::SaturateToI32(const IR::F32& src, const IR::F32& value, bool
     return IR::U32{ir.Select(ir.FPIsNan(src), nan_value, clamped)};
 }
 
-// Low 16 bits: the f16 of bits, rounded to nearest even or toward zero. Denormals are kept; a NaN
-// is quieted and keeps the payload's top 10 bits.
+// f16 bits of an f32, rounded to nearest even or toward zero; NaN quieted, top 10 payload bits.
 IR::U32 Translator::F32ToF16Bits(const IR::U32& bits, bool round_to_zero) {
     const IR::U32 sign{ir.BitwiseAnd(ir.ShiftRightLogical(bits, ir.Imm32(16U)), ir.Imm32(0x8000U))};
     const IR::U32 magnitude{ir.BitwiseAnd(bits, ir.Imm32(~SignBit32))};
@@ -2116,10 +2113,6 @@ IR::U32 Translator::F32ToF16Bits(const IR::U32& bits, bool round_to_zero) {
         ir.Imm32(0x7E00U),
         ir.BitwiseAnd(ir.ShiftRightLogical(magnitude, ir.Imm32(13U)), ir.Imm32(0x3FFU)))};
 
-    // Normals and denormals alike: the mantissa with its implicit bit shifted right by
-    // 126 - e (at least 13: then the implicit bit lands on 0x400) on top of exponent
-    // max(e - 113, 0) << 10. Rounding to nearest even adds half - 1 + the result's lsb first;
-    // a carry moves into the exponent. Below 2^-25 the shift is >= 25 and the result 0.
     const IR::U32 exponent{ir.ShiftRightLogical(magnitude, ir.Imm32(23U))};
     const IR::U32 shift{ir.SClamp(ir.ISub(ir.Imm32(126U), exponent), ir.Imm32(13U), ir.Imm32(31U))};
     const IR::U32 high{ir.SMax(ir.ISub(exponent, ir.Imm32(113U)), ir.Imm32(0U))};
@@ -2176,7 +2169,6 @@ IR::U32 Translator::PackNorm16(const IR::F32& value, bool is_signed) {
     return ir.BitwiseAnd(rounded, ir.Imm32(0xFFFFU));
 }
 
-// lo in bits 15..0, hi in 31..16 (hi's upper half shifted out).
 IR::U32 Translator::PackHalves(const IR::U32& lo, const IR::U32& hi) {
     return ir.BitwiseOr(lo, ir.ShiftLeftLogical(hi, ir.Imm32(16U)));
 }
