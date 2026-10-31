@@ -2116,37 +2116,26 @@ IR::U32 Translator::F32ToF16Bits(const IR::U32& bits, bool round_to_zero) {
         ir.Imm32(0x7E00U),
         ir.BitwiseAnd(ir.ShiftRightLogical(magnitude, ir.Imm32(13U)), ir.Imm32(0x3FFU)))};
 
-    // f16 normals: the exponent rebiased; + 0xFFF + the result's lsb rounds to nearest even.
-    const IR::U32 rebiased{ir.ISub(magnitude, ir.Imm32(0x38000000U))};
-    IR::U32 normal;
-    if (round_to_zero) {
-        normal = ir.ShiftRightLogical(rebiased, ir.Imm32(13U));
-    } else {
-        const IR::U32 lsb{
-            ir.BitwiseAnd(ir.ShiftRightLogical(magnitude, ir.Imm32(13U)), ir.Imm32(1U))};
-        normal =
-            ir.ShiftRightLogical(ir.IAdd(ir.IAdd(rebiased, ir.Imm32(0xFFFU)), lsb), ir.Imm32(13U));
-    }
-
-    // f16 denormals: the mantissa with its implicit bit shifted into place, rounded the same way
-    // with half - 1 + lsb. Below 2^-25 the shift is >= 25 and the result 0.
-    const IR::U32 shift{
-        ir.UClamp(ir.ISub(ir.Imm32(126U), ir.ShiftRightLogical(magnitude, ir.Imm32(23U))),
-                  ir.Imm32(1U), ir.Imm32(31U))};
+    // Normals and denormals alike: the mantissa with its implicit bit shifted right by
+    // 126 - e (at least 13: then the implicit bit lands on 0x400) on top of exponent
+    // max(e - 113, 0) << 10. Rounding to nearest even adds half - 1 + the result's lsb first;
+    // a carry moves into the exponent. Below 2^-25 the shift is >= 25 and the result 0.
+    const IR::U32 exponent{ir.ShiftRightLogical(magnitude, ir.Imm32(23U))};
+    const IR::U32 shift{ir.SClamp(ir.ISub(ir.Imm32(126U), exponent), ir.Imm32(13U), ir.Imm32(31U))};
+    const IR::U32 high{ir.SMax(ir.ISub(exponent, ir.Imm32(113U)), ir.Imm32(0U))};
     const IR::U32 mantissa{
         ir.BitwiseOr(ir.BitwiseAnd(magnitude, ir.Imm32(0x7FFFFFU)), ir.Imm32(0x800000U))};
-    IR::U32 denorm;
+    IR::U32 low;
     if (round_to_zero) {
-        denorm = ir.ShiftRightLogical(mantissa, shift);
+        low = ir.ShiftRightLogical(mantissa, shift);
     } else {
         const IR::U32 bias{
             ir.ISub(ir.ShiftLeftLogical(ir.Imm32(1U), ir.ISub(shift, ir.Imm32(1U))), ir.Imm32(1U))};
         const IR::U32 lsb{ir.BitwiseAnd(ir.ShiftRightLogical(mantissa, shift), ir.Imm32(1U))};
-        denorm = ir.ShiftRightLogical(ir.IAdd(ir.IAdd(mantissa, bias), lsb), shift);
+        low = ir.ShiftRightLogical(ir.IAdd(ir.IAdd(mantissa, bias), lsb), shift);
     }
 
-    IR::U32 result{
-        ir.Select(ir.IGreaterThanEqual(magnitude, ir.Imm32(0x38800000U), false), normal, denorm)};
+    IR::U32 result{ir.IAdd(ir.ShiftLeftLogical(high, ir.Imm32(10U)), low)};
     if (round_to_zero) {
         result = IR::U32{ir.Select(ir.IGreaterThanEqual(magnitude, ir.Imm32(0x477FE000U), false),
                                    ir.Imm32(0x7BFFU), result)};
