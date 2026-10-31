@@ -1,4 +1,4 @@
-// SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
+// SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #pragma once
@@ -385,6 +385,12 @@ private:
     IR::F32 LegacyMul(const IR::F32& a, const IR::F32& b);
     IR::U32 VMovRelSHelper(u32 src_vgprno, const IR::U32 m0);
     void VMovRelDHelper(u32 dst_vgprno, const IR::U32 src_val, const IR::U32 m0);
+    IR::F32 FlushDenorm32(const IR::F32& value);
+    IR::F32 DenormInput32(const IR::F32& value);
+    IR::U32 SaturateToI32(const IR::F32& src, const IR::F32& value, bool nan_by_sign);
+    IR::U32 F32ToF16Bits(const IR::U32& bits, bool round_to_zero);
+    IR::U32 PackNorm16(const IR::F32& value, bool is_signed);
+    IR::U32 PackHalves(const IR::U32& lo, const IR::U32& hi);
 
     void ExportRenderTarget(const GcnInst& inst);
     void ExportDepth(const GcnInst& inst);

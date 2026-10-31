@@ -9,6 +9,19 @@
 
 namespace Shader::Gcn {
 
+static constexpr u32 SignBit32 = 0x80000000U;
+static constexpr u32 ExponentMask32 = 0x7F800000U;
+
+static bool FlushesDenormInput(AmdGpu::FpDenormMode mode) {
+    return mode == AmdGpu::FpDenormMode::InOutFlush ||
+           mode == AmdGpu::FpDenormMode::InFlushOutAllow;
+}
+
+static bool FlushesDenormOutput(AmdGpu::FpDenormMode mode) {
+    return mode == AmdGpu::FpDenormMode::InOutFlush ||
+           mode == AmdGpu::FpDenormMode::InAllowOutFlush;
+}
+
 void Translator::EmitVectorAlu(const GcnInst& inst) {
     switch (inst.opcode) {
         // VOP2
@@ -837,133 +850,22 @@ void Translator::V_LDEXP_F32(const GcnInst& inst) {
     SetDst(inst.dst[0], ir.FPLdexp(src0, src1));
 }
 
-namespace {
-
-bool FlushesDenormInput(AmdGpu::FpDenormMode mode) {
-    return mode == AmdGpu::FpDenormMode::InOutFlush ||
-           mode == AmdGpu::FpDenormMode::InFlushOutAllow;
-}
-
-bool FlushesDenormOutput(AmdGpu::FpDenormMode mode) {
-    return mode == AmdGpu::FpDenormMode::InOutFlush ||
-           mode == AmdGpu::FpDenormMode::InAllowOutFlush;
-}
-
-IR::F32 FlushDenorm32(IR::IREmitter& ir, const IR::F32& value) {
-    const IR::U32 bits{ir.BitCast<IR::U32>(value)};
-    const IR::U1 is_denorm{ir.IEqual(ir.BitwiseAnd(bits, ir.Imm32(0x7F800000U)), ir.Imm32(0U))};
-    const IR::U32 zero{ir.BitwiseAnd(bits, ir.Imm32(0x80000000U))};
-    return ir.BitCast<IR::F32>(IR::U32{ir.Select(is_denorm, zero, bits)});
-}
-
-// value is integral or infinite; NaN source saturates by sign.
-IR::U32 SaturateToI32(IR::IREmitter& ir, const IR::F32& src, const IR::F32& value) {
-    const IR::U32 converted{ir.ConvertFToS(32, value)};
-    const IR::U32 high{ir.Select(ir.FPGreaterThanEqual(value, ir.Imm32(2147483648.f)),
-                                 ir.Imm32(0x7FFFFFFFU), converted)};
-    const IR::U32 clamped{
-        ir.Select(ir.FPLessThan(value, ir.Imm32(-2147483648.f)), ir.Imm32(0x80000000U), high)};
-    const IR::U1 negative{ir.ILessThan(ir.BitCast<IR::U32>(src), ir.Imm32(0U), true)};
-    const IR::U32 nan_value{ir.Select(negative, ir.Imm32(0x80000000U), ir.Imm32(0x7FFFFFFFU))};
-    return IR::U32{ir.Select(ir.FPIsNan(src), nan_value, clamped)};
-}
-
-// Low 16 bits hold the f16 result; denormals are kept, NaN payload is truncated.
-IR::U32 F32ToF16Bits(IR::IREmitter& ir, const IR::U32& bits, bool round_to_zero) {
-    const IR::U32 sign{ir.BitwiseAnd(ir.ShiftRightLogical(bits, ir.Imm32(16U)), ir.Imm32(0x8000U))};
-    const IR::U32 abs{ir.BitwiseAnd(bits, ir.Imm32(0x7FFFFFFFU))};
-    // NaN: the quiet bit set, the payload's top 10 bits kept
-    const IR::U32 nan{
-        ir.BitwiseOr(ir.Imm32(0x7E00U),
-                     ir.BitwiseAnd(ir.ShiftRightLogical(abs, ir.Imm32(13U)), ir.Imm32(0x3FFU)))};
-
-    const IR::U32 rebiased{ir.ISub(abs, ir.Imm32(0x38000000U))};
-    IR::U32 normal;
-    if (round_to_zero) {
-        normal = ir.ShiftRightLogical(rebiased, ir.Imm32(13U));
-    } else {
-        const IR::U32 lsb{ir.BitwiseAnd(ir.ShiftRightLogical(abs, ir.Imm32(13U)), ir.Imm32(1U))};
-        normal =
-            ir.ShiftRightLogical(ir.IAdd(ir.IAdd(rebiased, ir.Imm32(0xFFFU)), lsb), ir.Imm32(13U));
-    }
-
-    const IR::U32 exponent{ir.ShiftRightLogical(abs, ir.Imm32(23U))};
-    const IR::U32 shift{ir.UClamp(ir.ISub(ir.Imm32(126U), exponent), ir.Imm32(1U), ir.Imm32(31U))};
-    const IR::U32 mantissa{
-        ir.BitwiseOr(ir.BitwiseAnd(abs, ir.Imm32(0x7FFFFFU)), ir.Imm32(0x800000U))};
-    const IR::U32 truncated{ir.ShiftRightLogical(mantissa, shift)};
-    IR::U32 denorm{truncated};
-    if (!round_to_zero) {
-        const IR::U32 rem{ir.BitwiseAnd(
-            mantissa, ir.ISub(ir.ShiftLeftLogical(ir.Imm32(1U), shift), ir.Imm32(1U)))};
-        const IR::U32 half{ir.ShiftLeftLogical(ir.Imm32(1U), ir.ISub(shift, ir.Imm32(1U)))};
-        const IR::U1 odd{ir.INotEqual(ir.BitwiseAnd(truncated, ir.Imm32(1U)), ir.Imm32(0U))};
-        const IR::U1 round_up{ir.LogicalOr(ir.IGreaterThan(rem, half, false),
-                                           ir.LogicalAnd(ir.IEqual(rem, half), odd))};
-        denorm = ir.IAdd(truncated, IR::U32{ir.Select(round_up, ir.Imm32(1U), ir.Imm32(0U))});
-    }
-
-    IR::U32 result{
-        ir.Select(ir.IGreaterThanEqual(abs, ir.Imm32(0x38800000U), false), normal, denorm)};
-    result =
-        IR::U32{ir.Select(ir.ILessThan(abs, ir.Imm32(0x33000000U), false), ir.Imm32(0U), result)};
-    if (round_to_zero) {
-        result = IR::U32{ir.Select(ir.IGreaterThanEqual(abs, ir.Imm32(0x477FE000U), false),
-                                   ir.Imm32(0x7BFFU), result)};
-        result =
-            IR::U32{ir.Select(ir.IEqual(abs, ir.Imm32(0x7F800000U)), ir.Imm32(0x7C00U), result)};
-    } else {
-        result = IR::U32{ir.Select(ir.IGreaterThanEqual(abs, ir.Imm32(0x477FF000U), false),
-                                   ir.Imm32(0x7C00U), result)};
-    }
-    result = IR::U32{ir.Select(ir.IGreaterThan(abs, ir.Imm32(0x7F800000U), false), nan, result)};
-    return ir.BitwiseOr(sign, result);
-}
-
-// Rounds clamp(value) * (2^n - 1) to nearest using the exact product.
-IR::U32 PackNorm16(IR::IREmitter& ir, const IR::F32& value, bool is_signed) {
-    const IR::F32 low{ir.Imm32(is_signed ? -1.f : 0.f)};
-    const IR::F32 high{ir.Imm32(1.f)};
-    const IR::F32 lower{ir.Select(ir.FPLessThan(value, low), low, value)};
-    const IR::F32 bounded{ir.Select(ir.FPGreaterThan(lower, high), high, lower)};
-    const IR::F32 clamped{ir.Select(ir.FPIsNan(value), ir.Imm32(0.f), bounded)};
-
-    const IR::F32 product{ir.FPMul(clamped, ir.Imm32(is_signed ? 32767.f : 65535.f))};
-    // clamped * 2^n is exact and close to product, so this difference is exact.
-    const IR::F32 residual{
-        ir.FPSub(ir.FPMul(clamped, ir.Imm32(is_signed ? 32768.f : 65536.f)), product)};
-
-    const IR::F32 floor{ir.FPFloor(product)};
-    const IR::F32 mid{ir.FPAdd(floor, ir.Imm32(0.5f))};
-    const IR::U32 floor_int{ir.ConvertFToS(32, floor)};
-    const IR::U1 odd{ir.INotEqual(ir.BitwiseAnd(floor_int, ir.Imm32(1U)), ir.Imm32(0U))};
-    const IR::U1 tie_up{ir.LogicalOr(ir.FPGreaterThan(residual, clamped),
-                                     ir.LogicalAnd(ir.FPEqual(residual, clamped), odd))};
-    const IR::U1 round_up{ir.LogicalOr(ir.FPGreaterThan(product, mid),
-                                       ir.LogicalAnd(ir.FPEqual(product, mid), tie_up))};
-    const IR::U32 rounded{
-        ir.IAdd(floor_int, IR::U32{ir.Select(round_up, ir.Imm32(1U), ir.Imm32(0U))})};
-    return ir.BitwiseAnd(rounded, ir.Imm32(0xFFFFU));
-}
-
-} // Anonymous namespace
-
 void Translator::V_CVT_PKNORM_U16_F32(const GcnInst& inst) {
-    const IR::U32 lo{PackNorm16(ir, GetSrc<IR::F32>(inst.src[0]), false)};
-    const IR::U32 hi{PackNorm16(ir, GetSrc<IR::F32>(inst.src[1]), false)};
-    SetDst(inst.dst[0], ir.BitwiseOr(lo, ir.ShiftLeftLogical(hi, ir.Imm32(16U))));
+    const IR::U32 lo{PackNorm16(GetSrc<IR::F32>(inst.src[0]), false)};
+    const IR::U32 hi{PackNorm16(GetSrc<IR::F32>(inst.src[1]), false)};
+    SetDst(inst.dst[0], PackHalves(lo, hi));
 }
 
 void Translator::V_CVT_PKNORM_I16_F32(const GcnInst& inst) {
-    const IR::U32 lo{PackNorm16(ir, GetSrc<IR::F32>(inst.src[0]), true)};
-    const IR::U32 hi{PackNorm16(ir, GetSrc<IR::F32>(inst.src[1]), true)};
-    SetDst(inst.dst[0], ir.BitwiseOr(lo, ir.ShiftLeftLogical(hi, ir.Imm32(16U))));
+    const IR::U32 lo{PackNorm16(GetSrc<IR::F32>(inst.src[0]), true)};
+    const IR::U32 hi{PackNorm16(GetSrc<IR::F32>(inst.src[1]), true)};
+    SetDst(inst.dst[0], PackHalves(lo, hi));
 }
 
 void Translator::V_CVT_PKRTZ_F16_F32(const GcnInst& inst) {
-    const IR::U32 lo{F32ToF16Bits(ir, ir.BitCast<IR::U32>(GetSrc<IR::F32>(inst.src[0])), true)};
-    const IR::U32 hi{F32ToF16Bits(ir, ir.BitCast<IR::U32>(GetSrc<IR::F32>(inst.src[1])), true)};
-    SetDst(inst.dst[0], ir.BitwiseOr(lo, ir.ShiftLeftLogical(hi, ir.Imm32(16U))));
+    const IR::U32 lo{F32ToF16Bits(ir.BitCast<IR::U32>(GetSrc<IR::F32>(inst.src[0])), true)};
+    const IR::U32 hi{F32ToF16Bits(ir.BitCast<IR::U32>(GetSrc<IR::F32>(inst.src[1])), true)};
+    SetDst(inst.dst[0], PackHalves(lo, hi));
 }
 
 void Translator::V_ADD_F16(const GcnInst& inst) {
@@ -1058,17 +960,12 @@ void Translator::V_CVT_U32_F32(const GcnInst& inst) {
 
 void Translator::V_CVT_I32_F32(const GcnInst& inst) {
     const IR::F32 src0{GetSrc<IR::F32>(inst.src[0])};
-    const IR::U32 converted{ir.ConvertFToS(32, src0)};
-    const IR::U32 high{ir.Select(ir.FPGreaterThanEqual(src0, ir.Imm32(2147483648.f)),
-                                 ir.Imm32(0x7FFFFFFFU), converted)};
-    const IR::U32 clamped{
-        ir.Select(ir.FPLessThan(src0, ir.Imm32(-2147483648.f)), ir.Imm32(0x80000000U), high)};
-    SetDst(inst.dst[0], IR::U32{ir.Select(ir.FPIsNan(src0), ir.Imm32(0U), clamped)});
+    SetDst(inst.dst[0], SaturateToI32(src0, src0, false));
 }
 
 void Translator::V_CVT_F16_F32(const GcnInst& inst) {
     const IR::F32 src0{GetSrc<IR::F32>(inst.src[0])};
-    SetDst(inst.dst[0], F32ToF16Bits(ir, ir.BitCast<IR::U32>(src0), false));
+    SetDst(inst.dst[0], F32ToF16Bits(ir.BitCast<IR::U32>(src0), false));
 }
 
 void Translator::V_CVT_F32_F16(const GcnInst& inst) {
@@ -1092,21 +989,19 @@ void Translator::V_CVT_F32_F16(const GcnInst& inst) {
 
 void Translator::V_CVT_RPI_I32_F32(const GcnInst& inst) {
     const IR::F32 src0{GetSrc<IR::F32>(inst.src[0])};
-    const IR::F32 value{
-        FlushesDenormInput(runtime_info.props.fp_denorm_mode32) ? FlushDenorm32(ir, src0) : src0};
+    const IR::F32 value{DenormInput32(src0)};
     // value - floor is exact, so the half comparison sees the unrounded value + 0.5.
     const IR::F32 floor{ir.FPFloor(value)};
     const IR::F32 fraction{ir.FPSub(value, floor)};
     const IR::F32 rounded{ir.Select(ir.FPGreaterThanEqual(fraction, ir.Imm32(0.5f)),
                                     ir.FPAdd(floor, ir.Imm32(1.f)), floor)};
-    SetDst(inst.dst[0], SaturateToI32(ir, src0, rounded));
+    SetDst(inst.dst[0], SaturateToI32(src0, rounded, true));
 }
 
 void Translator::V_CVT_FLR_I32_F32(const GcnInst& inst) {
     const IR::F32 src0{GetSrc<IR::F32>(inst.src[0])};
-    const IR::F32 value{
-        FlushesDenormInput(runtime_info.props.fp_denorm_mode32) ? FlushDenorm32(ir, src0) : src0};
-    SetDst(inst.dst[0], SaturateToI32(ir, src0, IR::F32{ir.FPFloor(value)}));
+    const IR::F32 value{DenormInput32(src0)};
+    SetDst(inst.dst[0], SaturateToI32(src0, IR::F32{ir.FPFloor(value)}, true));
 }
 
 void Translator::V_CVT_OFF_F32_I4(const GcnInst& inst) {
@@ -1118,9 +1013,8 @@ void Translator::V_CVT_OFF_F32_I4(const GcnInst& inst) {
 void Translator::V_CVT_F32_F64(const GcnInst& inst) {
     const IR::F64 src0{GetSrc64<IR::F64>(inst.src[0])};
     const IR::F32 value{ir.FPConvert(32, src0)};
-    const IR::F32 result{FlushesDenormOutput(runtime_info.props.fp_denorm_mode32)
-                             ? FlushDenorm32(ir, value)
-                             : value};
+    const IR::F32 result{
+        FlushesDenormOutput(runtime_info.props.fp_denorm_mode32) ? FlushDenorm32(value) : value};
     // NaN: the quiet bit set, the payload's top 22 bits kept
     const IR::Value halves{ir.UnpackDouble2x32(src0)};
     const IR::U32 lo{ir.CompositeExtract(halves, 0)};
@@ -1136,8 +1030,8 @@ void Translator::V_CVT_F32_F64(const GcnInst& inst) {
 
 void Translator::V_CVT_F64_F32(const GcnInst& inst) {
     const IR::F32 src0{GetSrc<IR::F32>(inst.src[0])};
-    const IR::F32 value{
-        FlushesDenormInput(runtime_info.props.fp_denorm_mode32) ? FlushDenorm32(ir, src0) : src0};
+    const bool flush_input{FlushesDenormInput(runtime_info.props.fp_denorm_mode32)};
+    const IR::F32 value{flush_input ? FlushDenorm32(src0) : src0};
     // NaN is widened bit for bit, without quieting.
     const IR::U32 bits{ir.BitCast<IR::U32>(src0)};
     const IR::U32 nan_hi{ir.BitwiseOr(
@@ -1148,7 +1042,7 @@ void Translator::V_CVT_F64_F32(const GcnInst& inst) {
     const IR::Value converted{ir.UnpackDouble2x32(IR::F64{ir.FPConvert(64, value)})};
     IR::U32 conv_lo{ir.CompositeExtract(converted, 0)};
     IR::U32 conv_hi{ir.CompositeExtract(converted, 1)};
-    if (!FlushesDenormInput(runtime_info.props.fp_denorm_mode32)) {
+    if (!flush_input) {
         // A kept denormal widens exactly: mantissa * 2^-149 is normal in f64
         const IR::F64 magnitude{ir.FPMul(
             ir.ConvertUToF(64, 32, ir.BitwiseAnd(bits, ir.Imm32(0x7FFFFFU))), ir.Imm64(0x1p-149))};
@@ -1168,7 +1062,7 @@ void Translator::V_CVT_F64_F32(const GcnInst& inst) {
 
 void Translator::V_CVT_F32_UBYTE(u32 index, const GcnInst& inst) {
     const IR::U32 src0{GetSrc(inst.src[0])};
-    const IR::U32 byte = ir.BitFieldExtract(src0, ir.Imm32(8 * index), ir.Imm32(8));
+    const IR::U32 byte{ir.BitFieldExtract(src0, ir.Imm32(8 * index), ir.Imm32(8))};
     SetDst(inst.dst[0], ir.ConvertUToF(32, 32, byte));
 }
 
@@ -1706,7 +1600,7 @@ void Translator::V_SAD_U32(const GcnInst& inst) {
 void Translator::V_CVT_PK_U16_U32(const GcnInst& inst) {
     const IR::U32 lo{ir.UMin(GetSrc<IR::U32>(inst.src[0]), ir.Imm32(0xFFFFU))};
     const IR::U32 hi{ir.UMin(GetSrc<IR::U32>(inst.src[1]), ir.Imm32(0xFFFFU))};
-    SetDst(inst.dst[0], ir.BitwiseOr(lo, ir.ShiftLeftLogical(hi, ir.Imm32(16U))));
+    SetDst(inst.dst[0], PackHalves(lo, hi));
 }
 
 void Translator::V_CVT_PK_I16_I32(const GcnInst& inst) {
@@ -1714,8 +1608,7 @@ void Translator::V_CVT_PK_I16_I32(const GcnInst& inst) {
     const IR::U32 max{ir.Imm32(32767)};
     const IR::U32 lo{ir.SClamp(GetSrc<IR::U32>(inst.src[0]), min, max)};
     const IR::U32 hi{ir.SClamp(GetSrc<IR::U32>(inst.src[1]), min, max)};
-    SetDst(inst.dst[0], ir.BitwiseOr(ir.BitwiseAnd(lo, ir.Imm32(0xFFFFU)),
-                                     ir.ShiftLeftLogical(hi, ir.Imm32(16U))));
+    SetDst(inst.dst[0], PackHalves(ir.BitwiseAnd(lo, ir.Imm32(0xFFFFU)), hi));
 }
 
 void Translator::V_CVT_PK_U8_F32(const GcnInst& inst) {
@@ -2185,6 +2078,118 @@ void Translator::VMovRelDHelper(u32 dst_vgprno, const IR::U32 src_val, const IR:
             IR::U32{ir.Select(cond, src_val, ir.GetVectorReg<IR::U32>(IR::VectorReg::V0 + i))};
         ir.SetVectorReg(IR::VectorReg::V0 + i, dst_val);
     }
+}
+
+// A denormal (or zero) becomes the zero of its sign.
+IR::F32 Translator::FlushDenorm32(const IR::F32& value) {
+    const IR::U32 bits{ir.BitCast<IR::U32>(value)};
+    const IR::U1 is_denorm{ir.IEqual(ir.BitwiseAnd(bits, ir.Imm32(ExponentMask32)), ir.Imm32(0U))};
+    const IR::U32 zero{ir.BitwiseAnd(bits, ir.Imm32(SignBit32))};
+    return ir.BitCast<IR::F32>(IR::U32{ir.Select(is_denorm, zero, bits)});
+}
+
+// The f32 source as the instruction reads it in this shader's denorm mode.
+IR::F32 Translator::DenormInput32(const IR::F32& value) {
+    return FlushesDenormInput(runtime_info.props.fp_denorm_mode32) ? FlushDenorm32(value) : value;
+}
+
+// value is integral or infinite. A NaN source gives 0, or with nan_by_sign the limit of its sign.
+IR::U32 Translator::SaturateToI32(const IR::F32& src, const IR::F32& value, bool nan_by_sign) {
+    const IR::U32 converted{ir.ConvertFToS(32, value)};
+    const IR::U32 high{ir.Select(ir.FPGreaterThanEqual(value, ir.Imm32(2147483648.f)),
+                                 ir.Imm32(0x7FFFFFFFU), converted)};
+    const IR::U32 clamped{
+        ir.Select(ir.FPLessThan(value, ir.Imm32(-2147483648.f)), ir.Imm32(SignBit32), high)};
+    const IR::U32 nan_value{
+        nan_by_sign ? IR::U32{ir.Select(ir.ILessThan(ir.BitCast<IR::U32>(src), ir.Imm32(0U), true),
+                                        ir.Imm32(SignBit32), ir.Imm32(0x7FFFFFFFU))}
+                    : ir.Imm32(0U)};
+    return IR::U32{ir.Select(ir.FPIsNan(src), nan_value, clamped)};
+}
+
+// Low 16 bits: the f16 of bits, rounded to nearest even or toward zero. Denormals are kept; a NaN
+// is quieted and keeps the payload's top 10 bits.
+IR::U32 Translator::F32ToF16Bits(const IR::U32& bits, bool round_to_zero) {
+    const IR::U32 sign{ir.BitwiseAnd(ir.ShiftRightLogical(bits, ir.Imm32(16U)), ir.Imm32(0x8000U))};
+    const IR::U32 magnitude{ir.BitwiseAnd(bits, ir.Imm32(~SignBit32))};
+    const IR::U32 nan{ir.BitwiseOr(
+        ir.Imm32(0x7E00U),
+        ir.BitwiseAnd(ir.ShiftRightLogical(magnitude, ir.Imm32(13U)), ir.Imm32(0x3FFU)))};
+
+    // f16 normals: the exponent rebiased; + 0xFFF + the result's lsb rounds to nearest even.
+    const IR::U32 rebiased{ir.ISub(magnitude, ir.Imm32(0x38000000U))};
+    IR::U32 normal;
+    if (round_to_zero) {
+        normal = ir.ShiftRightLogical(rebiased, ir.Imm32(13U));
+    } else {
+        const IR::U32 lsb{
+            ir.BitwiseAnd(ir.ShiftRightLogical(magnitude, ir.Imm32(13U)), ir.Imm32(1U))};
+        normal =
+            ir.ShiftRightLogical(ir.IAdd(ir.IAdd(rebiased, ir.Imm32(0xFFFU)), lsb), ir.Imm32(13U));
+    }
+
+    // f16 denormals: the mantissa with its implicit bit shifted into place, rounded the same way
+    // with half - 1 + lsb. Below 2^-25 the shift is >= 25 and the result 0.
+    const IR::U32 shift{
+        ir.UClamp(ir.ISub(ir.Imm32(126U), ir.ShiftRightLogical(magnitude, ir.Imm32(23U))),
+                  ir.Imm32(1U), ir.Imm32(31U))};
+    const IR::U32 mantissa{
+        ir.BitwiseOr(ir.BitwiseAnd(magnitude, ir.Imm32(0x7FFFFFU)), ir.Imm32(0x800000U))};
+    IR::U32 denorm;
+    if (round_to_zero) {
+        denorm = ir.ShiftRightLogical(mantissa, shift);
+    } else {
+        const IR::U32 bias{
+            ir.ISub(ir.ShiftLeftLogical(ir.Imm32(1U), ir.ISub(shift, ir.Imm32(1U))), ir.Imm32(1U))};
+        const IR::U32 lsb{ir.BitwiseAnd(ir.ShiftRightLogical(mantissa, shift), ir.Imm32(1U))};
+        denorm = ir.ShiftRightLogical(ir.IAdd(ir.IAdd(mantissa, bias), lsb), shift);
+    }
+
+    IR::U32 result{
+        ir.Select(ir.IGreaterThanEqual(magnitude, ir.Imm32(0x38800000U), false), normal, denorm)};
+    if (round_to_zero) {
+        result = IR::U32{ir.Select(ir.IGreaterThanEqual(magnitude, ir.Imm32(0x477FE000U), false),
+                                   ir.Imm32(0x7BFFU), result)};
+        result = IR::U32{
+            ir.Select(ir.IEqual(magnitude, ir.Imm32(ExponentMask32)), ir.Imm32(0x7C00U), result)};
+    } else {
+        result = IR::U32{ir.Select(ir.IGreaterThanEqual(magnitude, ir.Imm32(0x477FF000U), false),
+                                   ir.Imm32(0x7C00U), result)};
+    }
+    result = IR::U32{
+        ir.Select(ir.IGreaterThan(magnitude, ir.Imm32(ExponentMask32), false), nan, result)};
+    return ir.BitwiseOr(sign, result);
+}
+
+// Rounds clamp(value) * (2^n - 1) to nearest using the exact product.
+IR::U32 Translator::PackNorm16(const IR::F32& value, bool is_signed) {
+    const IR::F32 low{ir.Imm32(is_signed ? -1.f : 0.f)};
+    const IR::F32 high{ir.Imm32(1.f)};
+    const IR::F32 lower{ir.Select(ir.FPLessThan(value, low), low, value)};
+    const IR::F32 bounded{ir.Select(ir.FPGreaterThan(lower, high), high, lower)};
+    const IR::F32 clamped{ir.Select(ir.FPIsNan(value), ir.Imm32(0.f), bounded)};
+
+    const IR::F32 product{ir.FPMul(clamped, ir.Imm32(is_signed ? 32767.f : 65535.f))};
+    // clamped * 2^n is exact and close to product, so this difference is exact.
+    const IR::F32 residual{
+        ir.FPSub(ir.FPMul(clamped, ir.Imm32(is_signed ? 32768.f : 65536.f)), product)};
+
+    const IR::F32 floor{ir.FPFloor(product)};
+    const IR::F32 mid{ir.FPAdd(floor, ir.Imm32(0.5f))};
+    const IR::U32 floor_int{ir.ConvertFToS(32, floor)};
+    const IR::U1 odd{ir.INotEqual(ir.BitwiseAnd(floor_int, ir.Imm32(1U)), ir.Imm32(0U))};
+    const IR::U1 tie_up{ir.LogicalOr(ir.FPGreaterThan(residual, clamped),
+                                     ir.LogicalAnd(ir.FPEqual(residual, clamped), odd))};
+    const IR::U1 round_up{ir.LogicalOr(ir.FPGreaterThan(product, mid),
+                                       ir.LogicalAnd(ir.FPEqual(product, mid), tie_up))};
+    const IR::U32 rounded{
+        ir.IAdd(floor_int, IR::U32{ir.Select(round_up, ir.Imm32(1U), ir.Imm32(0U))})};
+    return ir.BitwiseAnd(rounded, ir.Imm32(0xFFFFU));
+}
+
+// lo in bits 15..0, hi in 31..16 (hi's upper half shifted out).
+IR::U32 Translator::PackHalves(const IR::U32& lo, const IR::U32& hi) {
+    return ir.BitwiseOr(lo, ir.ShiftLeftLogical(hi, ir.Imm32(16U)));
 }
 
 } // namespace Shader::Gcn
