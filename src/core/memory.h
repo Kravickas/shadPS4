@@ -1,4 +1,4 @@
-// SPDX-FileCopyrightText: Copyright 2025 shadPS4 Emulator Project
+// SPDX-FileCopyrightText: Copyright 2025-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #pragma once
@@ -299,6 +299,8 @@ public:
     s32 IsStack(VAddr addr, void** start, void** end);
 
     s32 SetDirectMemoryType(VAddr addr, u64 size, s32 memory_type);
+
+    bool IsDirectMemoryShared(VAddr addr, u64 size);
 
     void NameVirtualRange(VAddr virtual_addr, u64 size, std::string_view name);
 

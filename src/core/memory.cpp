@@ -984,8 +984,7 @@ u64 MemoryManager::UnmapBytesFromEntry(VAddr virtual_addr, VirtualMemoryArea vma
                 PAddr chunk_addr = phys_addr;
                 const PAddr chunk_end = phys_addr + size_in_dma;
                 while (chunk_addr < chunk_end) {
-                    const PAddr area_end =
-                        std::prev(fmem_map.upper_bound(chunk_addr))->second.GetEnd();
+                    const PAddr area_end = FindFmemArea(chunk_addr)->second.GetEnd();
                     const u64 chunk = std::min<u64>(chunk_end, area_end) - chunk_addr;
                     const auto new_fmem_handle = CarvePhysArea(fmem_map, chunk_addr, chunk);
                     new_fmem_handle->second.dma_type = PhysicalMemoryType::Free;
@@ -1238,7 +1237,12 @@ s32 MemoryManager::VirtualQuery(VAddr addr, s32 flags,
         // Offset is only assigned for direct mappings.
         ASSERT_MSG(vma.phys_areas.size() > 0, "No physical backing for direct mapping?");
         info->offset = vma.phys_areas.begin()->second.base;
-        info->memory_type = vma.phys_areas.begin()->second.memory_type;
+
+        // The memory type belongs to the physical page; another mapping of it can change it.
+        const u64 offset_in_vma = (vma.Contains(query_addr, 1) ? query_addr : vma.base) - vma.base;
+        const auto phys_area = std::prev(vma.phys_areas.upper_bound(offset_in_vma));
+        const PAddr phys = phys_area->second.base + (offset_in_vma - phys_area->first);
+        info->memory_type = FindDmemArea(phys)->second.memory_type;
     }
     if (vma.type == VMAType::Reserved || vma.type == VMAType::PoolReserved) {
         // Protection is hidden from reserved mappings.
@@ -1266,6 +1270,11 @@ s32 MemoryManager::DirectMemoryQuery(PAddr addr, bool find_next,
 
     if (dmem_area == dmem_map.end() || dmem_area->second.dma_type == PhysicalMemoryType::Free) {
         LOG_WARNING(Kernel_Vmm, "Unable to find allocated direct memory region to query!");
+        return ORBIS_KERNEL_ERROR_EACCES;
+    }
+    if (!find_next && (dmem_area->second.dma_type == PhysicalMemoryType::Pooled ||
+                       dmem_area->second.dma_type == PhysicalMemoryType::Committed)) {
+        LOG_WARNING(Kernel_Vmm, "Direct memory query on pooled memory");
         return ORBIS_KERNEL_ERROR_EACCES;
     }
 
@@ -1404,6 +1413,50 @@ s32 MemoryManager::SetDirectMemoryType(VAddr addr, u64 size, s32 memory_type) {
     return ORBIS_OK;
 }
 
+bool MemoryManager::IsDirectMemoryShared(VAddr addr, u64 size) {
+    std::shared_lock lk{mutex};
+
+    // Physical ranges of the direct mappings in the range, with the mapping each belongs to.
+    struct PhysRange {
+        PAddr start, end;
+        VAddr owner;
+    };
+    std::vector<PhysRange> ranges;
+    VAddr current_addr = addr;
+    u64 remaining_size = size;
+    for (auto it = FindVMA(addr); it != vma_map.end() && remaining_size > 0; ++it) {
+        auto& vma = it->second;
+        const u64 start_in_vma = current_addr - vma.base;
+        const u64 size_in_vma = std::min<u64>(remaining_size, vma.size - start_in_vma);
+        if (vma.type == VMAType::Direct) {
+            vma.ForEachPhysArea(start_in_vma, size_in_vma, [&](PAddr phys, u64 len) {
+                ranges.push_back({phys, phys + len, vma.base});
+            });
+        }
+        current_addr += size_in_vma;
+        remaining_size -= size_in_vma;
+    }
+
+    // Any other direct mapping of one of those pages.
+    for (auto& [base, vma] : vma_map) {
+        if (vma.type != VMAType::Direct) {
+            continue;
+        }
+        bool shared = false;
+        vma.ForEachPhysArea(0, vma.size, [&](PAddr phys, u64 len) {
+            for (const auto& range : ranges) {
+                if (range.owner != base && phys < range.end && range.start < phys + len) {
+                    shared = true;
+                }
+            }
+        });
+        if (shared) {
+            return true;
+        }
+    }
+    return false;
+}
+
 void MemoryManager::NameVirtualRange(VAddr virtual_addr, u64 size, std::string_view name) {
     std::scoped_lock lk{mutex, unmap_mutex};
 
@@ -1453,7 +1506,9 @@ s32 MemoryManager::GetDirectMemoryType(PAddr addr, s32* directMemoryTypeOut,
     std::shared_lock lk{mutex};
     const auto dmem_handle = FindDmemArea(addr);
     const auto& dmem_area = dmem_handle->second;
-    if (dmem_area.dma_type == PhysicalMemoryType::Free) {
+    if (dmem_area.dma_type == PhysicalMemoryType::Free ||
+        dmem_area.dma_type == PhysicalMemoryType::Pooled ||
+        dmem_area.dma_type == PhysicalMemoryType::Committed) {
         LOG_ERROR(Kernel_Vmm, "Unable to find allocated direct memory region to check type!");
         return ORBIS_KERNEL_ERROR_ENOENT;
     }
