@@ -135,6 +135,13 @@ struct VirtualMemoryArea {
     // private mappings merge when mapped; read-write private ones never merge.
     u64 file_offset = 0;
     bool file_merges = false;
+    // A file opened without read access (DmemTest TF3): mapped without CPU access, and mprotect
+    // cannot give CPU read.
+    bool file_write_only = false;
+    // A reservation made by mmap with MAP_VOID that ends where the reserved range it was made in
+    // ends, and did not merge when made. Measured on hardware (DmemTest CO2, CO3, CO13, CO14): a
+    // mapping made later to its left never merges with it.
+    bool no_merge_from_left = false;
 
     bool Contains(VAddr addr, u64 size) const {
         return addr >= base && (addr + size) <= (base + this->size);
@@ -179,6 +186,9 @@ struct VirtualMemoryArea {
         // Measured on hardware at SDK 4.508 (DmemTest CO1, CO9, FW6): anonymous flexible mappings
         // never merge. From SDK 5.50 on, test_550 documents merging (ignore_anon_names).
         if (type == VMAType::Flexible && !ignore_anon_names) {
+            return false;
+        }
+        if (next.no_merge_from_left) {
             return false;
         }
         if (type == VMAType::File && (!file_merges || !next.file_merges || fd != next.fd ||
@@ -324,6 +334,8 @@ public:
 
     s32 PoolMove(VAddr dest_addr, VAddr src_addr, u64 size);
 
+    bool IsPhysicalMemoryAliased(VAddr addr, u64 size);
+
     s32 UnmapMemory(VAddr virtual_addr, u64 size);
 
     s32 QueryProtection(VAddr addr, void** start, void** end, u32* prot);
@@ -388,6 +400,10 @@ private:
     VAddr SearchFree(VAddr virtual_addr, u64 size, u64 alignment);
 
     VMAHandle MergeAdjacent(VMAMap& map, VMAHandle iter);
+
+    bool MergeWithNext(VMAMap& map, VMAHandle iter);
+
+    VMAHandle MergeWithPrev(VMAMap& map, VMAHandle iter);
 
     PhysHandle MergeAdjacent(PhysMap& map, PhysHandle iter);
 

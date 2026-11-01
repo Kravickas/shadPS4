@@ -771,6 +771,14 @@ s32 MemoryManager::MapMemory(void** out_addr, VAddr virtual_addr, u64 size, Memo
     }
 
     // Create VMA representing this mapping.
+    // Whether a fixed void reservation ends where the reserved range it replaces ends (see below).
+    bool at_reserved_end = false;
+    if (type == VMAType::Reserved && True(flags & MemoryMapFlags::Void) &&
+        True(flags & MemoryMapFlags::Fixed)) {
+        const auto existing = FindVMA(virtual_addr);
+        at_reserved_end = existing != vma_map.end() && existing->second.type == VMAType::Reserved &&
+                          existing->second.base + existing->second.size == virtual_addr + size;
+    }
     auto new_vma_handle = CreateArea(virtual_addr, size, prot, flags, type, name, alignment);
     auto& new_vma = new_vma_handle->second;
     auto mapped_addr = new_vma.base;
@@ -851,7 +859,21 @@ s32 MemoryManager::MapMemory(void** out_addr, VAddr virtual_addr, u64 size, Memo
         ASSERT_MSG(remaining_size == 0, "Failed to map physical memory");
     }
 
-    if (new_vma.type != VMAType::Direct || sdk_version >= Common::ElfInfo::FW_200) {
+    if (type == VMAType::Reserved && True(flags & MemoryMapFlags::Void)) {
+        // Measured on hardware (DmemTest CO2, CO3, CO11-CO14) for reservations made by mmap with
+        // MAP_VOID: a new one merges with its left neighbour; with MAP_SHARED also with its right
+        // one, without it only when it did not merge left. One that ends where the reserved range
+        // it was made in ends and merged with nothing is never merged into from the left later.
+        // (compared by start address: a merge erases new_vma_handle)
+        const VAddr own_base = new_vma_handle->second.base;
+        const auto merged = MergeWithPrev(vma_map, new_vma_handle);
+        const bool merged_left = merged->second.base != own_base;
+        const bool merged_right = (True(flags & MemoryMapFlags::Shared) || !merged_left) &&
+                                  MergeWithNext(vma_map, merged);
+        if (!merged_left && !merged_right && at_reserved_end) {
+            merged->second.no_merge_from_left = true;
+        }
+    } else if (new_vma.type != VMAType::Direct || sdk_version >= Common::ElfInfo::FW_200) {
         // Merge this VMA with similar nearby areas
         // Direct memory mappings only coalesce on SDK version 2.00 or later.
         MergeAdjacent(vma_map, new_vma_handle);
@@ -996,15 +1018,6 @@ s32 MemoryManager::MapFile(void** out_addr, VAddr virtual_addr, u64 size, Memory
     // Aquire writer lock
     std::scoped_lock lk2{mutex};
 
-    // A file without read access has nothing the host could map; the area behaves like a reserved
-    // one, which keeps mprotect from granting access (see above).
-    if (write_only) {
-        auto area =
-            CreateArea(virtual_addr, size, MemoryProt::NoAccess, flags, VMAType::Reserved, name, 0);
-        *out_addr = std::bit_cast<void*>(area->second.base);
-        return ORBIS_OK;
-    }
-
     // Update VMA map and map to address space.
     auto new_vma_handle = CreateArea(virtual_addr, size, prot, flags, VMAType::File, name, 0);
 
@@ -1013,6 +1026,7 @@ s32 MemoryManager::MapFile(void** out_addr, VAddr virtual_addr, u64 size, Memory
     // Set for a shared mapping of a host file without write access, and for non-host backends
     // (read-only); a private mapping of a host file is a writable copy (below).
     new_vma.file_read_only = read_only_file;
+    new_vma.file_write_only = write_only;
     new_vma.file_offset = static_cast<u64>(phys_addr);
     new_vma.file_merges =
         True(flags & MemoryMapFlags::Shared) || False(prot & MemoryProt::CpuWrite);
@@ -1049,7 +1063,13 @@ s32 MemoryManager::MapFile(void** out_addr, VAddr virtual_addr, u64 size, Memory
     // when it is mapped. Writes to the file afterwards do not show in it (even in pages never
     // touched), writes to it do not reach the file, and it can be made writable even when the file
     // cannot be written. Host files are copied in the way other backends populate mappings.
-    if (host_file != nullptr && False(flags & MemoryMapFlags::Shared)) {
+    if (write_only) {
+        // A file without read access has nothing the host could map: the area is anonymous memory
+        // without CPU access (DmemTest TF3).
+        u8* const dst = reinterpret_cast<u8*>(mapped_addr);
+        map_ctx.map_anonymous(dst, size);
+        map_ctx.protect(dst, size, std::bit_cast<u32>(MemoryProt::NoAccess));
+    } else if (host_file != nullptr && False(flags & MemoryMapFlags::Shared)) {
         u8* const dst = reinterpret_cast<u8*>(mapped_addr);
         map_ctx.map_anonymous(dst, size);
         const u64 offset = static_cast<u64>(phys_addr);
@@ -1283,6 +1303,47 @@ s32 MemoryManager::PoolMove(VAddr dest_addr, VAddr src_addr, u64 size) {
     return ORBIS_OK;
 }
 
+bool MemoryManager::IsPhysicalMemoryAliased(VAddr addr, u64 size) {
+    std::shared_lock lk{mutex};
+    // The physical pieces of [addr, addr + size), each with the virtual address mapping it.
+    struct Piece {
+        VAddr va;
+        PAddr pa;
+        u64 size;
+    };
+    std::vector<Piece> pieces;
+    for (auto it = FindVMA(addr); it != vma_map.end() && it->second.base < addr + size; ++it) {
+        const auto& vma = it->second;
+        if (vma.type != VMAType::Direct) {
+            continue;
+        }
+        for (const auto& [offset, area] : vma.phys_areas) {
+            const VAddr start = std::max<VAddr>(vma.base + offset, addr);
+            const VAddr end = std::min<VAddr>(vma.base + offset + area.size, addr + size);
+            if (start < end) {
+                pieces.push_back({start, area.base + (start - vma.base - offset), end - start});
+            }
+        }
+    }
+    // A physical page in the range is also mapped at a second virtual address.
+    for (const auto& [base, vma] : vma_map) {
+        if (vma.type != VMAType::Direct) {
+            continue;
+        }
+        for (const auto& [offset, area] : vma.phys_areas) {
+            for (const auto& piece : pieces) {
+                const PAddr start = std::max<PAddr>(piece.pa, area.base);
+                const PAddr end = std::min<PAddr>(piece.pa + piece.size, area.base + area.size);
+                if (start < end &&
+                    vma.base + offset + (start - area.base) != piece.va + (start - piece.pa)) {
+                    return true;
+                }
+            }
+        }
+    }
+    return false;
+}
+
 s32 MemoryManager::UnmapMemory(VAddr virtual_addr, u64 size) {
     if (size == 0) {
         return ORBIS_OK;
@@ -1476,7 +1537,9 @@ s32 MemoryManager::QueryProtection(VAddr addr, void** start, void** end, u32* pr
         // Measured on hardware: this query reports committed pool memory as CPU and GPU read/write.
         // The protection it really has, which VirtualQuery reports, is the one it was given.
         // A range from ReserveVirtualRange reads back 0 whatever mprotect gave it (RV4).
-        *prot = vma.type == VMAType::Pooled
+        // Measured on hardware (DmemTest CV40-CV42, CV70-CV94): every page of a pool reservation
+        // reads back 0x33, committed or not.
+        *prot = vma.type == VMAType::Pooled || vma.type == VMAType::PoolReserved
                     ? static_cast<u32>(MemoryProt::CpuReadWrite | MemoryProt::GpuReadWrite)
                 : vma.type == VMAType::Reserved ? 0u
                                                 : static_cast<u32>(vma.prot);
@@ -1506,6 +1569,11 @@ s64 MemoryManager::ProtectBytes(VAddr addr, VirtualMemoryArea& vma_base, u64 siz
     // writable as a copy on the PS4; without copy-on-write views here it stays read-only.
     if (vma_base.type == VMAType::File && vma_base.file_read_only) {
         prot &= ~MemoryProt::CpuWrite;
+    }
+    // Measured on hardware (DmemTest TF3): a mapping of a file opened without read access reads
+    // back write-only after mprotect to read/write.
+    if (vma_base.type == VMAType::File && vma_base.file_write_only) {
+        prot &= ~MemoryProt::CpuRead;
     }
     const MemoryProt new_prot = prot;
 
@@ -1674,7 +1742,15 @@ s32 MemoryManager::VirtualQuery(VAddr addr, s32 flags,
         // Offset is only assigned for direct mappings.
         ASSERT_MSG(vma.phys_areas.size() > 0, "No physical backing for direct mapping?");
         info->offset = vma.phys_areas.begin()->second.base;
-        info->memory_type = vma.phys_areas.begin()->second.memory_type;
+        // Measured on hardware (DmemTest CV54, CV62): the type is the current type of the physical
+        // memory at the queried address, also when another mapping changed it.
+        const u64 query_offset = std::max<VAddr>(query_addr, vma.base) - vma.base;
+        auto phys = vma.phys_areas.upper_bound(query_offset);
+        if (phys != vma.phys_areas.begin()) {
+            --phys;
+        }
+        info->memory_type =
+            FindDmemArea(phys->second.base + (query_offset - phys->first))->second.memory_type;
     }
     if (vma.type == VMAType::PoolReserved || vma.type == VMAType::Pooled) {
         // Measured on hardware: pool memory reports its offset in its reservation, and committed
@@ -1993,8 +2069,27 @@ s32 MemoryManager::GetDirectMemoryType(PAddr addr, s32* directMemoryTypeOut,
         return ORBIS_KERNEL_ERROR_ENOENT;
     }
 
-    *directMemoryStartOut = reinterpret_cast<void*>(dmem_area.base);
-    *directMemoryEndOut = reinterpret_cast<void*>(dmem_area.GetEnd());
+    // Measured on hardware (DmemTest CarveTest probes CV3-CV35, CV61): the region reported covers
+    // the neighbouring allocated areas of the same type, mapped or not, wherever mappings split
+    // them; an area whose type MapDirectMemory2 set stays apart (DT5, DT7, DT8).
+    const auto joins = [](const PhysicalMemoryArea& a, const PhysicalMemoryArea& b) {
+        const auto allocated = [](const PhysicalMemoryArea& area) {
+            return area.dma_type == PhysicalMemoryType::Allocated ||
+                   area.dma_type == PhysicalMemoryType::Mapped;
+        };
+        return a.GetEnd() == b.base && allocated(a) && allocated(b) &&
+               a.memory_type == b.memory_type && !a.type_from_map2 && !b.type_from_map2;
+    };
+    auto first = FindDmemArea(addr);
+    while (first != dmem_map.begin() && joins(std::prev(first)->second, first->second)) {
+        --first;
+    }
+    auto last = FindDmemArea(addr);
+    while (std::next(last) != dmem_map.end() && joins(last->second, std::next(last)->second)) {
+        ++last;
+    }
+    *directMemoryStartOut = reinterpret_cast<void*>(first->second.base);
+    *directMemoryEndOut = reinterpret_cast<void*>(last->second.GetEnd());
     *directMemoryTypeOut = dmem_area.memory_type;
     return ORBIS_OK;
 }
@@ -2102,36 +2197,46 @@ VAddr MemoryManager::SearchFree(VAddr virtual_addr, u64 size, u64 alignment) {
     return -1;
 }
 
-MemoryManager::VMAHandle MemoryManager::MergeAdjacent(VMAMap& handle_map, VMAHandle iter) {
+bool MemoryManager::MergeWithNext(VMAMap& handle_map, VMAHandle iter) {
     // From SDK 5.50 on, mappings made from different call sites merge, and the merged area keeps
     // the name of the newest mapping (OpenOrbis-Unit-Tests memory_test, test_550).
     const bool ignore_anon_names = static_cast<u32>(sdk_version) >= Common::ElfInfo::FW_550;
     const auto next_vma = std::next(iter);
-    if (next_vma != handle_map.end() &&
-        iter->second.CanMergeWith(next_vma->second, ignore_anon_names)) {
-        u64 base_offset = iter->second.size;
-        iter->second.size += next_vma->second.size;
-        for (auto& area : next_vma->second.phys_areas) {
-            iter->second.phys_areas[base_offset + area.first] = area.second;
-        }
-        handle_map.erase(next_vma);
+    if (next_vma == handle_map.end() ||
+        !iter->second.CanMergeWith(next_vma->second, ignore_anon_names)) {
+        return false;
     }
-
-    if (iter != handle_map.begin()) {
-        auto prev_vma = std::prev(iter);
-        if (prev_vma->second.CanMergeWith(iter->second, ignore_anon_names)) {
-            prev_vma->second.name = iter->second.name;
-            u64 base_offset = prev_vma->second.size;
-            prev_vma->second.size += iter->second.size;
-            for (auto& area : iter->second.phys_areas) {
-                prev_vma->second.phys_areas[base_offset + area.first] = area.second;
-            }
-            handle_map.erase(iter);
-            iter = prev_vma;
-        }
+    u64 base_offset = iter->second.size;
+    iter->second.size += next_vma->second.size;
+    for (auto& area : next_vma->second.phys_areas) {
+        iter->second.phys_areas[base_offset + area.first] = area.second;
     }
+    handle_map.erase(next_vma);
+    return true;
+}
 
-    return iter;
+MemoryManager::VMAHandle MemoryManager::MergeWithPrev(VMAMap& handle_map, VMAHandle iter) {
+    const bool ignore_anon_names = static_cast<u32>(sdk_version) >= Common::ElfInfo::FW_550;
+    if (iter == handle_map.begin()) {
+        return iter;
+    }
+    auto prev_vma = std::prev(iter);
+    if (!prev_vma->second.CanMergeWith(iter->second, ignore_anon_names)) {
+        return iter;
+    }
+    prev_vma->second.name = iter->second.name;
+    u64 base_offset = prev_vma->second.size;
+    prev_vma->second.size += iter->second.size;
+    for (auto& area : iter->second.phys_areas) {
+        prev_vma->second.phys_areas[base_offset + area.first] = area.second;
+    }
+    handle_map.erase(iter);
+    return prev_vma;
+}
+
+MemoryManager::VMAHandle MemoryManager::MergeAdjacent(VMAMap& handle_map, VMAHandle iter) {
+    MergeWithNext(handle_map, iter);
+    return MergeWithPrev(handle_map, iter);
 }
 
 MemoryManager::PhysHandle MemoryManager::MergeAdjacent(PhysMap& handle_map, PhysHandle iter) {

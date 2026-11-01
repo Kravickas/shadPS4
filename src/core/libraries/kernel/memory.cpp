@@ -611,6 +611,11 @@ s32 PS4_SYSV_ABI sceKernelMtypeprotect(const void* addr, u64 size, s32 mtype, s3
     if (memory_manager->ContainsFlexibleMemory(aligned_addr, aligned_size)) {
         return ORBIS_KERNEL_ERROR_EOPNOTSUPP;
     }
+    // Measured on hardware (DmemTest CV21, CV22, CV50, CV51, CV56, CV99): memory whose physical
+    // pages are also mapped at another address is EBUSY.
+    if (memory_manager->IsPhysicalMemoryAliased(aligned_addr, aligned_size)) {
+        return ORBIS_KERNEL_ERROR_EBUSY;
+    }
     // Measured on hardware (DmemTest TP3): a range from ReserveVirtualRange is EACCES.
     if (memory_manager->ContainsVmaType(aligned_addr, aligned_size, Core::VMAType::Reserved)) {
         return ORBIS_KERNEL_ERROR_EACCES;
@@ -1097,7 +1102,9 @@ static void* PosixMmapImpl(void* addr, u64 len, s32 prot, s32 flags, s32 fd, s64
     }
 
     s32 result = ORBIS_OK;
-    if (True(mem_flags & Core::MemoryMapFlags::Anon)) {
+    // Measured on hardware (DmemTest BT9): MAP_VOID with MAP_ANON is a void reservation.
+    if (True(mem_flags & Core::MemoryMapFlags::Anon) &&
+        False(mem_flags & Core::MemoryMapFlags::Void)) {
         // Measured on hardware for each of the 32 bits: an anonymous mapping keeps CPU
         // read/write/execute and GPU read/write and drops every other protection bit.
         constexpr auto KeptProt = Core::MemoryProt::CpuRead | Core::MemoryProt::CpuWrite |
