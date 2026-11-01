@@ -1169,23 +1169,45 @@ s32 MemoryManager::PoolMove(VAddr dest_addr, VAddr src_addr, u64 size) {
     std::scoped_lock lk{unmap_mutex};
     ASSERT_MSG(IsValidMapping(src_addr, size) && IsValidMapping(dest_addr, size),
                "Attempted to access invalid address {:#x} or {:#x}", src_addr, dest_addr);
-    // The source must be committed and the destination reserved, both in pool memory. The PS4's
-    // error codes for other states are not measured yet (DmemTest PB5).
+    // Measured on hardware (DmemTest PB5): a destination with committed memory is EBUSY, and a
+    // source that is only reserved succeeds with nothing to move. Other states (a partly committed
+    // source, memory outside a pool) are not measured yet and are EINVAL here.
+    bool src_committed = false;
+    bool src_reserved = false;
     for (VAddr addr = src_addr; addr < src_addr + size;) {
         const auto it = FindVMA(addr);
-        if (it == vma_map.end() || it->second.type != VMAType::Pooled) {
-            LOG_ERROR(Kernel_Vmm, "Move source {:#x} is not committed pool memory", addr);
+        if (it == vma_map.end()) {
+            return ORBIS_KERNEL_ERROR_EINVAL;
+        }
+        src_committed |= it->second.type == VMAType::Pooled;
+        src_reserved |= it->second.type == VMAType::PoolReserved;
+        if (it->second.type != VMAType::Pooled && it->second.type != VMAType::PoolReserved) {
+            LOG_ERROR(Kernel_Vmm, "Move source {:#x} is not pool memory", addr);
             return ORBIS_KERNEL_ERROR_EINVAL;
         }
         addr = it->second.base + it->second.size;
     }
     for (VAddr addr = dest_addr; addr < dest_addr + size;) {
         const auto it = FindVMA(addr);
-        if (it == vma_map.end() || it->second.type != VMAType::PoolReserved) {
-            LOG_ERROR(Kernel_Vmm, "Move destination {:#x} is not reserved pool memory", addr);
+        if (it == vma_map.end()) {
+            return ORBIS_KERNEL_ERROR_EINVAL;
+        }
+        if (it->second.type == VMAType::Pooled) {
+            LOG_ERROR(Kernel_Vmm, "Move destination {:#x} is committed", addr);
+            return ORBIS_KERNEL_ERROR_EBUSY;
+        }
+        if (it->second.type != VMAType::PoolReserved) {
+            LOG_ERROR(Kernel_Vmm, "Move destination {:#x} is not pool memory", addr);
             return ORBIS_KERNEL_ERROR_EINVAL;
         }
         addr = it->second.base + it->second.size;
+    }
+    if (!src_committed) {
+        return ORBIS_OK;
+    }
+    if (src_reserved) {
+        LOG_ERROR(Kernel_Vmm, "Move source {:#x} is only partly committed", src_addr);
+        return ORBIS_KERNEL_ERROR_EINVAL;
     }
     if (IsValidGpuMapping(src_addr, size)) {
         rasterizer->UnmapMemory(src_addr, size);
