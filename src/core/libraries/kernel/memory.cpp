@@ -1232,10 +1232,12 @@ s32 PS4_SYSV_ABI posix_mlock(const void* addr, u64 len) {
         return -1;
     }
 
-    // Measured on hardware: a range that is not all mapped is ENOMEM, and so is one with reserved
-    // memory in it (DmemTest CO2, CO3, CO8).
+    // Measured on hardware: a range that is not all mapped is ENOMEM, and so is one with memory the
+    // CPU cannot access (reserved memory: DmemTest CO2, CO3, CO8; an anonymous mapping without
+    // access: CO16). Wiring faults the pages in, which fails for such memory (fpPS4 kern
+    // vm_map_wire, as FreeBSD).
     if (!Core::Memory::Instance()->IsRangeMapped(raw_addr, len) ||
-        Core::Memory::Instance()->ContainsVmaType(raw_addr, len, Core::VMAType::Reserved)) {
+        Core::Memory::Instance()->ContainsNoCpuAccess(raw_addr, len)) {
         *__Error() = POSIX_ENOMEM;
         return -1;
     }

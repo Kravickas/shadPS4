@@ -145,6 +145,15 @@ struct VirtualMemoryArea {
     // For an area made by ReserveVirtualRange: where that reserved range ended, kept when the area
     // is split, so a reservation made inside it can tell whether it ends at the range's end.
     VAddr reserve_end = 0;
+    // An anonymous mapping made with any access. Measured on hardware (DmemTest CO1, CO9, CO15:
+    // read only as well): it never merges, also after mprotect (fpPS4 kern: a credential in
+    // vm_map_simplify_entry, set for writable ones only there).
+    bool charged = false;
+    // A reservation made by mmap with MAP_VOID and without MAP_SHARED, or an anonymous mapping made
+    // without any access. Measured on hardware (DmemTest CO3, CO16): such an area merges with its
+    // left neighbour when made, with its right one only when it did not merge left, and mprotect
+    // does not merge it.
+    bool void_private = false;
 
     bool Contains(VAddr addr, u64 size) const {
         return addr >= base && (addr + size) <= (base + this->size);
@@ -186,11 +195,11 @@ struct VirtualMemoryArea {
         if (prot != next.prot || type != next.type) {
             return false;
         }
-        // Anonymous mappings charged to the budget (writable ones) never merge, at any SDK
-        // version: vm_map_simplify_entry returns early for entries with a credential (fpPS4 kern,
-        // reconstructed from the PS4 kernel; measured in DmemTest CO1, CO9, FW6).
-        if (type == VMAType::Flexible &&
-            True(prot & (MemoryProt::CpuWrite | MemoryProt::GpuWrite))) {
+        // Anonymous mappings charged to the budget (made writable) never merge, at any SDK
+        // version and whatever their protection now: vm_map_simplify_entry returns early for
+        // entries with a credential (fpPS4 kern, reconstructed from the PS4 kernel; measured in
+        // DmemTest CO1, CO9, FW6).
+        if (charged || next.charged) {
             return false;
         }
         if (next.no_merge_from_left) {
@@ -342,6 +351,8 @@ public:
     bool IsPhysicalMemoryAliased(VAddr addr, u64 size);
 
     bool IsWithinOnePoolReservation(VAddr addr, u64 size);
+
+    bool ContainsNoCpuAccess(VAddr addr, u64 size);
 
     s32 UnmapMemory(VAddr virtual_addr, u64 size);
 

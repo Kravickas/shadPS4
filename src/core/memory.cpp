@@ -658,6 +658,10 @@ MemoryManager::VMAHandle MemoryManager::CreateArea(VAddr virtual_addr, u64 size,
     new_vma.disallow_merge = True(flags & MemoryMapFlags::NoCoalesce);
     new_vma.no_merge_from_left = false;
     new_vma.reserve_end = 0;
+    new_vma.charged = type == VMAType::Flexible && prot != MemoryProt::NoAccess;
+    new_vma.void_private = (type == VMAType::Reserved && True(flags & MemoryMapFlags::Void) &&
+                            False(flags & MemoryMapFlags::Shared)) ||
+                           (type == VMAType::Flexible && prot == MemoryProt::NoAccess);
     new_vma.prot = prot;
     new_vma.name = name;
     new_vma.type = type;
@@ -865,7 +869,8 @@ s32 MemoryManager::MapMemory(void** out_addr, VAddr virtual_addr, u64 size, Memo
         ASSERT_MSG(remaining_size == 0, "Failed to map physical memory");
     }
 
-    if (type == VMAType::Reserved && True(flags & MemoryMapFlags::Void)) {
+    if ((type == VMAType::Reserved && True(flags & MemoryMapFlags::Void)) ||
+        (type == VMAType::Flexible && prot == MemoryProt::NoAccess)) {
         // Measured on hardware (DmemTest CO2, CO3, CO11-CO14) for reservations made by mmap with
         // MAP_VOID: a new one merges with its left neighbour; with MAP_SHARED also with its right
         // one, without it only when it did not merge left. One that ends where the reserved range
@@ -985,8 +990,10 @@ s32 MemoryManager::MapFile(void** out_addr, VAddr virtual_addr, u64 size, Memory
     }
 
     if (prot >= MemoryProt::GpuRead) {
-        // On real hardware, GPU file mmaps cause a full system crash due to an internal error.
-        ASSERT_MSG(false, "Files cannot be mapped to GPU memory");
+        // Measured on hardware (DmemTest TF6): mapping a file with GPU protection succeeds. What
+        // the GPU does with such memory is not known (reported to crash the system); it is not
+        // given to the GPU here.
+        LOG_WARNING(Kernel_Vmm, "File mapped with GPU protection {:#x}", static_cast<u32>(prot));
     }
 
     if (True(prot & MemoryProt::CpuExec)) {
@@ -1310,6 +1317,21 @@ s32 MemoryManager::PoolMove(VAddr dest_addr, VAddr src_addr, u64 size) {
     return ORBIS_OK;
 }
 
+bool MemoryManager::ContainsNoCpuAccess(VAddr addr, u64 size) {
+    std::shared_lock lk{mutex};
+    for (auto it = FindVMA(addr); it != vma_map.end() && it->second.base < addr + size; ++it) {
+        const auto& vma = it->second;
+        if (vma.IsFree()) {
+            continue;
+        }
+        if (vma.type == VMAType::Reserved || vma.type == VMAType::PoolReserved ||
+            False(vma.prot & (MemoryProt::CpuRead | MemoryProt::CpuExec))) {
+            return true;
+        }
+    }
+    return false;
+}
+
 bool MemoryManager::IsWithinOnePoolReservation(VAddr addr, u64 size) {
     std::shared_lock lk{mutex};
     const auto first = FindVMA(addr);
@@ -1511,6 +1533,8 @@ u64 MemoryManager::UnmapBytesFromEntry(VAddr virtual_addr, VirtualMemoryArea vma
     // A free area carries nothing over to the mappings made in it later.
     vma.no_merge_from_left = false;
     vma.reserve_end = 0;
+    vma.charged = false;
+    vma.void_private = false;
     vma.file_read_only = false;
     vma.file_write_only = false;
     vma.file_merges = false;
@@ -1558,11 +1582,23 @@ s32 MemoryManager::QueryProtection(VAddr addr, void** start, void** end, u32* pr
         return ORBIS_KERNEL_ERROR_EACCES;
     }
 
+    VAddr range_start = vma.base;
+    VAddr range_end = vma.base + vma.size;
+    // Below SDK 10.00 pool memory reports the whole map entry: its reservation (DmemTest PG4; fpPS4
+    // kern sys_query_memory_protection).
+    if ((vma.type == VMAType::Pooled || vma.type == VMAType::PoolReserved) &&
+        static_cast<u32>(sdk_version) < 0x10000000) {
+        const auto reservation = pool_reservations.find(vma.pool_base);
+        if (reservation != pool_reservations.end()) {
+            range_start = reservation->first;
+            range_end = reservation->first + reservation->second;
+        }
+    }
     if (start != nullptr) {
-        *start = reinterpret_cast<void*>(vma.base);
+        *start = reinterpret_cast<void*>(range_start);
     }
     if (end != nullptr) {
-        *end = reinterpret_cast<void*>(vma.base + vma.size);
+        *end = reinterpret_cast<void*>(range_end);
     }
     if (prot != nullptr) {
         // Below SDK 10.00 this reports the protection of the whole map entry, which for a pool
@@ -1660,7 +1696,9 @@ s64 MemoryManager::ProtectBytes(VAddr addr, VirtualMemoryArea& vma_base, u64 siz
     new_vma.prot = prot;
     // Measured on hardware (DmemTest FW2, TP2): direct mappings split by a protection change do not
     // merge again.
-    if (vma_base.type != VMAType::Direct) {
+    // Measured on hardware (DmemTest FW2, TP2, CO3): direct mappings and reservations made by mmap
+    // with MAP_VOID and without MAP_SHARED do not merge through mprotect.
+    if (vma_base.type != VMAType::Direct && !vma_base.void_private) {
         MergeAdjacent(vma_map, new_it);
     }
 
