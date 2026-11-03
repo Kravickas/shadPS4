@@ -656,6 +656,8 @@ MemoryManager::VMAHandle MemoryManager::CreateArea(VAddr virtual_addr, u64 size,
 
     // Update VMA appropriately.
     new_vma.disallow_merge = True(flags & MemoryMapFlags::NoCoalesce);
+    new_vma.no_merge_from_left = false;
+    new_vma.reserve_end = 0;
     new_vma.prot = prot;
     new_vma.name = name;
     new_vma.type = type;
@@ -777,12 +779,16 @@ s32 MemoryManager::MapMemory(void** out_addr, VAddr virtual_addr, u64 size, Memo
         True(flags & MemoryMapFlags::Fixed)) {
         const auto existing = FindVMA(virtual_addr);
         at_reserved_end = existing != vma_map.end() && existing->second.type == VMAType::Reserved &&
-                          existing->second.base + existing->second.size == virtual_addr + size;
+                          existing->second.reserve_end == virtual_addr + size;
     }
     auto new_vma_handle = CreateArea(virtual_addr, size, prot, flags, type, name, alignment);
     auto& new_vma = new_vma_handle->second;
     auto mapped_addr = new_vma.base;
     bool is_exec = True(prot & MemoryProt::CpuExec);
+    if (type == VMAType::Reserved && False(flags & MemoryMapFlags::Void)) {
+        // A range from ReserveVirtualRange: remember its end (see at_reserved_end).
+        new_vma.reserve_end = mapped_addr + size;
+    }
 
     // If type is Flexible, we need to track how much flexible memory is used here.
     // We also need to determine a reasonable physical base to perform this mapping at.
@@ -1502,6 +1508,13 @@ u64 MemoryManager::UnmapBytesFromEntry(VAddr virtual_addr, VirtualMemoryArea vma
     vma.disallow_merge = false;
     vma.name = "";
     vma.pool_base = 0;
+    // A free area carries nothing over to the mappings made in it later.
+    vma.no_merge_from_left = false;
+    vma.reserve_end = 0;
+    vma.file_read_only = false;
+    vma.file_write_only = false;
+    vma.file_merges = false;
+    vma.file_offset = 0;
     MergeAdjacent(vma_map, new_it);
 
     if (vma_type != VMAType::Reserved && vma_type != VMAType::PoolReserved) {
@@ -1590,12 +1603,6 @@ s64 MemoryManager::ProtectBytes(VAddr addr, VirtualMemoryArea& vma_base, u64 siz
     if (vma_base.type == VMAType::File && vma_base.file_read_only) {
         prot &= ~MemoryProt::CpuWrite;
     }
-    // A mapping of a file opened without read access has no read of any kind in its maximum
-    // protection: CPU read measured in DmemTest TF3 (read/write reads back write-only), GPU read
-    // from fpPS4 kern sys_mmap (reconstructed from the PS4 kernel).
-    if (vma_base.type == VMAType::File && vma_base.file_write_only) {
-        prot &= ~(MemoryProt::CpuRead | MemoryProt::GpuRead);
-    }
     const MemoryProt new_prot = prot;
 
     // Measured on hardware (DmemTest RV4, PT1): protecting a range from ReserveVirtualRange
@@ -1609,6 +1616,13 @@ s64 MemoryManager::ProtectBytes(VAddr addr, VirtualMemoryArea& vma_base, u64 siz
     if (True(prot & MemoryProt::CpuWrite)) {
         // On PS4, read is appended to write mappings.
         prot |= MemoryProt::CpuRead;
+    }
+    // After read is appended to write: a mapping of a file opened without read access has no
+    // read of any kind in its maximum
+    // protection: CPU read measured in DmemTest TF3 (read/write reads back write-only), GPU read
+    // from fpPS4 kern sys_mmap (reconstructed from the PS4 kernel).
+    if (vma_base.type == VMAType::File && vma_base.file_write_only) {
+        prot &= ~(MemoryProt::CpuRead | MemoryProt::GpuRead);
     }
 
     // Set permissions
@@ -1770,8 +1784,41 @@ s32 MemoryManager::VirtualQuery(VAddr addr, s32 flags,
         if (phys != vma.phys_areas.begin()) {
             --phys;
         }
-        info->memory_type =
-            FindDmemArea(phys->second.base + (query_offset - phys->first))->second.memory_type;
+        const PAddr query_phys = phys->second.base + (query_offset - phys->first);
+        info->memory_type = FindDmemArea(query_phys)->second.memory_type;
+        // Measured on hardware (CarveTest CV100, CV101): the region reported is the run of pages
+        // of this mapping whose physical memory has the queried page's current type, and the
+        // offset is the physical address at its start.
+        struct Run {
+            u64 start;
+            u64 end;
+            s32 type;
+            PAddr phys;
+        };
+        std::vector<Run> runs;
+        for (const auto& [offset, area] : vma.phys_areas) {
+            for (PAddr pa = area.base; pa < area.base + area.size;) {
+                const auto& dmem = FindDmemArea(pa)->second;
+                const PAddr piece_end = std::min<PAddr>(dmem.GetEnd(), area.base + area.size);
+                const u64 start = offset + (pa - area.base);
+                const u64 end = offset + (piece_end - area.base);
+                if (!runs.empty() && runs.back().end == start &&
+                    runs.back().type == dmem.memory_type) {
+                    runs.back().end = end;
+                } else {
+                    runs.push_back({start, end, dmem.memory_type, pa});
+                }
+                pa = piece_end;
+            }
+        }
+        for (const auto& run : runs) {
+            if (query_offset >= run.start && query_offset < run.end) {
+                info->start = vma.base + run.start;
+                info->end = vma.base + run.end;
+                info->offset = run.phys;
+                break;
+            }
+        }
     }
     if (vma.type == VMAType::PoolReserved || vma.type == VMAType::Pooled) {
         // Measured on hardware: pool memory reports its offset in its reservation, and committed
@@ -2001,12 +2048,15 @@ s32 MemoryManager::SetDirectMemoryType(VAddr addr, u64 size, s32 memory_type,
                     const u64 size_in_dmem = std::min<u64>(dmem_remaining, area_end - dmem_addr);
                     auto dmem_handle = CarvePhysArea(dmem_map, dmem_addr, size_in_dmem);
                     auto& dmem_area = dmem_handle->second;
+                    const bool type_changes = dmem_area.memory_type != reported_type;
                     dmem_area.memory_type = reported_type;
                     // Measured on hardware: a type set by MapDirectMemory2 keeps the area apart
                     // from its neighbours (DT5, DT7, DT8); a type set by mtypeprotect lets direct
                     // memory areas of the same type merge (TP2).
+                    // Only a type MapDirectMemory2 actually changes keeps the area apart: the same
+                    // type again does not (CarveTest CV23).
                     if (from_map_direct2) {
-                        dmem_area.type_from_map2 = true;
+                        dmem_area.type_from_map2 |= type_changes;
                     } else if (vma_handle->second.type == VMAType::Direct) {
                         MergeAdjacent(dmem_map, dmem_handle);
                     }
@@ -2232,6 +2282,9 @@ bool MemoryManager::MergeWithNext(VMAMap& handle_map, VMAHandle iter) {
     for (auto& area : next_vma->second.phys_areas) {
         iter->second.phys_areas[base_offset + area.first] = area.second;
     }
+    if (next_vma->second.reserve_end != 0) {
+        iter->second.reserve_end = next_vma->second.reserve_end;
+    }
     handle_map.erase(next_vma);
     return true;
 }
@@ -2250,6 +2303,9 @@ MemoryManager::VMAHandle MemoryManager::MergeWithPrev(VMAMap& handle_map, VMAHan
     prev_vma->second.size += iter->second.size;
     for (auto& area : iter->second.phys_areas) {
         prev_vma->second.phys_areas[base_offset + area.first] = area.second;
+    }
+    if (iter->second.reserve_end != 0) {
+        prev_vma->second.reserve_end = iter->second.reserve_end;
     }
     handle_map.erase(iter);
     return prev_vma;

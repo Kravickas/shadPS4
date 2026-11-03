@@ -142,6 +142,9 @@ struct VirtualMemoryArea {
     // ends, and did not merge when made. Measured on hardware (DmemTest CO2, CO3, CO13, CO14): a
     // mapping made later to its left never merges with it.
     bool no_merge_from_left = false;
+    // For an area made by ReserveVirtualRange: where that reserved range ended, kept when the area
+    // is split, so a reservation made inside it can tell whether it ends at the range's end.
+    VAddr reserve_end = 0;
 
     bool Contains(VAddr addr, u64 size) const {
         return addr >= base && (addr + size) <= (base + this->size);
