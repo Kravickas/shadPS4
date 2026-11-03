@@ -956,7 +956,8 @@ s32 MemoryManager::MapFile(void** out_addr, VAddr virtual_addr, u64 size, Memory
             // writable later; a private mapping is a writable copy (see below), read-write from
             // the start or after mprotect.
             if (True(flags & MemoryMapFlags::Shared)) {
-                if (True(prot & MemoryProt::CpuWrite)) {
+                // CPU write measured (TF4); GPU write from fpPS4 kern sys_mmap.
+                if (True(prot & (MemoryProt::CpuWrite | MemoryProt::GpuWrite))) {
                     LOG_ERROR(Kernel_Vmm, "Shared writable mapping of a file without write access");
                     return ORBIS_KERNEL_ERROR_EACCES;
                 }
@@ -1303,6 +1304,23 @@ s32 MemoryManager::PoolMove(VAddr dest_addr, VAddr src_addr, u64 size) {
     return ORBIS_OK;
 }
 
+bool MemoryManager::IsWithinOnePoolReservation(VAddr addr, u64 size) {
+    std::shared_lock lk{mutex};
+    const auto first = FindVMA(addr);
+    if (first == vma_map.end()) {
+        return false;
+    }
+    const VAddr pool_base = first->second.pool_base;
+    for (auto it = first; it != vma_map.end() && it->second.base < addr + size; ++it) {
+        const auto& vma = it->second;
+        if ((vma.type != VMAType::Pooled && vma.type != VMAType::PoolReserved) ||
+            vma.pool_base != pool_base) {
+            return false;
+        }
+    }
+    return true;
+}
+
 bool MemoryManager::IsPhysicalMemoryAliased(VAddr addr, u64 size) {
     std::shared_lock lk{mutex};
     // The physical pieces of [addr, addr + size), each with the virtual address mapping it.
@@ -1534,15 +1552,17 @@ s32 MemoryManager::QueryProtection(VAddr addr, void** start, void** end, u32* pr
         *end = reinterpret_cast<void*>(vma.base + vma.size);
     }
     if (prot != nullptr) {
-        // Measured on hardware: this query reports committed pool memory as CPU and GPU read/write.
-        // The protection it really has, which VirtualQuery reports, is the one it was given.
-        // A range from ReserveVirtualRange reads back 0 whatever mprotect gave it (RV4).
-        // Measured on hardware (DmemTest CV40-CV42, CV70-CV94): every page of a pool reservation
-        // reads back 0x33, committed or not.
-        *prot = vma.type == VMAType::Pooled || vma.type == VMAType::PoolReserved
+        // Below SDK 10.00 this reports the protection of the whole map entry, which for a pool
+        // reservation is CPU and GPU read/write: every page reads back 0x33, committed or not
+        // (DmemTest CV40-CV42, CV70-CV94; fpPS4 kern sys_query_memory_protection). From SDK 10.00
+        // on, pool memory reports what VirtualQuery reports. A range from ReserveVirtualRange reads
+        // back 0 whatever mprotect gave it (RV4).
+        const bool pool = vma.type == VMAType::Pooled || vma.type == VMAType::PoolReserved;
+        *prot = pool && static_cast<u32>(sdk_version) < 0x10000000
                     ? static_cast<u32>(MemoryProt::CpuReadWrite | MemoryProt::GpuReadWrite)
-                : vma.type == VMAType::Reserved ? 0u
-                                                : static_cast<u32>(vma.prot);
+                : vma.type == VMAType::Reserved || vma.type == VMAType::PoolReserved
+                    ? 0u
+                    : static_cast<u32>(vma.prot);
     }
 
     return ORBIS_OK;
@@ -1570,10 +1590,11 @@ s64 MemoryManager::ProtectBytes(VAddr addr, VirtualMemoryArea& vma_base, u64 siz
     if (vma_base.type == VMAType::File && vma_base.file_read_only) {
         prot &= ~MemoryProt::CpuWrite;
     }
-    // Measured on hardware (DmemTest TF3): a mapping of a file opened without read access reads
-    // back write-only after mprotect to read/write.
+    // A mapping of a file opened without read access has no read of any kind in its maximum
+    // protection: CPU read measured in DmemTest TF3 (read/write reads back write-only), GPU read
+    // from fpPS4 kern sys_mmap (reconstructed from the PS4 kernel).
     if (vma_base.type == VMAType::File && vma_base.file_write_only) {
-        prot &= ~MemoryProt::CpuRead;
+        prot &= ~(MemoryProt::CpuRead | MemoryProt::GpuRead);
     }
     const MemoryProt new_prot = prot;
 

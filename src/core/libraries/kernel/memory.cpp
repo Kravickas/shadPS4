@@ -165,30 +165,39 @@ s32 PS4_SYSV_ABI sceKernelAvailableDirectMemorySize(u64 searchStart, u64 searchE
     return result;
 }
 
+// The kernel's rule (fpPS4 kern sys_virtual_query, reconstructed from the PS4 kernel; measured in
+// DmemTest VQ9-VQ15): a map entry lying entirely in the system library area, 0x7F0000000 up to
+// 0xFF0000000, is not reported unless the caller is code in that area itself. A query for it is
+// EACCES; a search for the next mapping (flag 1) skips such entries and reports the first one
+// after them, or EACCES. An entry reaching outside the area is reported. On the PS4 every module
+// but the executable, the main thread's TLS and the GnmDriver area at 0xFE0000000 are in this
+// area; what is placed here (system modules, the GnmDriver area) has its PS4 counterpart in it.
+static s32 VirtualQueryImpl(const void* addr, s32 flags, OrbisVirtualQueryInfo* info,
+                            bool system_caller) {
+    LOG_INFO(Kernel_Vmm, "called addr = {}, flags = {:#x}", fmt::ptr(addr), flags);
+    constexpr VAddr SystemAreaStart = 0x7F0000000ULL;
+    constexpr VAddr SystemAreaEnd = 0xFF0000000ULL;
+    auto* memory = Core::Memory::Instance();
+    s32 result = memory->VirtualQuery(std::bit_cast<VAddr>(addr), flags, info);
+    if (result != ORBIS_OK || system_caller) {
+        return result;
+    }
+    while (info->start >= SystemAreaStart && info->end <= SystemAreaEnd) {
+        if ((flags & 1) == 0) {
+            return ORBIS_KERNEL_ERROR_EACCES;
+        }
+        result = memory->VirtualQuery(info->end, 1, info);
+        if (result != ORBIS_OK) {
+            return ORBIS_KERNEL_ERROR_EACCES;
+        }
+    }
+    return ORBIS_OK;
+}
+
+// Calls from inside the emulator stand for system library code.
 s32 PS4_SYSV_ABI sceKernelVirtualQuery(const void* addr, s32 flags, OrbisVirtualQueryInfo* info,
                                        u64 infoSize) {
-    LOG_INFO(Kernel_Vmm, "called addr = {}, flags = {:#x}", fmt::ptr(addr), flags);
-    auto* memory = Core::Memory::Instance();
-    // Measured on hardware (DmemTest VQ9-VQ14): addresses from 0x7F0000000 up to 0xFF0000000 are
-    // refused with EACCES, mapped or not, with either flag (0x7EFFFC000 and 0xFF0000000 are
-    // answered). On the PS4 every module but the executable (system and game-bundled), the main
-    // thread's TLS and the GnmDriver area at 0xFE0000000 are in this range; what is placed here
-    // (system modules, the GnmDriver area) has its PS4 counterpart in it as well.
-    // A search for the next mapping (flag 1) from below the range is refused too when the mapping
-    // it finds starts in the range (DmemTest VQ15: a system module, and a page of the process's
-    // own at 0x7F0000000).
-    constexpr VAddr RefusedStart = 0x7F0000000ULL;
-    constexpr VAddr RefusedEnd = 0xFF0000000ULL;
-    const VAddr query_addr = std::bit_cast<VAddr>(addr);
-    if (query_addr >= RefusedStart && query_addr < RefusedEnd) {
-        return ORBIS_KERNEL_ERROR_EACCES;
-    }
-    const s32 result = memory->VirtualQuery(query_addr, flags, info);
-    if (result == ORBIS_OK && flags == 1 && info->start >= RefusedStart &&
-        info->start < RefusedEnd) {
-        return ORBIS_KERNEL_ERROR_EACCES;
-    }
-    return result;
+    return VirtualQueryImpl(addr, flags, info, true);
 }
 
 static s32 ReserveVirtualRangeImpl(void** addr, u64 len, s32 flags, u64 alignment,
@@ -613,6 +622,15 @@ s32 PS4_SYSV_ABI sceKernelMtypeprotect(const void* addr, u64 size, s32 mtype, s3
     }
     // Measured on hardware (DmemTest CV21, CV22, CV50, CV51, CV56, CV99): memory whose physical
     // pages are also mapped at another address is EBUSY.
+    // Pool memory: start and end 64 KiB aligned and within one reservation, else EINVAL (fpPS4 kern
+    // vm_map_type_protect, reconstructed from the PS4 kernel; DmemTest TP4).
+    if (memory_manager->ContainsVmaType(aligned_addr, 1, Core::VMAType::Pooled) ||
+        memory_manager->ContainsVmaType(aligned_addr, 1, Core::VMAType::PoolReserved)) {
+        if (!Common::Is64KBAligned(aligned_addr) || !Common::Is64KBAligned(aligned_size) ||
+            !memory_manager->IsWithinOnePoolReservation(aligned_addr, aligned_size)) {
+            return ORBIS_KERNEL_ERROR_EINVAL;
+        }
+    }
     if (memory_manager->IsPhysicalMemoryAliased(aligned_addr, aligned_size)) {
         return ORBIS_KERNEL_ERROR_EBUSY;
     }
@@ -1360,6 +1378,11 @@ static s32 PS4_SYSV_ABI MapDirectMemoryFromGuest(VAddr caller, void** addr, u64 
     return sceKernelMapNamedDirectMemory(addr, len, prot, flags, phys_addr, alignment,
                                          CallerName(caller).c_str());
 }
+static s32 PS4_SYSV_ABI VirtualQueryFromGuest(VAddr caller, const void* addr, s32 flags,
+                                              OrbisVirtualQueryInfo* info, u64 /*infoSize*/) {
+    return VirtualQueryImpl(addr, flags, info, caller - 0x7F0000000ULL < 0x800000000ULL);
+}
+
 // Measured on hardware: an empty name gives the mapping its caller-based name.
 static s32 PS4_SYSV_ABI MapNamedDirectMemoryFromGuest(VAddr caller, void** addr, u64 len, s32 prot,
                                                       s32 flags, s64 phys_addr, u64 alignment,
@@ -1398,7 +1421,7 @@ void RegisterMemory(Core::Loader::SymbolsResolver* sym) {
     LIB_FUNCTION("B+vc2AO2Zrc", "libkernel", 1, "libkernel", sceKernelAllocateMainDirectMemory);
     LIB_FUNCTION("C0f7TJcbfac", "libkernel", 1, "libkernel", sceKernelAvailableDirectMemorySize);
     LIB_FUNCTION("hwVSPCmp5tM", "libkernel", 1, "libkernel", sceKernelCheckedReleaseDirectMemory);
-    LIB_FUNCTION("rVjRvHJ0X6c", "libkernel", 1, "libkernel", sceKernelVirtualQuery);
+    LIB_FUNCTION_WITH_CALLER("rVjRvHJ0X6c", "libkernel", 1, "libkernel", VirtualQueryFromGuest);
     LIB_FUNCTION_WITH_CALLER("7oxv3PPCumo", "libkernel", 1, "libkernel",
                              ReserveVirtualRangeFromGuest);
     LIB_FUNCTION("BC+OG5m9+bw", "libkernel", 1, "libkernel", sceKernelGetDirectMemoryType);

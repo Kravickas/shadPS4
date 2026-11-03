@@ -183,9 +183,11 @@ struct VirtualMemoryArea {
         if (prot != next.prot || type != next.type) {
             return false;
         }
-        // Measured on hardware at SDK 4.508 (DmemTest CO1, CO9, FW6): anonymous flexible mappings
-        // never merge. From SDK 5.50 on, test_550 documents merging (ignore_anon_names).
-        if (type == VMAType::Flexible && !ignore_anon_names) {
+        // Anonymous mappings charged to the budget (writable ones) never merge, at any SDK
+        // version: vm_map_simplify_entry returns early for entries with a credential (fpPS4 kern,
+        // reconstructed from the PS4 kernel; measured in DmemTest CO1, CO9, FW6).
+        if (type == VMAType::Flexible &&
+            True(prot & (MemoryProt::CpuWrite | MemoryProt::GpuWrite))) {
             return false;
         }
         if (next.no_merge_from_left) {
@@ -335,6 +337,8 @@ public:
     s32 PoolMove(VAddr dest_addr, VAddr src_addr, u64 size);
 
     bool IsPhysicalMemoryAliased(VAddr addr, u64 size);
+
+    bool IsWithinOnePoolReservation(VAddr addr, u64 size);
 
     s32 UnmapMemory(VAddr virtual_addr, u64 size);
 
