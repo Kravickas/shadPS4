@@ -294,10 +294,22 @@ s32 PS4_SYSV_ABI sceKernelMapNamedDirectMemory(void** addr, u64 len, s32 prot, s
         return ORBIS_KERNEL_ERROR_ENAMETOOLONG;
     }
 
-    const auto mem_prot = static_cast<Core::MemoryProt>(prot);
+    // From SDK 2.50, except with MAP_STACK, libkernel maps through sceKernelMapDirectMemory2.
+    // Measured on hardware with the SDK chain (DmemTest BT6, EX2; FW 12.02, every released version
+    // 1.00-9.50): execute is EACCES below 2.50 and EINVAL from 2.50; from 2.50 until 3.00 the
+    // protection bits from 0x100 up are accepted (and have no effect), before and after that
+    // EINVAL.
+    const u32 sdk = static_cast<u32>(g_sdk_version);
+    const bool via_map2 =
+        sdk >= Common::ElfInfo::FW_250 &&
+        False(static_cast<Core::MemoryMapFlags>(flags) & Core::MemoryMapFlags::Stack);
+    auto mem_prot = static_cast<Core::MemoryProt>(prot);
     if (True(mem_prot & Core::MemoryProt::CpuExec)) {
         LOG_ERROR(Kernel_Vmm, "Executable permissions are not allowed.");
-        return ORBIS_KERNEL_ERROR_EACCES;
+        return via_map2 ? ORBIS_KERNEL_ERROR_EINVAL : ORBIS_KERNEL_ERROR_EACCES;
+    }
+    if (via_map2 && sdk < Common::ElfInfo::FW_300) {
+        mem_prot &= static_cast<Core::MemoryProt>(0xFF);
     }
     // Measured on hardware for each of the 32 bits: other protection bits are refused, and the
     // flags are limited to fixed, no-overwrite, DmemCompat (0x400) and no-coalesce.
@@ -334,10 +346,19 @@ s32 PS4_SYSV_ABI sceKernelMapNamedDirectMemory(void** addr, u64 len, s32 prot, s
 
     auto* memory = Core::Memory::Instance();
     bool should_check = false;
-    if (g_sdk_version >= Common::ElfInfo::FW_250 &&
-        False(map_flags & Core::MemoryMapFlags::Stack)) {
+    if (via_map2) {
         // Under these conditions, this would normally redirect to sceKernelMapDirectMemory2.
         should_check = !g_alias_dmem;
+        // Measured on hardware with the SDK chain (DmemTest VQ10-VQ13, VQ15, VQ17, LA1, LA2): from
+        // SDK 2.50 a fixed direct mapping reaching the system library area is EINVAL, a page ending
+        // exactly at 0x7F0000000 included; from 0xFF0000000 on it maps.
+        constexpr VAddr SystemAreaStart = 0x7F0000000ULL;
+        constexpr VAddr SystemAreaEnd = 0xFF0000000ULL;
+        if (True(map_flags & Core::MemoryMapFlags::Fixed) && in_addr < SystemAreaEnd &&
+            in_addr + len >= SystemAreaStart) {
+            LOG_ERROR(Kernel_Vmm, "Fixed direct mapping at {:#x} reaches the system area", in_addr);
+            return ORBIS_KERNEL_ERROR_EINVAL;
+        }
     }
 
     if (True(map_flags & Core::MemoryMapFlags::Fixed) && in_addr == 0) {

@@ -340,7 +340,10 @@ void MemoryManager::SetCommittedPoolBlockType(PAddr base, u64 size, s32 memory_t
 s32 MemoryManager::PoolReserve(void** out_addr, VAddr virtual_addr, u64 size, MemoryMapFlags flags,
                                u64 alignment, std::string_view name) {
     // Measured on hardware: a single pool reservation must be smaller than 16 GiB.
-    if (size >= 16_GB) {
+    // Below SDK 5.00 a pool object of 16 GiB or more is refused (fpPS4 kern blockpool_pager_alloc:
+    // size >> 16 > 0x3FFFF); from 5.00 there is no such limit. Measured with the SDK chain
+    // (DmemTest U10: largest reservation 0x3FFE00000 below 5.00, 0x5ED400000 at 5.00).
+    if (size >= 16_GB && static_cast<u32>(sdk_version) < Common::ElfInfo::FW_500) {
         LOG_ERROR(Kernel_Vmm, "Pool reservation of {:#x} bytes is too large", size);
         return ORBIS_KERNEL_ERROR_ENOMEM;
     }
@@ -679,7 +682,10 @@ s32 MemoryManager::MapMemory(void** out_addr, VAddr virtual_addr, u64 size, Memo
                   "Out of flexible memory, available flexible memory = {:#x}"
                   " requested size = {:#x}",
                   total_flexible_size - flexible_usage, size);
-        return ORBIS_KERNEL_ERROR_EINVAL;
+        // Measured on hardware with the SDK chain (DmemTest FW5): EINVAL below SDK 3.50, ENOMEM
+        // from 3.50 (fpPS4 kern: resource shortage is EINVAL below 3.50).
+        return static_cast<u32>(sdk_version) < Common::ElfInfo::FW_350 ? ORBIS_KERNEL_ERROR_EINVAL
+                                                                       : ORBIS_KERNEL_ERROR_ENOMEM;
     }
     std::scoped_lock lk{unmap_mutex};
 
@@ -739,6 +745,10 @@ s32 MemoryManager::MapMemory(void** out_addr, VAddr virtual_addr, u64 size, Memo
         }
     }
 
+    if (const s32 r = CheckMapAreaEnd(virtual_addr, size, True(flags & MemoryMapFlags::Fixed));
+        r != ORBIS_OK) {
+        return r;
+    }
     if (True(flags & MemoryMapFlags::Fixed) && !IsInGuestAreas(virtual_addr, size)) {
         // The result on hardware for this case was not measured.
         LOG_ERROR(Kernel_Vmm, "Fixed mapping at {:#x} is outside the guest address space",
@@ -1022,6 +1032,10 @@ s32 MemoryManager::MapFile(void** out_addr, VAddr virtual_addr, u64 size, Memory
             // No suitable memory areas to map to
             return ORBIS_KERNEL_ERROR_ENOMEM;
         }
+    }
+    if (const s32 r = CheckMapAreaEnd(virtual_addr, size, True(flags & MemoryMapFlags::Fixed));
+        r != ORBIS_OK) {
+        return r;
     }
 
     // Perform early GPU unmap to avoid potential deadlocks
@@ -1313,6 +1327,22 @@ s32 MemoryManager::PoolMove(VAddr dest_addr, VAddr src_addr, u64 size) {
     lk2.unlock();
     if (IsValidGpuMapping(dest_addr, size)) {
         rasterizer->MapMemory(dest_addr, size);
+    }
+    return ORBIS_OK;
+}
+
+s32 MemoryManager::CheckMapAreaEnd(VAddr addr, u64 size, bool fixed) const {
+    // From SDK 3.00 a mapping starting at or reaching past 0xFC00000000 (MAP_AREA_END) is refused:
+    // a fixed one EINVAL, a search ENOMEM (fpPS4 kern vm_map_fixed / vm_map_find; measured with the
+    // SDK chain, DmemTest FW4 and VQ10: mapped below 3.00).
+    constexpr VAddr MapAreaEnd = 0xFC00000000ULL;
+    if (static_cast<u32>(sdk_version) < Common::ElfInfo::FW_300) {
+        return ORBIS_OK;
+    }
+    if (addr >= MapAreaEnd || addr + size > MapAreaEnd) {
+        LOG_ERROR(Kernel_Vmm, "Mapping at {:#x} of {:#x} bytes reaches past {:#x}", addr, size,
+                  MapAreaEnd);
+        return fixed ? ORBIS_KERNEL_ERROR_EINVAL : ORBIS_KERNEL_ERROR_ENOMEM;
     }
     return ORBIS_OK;
 }
@@ -1696,9 +1726,12 @@ s64 MemoryManager::ProtectBytes(VAddr addr, VirtualMemoryArea& vma_base, u64 siz
     new_vma.prot = prot;
     // Measured on hardware (DmemTest FW2, TP2): direct mappings split by a protection change do not
     // merge again.
-    // Measured on hardware (DmemTest FW2, TP2, CO3): direct mappings and reservations made by mmap
-    // with MAP_VOID and without MAP_SHARED do not merge through mprotect.
-    if (vma_base.type != VMAType::Direct && !vma_base.void_private) {
+    // Measured on hardware: below SDK 2.00 direct mappings do not merge through mprotect (DmemTest
+    // FW2, TP2 at SDK 1.00 and 1.50); from 2.00 they do (the same at SDK 2.00). Reservations made
+    // by mmap with MAP_VOID and without MAP_SHARED never do (CO3).
+    if ((vma_base.type != VMAType::Direct ||
+         static_cast<u32>(sdk_version) >= Common::ElfInfo::FW_200) &&
+        !vma_base.void_private) {
         MergeAdjacent(vma_map, new_it);
     }
 
@@ -2110,9 +2143,10 @@ s32 MemoryManager::SetDirectMemoryType(VAddr addr, u64 size, s32 memory_type,
         remaining_size -= size_in_vma;
 
         // Check if VMA can be merged with adjacent areas after modifications.
-        // Measured on hardware (DmemTest TP2, FW2): direct mappings split by a type change do not
-        // merge again.
-        if (vma_handle->second.type != VMAType::Direct) {
+        // Measured on hardware: below SDK 2.00 direct mappings split by a type change do not merge
+        // again (DmemTest TP2, FW2 at SDK 1.00 and 1.50); from 2.00 they do (the same at 2.00).
+        if (vma_handle->second.type != VMAType::Direct ||
+            static_cast<u32>(sdk_version) >= Common::ElfInfo::FW_200) {
             vma_handle = MergeAdjacent(vma_map, vma_handle);
         }
         if (vma_handle->second.base + vma_handle->second.size <= current_addr) {

@@ -354,6 +354,8 @@ public:
 
     bool ContainsNoCpuAccess(VAddr addr, u64 size);
 
+    s32 CheckMapAreaEnd(VAddr addr, u64 size, bool fixed) const;
+
     s32 UnmapMemory(VAddr virtual_addr, u64 size);
 
     s32 QueryProtection(VAddr addr, void** start, void** end, u32* prot);
