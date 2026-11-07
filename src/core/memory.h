@@ -140,6 +140,8 @@ struct VirtualMemoryArea {
     bool file_merges = false;
     // A mapping of a file made with MAP_SHARED.
     bool file_shared = false;
+    // A direct mapping's caller, from its name "anon:" and the caller's address; 0 otherwise.
+    VAddr caller = 0;
     // A file opened without read access (DmemTest TF3): mapped without CPU access, and mprotect
     // cannot give CPU read.
     bool file_write_only = false;
@@ -176,7 +178,12 @@ struct VirtualMemoryArea {
         return type != VMAType::Free && type != VMAType::Reserved && type != VMAType::PoolReserved;
     }
 
-    bool CanMergeWith(VirtualMemoryArea& next) {
+    static bool IsCallerName(const std::string& n) {
+        return n.starts_with("anon:");
+    }
+
+    // ignore_callers: from SDK 5.50 on, direct mappings from different callers merge.
+    bool CanMergeWith(VirtualMemoryArea& next, bool ignore_callers = false) {
         if (disallow_merge || next.disallow_merge) {
             return false;
         }
@@ -213,10 +220,18 @@ struct VirtualMemoryArea {
             pool_base != next.pool_base) {
             return false;
         }
-        // Areas with different names never merge, at any SDK version, call-site names included
-        // (measured on hardware: DmemTest FW6, five mappings from five call sites, 1.00-12.00;
-        // CO2, CO3, CO11-CO14).
-        if (name.compare(next.name) != 0) {
+        // Measured on hardware (DmemTest FW7, FW8): a direct mapping records its caller apart from
+        // its name. Below SDK 5.50 direct mappings from different callers never merge, renamed or
+        // not; from 5.50 the caller is not compared, so two named after their callers merge too.
+        const bool both_direct = type == VMAType::Direct && next.type == VMAType::Direct;
+        if (both_direct && caller != next.caller && !ignore_callers) {
+            return false;
+        }
+        // Otherwise areas with different names never merge, at any SDK version, call-site names
+        // included (measured on hardware: DmemTest FW6, FW9, five and two mappings from as many
+        // call sites, 1.00-12.00; CO2, CO3, CO11-CO14).
+        if (name.compare(next.name) != 0 &&
+            !(both_direct && ignore_callers && IsCallerName(name) && IsCallerName(next.name))) {
             return false;
         }
 

@@ -750,6 +750,10 @@ MemoryManager::VMAHandle MemoryManager::CreateArea(VAddr virtual_addr, u64 size,
     new_vma.prot = prot;
     new_vma.name = name;
     new_vma.type = type;
+    new_vma.caller = 0;
+    if (type == VMAType::Direct && VirtualMemoryArea::IsCallerName(new_vma.name)) {
+        new_vma.caller = std::strtoull(new_vma.name.c_str() + 5, nullptr, 16);
+    }
     new_vma.phys_areas.clear();
     return new_vma_handle;
 }
@@ -1677,6 +1681,7 @@ u64 MemoryManager::UnmapBytesFromEntry(VAddr virtual_addr, VirtualMemoryArea vma
     vma.file_write_only = false;
     vma.file_merges = false;
     vma.file_shared = false;
+    vma.caller = 0;
     vma.file_offset = 0;
     MergeAdjacent(vma_map, new_it);
 
@@ -2297,12 +2302,22 @@ void MemoryManager::NameVirtualRange(VAddr virtual_addr, u64 size, std::string_v
         remaining_size -= size_in_vma;
         current_addr += size_in_vma;
 
-        // Measured on hardware (DmemTest CO1-CO8, FW6): a rename never merges areas, for any kind
-        // of mapping.
         if (it->second.base + it->second.size <= current_addr) {
             // If we're now in the next VMA, then go to the next handle.
             it++;
         }
+    }
+
+    // Measured on hardware (DmemTest FW9): renamed areas merge with their neighbours like any other
+    // (two inaccessible anonymous mappings from two call sites merge once they have one name, at
+    // every SDK version); where they could not merge before, a rename changes nothing (CO1-CO9,
+    // FW6, FW7 below 5.50).
+    it = FindVMA(aligned_addr);
+    while (it != vma_map.end() && it->second.base < aligned_addr + aligned_size) {
+        if (!it->second.IsFree()) {
+            it = MergeAdjacent(vma_map, it);
+        }
+        ++it;
     }
 }
 
@@ -2450,8 +2465,10 @@ VAddr MemoryManager::SearchFree(VAddr virtual_addr, u64 size, u64 alignment) {
 }
 
 bool MemoryManager::MergeWithNext(VMAMap& handle_map, VMAHandle iter) {
+    const bool ignore_callers = static_cast<u32>(sdk_version) >= Common::ElfInfo::FW_550;
     const auto next_vma = std::next(iter);
-    if (next_vma == handle_map.end() || !iter->second.CanMergeWith(next_vma->second)) {
+    if (next_vma == handle_map.end() ||
+        !iter->second.CanMergeWith(next_vma->second, ignore_callers)) {
         return false;
     }
     u64 base_offset = iter->second.size;
@@ -2467,11 +2484,12 @@ bool MemoryManager::MergeWithNext(VMAMap& handle_map, VMAHandle iter) {
 }
 
 MemoryManager::VMAHandle MemoryManager::MergeWithPrev(VMAMap& handle_map, VMAHandle iter) {
+    const bool ignore_callers = static_cast<u32>(sdk_version) >= Common::ElfInfo::FW_550;
     if (iter == handle_map.begin()) {
         return iter;
     }
     auto prev_vma = std::prev(iter);
-    if (!prev_vma->second.CanMergeWith(iter->second)) {
+    if (!prev_vma->second.CanMergeWith(iter->second, ignore_callers)) {
         return iter;
     }
     prev_vma->second.name = iter->second.name;

@@ -320,6 +320,15 @@ s32 PS4_SYSV_ABI sceKernelMapNamedDirectMemory(void** addr, u64 len, s32 prot, s
         LOG_ERROR(Kernel_Vmm, "Invalid protection {:#x}", prot);
         return ORBIS_KERNEL_ERROR_EINVAL;
     }
+    constexpr auto ValidDirectFlags =
+        Core::MemoryMapFlags::Fixed | Core::MemoryMapFlags::NoOverwrite |
+        Core::MemoryMapFlags::Stack | Core::MemoryMapFlags::NoCoalesce;
+    // Measured on hardware (DmemTest DT9): invalid flags are EINVAL before the type 10 rule (type
+    // 10 with write access and flag 0x800000: EINVAL).
+    if (True(static_cast<Core::MemoryMapFlags>(flags) & ~ValidDirectFlags)) {
+        LOG_ERROR(Kernel_Vmm, "Invalid flags {:#x}", flags);
+        return ORBIS_KERNEL_ERROR_EINVAL;
+    }
     // Measured on hardware (DmemTest DT6): direct memory of type 10 refuses CPU or GPU write.
     {
         s32 phys_type = -1;
@@ -332,13 +341,6 @@ s32 PS4_SYSV_ABI sceKernelMapNamedDirectMemory(void** addr, u64 len, s32 prot, s
             LOG_ERROR(Kernel_Vmm, "Memory type 10 is not allowed with write access");
             return ORBIS_KERNEL_ERROR_EACCES;
         }
-    }
-    constexpr auto ValidDirectFlags =
-        Core::MemoryMapFlags::Fixed | Core::MemoryMapFlags::NoOverwrite |
-        Core::MemoryMapFlags::Stack | Core::MemoryMapFlags::NoCoalesce;
-    if (True(static_cast<Core::MemoryMapFlags>(flags) & ~ValidDirectFlags)) {
-        LOG_ERROR(Kernel_Vmm, "Invalid flags {:#x}", flags);
-        return ORBIS_KERNEL_ERROR_EINVAL;
     }
 
     auto map_flags = static_cast<Core::MemoryMapFlags>(flags);
@@ -1433,6 +1435,13 @@ static s32 PS4_SYSV_ABI MmapFromGuest(VAddr caller, void* addr, u64 len, s32 pro
     return KernelMmapImpl(addr, len, prot, flags, fd, phys_addr, res, CallerName(caller));
 }
 
+// Guest entry. Measured on hardware (DmemTest PX1, PX3): a POSIX mmap is named "anon:" and the
+// return address of the call too, as sceKernelMmap.
+static void* PS4_SYSV_ABI PosixMmapFromGuest(VAddr caller, void* addr, u64 len, s32 prot, s32 flags,
+                                             s32 fd, s64 phys_addr) {
+    return PosixMmapImpl(addr, len, prot, flags, fd, phys_addr, CallerName(caller));
+}
+
 void RegisterMemory(Core::Loader::SymbolsResolver* sym) {
     ASSERT_MSG(sceKernelGetCompiledSdkVersion(&g_sdk_version) == ORBIS_OK,
                "Failed to get compiled SDK verision.");
@@ -1489,8 +1498,8 @@ void RegisterMemory(Core::Loader::SymbolsResolver* sym) {
     LIB_FUNCTION("YN878uKRBbE", "libkernel", 1, "libkernel", sceKernelMemoryPoolBatch);
     LIB_FUNCTION("bvD+95Q6asU", "libkernel", 1, "libkernel", sceKernelMemoryPoolGetBlockStats);
 
-    LIB_FUNCTION("BPE9s9vQQXo", "libkernel", 1, "libkernel", posix_mmap);
-    LIB_FUNCTION("BPE9s9vQQXo", "libScePosix", 1, "libkernel", posix_mmap);
+    LIB_FUNCTION_WITH_CALLER("BPE9s9vQQXo", "libkernel", 1, "libkernel", PosixMmapFromGuest);
+    LIB_FUNCTION_WITH_CALLER("BPE9s9vQQXo", "libScePosix", 1, "libkernel", PosixMmapFromGuest);
     LIB_FUNCTION("UqDGjXA5yUM", "libkernel", 1, "libkernel", posix_munmap);
     LIB_FUNCTION("UqDGjXA5yUM", "libScePosix", 1, "libkernel", posix_munmap);
     LIB_FUNCTION("3k6kx-zOOSQ", "libkernel", 1, "libkernel", sceKernelMlock);
