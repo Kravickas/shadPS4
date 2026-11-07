@@ -161,6 +161,88 @@ void MemoryManager::CopySparseMemory(VAddr virtual_addr, u8* dest, u64 size) {
     }
 }
 
+// Measured on hardware (DmemTest MF24): bytes written to a shared mapping past the end of its file,
+// inside the file's last 16 KiB page, stay with the file while it is open and its size does not
+// change: a later mapping shows them, and the file does not grow. A POSIX host's page cache does
+// the same. On Windows a view of a file ends at the first host page after the file's end and the
+// rest of the mapping is private memory (AddressSpace::MapFile), so those bytes are kept here when
+// such a mapping is unmapped and copied into the next shared mapping of the file.
+#ifdef _WIN32
+static constexpr u64 HostFileViewPage = 4_KB;
+#endif
+
+void MemoryManager::SaveFileTail(const VirtualMemoryArea& vma, VAddr virtual_addr, u64 size) {
+#ifdef _WIN32
+    auto* h = Common::Singleton<Core::FileSys::HandleTable>::Instance();
+    auto* file = h->GetFile(vma.fd);
+    if (file == nullptr || !file->is_opened || !file->handle) {
+        return;
+    }
+    Common::FS::IOFile* host_file = file->handle->GetHostFile();
+    if (host_file == nullptr) {
+        return;
+    }
+    const u64 file_size = host_file->GetSize();
+    const u64 tail_start = Common::AlignUp(file_size, HostFileViewPage);
+    const u64 page_end = Common::AlignUp(file_size, 16_KB);
+    const u64 range_start = vma.file_offset + (virtual_addr - vma.base);
+    const u64 from = std::max(range_start, tail_start);
+    const u64 to = std::min(range_start + size, page_end);
+    if (from >= to) {
+        return;
+    }
+    auto& tail = file_tails[file];
+    if (tail.file_size != file_size || tail.bytes.size() != page_end - tail_start) {
+        tail.file_size = file_size;
+        tail.bytes.assign(page_end - tail_start, 0);
+    }
+    const VAddr src = vma.base + (from - vma.file_offset);
+    if (False(vma.prot & MemoryProt::CpuRead)) {
+        impl.Protect(src, to - from, MemoryPermission::Read);
+    }
+    std::memcpy(tail.bytes.data() + (from - tail_start), reinterpret_cast<const void*>(src),
+                to - from);
+#else
+    (void)vma;
+    (void)virtual_addr;
+    (void)size;
+#endif
+}
+
+void MemoryManager::RestoreFileTail(const void* file, u64 file_size, VAddr virtual_addr, u64 size,
+                                    u64 offset, const std::function<void(u8*, u64, u32)>& protect,
+                                    MemoryProt prot) {
+#ifdef _WIN32
+    const auto it = file_tails.find(file);
+    if (it == file_tails.end() || it->second.file_size != file_size) {
+        return;
+    }
+    const u64 tail_start = Common::AlignUp(file_size, HostFileViewPage);
+    const u64 from = std::max(offset, tail_start);
+    const u64 to = std::min(offset + size, tail_start + it->second.bytes.size());
+    if (from >= to) {
+        return;
+    }
+    u8* const dst = reinterpret_cast<u8*>(virtual_addr + (from - offset));
+    protect(dst, to - from, std::bit_cast<u32>(MemoryProt::CpuReadWrite));
+    std::memcpy(dst, it->second.bytes.data() + (from - tail_start), to - from);
+    protect(dst, to - from, std::bit_cast<u32>(prot));
+#else
+    (void)file;
+    (void)file_size;
+    (void)virtual_addr;
+    (void)size;
+    (void)offset;
+    (void)protect;
+    (void)prot;
+#endif
+}
+
+void MemoryManager::DropFileTail(const void* file) {
+    std::scoped_lock lk{mutex};
+    file_tails.erase(file);
+}
+
 bool MemoryManager::IsInGuestAreas(VAddr virtual_addr, u64 size) {
     // True when every byte of the range lies inside an area of the guest address space.
     std::shared_lock lk{mutex};
@@ -720,6 +802,12 @@ s32 MemoryManager::MapMemory(void** out_addr, VAddr virtual_addr, u64 size, Memo
         }
     }
 
+    const bool stack = True(flags & MemoryMapFlags::Stack) || type == VMAType::Stack;
+    if (True(flags & MemoryMapFlags::Fixed)) {
+        if (const s32 r = CheckMapAreaEnd(virtual_addr, size, true, stack); r != ORBIS_OK) {
+            return r;
+        }
+    }
     if (True(flags & MemoryMapFlags::Fixed) && True(flags & MemoryMapFlags::NoOverwrite)) {
         // Perform necessary error checking for Fixed & NoOverwrite case
         if (!IsValidMapping(virtual_addr, size)) {
@@ -745,9 +833,10 @@ s32 MemoryManager::MapMemory(void** out_addr, VAddr virtual_addr, u64 size, Memo
         }
     }
 
-    if (const s32 r = CheckMapAreaEnd(virtual_addr, size, True(flags & MemoryMapFlags::Fixed));
-        r != ORBIS_OK) {
-        return r;
+    if (False(flags & MemoryMapFlags::Fixed)) {
+        if (const s32 r = CheckMapAreaEnd(virtual_addr, size, false, stack); r != ORBIS_OK) {
+            return r;
+        }
     }
     if (True(flags & MemoryMapFlags::Fixed) && !IsInGuestAreas(virtual_addr, size)) {
         // The result on hardware for this case was not measured.
@@ -1033,7 +1122,8 @@ s32 MemoryManager::MapFile(void** out_addr, VAddr virtual_addr, u64 size, Memory
             return ORBIS_KERNEL_ERROR_ENOMEM;
         }
     }
-    if (const s32 r = CheckMapAreaEnd(virtual_addr, size, True(flags & MemoryMapFlags::Fixed));
+    if (const s32 r =
+            CheckMapAreaEnd(virtual_addr, size, True(flags & MemoryMapFlags::Fixed), false);
         r != ORBIS_OK) {
         return r;
     }
@@ -1058,6 +1148,7 @@ s32 MemoryManager::MapFile(void** out_addr, VAddr virtual_addr, u64 size, Memory
     new_vma.file_offset = static_cast<u64>(phys_addr);
     new_vma.file_merges =
         True(flags & MemoryMapFlags::Shared) || False(prot & MemoryProt::CpuWrite);
+    new_vma.file_shared = True(flags & MemoryMapFlags::Shared);
     auto mapped_addr = new_vma.base;
 
     // Delegate the actual mapping to the file backend.
@@ -1112,6 +1203,10 @@ s32 MemoryManager::MapFile(void** out_addr, VAddr virtual_addr, u64 size, Memory
     } else {
         file->handle->Map(reinterpret_cast<u8*>(mapped_addr), size, phys_addr,
                           std::bit_cast<u32>(prot), map_ctx);
+        if (host_file != nullptr) {
+            RestoreFileTail(file, file_size, mapped_addr, size, static_cast<u64>(phys_addr),
+                            map_ctx.protect, prot);
+        }
     }
     if (prot != Core::MemoryProt::CpuRead) {
         // read-only mappings cannot be registered with userfaultfd in writeprotect mode
@@ -1331,12 +1426,22 @@ s32 MemoryManager::PoolMove(VAddr dest_addr, VAddr src_addr, u64 size) {
     return ORBIS_OK;
 }
 
-s32 MemoryManager::CheckMapAreaEnd(VAddr addr, u64 size, bool fixed) const {
-    // From SDK 3.00 a mapping starting at or reaching past 0xFC00000000 (MAP_AREA_END) is refused:
-    // a fixed one EINVAL, a search ENOMEM (fpPS4 kern vm_map_fixed / vm_map_find; measured with the
-    // SDK chain, DmemTest FW4 and VQ10: mapped below 3.00).
+s32 MemoryManager::CheckMapAreaEnd(VAddr addr, u64 size, bool fixed, bool stack) const {
+    // From SDK 3.00 (fpPS4 kern; measured with the SDK chain, DmemTest FW4, VQ10, SF3: below 3.00
+    // all map). A stack mapping (vm_map_stack) is refused with ENOMEM when it starts above
+    // 0xFC00000000 (MAP_AREA_END) or its start minus its size is above it, so one starting at
+    // 0xFC00000000 maps. Any other mapping is refused when it starts at or reaches past it: fixed
+    // EINVAL (vm_map_fixed, before a no-overwrite mapping finds the range in use), searched ENOMEM.
     constexpr VAddr MapAreaEnd = 0xFC00000000ULL;
-    if (static_cast<u32>(sdk_version) < Common::ElfInfo::FW_300) {
+    if (static_cast<u32>(sdk_version) < Common::ElfInfo::FW_300 || (addr >> 47) != 0) {
+        return ORBIS_OK;
+    }
+    if (stack) {
+        if (addr > MapAreaEnd || addr - size > MapAreaEnd) {
+            LOG_ERROR(Kernel_Vmm, "Stack mapping at {:#x} of {:#x} bytes is past {:#x}", addr, size,
+                      MapAreaEnd);
+            return ORBIS_KERNEL_ERROR_ENOMEM;
+        }
         return ORBIS_OK;
     }
     if (addr >= MapAreaEnd || addr + size > MapAreaEnd) {
@@ -1476,6 +1581,9 @@ u64 MemoryManager::UnmapBytesFromEntry(VAddr virtual_addr, VirtualMemoryArea vma
     if (vma_base.type == VMAType::Free) {
         return size_in_vma;
     }
+    if (vma_type == VMAType::File && vma_base.file_shared) {
+        SaveFileTail(vma_base, virtual_addr, size_in_vma);
+    }
     if (vma_type == VMAType::Pooled) {
         // Unmapping committed pool memory returns it to the pool.
         pool_budget += size_in_vma;
@@ -1568,6 +1676,7 @@ u64 MemoryManager::UnmapBytesFromEntry(VAddr virtual_addr, VirtualMemoryArea vma
     vma.file_read_only = false;
     vma.file_write_only = false;
     vma.file_merges = false;
+    vma.file_shared = false;
     vma.file_offset = 0;
     MergeAdjacent(vma_map, new_it);
 
@@ -2341,12 +2450,8 @@ VAddr MemoryManager::SearchFree(VAddr virtual_addr, u64 size, u64 alignment) {
 }
 
 bool MemoryManager::MergeWithNext(VMAMap& handle_map, VMAHandle iter) {
-    // From SDK 5.50 on, mappings made from different call sites merge, and the merged area keeps
-    // the name of the newest mapping (OpenOrbis-Unit-Tests memory_test, test_550).
-    const bool ignore_anon_names = static_cast<u32>(sdk_version) >= Common::ElfInfo::FW_550;
     const auto next_vma = std::next(iter);
-    if (next_vma == handle_map.end() ||
-        !iter->second.CanMergeWith(next_vma->second, ignore_anon_names)) {
+    if (next_vma == handle_map.end() || !iter->second.CanMergeWith(next_vma->second)) {
         return false;
     }
     u64 base_offset = iter->second.size;
@@ -2362,12 +2467,11 @@ bool MemoryManager::MergeWithNext(VMAMap& handle_map, VMAHandle iter) {
 }
 
 MemoryManager::VMAHandle MemoryManager::MergeWithPrev(VMAMap& handle_map, VMAHandle iter) {
-    const bool ignore_anon_names = static_cast<u32>(sdk_version) >= Common::ElfInfo::FW_550;
     if (iter == handle_map.begin()) {
         return iter;
     }
     auto prev_vma = std::prev(iter);
-    if (!prev_vma->second.CanMergeWith(iter->second, ignore_anon_names)) {
+    if (!prev_vma->second.CanMergeWith(iter->second)) {
         return iter;
     }
     prev_vma->second.name = iter->second.name;

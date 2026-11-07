@@ -422,6 +422,7 @@ s32 PS4_SYSV_ABI close(s32 fd) {
     ReleaseFlockState(file);
     if (file->ref_count <= 1) {
         if (file->type == Core::FileSys::FileType::Regular) {
+            Core::Memory::Instance()->DropFileTail(file);
             file->handle.reset();
         }
         file->is_opened = false;

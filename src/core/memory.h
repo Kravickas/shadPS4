@@ -3,11 +3,14 @@
 
 #pragma once
 
+#include <functional>
 #include <map>
 #include <mutex>
 #include <set>
 #include <string>
 #include <string_view>
+#include <unordered_map>
+#include <vector>
 #include "common/enum.h"
 #include "common/shared_first_mutex.h"
 #include "common/singleton.h"
@@ -135,6 +138,8 @@ struct VirtualMemoryArea {
     // private mappings merge when mapped; read-write private ones never merge.
     u64 file_offset = 0;
     bool file_merges = false;
+    // A mapping of a file made with MAP_SHARED.
+    bool file_shared = false;
     // A file opened without read access (DmemTest TF3): mapped without CPU access, and mprotect
     // cannot give CPU read.
     bool file_write_only = false;
@@ -171,13 +176,7 @@ struct VirtualMemoryArea {
         return type != VMAType::Free && type != VMAType::Reserved && type != VMAType::PoolReserved;
     }
 
-    static bool IsAnonName(const std::string& n) {
-        return n == "anon" || n.starts_with("anon:");
-    }
-
-    // ignore_anon_names: from SDK 5.50 on, mappings made from different call sites merge; anon
-    // names do not keep them apart, other names still do.
-    bool CanMergeWith(VirtualMemoryArea& next, bool ignore_anon_names = false) {
+    bool CanMergeWith(VirtualMemoryArea& next) {
         if (disallow_merge || next.disallow_merge) {
             return false;
         }
@@ -214,8 +213,10 @@ struct VirtualMemoryArea {
             pool_base != next.pool_base) {
             return false;
         }
-        if (name.compare(next.name) != 0 &&
-            !(ignore_anon_names && IsAnonName(name) && IsAnonName(next.name))) {
+        // Areas with different names never merge, at any SDK version, call-site names included
+        // (measured on hardware: DmemTest FW6, five mappings from five call sites, 1.00-12.00;
+        // CO2, CO3, CO11-CO14).
+        if (name.compare(next.name) != 0) {
             return false;
         }
 
@@ -327,6 +328,9 @@ public:
 
     bool IsInGuestAreas(VAddr virtual_addr, u64 size);
 
+    // Forgets the bytes kept past the end of a file (see SaveFileTail); called when it is closed.
+    void DropFileTail(const void* file);
+
     void SetupMemoryRegions(u64 flexible_size, bool use_extended_mem1, bool use_extended_mem2);
 
     PAddr PoolExpand(PAddr search_start, PAddr search_end, u64 size, u64 alignment);
@@ -354,7 +358,12 @@ public:
 
     bool ContainsNoCpuAccess(VAddr addr, u64 size);
 
-    s32 CheckMapAreaEnd(VAddr addr, u64 size, bool fixed) const;
+    s32 CheckMapAreaEnd(VAddr addr, u64 size, bool fixed, bool stack) const;
+
+    void SaveFileTail(const VirtualMemoryArea& vma, VAddr virtual_addr, u64 size);
+
+    void RestoreFileTail(const void* file, u64 file_size, VAddr virtual_addr, u64 size, u64 offset,
+                         const std::function<void(u8*, u64, u32)>& protect, MemoryProt prot);
 
     s32 UnmapMemory(VAddr virtual_addr, u64 size);
 
@@ -468,6 +477,13 @@ private:
     std::set<PAddr> pool_flushed_blocks;
     std::map<VAddr, u64> pool_reservations;
     s32 sdk_version{};
+    // Bytes past the end of a file inside its last 16 KiB page, kept from shared mappings of it
+    // (Windows hosts; see SaveFileTail).
+    struct FileTail {
+        u64 file_size = 0;
+        std::vector<u8> bytes;
+    };
+    std::unordered_map<const void*, FileTail> file_tails;
     Vulkan::Rasterizer* rasterizer{};
 
     struct PrtArea {
