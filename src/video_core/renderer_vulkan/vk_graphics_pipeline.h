@@ -41,13 +41,13 @@ struct GraphicsPipelineKey {
     AmdGpu::ColorControl::LogicOp logic_op;
     u8 num_samples;
     u8 depth_samples;
+    vk::SampleMask sample_mask;
     std::array<u8, AmdGpu::NUM_COLOR_BUFFERS> color_samples;
     u32 mrt_mask;
     struct {
         AmdGpu::DepthBuffer::ZFormat z_format : 2;
         AmdGpu::DepthBuffer::StencilFormat stencil_format : 1;
         u32 depth_clamp_enable : 1;
-        u32 alpha_to_mask_enable : 1;
     };
     struct {
         AmdGpu::PrimitiveType prim_type : 5;

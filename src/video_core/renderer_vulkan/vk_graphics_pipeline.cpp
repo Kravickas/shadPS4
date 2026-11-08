@@ -128,9 +128,9 @@ GraphicsPipeline::GraphicsPipeline(
                 key.num_samples, instance.GetColorSampleCounts() & instance.GetDepthSampleCounts()),
             .sampleShadingEnable =
                 fs_info.addr_flags.persp_sample_ena || fs_info.addr_flags.linear_sample_ena,
-            .alphaToCoverageEnable = key.alpha_to_mask_enable,
         };
     }
+    sdata.multisampling.pSampleMask = &key.sample_mask;
 
     const vk::PipelineViewportDepthClipControlCreateInfoEXT clip_control = {
         .negativeOneToOne = key.clip_space == AmdGpu::ClipSpace::MinusWToW,

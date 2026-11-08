@@ -763,7 +763,7 @@ void ParseEqaa(u32 value, bool begin_table) {
 }
 
 void ParseDbAlphaToMask(u32 value, bool begin_table) {
-    auto const reg = reinterpret_cast<AmdGpu::DbAlphaToMask const&>(value);
+    auto const reg = reinterpret_cast<AmdGpu::AlphaToMask const&>(value);
 
     if (!begin_table ||
         BeginTable("DB_ALPHA_TO_MASK", 2, ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg)) {
@@ -771,31 +771,31 @@ void ParseDbAlphaToMask(u32 value, bool begin_table) {
         TableSetColumnIndex(0);
         Text("ALPHA_TO_MASK_ENABLE");
         TableSetColumnIndex(1);
-        Text("%X", reg.alpha_to_mask_enable);
+        Text("%X", reg.enable);
 
         TableNextRow();
         TableSetColumnIndex(0);
         Text("ALPHA_TO_MASK_OFFSET0");
         TableSetColumnIndex(1);
-        Text("%X", reg.alpha_to_mask_offset0);
+        Text("%X", reg.offset0);
 
         TableNextRow();
         TableSetColumnIndex(0);
         Text("ALPHA_TO_MASK_OFFSET1");
         TableSetColumnIndex(1);
-        Text("%X", reg.alpha_to_mask_offset1);
+        Text("%X", reg.offset1);
 
         TableNextRow();
         TableSetColumnIndex(0);
         Text("ALPHA_TO_MASK_OFFSET2");
         TableSetColumnIndex(1);
-        Text("%X", reg.alpha_to_mask_offset2);
+        Text("%X", reg.offset2);
 
         TableNextRow();
         TableSetColumnIndex(0);
         Text("ALPHA_TO_MASK_OFFSET3");
         TableSetColumnIndex(1);
-        Text("%X", reg.alpha_to_mask_offset3);
+        Text("%X", reg.offset3);
 
         TableNextRow();
         TableSetColumnIndex(0);
