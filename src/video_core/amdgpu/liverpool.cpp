@@ -191,7 +191,8 @@ void Liverpool::Process(std::stop_token stoken) {
                  "vo_blocks={} vo_spin_us={} mem_spin_us={} mem_spins={} asc_spin_us={} "
                  "draws={} draw_us={} draw_pipeline_us={} draw_bind_us={} dispatches={} "
                  "dispatch_us={} dispatch_pipeline_us={} copy_us={} fence_us={} eop_us={} "
-                 "flushes={} host_flush_us={}",
+                 "flushes={} host_flush_us={} rb_downloads={} rb_kb={} rb_finish_us={} "
+                 "img_downloads={} img_finish_us={} rbw_n={} rbw_us={} rbw_max_us={}",
                  cycle_t0, cycle_t1, cp_perf.tasks, was_submit_done, (cycle_t1 - flush_t0) / 1000,
                  cp_perf.vo_block_ns / 1000, cp_perf.vo_blocks, cp_perf.vo_spin_ns / 1000,
                  cp_perf.mem_spin_ns / 1000, cp_perf.mem_spins, cp_perf.asc_spin_ns / 1000,
@@ -199,7 +200,11 @@ void Liverpool::Process(std::stop_token stoken) {
                  cp_perf.draw_bind_ns / 1000, cp_perf.dispatches, cp_perf.dispatch_ns / 1000,
                  cp_perf.dispatch_pipeline_ns / 1000, cp_perf.copy_ns / 1000,
                  cp_perf.fence_ns / 1000, cp_perf.eop_ns / 1000, cp_perf.flushes,
-                 cp_perf.flush_ns / 1000);
+                 cp_perf.flush_ns / 1000, cp_perf.rb_downloads, cp_perf.rb_bytes / 1024,
+                 cp_perf.rb_finish_ns / 1000, cp_perf.img_downloads, cp_perf.img_finish_ns / 1000,
+                 readback_wait.count.exchange(0, std::memory_order_relaxed),
+                 readback_wait.wait_ns.exchange(0, std::memory_order_relaxed) / 1000,
+                 readback_wait.max_ns.exchange(0, std::memory_order_relaxed) / 1000);
 
         Platform::IrqC::Instance()->Signal(Platform::InterruptId::GpuIdle);
     }

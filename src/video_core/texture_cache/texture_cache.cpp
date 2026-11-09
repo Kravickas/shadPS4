@@ -11,6 +11,7 @@
 #include "common/hash.h"
 #include "core/emulator_settings.h"
 #include "core/memory.h"
+#include "video_core/amdgpu/liverpool.h"
 #include "video_core/buffer_cache/buffer_cache.h"
 #include "video_core/page_manager.h"
 #include "video_core/renderer_vulkan/liverpool_to_vk.h"
@@ -101,8 +102,12 @@ void TextureCache::ProcessDownloadImages() {
     for (const ImageId image_id : download_images) {
         DownloadImageMemory(image_id);
     }
+    AmdGpu::cp_perf.img_downloads += static_cast<u32>(download_images.size());
     download_images.clear();
-    scheduler.Finish();
+    {
+        const AmdGpu::CpPerfScope perf_finish{AmdGpu::cp_perf.img_finish_ns};
+        scheduler.Finish();
+    }
     scheduler.PopPendingOperations();
 }
 
@@ -168,7 +173,10 @@ void TextureCache::DownloadImageMemory(ImageId image_id, DownloadMemoryFlags fla
     if (is_priority) {
         scheduler.DeferPriorityOperation(std::move(write_data));
     } else if (is_sync) {
-        scheduler.Finish();
+        {
+            const AmdGpu::CpPerfScope perf_finish{AmdGpu::cp_perf.img_finish_ns};
+            scheduler.Finish();
+        }
         write_data();
     } else {
         scheduler.DeferOperation(std::move(write_data));

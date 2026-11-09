@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include <atomic>
 #include <chrono>
 #include <condition_variable>
 #include <coroutine>
@@ -60,8 +61,21 @@ struct CpPerf {
     u32 dispatches;
     u32 flushes;
     u32 post_spin_trace; ///< Packets still to log after a WAIT_REG_MEM spin
+    u32 rb_downloads;    ///< Buffer readbacks downloaded
+    u64 rb_bytes;
+    u64 rb_finish_ns; ///< Host GPU drains for buffer readbacks
+    u32 img_downloads;
+    u64 img_finish_ns; ///< Host GPU drains for linear image readbacks
 };
 inline CpPerf cp_perf;
+
+/// Time guest threads spend waiting for a buffer readback done by the GPU thread.
+struct ReadbackWaitPerf {
+    std::atomic<u64> count;
+    std::atomic<u64> wait_ns;
+    std::atomic<u64> max_ns;
+};
+inline ReadbackWaitPerf readback_wait;
 
 /// Adds the lifetime of the object to a CpPerf field.
 struct CpPerfScope {

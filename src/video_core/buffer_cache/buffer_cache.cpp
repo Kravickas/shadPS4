@@ -154,7 +154,16 @@ void BufferCache::ReadMemory(VAddr device_addr, u64 size, bool is_write, bool as
     if (assume_locks) {
         flush_request();
     } else {
+        const u64 wait_t0 = AmdGpu::PerfNs();
         liverpool->SendCommand<true>(std::move(flush_request));
+        const u64 wait_ns = AmdGpu::PerfNs() - wait_t0;
+        auto& perf = AmdGpu::readback_wait;
+        perf.count.fetch_add(1, std::memory_order_relaxed);
+        perf.wait_ns.fetch_add(wait_ns, std::memory_order_relaxed);
+        u64 prev = perf.max_ns.load(std::memory_order_relaxed);
+        while (prev < wait_ns &&
+               !perf.max_ns.compare_exchange_weak(prev, wait_ns, std::memory_order_relaxed)) {
+        }
     }
 }
 
@@ -182,6 +191,8 @@ void BufferCache::DownloadMemory(const Buffer* arena, VAddr device_addr, u64 siz
     if (total_size_bytes == 0) {
         return;
     }
+    ++AmdGpu::cp_perf.rb_downloads;
+    AmdGpu::cp_perf.rb_bytes += total_size_bytes;
     const auto download =
         staging_pool.Request(total_size_bytes, VideoCore::MemoryType::HostCached, 16, async);
     for (auto& copy : copies) {
@@ -207,7 +218,10 @@ void BufferCache::DownloadMemory(const Buffer* arena, VAddr device_addr, u64 siz
     if (async) {
         scheduler.DeferOperation(std::move(write_data));
     } else {
-        scheduler.Finish();
+        {
+            const AmdGpu::CpPerfScope perf_finish{AmdGpu::cp_perf.rb_finish_ns};
+            scheduler.Finish();
+        }
         write_data();
     }
 }
