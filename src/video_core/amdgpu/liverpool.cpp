@@ -772,10 +772,21 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb) {
                 if (rasterizer) {
                     rasterizer->OnFence();
                 }
-                event_eos->SignalFence([](void* address, u64 data, u32 num_bytes) {
+                auto write_fence = [](void* address, u64 data, u32 num_bytes) {
                     auto* memory = Core::Memory::Instance();
                     ASSERT(memory->TryWriteBacking(address, &data, num_bytes));
-                });
+                };
+                if (rasterizer && event_eos->command == PM4CmdEventWriteEos::Command::SignalFence) {
+                    auto landed = std::make_shared<std::atomic<bool>>(false);
+                    AddPendingFence(event_eos->Address(), event_eos->DataDWord(), landed);
+                    // End of shader: the fence lands once the GPU has run the shaders before it.
+                    rasterizer->EnqueueEopFence([eos = *event_eos, write_fence, landed] {
+                        eos.SignalFence(write_fence);
+                        landed->store(true, std::memory_order_release);
+                    });
+                    break;
+                }
+                event_eos->SignalFence(write_fence);
                 if (event_eos->command == PM4CmdEventWriteEos::Command::GdsStore) {
                     ASSERT(event_eos->size == 1);
                     if (rasterizer) {
@@ -808,17 +819,9 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb) {
                     landed->store(true, std::memory_order_release);
                 };
                 if (rasterizer) {
-                    while (!pending_eop_fences.empty() &&
-                           pending_eop_fences.front().landed->load(std::memory_order_acquire)) {
-                        pending_eop_fences.pop_front();
-                    }
                     const auto data_sel = event_eop->data_sel.Value();
                     if (data_sel == DataSelect::Data32Low || data_sel == DataSelect::Data64) {
-                        pending_eop_fences.push_back({
-                            .address = event_eop->Address<u32>(),
-                            .value = event_eop->DataDWord(),
-                            .landed = landed,
-                        });
+                        AddPendingFence(event_eop->Address<u32>(), event_eop->DataDWord(), landed);
                     }
                     rasterizer->OnFence();
                     // End of pipe: the fence and interrupt land once the GPU has done the work.
@@ -923,10 +926,10 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb) {
                 if (wait_reg_mem->Test(regs.reg_array)) {
                     break;
                 }
-                // Waiting on an EOP fence still in the host queue: everything recorded after it
+                // Waiting on a fence still in the host queue: everything recorded after it
                 // runs behind that work anyway, so the CP only has to stall on it before a packet
                 // with an effect outside the queue.
-                if (auto landed = FindPendingEopFence(*wait_reg_mem)) {
+                if (auto landed = FindPendingFence(*wait_reg_mem)) {
                     deferred_waits.push_back(std::move(landed));
                     ++cp_perf.deferred;
                     break;
@@ -1415,6 +1418,11 @@ bool Liverpool::CanRunPastDeferredWaits(const PM4Header* header) {
         const auto* event = reinterpret_cast<const PM4CmdEventWrite*>(header);
         return event->event_index.Value() != EventIndex::ZpassDone;
     }
+    case PM4ItOpcode::EventWriteEos: {
+        // A GDS store reads the GDS back once the host GPU is idle.
+        const auto* event_eos = reinterpret_cast<const PM4CmdEventWriteEos*>(header);
+        return rasterizer && event_eos->command == PM4CmdEventWriteEos::Command::SignalFence;
+    }
     case PM4ItOpcode::DmaData:
         return !DmaWritesFromCpu(reinterpret_cast<const PM4DmaData*>(header));
     case PM4ItOpcode::ContextControl:
@@ -1470,13 +1478,26 @@ bool Liverpool::DmaWritesFromCpu(const PM4DmaData* dma_data) {
     return dma_data->dst_sel != DmaDataDst::Gds && dma_data->src_sel != DmaDataSrc::Gds;
 }
 
-std::shared_ptr<std::atomic<bool>> Liverpool::FindPendingEopFence(
+void Liverpool::AddPendingFence(const u32* address, u32 value,
+                                const std::shared_ptr<std::atomic<bool>>& landed) {
+    while (!pending_fences.empty() &&
+           pending_fences.front().landed->load(std::memory_order_acquire)) {
+        pending_fences.pop_front();
+    }
+    pending_fences.push_back({
+        .address = address,
+        .value = value,
+        .landed = landed,
+    });
+}
+
+std::shared_ptr<std::atomic<bool>> Liverpool::FindPendingFence(
     const PM4CmdWaitRegMem& wait_reg_mem) {
     if (wait_reg_mem.mem_space.Value() != PM4CmdWaitRegMem::MemSpace::Memory) {
         return nullptr;
     }
     const u32* address = wait_reg_mem.Address();
-    for (const auto& fence : pending_eop_fences) {
+    for (const auto& fence : pending_fences) {
         if (fence.address == address && !fence.landed->load(std::memory_order_acquire) &&
             wait_reg_mem.Compare(fence.value)) {
             return fence.landed;

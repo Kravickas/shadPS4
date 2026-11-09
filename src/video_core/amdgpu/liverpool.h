@@ -258,7 +258,9 @@ private:
     void HandleGetLodStats(const PM4CmdGetLodStats* get_lod);
     bool CanRunPastDeferredWaits(const PM4Header* header);
     bool DmaWritesFromCpu(const PM4DmaData* dma_data);
-    std::shared_ptr<std::atomic<bool>> FindPendingEopFence(const PM4CmdWaitRegMem& wait_reg_mem);
+    std::shared_ptr<std::atomic<bool>> FindPendingFence(const PM4CmdWaitRegMem& wait_reg_mem);
+    void AddPendingFence(const u32* address, u32 value,
+                         const std::shared_ptr<std::atomic<bool>>& landed);
     bool IsNextGfxSubmitQueued();
 
     struct GpuQueue {
@@ -274,13 +276,14 @@ private:
     std::queue<Task::Handle> ce_submits;
     u32 num_mapped_queues{1u}; // GFX is always available
 
-    /// A graphics EVENT_WRITE_EOP fence that lands once the host GPU has done the work before it.
-    struct PendingEopFence {
+    /// A graphics EVENT_WRITE_EOP/EOS fence that lands once the host GPU has done the work before
+    /// it.
+    struct PendingFence {
         const u32* address;
         u32 value; ///< Dword the fence writes at address
         std::shared_ptr<std::atomic<bool>> landed;
     };
-    std::deque<PendingEopFence> pending_eop_fences; ///< In submission order, GPU thread only
+    std::deque<PendingFence> pending_fences; ///< In submission order, GPU thread only
     /// Fences of graphics WAIT_REG_MEMs the CP went past before they landed. Packets recorded
     /// into the host queue stay ordered behind them; the CP stalls on them before any packet
     /// with an effect outside that queue.
