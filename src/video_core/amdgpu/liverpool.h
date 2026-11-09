@@ -7,7 +7,9 @@
 #include <chrono>
 #include <condition_variable>
 #include <coroutine>
+#include <deque>
 #include <exception>
+#include <memory>
 #include <mutex>
 #include <semaphore>
 #include <span>
@@ -60,8 +62,10 @@ struct CpPerf {
     u32 draws;
     u32 dispatches;
     u32 flushes;
-    u32 post_spin_trace; ///< Packets still to log after a WAIT_REG_MEM spin
-    u32 rb_downloads;    ///< Buffer readbacks downloaded
+    u32 deferred; ///< WAIT_REG_MEMs the CP went past
+    u32 resolves;
+    u64 resolve_ns;   ///< Stalls on deferred waits
+    u32 rb_downloads; ///< Buffer readbacks downloaded
     u64 rb_bytes;
     u64 rb_finish_ns; ///< Host GPU drains for buffer readbacks
     u32 img_downloads;
@@ -252,6 +256,10 @@ private:
     void ProcessCeQueue();
     void Process(std::stop_token stoken);
     void HandleGetLodStats(const PM4CmdGetLodStats* get_lod);
+    bool CanRunPastDeferredWaits(const PM4Header* header);
+    bool DmaWritesFromCpu(const PM4DmaData* dma_data);
+    std::shared_ptr<std::atomic<bool>> FindPendingEopFence(const PM4CmdWaitRegMem& wait_reg_mem);
+    bool IsNextGfxSubmitQueued();
 
     struct GpuQueue {
         std::mutex m_access{};
@@ -265,6 +273,19 @@ private:
     std::array<GpuQueue, NumTotalQueues> mapped_queues{};
     std::queue<Task::Handle> ce_submits;
     u32 num_mapped_queues{1u}; // GFX is always available
+
+    /// A graphics EVENT_WRITE_EOP fence that lands once the host GPU has done the work before it.
+    struct PendingEopFence {
+        const u32* address;
+        u32 value; ///< Dword the fence writes at address
+        std::shared_ptr<std::atomic<bool>> landed;
+    };
+    std::deque<PendingEopFence> pending_eop_fences; ///< In submission order, GPU thread only
+    /// Fences of graphics WAIT_REG_MEMs the CP went past before they landed. Packets recorded
+    /// into the host queue stay ordered behind them; the CP stalls on them before any packet
+    /// with an effect outside that queue.
+    std::vector<std::shared_ptr<std::atomic<bool>>> deferred_waits;
+    u32 gfx_ib_depth{}; ///< Nesting of IT_INDIRECT_BUFFER calls in the graphics queue
 
     VAddr indirect_args_addr{};
     u32 num_counter_pairs{};

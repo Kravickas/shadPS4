@@ -71,6 +71,10 @@ public:
 
     void FillBuffer(VAddr address, u32 num_bytes, u32 value, bool is_gds);
     void CopyBuffer(VAddr dst, VAddr src, u32 num_bytes, bool dst_gds, bool src_gds);
+    /// Whether FillBuffer writes guest memory directly instead of recording a GPU fill.
+    bool IsCpuFill(VAddr address, u32 num_bytes);
+    /// Whether CopyBuffer copies in guest memory instead of recording a GPU copy.
+    bool IsCpuCopy(VAddr dst, VAddr src, u32 num_bytes);
     u32 ReadDataFromGds(u32 gsd_offset);
     bool InvalidateMemory(VAddr addr, u64 size, bool assume_locks = false);
     bool ReadMemory(VAddr addr, u64 size, bool assume_locks = false);
