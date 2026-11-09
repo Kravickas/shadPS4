@@ -1,6 +1,8 @@
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <chrono>
+
 #include "gnm_error.h"
 #include "gnmdriver.h"
 
@@ -78,16 +80,36 @@ static u32 asc_next_offs_dw[Liverpool::NumComputeRings];
 static VAddr tessellation_factors_ring_addr = -1;
 static constexpr u32 tessellation_offchip_buffer_size = 0x800000u;
 
+static u64 PerfNs() {
+    return std::chrono::duration_cast<std::chrono::nanoseconds>(
+               std::chrono::steady_clock::now().time_since_epoch())
+        .count();
+}
+
 static void ResetSubmissionLock(Platform::InterruptId irq) {
     std::unique_lock lock{m_wait_idle};
+    if (submission_lock != 0) {
+        LOG_INFO(Lib_GnmDriver, "PERF idle t={}", PerfNs());
+    }
     submission_lock = 0;
     cv_lock.notify_all();
 }
 
-static void WaitGpuIdle() {
+static void WaitGpuIdle(const char* who) {
     HLE_TRACE;
     std::unique_lock lock{m_wait_idle};
+    if (submission_lock == 0) {
+        return;
+    }
+    const u64 t0 = PerfNs();
     cv_lock.wait(lock, [] { return submission_lock == 0; });
+    LOG_INFO(Lib_GnmDriver, "PERF wait who={} frame={} t0={} t1={}", who, frames_submitted, t0,
+             PerfNs());
+}
+
+static void TraceSubmitDone(const char* who) {
+    LOG_INFO(Lib_GnmDriver, "PERF done who={} frame={} t={} locked={}", who, frames_submitted,
+             PerfNs(), submission_lock);
 }
 
 // Write a special NOP packet with N DWs data block
@@ -307,7 +329,7 @@ void PS4_SYSV_ABI sceGnmDingDong(u32 gnm_vqid, u32 next_offs_dw) {
     }
 
     std::scoped_lock lk{m_submit_lock};
-    WaitGpuIdle();
+    WaitGpuIdle("DingDong");
 
     if (DebugState.ShouldPauseInSubmit()) {
         DebugState.PauseGuestThreads();
@@ -1435,7 +1457,7 @@ s32 PS4_SYSV_ABI sceGnmRequestFlipAndSubmitDoneForWorkload(u64 workload, u32* gp
     }
 
     std::scoped_lock lk{m_submit_lock};
-    WaitGpuIdle();
+    WaitGpuIdle("RequestFlipAndSubmitDone");
 
     // Write a PrepareFlip, then patch the flip request
     auto* nop = reinterpret_cast<PM4CmdNop*>(gpu_addr);
@@ -1474,6 +1496,7 @@ s32 PS4_SYSV_ABI sceGnmRequestFlipAndSubmitDoneForWorkload(u64 workload, u32* gp
     if (!liverpool->IsGpuIdle()) {
         submission_lock = true;
     }
+    TraceSubmitDone("RequestFlipAndSubmitDone");
     liverpool->SubmitDone();
     send_init_packet = true;
 
@@ -2413,7 +2436,7 @@ s32 PS4_SYSV_ABI sceGnmSubmitAndFlipCommandBuffersForWorkload(
     const auto size_dw = dcb_sizes_in_bytes[count - 1] / 4;
 
     std::scoped_lock lk{m_submit_lock};
-    WaitGpuIdle();
+    WaitGpuIdle("SubmitAndFlip");
 
     const s32 patch_result =
         PatchFlipRequest(cmdbuf, size_dw, vo_handle, buf_idx, flip_mode, flip_arg, nullptr /*unk*/);
@@ -2456,7 +2479,7 @@ s32 PS4_SYSV_ABI sceGnmSubmitCommandBuffersForWorkload(u32 workload, u32 count,
     }
 
     std::scoped_lock lk{m_submit_lock};
-    WaitGpuIdle();
+    WaitGpuIdle("SubmitCommandBuffers");
 
     return PerformSubmit(count, const_cast<const u32**>(dcb_gpu_addrs), dcb_sizes_in_bytes,
                          const_cast<const u32**>(ccb_gpu_addrs), ccb_sizes_in_bytes);
@@ -2473,10 +2496,11 @@ s32 PS4_SYSV_ABI sceGnmSubmitDone() {
     HLE_TRACE;
     LOG_DEBUG(Lib_GnmDriver, "called");
     std::scoped_lock lk{m_submit_lock};
-    WaitGpuIdle();
+    WaitGpuIdle("SubmitDone");
     if (!liverpool->IsGpuIdle()) {
         submission_lock = true;
     }
+    TraceSubmitDone("SubmitDone");
     liverpool->SubmitDone();
     send_init_packet = true;
     ++frames_submitted;

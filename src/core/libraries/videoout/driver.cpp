@@ -1,6 +1,8 @@
 // SPDX-FileCopyrightText: Copyright 2025-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <chrono>
+
 #include "common/assert.h"
 #include "common/debug.h"
 #include "common/thread.h"
@@ -17,6 +19,12 @@ extern std::unique_ptr<Vulkan::Presenter> presenter;
 extern std::unique_ptr<AmdGpu::Liverpool> liverpool;
 
 namespace Libraries::VideoOut {
+
+static u64 PerfNs() {
+    return std::chrono::duration_cast<std::chrono::nanoseconds>(
+               std::chrono::steady_clock::now().time_since_epoch())
+        .count();
+}
 
 constexpr static bool Is32BppPixelFormat(PixelFormat format) {
     switch (format) {
@@ -238,10 +246,14 @@ void VideoOutDriver::Flip(const Request& req) {
     presenter->SetHDR(req.port->is_hdr);
 
     // Present the frame.
+    const u64 present_t0 = PerfNs();
     presenter->Present(req.frame);
+    const u64 present_t1 = PerfNs();
 
     // Update flip status.
     auto* port = req.port;
+    const s32 released = port->prev_index;
+    u64 label_ns = 0;
     {
         std::unique_lock lock{port->port_mutex};
         auto& flip_status = port->flip_status;
@@ -261,8 +273,14 @@ void VideoOutDriver::Flip(const Request& req) {
         // Release the previous buffer, unless a queued flip still targets it
         if (port->prev_index != -1 && port->buffer_queued[port->prev_index] == 0) {
             port->buffer_labels[port->prev_index] = 0;
+            label_ns = PerfNs();
         }
     }
+    LOG_INFO(Lib_VideoOut,
+             "PERF flip idx={} prev={} arg={} eop={} t_submit={} t_queued={} t_tick={} "
+             "t_present0={} t_present1={} t_label={}",
+             req.index, released, req.flip_arg, req.eop, req.submit_ns, req.queued_ns,
+             vblank_tick_ns, present_t0, present_t1, label_ns);
 
     // Trigger flip events for the port.
     for (auto event : port->flip_events) {
@@ -313,15 +331,18 @@ bool VideoOutDriver::SubmitFlip(VideoOutPort* port, s32 index, s64 flip_arg,
 
     if (!is_eop) {
         // Non EOP flips can arrive from any thread so ask GPU thread to perform them
-        liverpool->SendCommand([=, this]() { SubmitFlipInternal(port, index, flip_arg, is_eop); });
+        const u64 submit_ns = PerfNs();
+        liverpool->SendCommand(
+            [=, this]() { SubmitFlipInternal(port, index, flip_arg, is_eop, submit_ns); });
     } else {
-        SubmitFlipInternal(port, index, flip_arg, is_eop);
+        SubmitFlipInternal(port, index, flip_arg, is_eop, PerfNs());
     }
 
     return true;
 }
 
-void VideoOutDriver::SubmitFlipInternal(VideoOutPort* port, s32 index, s64 flip_arg, bool is_eop) {
+void VideoOutDriver::SubmitFlipInternal(VideoOutPort* port, s32 index, s64 flip_arg, bool is_eop,
+                                        u64 submit_ns) {
     Vulkan::Frame* frame;
     if (index == -1) {
         frame = presenter->PrepareBlankFrame(false);
@@ -339,6 +360,8 @@ void VideoOutDriver::SubmitFlipInternal(VideoOutPort* port, s32 index, s64 flip_
         .flip_arg = flip_arg,
         .index = index,
         .eop = is_eop,
+        .submit_ns = submit_ns,
+        .queued_ns = PerfNs(),
     });
 }
 
@@ -363,6 +386,7 @@ void VideoOutDriver::PresentThread(std::stop_token token) {
 
     while (!token.stop_requested()) {
         timer.Start();
+        vblank_tick_ns = PerfNs();
 
         if (DebugState.IsGuestThreadsPaused()) {
             DrawLastFrame();

@@ -1,6 +1,8 @@
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <chrono>
+
 #include <boost/preprocessor/stringize.hpp>
 
 #include "common/assert.h"
@@ -31,6 +33,22 @@ static_assert(Liverpool::NumComputeRings <= MAX_NAMES);
 #define NAME_ARRAY(name, num) {BOOST_PP_REPEAT(num, NAME_NUM, name)}
 
 static const char* acb_task_name[] = NAME_ARRAY(ACB_TASK, MAX_NAMES);
+
+static u64 PerfNs() {
+    return std::chrono::duration_cast<std::chrono::nanoseconds>(
+               std::chrono::steady_clock::now().time_since_epoch())
+        .count();
+}
+
+// Per command processor cycle (wake to GpuIdle), touched only by the GPU thread.
+static struct {
+    u64 vo_block_ns;
+    u64 vo_spin_ns;
+    u64 mem_spin_ns;
+    u64 asc_spin_ns;
+    u32 vo_blocks;
+    u32 tasks;
+} cp_perf;
 
 #define YIELD(name)                                                                                \
     FIBER_EXIT;                                                                                    \
@@ -140,6 +158,8 @@ void Liverpool::Process(std::stop_token stoken) {
 
         VideoCore::StartCapture();
 
+        const u64 cycle_t0 = PerfNs();
+        cp_perf = {};
         curr_qid = -1;
 
         while ((num_submits || num_commands) && !stoken.stop_requested()) {
@@ -162,6 +182,7 @@ void Liverpool::Process(std::stop_token stoken) {
 
             if (task.done()) {
                 task.destroy();
+                ++cp_perf.tasks;
 
                 std::scoped_lock lock{queue.m_access};
                 queue.submits.pop();
@@ -172,6 +193,8 @@ void Liverpool::Process(std::stop_token stoken) {
             }
         }
 
+        const u64 flush_t0 = PerfNs();
+        const bool was_submit_done = submit_done;
         if (submit_done) {
             VideoCore::EndCapture();
             if (rasterizer) {
@@ -180,6 +203,13 @@ void Liverpool::Process(std::stop_token stoken) {
             }
             submit_done = false;
         }
+        const u64 cycle_t1 = PerfNs();
+        LOG_INFO(Render,
+                 "PERF cp t0={} t1={} tasks={} submit_done={} flush_us={} vo_block_us={} "
+                 "vo_blocks={} vo_spin_us={} mem_spin_us={} asc_spin_us={}",
+                 cycle_t0, cycle_t1, cp_perf.tasks, was_submit_done, (cycle_t1 - flush_t0) / 1000,
+                 cp_perf.vo_block_ns / 1000, cp_perf.vo_blocks, cp_perf.vo_spin_ns / 1000,
+                 cp_perf.mem_spin_ns / 1000, cp_perf.asc_spin_ns / 1000);
 
         Platform::IrqC::Instance()->Signal(Platform::InterruptId::GpuIdle);
     }
@@ -853,13 +883,23 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb) {
                 // there are no other submits to yield to we can sleep the thread
                 // instead and allow other tasks to run.
                 const u64* wait_addr = wait_reg_mem->Address<u64*>();
-                if (vo_port->IsVoLabel(wait_addr) &&
-                    num_submits == mapped_queues[GfxQueueId].submits.size()) {
+                const bool vo_label = vo_port->IsVoLabel(wait_addr);
+                if (vo_label && num_submits == mapped_queues[GfxQueueId].submits.size()) {
+                    const u64 t0 = PerfNs();
                     vo_port->WaitVoLabel([&] { return wait_reg_mem->Test(regs.reg_array); });
+                    const u64 t1 = PerfNs();
+                    cp_perf.vo_block_ns += t1 - t0;
+                    ++cp_perf.vo_blocks;
+                    LOG_INFO(Render, "PERF voblock label={} t0={} t1={}",
+                             wait_addr - vo_port->buffer_labels.data(), t0, t1);
                     break;
                 }
-                while (!wait_reg_mem->Test(regs.reg_array)) {
-                    YIELD_GFX();
+                if (!wait_reg_mem->Test(regs.reg_array)) {
+                    const u64 t0 = PerfNs();
+                    while (!wait_reg_mem->Test(regs.reg_array)) {
+                        YIELD_GFX();
+                    }
+                    (vo_label ? cp_perf.vo_spin_ns : cp_perf.mem_spin_ns) += PerfNs() - t0;
                 }
                 break;
             }
@@ -1214,8 +1254,12 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
         case PM4ItOpcode::WaitRegMem: {
             const auto* wait_reg_mem = reinterpret_cast<const PM4CmdWaitRegMem*>(header);
             ASSERT(wait_reg_mem->engine.Value() == PM4CmdWaitRegMem::Engine::Me);
-            while (!wait_reg_mem->Test(regs.reg_array)) {
-                YIELD_ASC(vqid);
+            if (!wait_reg_mem->Test(regs.reg_array)) {
+                const u64 t0 = PerfNs();
+                while (!wait_reg_mem->Test(regs.reg_array)) {
+                    YIELD_ASC(vqid);
+                }
+                cp_perf.asc_spin_ns += PerfNs() - t0;
             }
             break;
         }
