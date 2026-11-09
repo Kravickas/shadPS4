@@ -317,6 +317,39 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb) {
         case 3:
             const u32 count = header->type3.NumWords();
             const PM4ItOpcode opcode = header->type3.opcode;
+            if (cp_perf.post_spin_trace != 0) {
+                // Log what the CP does after a wait, up to the next draw or dispatch.
+                switch (opcode) {
+                case PM4ItOpcode::SetConfigReg:
+                case PM4ItOpcode::SetContextReg:
+                case PM4ItOpcode::SetShReg:
+                case PM4ItOpcode::SetUconfigReg:
+                    break;
+                case PM4ItOpcode::DispatchDirect:
+                case PM4ItOpcode::DispatchIndirect:
+                case PM4ItOpcode::DrawIndirect:
+                case PM4ItOpcode::DrawIndexIndirect:
+                case PM4ItOpcode::DrawIndex2:
+                case PM4ItOpcode::DrawIndirectMulti:
+                case PM4ItOpcode::DrawIndexAuto:
+                case PM4ItOpcode::DrawIndexMultiAuto:
+                case PM4ItOpcode::DrawIndexOffset2:
+                case PM4ItOpcode::DrawIndexIndirectMulti:
+                case PM4ItOpcode::DrawIndirectCountMulti:
+                case PM4ItOpcode::DrawIndexIndirectCountMulti:
+                    LOG_INFO(Render, "PERF post op={:#x} end=1", static_cast<u32>(opcode));
+                    cp_perf.post_spin_trace = 0;
+                    break;
+                default: {
+                    const u32* body = reinterpret_cast<const u32*>(header) + 1;
+                    LOG_INFO(Render, "PERF post op={:#x} dw1={:#x} dw2={:#x} dw3={:#x}",
+                             static_cast<u32>(opcode), count > 0 ? body[0] : 0,
+                             count > 1 ? body[1] : 0, count > 2 ? body[2] : 0);
+                    --cp_perf.post_spin_trace;
+                    break;
+                }
+                }
+            }
             switch (opcode) {
             case PM4ItOpcode::Nop: {
                 const auto* nop = reinterpret_cast<const PM4CmdNop*>(header);
@@ -761,9 +794,11 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb) {
             case PM4ItOpcode::EventWriteEop: {
                 const auto* event_eop = reinterpret_cast<const PM4CmdEventWriteEop*>(header);
                 const u64 eop_t0 = PerfNs();
-                LOG_INFO(Render, "PERF eop addr={:#x} data={:#x} data_sel={} int_sel={} t={}",
+                LOG_INFO(Render,
+                         "PERF eop addr={:#x} data={:#x} event={:#x} data_sel={} int_sel={} t={}",
                          reinterpret_cast<uintptr_t>(event_eop->Address<void>()),
-                         event_eop->DataQWord(), static_cast<u32>(event_eop->data_sel.Value()),
+                         event_eop->DataQWord(), event_eop->event_type.Value(),
+                         static_cast<u32>(event_eop->data_sel.Value()),
                          static_cast<u32>(event_eop->int_sel.Value()), eop_t0);
                 auto signal = [eop = *event_eop] {
                     LOG_INFO(Render, "PERF eopland addr={:#x} t={}",
@@ -907,6 +942,7 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb) {
                     } else {
                         cp_perf.mem_spin_ns += t1 - t0;
                         ++cp_perf.mem_spins;
+                        cp_perf.post_spin_trace = 24;
                         LOG_INFO(Render,
                                  "PERF spin mem={} addr={:#x} func={} ref={:#x} mask={:#x} "
                                  "value0={:#x} value1={:#x} t0={} t1={}",

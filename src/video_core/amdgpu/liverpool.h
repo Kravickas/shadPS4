@@ -59,6 +59,7 @@ struct CpPerf {
     u32 draws;
     u32 dispatches;
     u32 flushes;
+    u32 post_spin_trace; ///< Packets still to log after a WAIT_REG_MEM spin
 };
 inline CpPerf cp_perf;
 
