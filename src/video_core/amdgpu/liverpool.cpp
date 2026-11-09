@@ -1,8 +1,6 @@
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
-#include <chrono>
-
 #include <boost/preprocessor/stringize.hpp>
 
 #include "common/assert.h"
@@ -33,22 +31,6 @@ static_assert(Liverpool::NumComputeRings <= MAX_NAMES);
 #define NAME_ARRAY(name, num) {BOOST_PP_REPEAT(num, NAME_NUM, name)}
 
 static const char* acb_task_name[] = NAME_ARRAY(ACB_TASK, MAX_NAMES);
-
-static u64 PerfNs() {
-    return std::chrono::duration_cast<std::chrono::nanoseconds>(
-               std::chrono::steady_clock::now().time_since_epoch())
-        .count();
-}
-
-// Per command processor cycle (wake to GpuIdle), touched only by the GPU thread.
-static struct {
-    u64 vo_block_ns;
-    u64 vo_spin_ns;
-    u64 mem_spin_ns;
-    u64 asc_spin_ns;
-    u32 vo_blocks;
-    u32 tasks;
-} cp_perf;
 
 #define YIELD(name)                                                                                \
     FIBER_EXIT;                                                                                    \
@@ -206,10 +188,18 @@ void Liverpool::Process(std::stop_token stoken) {
         const u64 cycle_t1 = PerfNs();
         LOG_INFO(Render,
                  "PERF cp t0={} t1={} tasks={} submit_done={} flush_us={} vo_block_us={} "
-                 "vo_blocks={} vo_spin_us={} mem_spin_us={} asc_spin_us={}",
+                 "vo_blocks={} vo_spin_us={} mem_spin_us={} mem_spins={} asc_spin_us={} "
+                 "draws={} draw_us={} draw_pipeline_us={} draw_bind_us={} dispatches={} "
+                 "dispatch_us={} dispatch_pipeline_us={} copy_us={} fence_us={} eop_us={} "
+                 "flushes={} host_flush_us={}",
                  cycle_t0, cycle_t1, cp_perf.tasks, was_submit_done, (cycle_t1 - flush_t0) / 1000,
                  cp_perf.vo_block_ns / 1000, cp_perf.vo_blocks, cp_perf.vo_spin_ns / 1000,
-                 cp_perf.mem_spin_ns / 1000, cp_perf.asc_spin_ns / 1000);
+                 cp_perf.mem_spin_ns / 1000, cp_perf.mem_spins, cp_perf.asc_spin_ns / 1000,
+                 cp_perf.draws, cp_perf.draw_ns / 1000, cp_perf.draw_pipeline_ns / 1000,
+                 cp_perf.draw_bind_ns / 1000, cp_perf.dispatches, cp_perf.dispatch_ns / 1000,
+                 cp_perf.dispatch_pipeline_ns / 1000, cp_perf.copy_ns / 1000,
+                 cp_perf.fence_ns / 1000, cp_perf.eop_ns / 1000, cp_perf.flushes,
+                 cp_perf.flush_ns / 1000);
 
         Platform::IrqC::Instance()->Signal(Platform::InterruptId::GpuIdle);
     }
@@ -770,7 +760,14 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb) {
             }
             case PM4ItOpcode::EventWriteEop: {
                 const auto* event_eop = reinterpret_cast<const PM4CmdEventWriteEop*>(header);
+                const u64 eop_t0 = PerfNs();
+                LOG_INFO(Render, "PERF eop addr={:#x} data={:#x} data_sel={} int_sel={} t={}",
+                         reinterpret_cast<uintptr_t>(event_eop->Address<void>()),
+                         event_eop->DataQWord(), static_cast<u32>(event_eop->data_sel.Value()),
+                         static_cast<u32>(event_eop->int_sel.Value()), eop_t0);
                 auto signal = [eop = *event_eop] {
+                    LOG_INFO(Render, "PERF eopland addr={:#x} t={}",
+                             reinterpret_cast<uintptr_t>(eop.Address<void>()), PerfNs());
                     eop.SignalFence(
                         [](void* address, u64 data, u32 num_bytes) {
                             auto* memory = Core::Memory::Instance();
@@ -782,6 +779,7 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb) {
                     rasterizer->OnFence();
                     // End of pipe: the fence and interrupt land once the GPU has done the work.
                     rasterizer->EnqueueEopFence(std::move(signal));
+                    cp_perf.eop_ns += PerfNs() - eop_t0;
                 } else {
                     signal();
                 }
@@ -896,10 +894,31 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb) {
                 }
                 if (!wait_reg_mem->Test(regs.reg_array)) {
                     const u64 t0 = PerfNs();
+                    const bool is_mem =
+                        wait_reg_mem->mem_space.Value() == PM4CmdWaitRegMem::MemSpace::Memory;
+                    const u32 value0 =
+                        is_mem ? *wait_reg_mem->Address() : regs.reg_array[wait_reg_mem->Reg()];
                     while (!wait_reg_mem->Test(regs.reg_array)) {
                         YIELD_GFX();
                     }
-                    (vo_label ? cp_perf.vo_spin_ns : cp_perf.mem_spin_ns) += PerfNs() - t0;
+                    const u64 t1 = PerfNs();
+                    if (vo_label) {
+                        cp_perf.vo_spin_ns += t1 - t0;
+                    } else {
+                        cp_perf.mem_spin_ns += t1 - t0;
+                        ++cp_perf.mem_spins;
+                        LOG_INFO(Render,
+                                 "PERF spin mem={} addr={:#x} func={} ref={:#x} mask={:#x} "
+                                 "value0={:#x} value1={:#x} t0={} t1={}",
+                                 is_mem,
+                                 is_mem ? reinterpret_cast<uintptr_t>(wait_reg_mem->Address())
+                                        : wait_reg_mem->Reg(),
+                                 static_cast<u32>(wait_reg_mem->function.Value()),
+                                 wait_reg_mem->ref, wait_reg_mem->mask, value0,
+                                 is_mem ? *wait_reg_mem->Address()
+                                        : regs.reg_array[wait_reg_mem->Reg()],
+                                 t0, t1);
+                    }
                 }
                 break;
             }
@@ -1265,6 +1284,9 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
         }
         case PM4ItOpcode::ReleaseMem: {
             const auto* release_mem = reinterpret_cast<const PM4CmdReleaseMem*>(header);
+            LOG_INFO(Render, "PERF relmem vqid={} addr={:#x} data={:#x} data_sel={} t={}", vqid,
+                     release_mem->Address<uintptr_t>(), release_mem->DataQWord(),
+                     static_cast<u32>(release_mem->data_sel.Value()), PerfNs());
             if (rasterizer) {
                 rasterizer->OnFence();
             }

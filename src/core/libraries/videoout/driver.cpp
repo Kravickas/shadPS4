@@ -1,8 +1,6 @@
 // SPDX-FileCopyrightText: Copyright 2025-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
-#include <chrono>
-
 #include "common/assert.h"
 #include "common/debug.h"
 #include "common/thread.h"
@@ -20,11 +18,7 @@ extern std::unique_ptr<AmdGpu::Liverpool> liverpool;
 
 namespace Libraries::VideoOut {
 
-static u64 PerfNs() {
-    return std::chrono::duration_cast<std::chrono::nanoseconds>(
-               std::chrono::steady_clock::now().time_since_epoch())
-        .count();
-}
+using AmdGpu::PerfNs;
 
 constexpr static bool Is32BppPixelFormat(PixelFormat format) {
     switch (format) {

@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include <chrono>
 #include <condition_variable>
 #include <coroutine>
 #include <exception>
@@ -30,6 +31,46 @@ struct VideoOutPort;
 }
 
 namespace AmdGpu {
+
+inline u64 PerfNs() {
+    return std::chrono::duration_cast<std::chrono::nanoseconds>(
+               std::chrono::steady_clock::now().time_since_epoch())
+        .count();
+}
+
+/// Timing of the current command processor cycle (wake to GpuIdle), GPU thread only.
+struct CpPerf {
+    u64 vo_block_ns;
+    u64 vo_spin_ns;
+    u64 mem_spin_ns;
+    u64 asc_spin_ns;
+    u64 draw_ns;
+    u64 draw_pipeline_ns;
+    u64 draw_bind_ns;
+    u64 dispatch_ns;
+    u64 dispatch_pipeline_ns;
+    u64 copy_ns;
+    u64 fence_ns;
+    u64 eop_ns;
+    u64 flush_ns;
+    u32 vo_blocks;
+    u32 mem_spins;
+    u32 tasks;
+    u32 draws;
+    u32 dispatches;
+    u32 flushes;
+};
+inline CpPerf cp_perf;
+
+/// Adds the lifetime of the object to a CpPerf field.
+struct CpPerfScope {
+    explicit CpPerfScope(u64& field_) : field{field_}, t0{PerfNs()} {}
+    ~CpPerfScope() {
+        field += PerfNs() - t0;
+    }
+    u64& field;
+    u64 t0;
+};
 
 struct Liverpool {
     static constexpr u32 GfxQueueId = 0u;
