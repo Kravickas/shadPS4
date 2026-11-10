@@ -92,6 +92,7 @@ void Scheduler::EndRendering() {
 }
 
 vk::CommandBuffer Scheduler::UploadCommandBuffer() {
+    has_recorded = true;
     auto& upload_cmdbuf = sessions.back().upload;
     if (upload_cmdbuf) {
         return upload_cmdbuf;
@@ -246,6 +247,7 @@ void Scheduler::SubmitExecution(SubmitInfo& info) {
 
     work_semaphore.Refresh();
     BeginSession();
+    has_recorded = false;
 
     // Apply pending operations
     PopPendingOperations();

@@ -62,7 +62,17 @@ struct CpPerf {
     u32 draws;
     u32 dispatches;
     u32 flushes;
-    u32 deferred; ///< WAIT_REG_MEMs the CP went past
+    u32 deferred;         ///< WAIT_REG_MEMs the CP went past
+    u32 fences_merged;    ///< EOP/EOS fences that landed with the previous submission
+    u64 draw_prep_ns;     ///< PrepareRenderState
+    u64 draw_begin_ns;    ///< BeginRendering
+    u64 bind_buffers_ns;  ///< BindBuffers, draws and dispatches
+    u64 bind_textures_ns; ///< BindTextures, draws and dispatches
+    u64 dma_sync_ns;      ///< SynchronizeDmaBuffers
+    u64 eos_ns;           ///< EVENT_WRITE_EOS handling
+    u64 commands_ns;      ///< Commands from other threads run on the GPU thread
+    u32 eos;
+    u32 commands;
     u32 resolves;
     u64 resolve_ns;   ///< Stalls on deferred waits
     u32 rb_downloads; ///< Buffer readbacks downloaded

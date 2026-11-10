@@ -209,11 +209,16 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset) {
 
     const u64 bind_t0 = AmdGpu::PerfNs();
     PrepareRenderState(pipeline);
+    const u64 bind_t1 = AmdGpu::PerfNs();
+    AmdGpu::cp_perf.draw_prep_ns += bind_t1 - bind_t0;
     if (!BindResources(pipeline)) {
         return;
     }
+    const u64 bind_t2 = AmdGpu::PerfNs();
     const auto state = BeginRendering(pipeline);
-    AmdGpu::cp_perf.draw_bind_ns += AmdGpu::PerfNs() - bind_t0;
+    const u64 bind_t3 = AmdGpu::PerfNs();
+    AmdGpu::cp_perf.draw_begin_ns += bind_t3 - bind_t2;
+    AmdGpu::cp_perf.draw_bind_ns += bind_t3 - bind_t0;
 
     BindVertexBuffers(pipeline);
     if (is_indexed) {
@@ -277,11 +282,16 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
 
     const u64 bind_t0 = AmdGpu::PerfNs();
     PrepareRenderState(pipeline);
+    const u64 bind_t1 = AmdGpu::PerfNs();
+    AmdGpu::cp_perf.draw_prep_ns += bind_t1 - bind_t0;
     if (!BindResources(pipeline)) {
         return;
     }
+    const u64 bind_t2 = AmdGpu::PerfNs();
     const auto state = BeginRendering(pipeline);
-    AmdGpu::cp_perf.draw_bind_ns += AmdGpu::PerfNs() - bind_t0;
+    const u64 bind_t3 = AmdGpu::PerfNs();
+    AmdGpu::cp_perf.draw_begin_ns += bind_t3 - bind_t2;
+    AmdGpu::cp_perf.draw_bind_ns += bind_t3 - bind_t0;
 
     BindVertexBuffers(pipeline);
     if (is_indexed) {
@@ -462,6 +472,12 @@ void Rasterizer::OnFence() {
 }
 
 void Rasterizer::EnqueueEopFence(Common::UniqueFunction<void>&& signal) {
+    if (!scheduler.HasRecorded()) {
+        // Nothing was recorded since the last submission, so the fence lands with it.
+        scheduler.DeferPriorityOperation(std::move(signal), scheduler.CurrentTick() - 1);
+        ++AmdGpu::cp_perf.fences_merged;
+        return;
+    }
     scheduler.DeferPriorityOperation(std::move(signal));
     Flush();
 }
@@ -488,12 +504,19 @@ bool Rasterizer::BindResources(const Pipeline* pipeline) {
         }
         set_writes.resize(set_writes.size() + stage->buffers.size() + stage->images.size() +
                           stage->samplers.size());
-        BindBuffers(*stage, binding, push_data);
-        BindTextures(*stage, binding);
+        {
+            const AmdGpu::CpPerfScope perf_buffers{AmdGpu::cp_perf.bind_buffers_ns};
+            BindBuffers(*stage, binding, push_data);
+        }
+        {
+            const AmdGpu::CpPerfScope perf_textures{AmdGpu::cp_perf.bind_textures_ns};
+            BindTextures(*stage, binding);
+        }
         uses_dma |= stage->uses_dma;
     }
 
     if (uses_dma) {
+        const AmdGpu::CpPerfScope perf_dma{AmdGpu::cp_perf.dma_sync_ns};
         buffer_cache.SynchronizeDmaBuffers();
     }
 

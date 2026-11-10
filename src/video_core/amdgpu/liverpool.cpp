@@ -134,6 +134,8 @@ void Liverpool::ProcessCommands() {
             command_queue.pop();
             --num_commands;
         }
+        const CpPerfScope perf_command{cp_perf.commands_ns};
+        ++cp_perf.commands;
         callback();
     }
 }
@@ -210,7 +212,9 @@ void Liverpool::Process(std::stop_token stoken) {
                  "dispatch_us={} dispatch_pipeline_us={} copy_us={} fence_us={} eop_us={} "
                  "flushes={} host_flush_us={} rb_downloads={} rb_kb={} rb_finish_us={} "
                  "img_downloads={} img_finish_us={} rbw_n={} rbw_us={} rbw_max_us={} deferred={} "
-                 "resolves={} resolve_us={}",
+                 "resolves={} resolve_us={} fences_merged={} draw_prep_us={} draw_begin_us={} "
+                 "bind_buffers_us={} bind_textures_us={} dma_sync_us={} eos={} eos_us={} "
+                 "commands={} commands_us={}",
                  cycle_t0, cycle_t1, cp_perf.tasks, was_submit_done, (cycle_t1 - flush_t0) / 1000,
                  cp_perf.vo_block_ns / 1000, cp_perf.vo_blocks, cp_perf.vo_spin_ns / 1000,
                  cp_perf.mem_spin_ns / 1000, cp_perf.mem_spins, cp_perf.asc_spin_ns / 1000,
@@ -223,7 +227,11 @@ void Liverpool::Process(std::stop_token stoken) {
                  readback_wait.count.exchange(0, std::memory_order_relaxed),
                  readback_wait.wait_ns.exchange(0, std::memory_order_relaxed) / 1000,
                  readback_wait.max_ns.exchange(0, std::memory_order_relaxed) / 1000,
-                 cp_perf.deferred, cp_perf.resolves, cp_perf.resolve_ns / 1000);
+                 cp_perf.deferred, cp_perf.resolves, cp_perf.resolve_ns / 1000,
+                 cp_perf.fences_merged, cp_perf.draw_prep_ns / 1000, cp_perf.draw_begin_ns / 1000,
+                 cp_perf.bind_buffers_ns / 1000, cp_perf.bind_textures_ns / 1000,
+                 cp_perf.dma_sync_ns / 1000, cp_perf.eos, cp_perf.eos_ns / 1000, cp_perf.commands,
+                 cp_perf.commands_ns / 1000);
 
         Platform::IrqC::Instance()->Signal(Platform::InterruptId::GpuIdle);
     }
@@ -768,6 +776,8 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb) {
                 break;
             }
             case PM4ItOpcode::EventWriteEos: {
+                const CpPerfScope perf_eos{cp_perf.eos_ns};
+                ++cp_perf.eos;
                 const auto* event_eos = reinterpret_cast<const PM4CmdEventWriteEos*>(header);
                 if (rasterizer) {
                     rasterizer->OnFence();
