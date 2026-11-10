@@ -224,7 +224,7 @@ void Liverpool::Process(std::stop_token stoken) {
                  "bind_buffers_us={} bind_textures_us={} dma_sync_us={} eos={} eos_us={} "
                  "commands={} commands_us={} draw_pre_us={} draw_vb_us={} draw_barrier_us={} "
                  "draw_desc_us={} draw_dyn_us={} draw_rp_us={} draw_cmd_us={} draw_barriers={} "
-                 "render_passes={}",
+                 "render_passes={} zpass_dumps={}",
                  cycle_t0, cycle_t1, cp_perf.tasks, was_submit_done, (cycle_t1 - flush_t0) / 1000,
                  cp_perf.vo_block_ns / 1000, cp_perf.vo_blocks, cp_perf.vo_spin_ns / 1000,
                  cp_perf.mem_spin_ns / 1000, cp_perf.mem_spins, cp_perf.asc_spin_ns / 1000,
@@ -244,7 +244,7 @@ void Liverpool::Process(std::stop_token stoken) {
                  cp_perf.commands_ns / 1000, cp_perf.draw_pre_ns / 1000, cp_perf.draw_vb_ns / 1000,
                  cp_perf.draw_barrier_ns / 1000, cp_perf.draw_desc_ns / 1000,
                  cp_perf.draw_dyn_ns / 1000, cp_perf.draw_rp_ns / 1000, cp_perf.draw_cmd_ns / 1000,
-                 cp_perf.draw_barriers, cp_perf.render_passes);
+                 cp_perf.draw_barriers, cp_perf.render_passes, cp_perf.zpass_dumps);
 
         Platform::IrqC::Instance()->Signal(Platform::InterruptId::GpuIdle);
     }
@@ -777,6 +777,7 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb) {
                     regs.cp_strmout_cntl.offset_update_done = 1;
                 } else if (event->event_index.Value() == EventIndex::ZpassDone) {
                     if (event->event_type.Value() == EventType::PixelPipeStatDump) {
+                        ++cp_perf.zpass_dumps;
                         static constexpr u64 OcclusionCounterValidMask = 0x8000000000000000ULL;
                         static constexpr u64 OcclusionCounterStep = 0x2FFFFFFULL;
                         u64* results = event->Address<u64*>();

@@ -82,6 +82,7 @@ struct CpPerf {
     u64 draw_cmd_ns;     ///< Draw: bind pipeline and draw command
     u32 draw_barriers;   ///< Draws that flushed barriers
     u32 render_passes;   ///< Dynamic rendering passes begun
+    u32 zpass_dumps;     ///< ZPASS_DONE occlusion counter dumps (results are synthesized)
     u32 resolves;
     u64 resolve_ns;   ///< Stalls on deferred waits
     u32 rb_downloads; ///< Buffer readbacks downloaded
