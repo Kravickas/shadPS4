@@ -778,7 +778,8 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb) {
                 };
                 if (rasterizer && event_eos->command == PM4CmdEventWriteEos::Command::SignalFence) {
                     auto landed = std::make_shared<std::atomic<bool>>(false);
-                    AddPendingFence(event_eos->Address(), event_eos->DataDWord(), landed);
+                    AddPendingFence(event_eos->Address(), event_eos->DataDWord(), sizeof(u32),
+                                    landed);
                     // End of shader: the fence lands once the GPU has run the shaders before it.
                     rasterizer->EnqueueEopFence([eos = *event_eos, write_fence, landed] {
                         eos.SignalFence(write_fence);
@@ -821,7 +822,9 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb) {
                 if (rasterizer) {
                     const auto data_sel = event_eop->data_sel.Value();
                     if (data_sel == DataSelect::Data32Low || data_sel == DataSelect::Data64) {
-                        AddPendingFence(event_eop->Address<u32>(), event_eop->DataDWord(), landed);
+                        AddPendingFence(event_eop->Address<u32>(), event_eop->DataDWord(),
+                                        data_sel == DataSelect::Data64 ? sizeof(u64) : sizeof(u32),
+                                        landed);
                     }
                     rasterizer->OnFence();
                     // End of pipe: the fence and interrupt land once the GPU has done the work.
@@ -1423,8 +1426,12 @@ bool Liverpool::CanRunPastDeferredWaits(const PM4Header* header) {
         const auto* event_eos = reinterpret_cast<const PM4CmdEventWriteEos*>(header);
         return rasterizer && event_eos->command == PM4CmdEventWriteEos::Command::SignalFence;
     }
-    case PM4ItOpcode::DmaData:
-        return !DmaWritesFromCpu(reinterpret_cast<const PM4DmaData*>(header));
+    case PM4ItOpcode::DmaData: {
+        // A copy done in guest memory only touches memory the GPU has not written, so it can go
+        // ahead unless it reads or writes a fence that has not landed yet.
+        const auto* dma_data = reinterpret_cast<const PM4DmaData*>(header);
+        return !DmaWritesFromCpu(dma_data) || !DmaTouchesPendingFence(dma_data);
+    }
     case PM4ItOpcode::ContextControl:
     case PM4ItOpcode::ClearState:
     case PM4ItOpcode::SetConfigReg:
@@ -1478,7 +1485,28 @@ bool Liverpool::DmaWritesFromCpu(const PM4DmaData* dma_data) {
     return dma_data->dst_sel != DmaDataDst::Gds && dma_data->src_sel != DmaDataSrc::Gds;
 }
 
-void Liverpool::AddPendingFence(const u32* address, u32 value,
+bool Liverpool::DmaTouchesPendingFence(const PM4DmaData* dma_data) {
+    const u32 num_bytes = dma_data->NumBytes();
+    const bool src_memory =
+        dma_data->src_sel == DmaDataSrc::Memory || dma_data->src_sel == DmaDataSrc::MemoryUsingL2;
+    const bool dst_memory =
+        dma_data->dst_sel == DmaDataDst::Memory || dma_data->dst_sel == DmaDataDst::MemoryUsingL2;
+    return (src_memory && OverlapsPendingFence(dma_data->SrcAddress<VAddr>(), num_bytes)) ||
+           (dst_memory && OverlapsPendingFence(dma_data->DstAddress<VAddr>(), num_bytes));
+}
+
+bool Liverpool::OverlapsPendingFence(VAddr address, u64 num_bytes) {
+    for (const auto& fence : pending_fences) {
+        const VAddr fence_address = reinterpret_cast<VAddr>(fence.address);
+        if (fence_address < address + num_bytes && address < fence_address + fence.num_bytes &&
+            !fence.landed->load(std::memory_order_acquire)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+void Liverpool::AddPendingFence(const u32* address, u32 value, u32 num_bytes,
                                 const std::shared_ptr<std::atomic<bool>>& landed) {
     while (!pending_fences.empty() &&
            pending_fences.front().landed->load(std::memory_order_acquire)) {
@@ -1487,6 +1515,7 @@ void Liverpool::AddPendingFence(const u32* address, u32 value,
     pending_fences.push_back({
         .address = address,
         .value = value,
+        .num_bytes = num_bytes,
         .landed = landed,
     });
 }

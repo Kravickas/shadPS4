@@ -258,8 +258,10 @@ private:
     void HandleGetLodStats(const PM4CmdGetLodStats* get_lod);
     bool CanRunPastDeferredWaits(const PM4Header* header);
     bool DmaWritesFromCpu(const PM4DmaData* dma_data);
+    bool DmaTouchesPendingFence(const PM4DmaData* dma_data);
     std::shared_ptr<std::atomic<bool>> FindPendingFence(const PM4CmdWaitRegMem& wait_reg_mem);
-    void AddPendingFence(const u32* address, u32 value,
+    bool OverlapsPendingFence(VAddr address, u64 num_bytes);
+    void AddPendingFence(const u32* address, u32 value, u32 num_bytes,
                          const std::shared_ptr<std::atomic<bool>>& landed);
     bool IsNextGfxSubmitQueued();
 
@@ -280,13 +282,14 @@ private:
     /// it.
     struct PendingFence {
         const u32* address;
-        u32 value; ///< Dword the fence writes at address
+        u32 value;     ///< Dword the fence writes at address
+        u32 num_bytes; ///< Size of the whole fence write
         std::shared_ptr<std::atomic<bool>> landed;
     };
     std::deque<PendingFence> pending_fences; ///< In submission order, GPU thread only
     /// Fences of graphics WAIT_REG_MEMs the CP went past before they landed. Packets recorded
     /// into the host queue stay ordered behind them; the CP stalls on them before any packet
-    /// with an effect outside that queue.
+    /// whose effect could be seen before they land.
     std::vector<std::shared_ptr<std::atomic<bool>>> deferred_waits;
     u32 gfx_ib_depth{}; ///< Nesting of IT_INDIRECT_BUFFER calls in the graphics queue
 
