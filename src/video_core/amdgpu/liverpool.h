@@ -73,6 +73,15 @@ struct CpPerf {
     u64 commands_ns;      ///< Commands from other threads run on the GPU thread
     u32 eos;
     u32 commands;
+    u64 draw_pre_ns;     ///< Draw: periodic flush, pending ops, filter
+    u64 draw_vb_ns;      ///< Draw: vertex and index buffers
+    u64 draw_barrier_ns; ///< Draw: FlushBarriers
+    u64 draw_desc_ns;    ///< Draw: pipeline descriptor/push updates
+    u64 draw_dyn_ns;     ///< Draw: UpdateDynamicState
+    u64 draw_rp_ns;      ///< Draw: Scheduler::BeginRendering
+    u64 draw_cmd_ns;     ///< Draw: bind pipeline and draw command
+    u32 draw_barriers;   ///< Draws that flushed barriers
+    u32 render_passes;   ///< Dynamic rendering passes begun
     u32 resolves;
     u64 resolve_ns;   ///< Stalls on deferred waits
     u32 rb_downloads; ///< Buffer readbacks downloaded
