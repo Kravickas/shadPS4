@@ -164,6 +164,10 @@ void Liverpool::Process(std::stop_token stoken) {
         curr_qid = -1;
 
         while ((num_submits || num_commands) && !stoken.stop_requested()) {
+            if (rasterizer) {
+                // A task that yielded may be waiting on a fence that has not been submitted.
+                rasterizer->SubmitFences();
+            }
             ProcessCommands();
             ProcessCeQueue();
 
@@ -203,6 +207,10 @@ void Liverpool::Process(std::stop_token stoken) {
                 rasterizer->Flush();
             }
             submit_done = false;
+        }
+        if (rasterizer) {
+            // Fences must not wait for work that will never be submitted while the GPU is idle.
+            rasterizer->SubmitFences();
         }
         const u64 cycle_t1 = PerfNs();
         LOG_INFO(Render,
@@ -791,7 +799,7 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb) {
                     AddPendingFence(event_eos->Address(), event_eos->DataDWord(), sizeof(u32),
                                     landed);
                     // End of shader: the fence lands once the GPU has run the shaders before it.
-                    rasterizer->EnqueueEopFence([eos = *event_eos, write_fence, landed] {
+                    rasterizer->EnqueueEosFence([eos = *event_eos, write_fence, landed] {
                         eos.SignalFence(write_fence);
                         landed->store(true, std::memory_order_release);
                     });
@@ -955,6 +963,9 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb) {
                 const u64* wait_addr = wait_reg_mem->Address<u64*>();
                 const bool vo_label = vo_port->IsVoLabel(wait_addr);
                 if (vo_label && num_submits == mapped_queues[GfxQueueId].submits.size()) {
+                    if (rasterizer) {
+                        rasterizer->SubmitFences();
+                    }
                     const u64 t0 = PerfNs();
                     vo_port->WaitVoLabel([&] { return wait_reg_mem->Test(regs.reg_array); });
                     const u64 t1 = PerfNs();

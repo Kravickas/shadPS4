@@ -88,6 +88,10 @@ public:
     void OnSubmit();
     void OnFence();
     void EnqueueEopFence(Common::UniqueFunction<void>&& signal);
+    /// Like EnqueueEopFence, but the fence goes out with the next submission instead of its own.
+    void EnqueueEosFence(Common::UniqueFunction<void>&& signal);
+    /// Submits the work an EnqueueEosFence fence is waiting behind, if it has not gone out yet.
+    void SubmitFences();
 
     PipelineCache& GetPipelineCache() {
         return pipeline_cache;
@@ -156,6 +160,7 @@ private:
     const bool host_markers_enabled;
     const bool guest_markers_enabled;
     const u32 submit_draw_interval;
+    u64 unsubmitted_fence_tick{}; ///< Tick of the last fence still waiting for a submission
     u64 last_submit_tick{};
     u32 draws_since_submit{};
 

@@ -482,6 +482,22 @@ void Rasterizer::EnqueueEopFence(Common::UniqueFunction<void>&& signal) {
     Flush();
 }
 
+void Rasterizer::EnqueueEosFence(Common::UniqueFunction<void>&& signal) {
+    if (!scheduler.HasRecorded()) {
+        // Nothing was recorded since the last submission, so the fence lands with it.
+        scheduler.DeferPriorityOperation(std::move(signal), scheduler.CurrentTick() - 1);
+        return;
+    }
+    scheduler.DeferPriorityOperation(std::move(signal));
+    unsubmitted_fence_tick = scheduler.CurrentTick();
+}
+
+void Rasterizer::SubmitFences() {
+    if (unsubmitted_fence_tick == scheduler.CurrentTick()) {
+        Flush();
+    }
+}
+
 bool Rasterizer::BindResources(const Pipeline* pipeline) {
     if (IsComputeImageCopy(pipeline) || IsComputeMetaClear(pipeline) ||
         IsComputeImageClear(pipeline)) {
