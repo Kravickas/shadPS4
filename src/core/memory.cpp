@@ -15,6 +15,10 @@
 
 namespace Core {
 
+// End of the user address space. Measured on hardware (DmemTest MP2, FM9, every SDK): a fixed
+// mapping starting here is EINVAL, flexible or file; 0x7FFFFFFFC000 is inside it.
+constexpr VAddr USER_SPACE_END = 0x800000000000ULL;
+
 MemoryManager::MemoryManager() {
     LOG_INFO(Kernel_Vmm, "Virtual memory space initialized with regions:");
 
@@ -808,6 +812,11 @@ s32 MemoryManager::MapMemory(void** out_addr, VAddr virtual_addr, u64 size, Memo
 
     const bool stack = True(flags & MemoryMapFlags::Stack) || type == VMAType::Stack;
     if (True(flags & MemoryMapFlags::Fixed)) {
+        if (virtual_addr >= USER_SPACE_END) {
+            LOG_ERROR(Kernel_Vmm, "Fixed mapping at {:#x} is past the user address space",
+                      virtual_addr);
+            return ORBIS_KERNEL_ERROR_EINVAL;
+        }
         if (const s32 r = CheckMapAreaEnd(virtual_addr, size, true, stack); r != ORBIS_OK) {
             return r;
         }
@@ -1104,6 +1113,12 @@ s32 MemoryManager::MapFile(void** out_addr, VAddr virtual_addr, u64 size, Memory
         prot &= ~MemoryProt::CpuExec;
     }
 
+    if (True(flags & MemoryMapFlags::Fixed) && virtual_addr >= USER_SPACE_END) {
+        LOG_ERROR(Kernel_Vmm, "Fixed mapping at {:#x} is past the user address space",
+                  virtual_addr);
+        return ORBIS_KERNEL_ERROR_EINVAL;
+    }
+
     if (True(flags & MemoryMapFlags::Fixed) && True(flags & MemoryMapFlags::NoOverwrite)) {
         if (!IsValidMapping(virtual_addr, size)) {
             LOG_ERROR(Kernel_Vmm, "addr = {:#x} size = {:#x} is outside the memory map",
@@ -1130,6 +1145,13 @@ s32 MemoryManager::MapFile(void** out_addr, VAddr virtual_addr, u64 size, Memory
             CheckMapAreaEnd(virtual_addr, size, True(flags & MemoryMapFlags::Fixed), false);
         r != ORBIS_OK) {
         return r;
+    }
+    if (True(flags & MemoryMapFlags::Fixed) && !IsInGuestAreas(virtual_addr, size)) {
+        // As in MapMemory: outside the guest address space (a host limit). Before this check, a
+        // fixed file mapping there reached CarveVMA and asserted (DmemTest FM9).
+        LOG_ERROR(Kernel_Vmm, "Fixed mapping at {:#x} is outside the guest address space",
+                  virtual_addr);
+        return ORBIS_KERNEL_ERROR_ENOMEM;
     }
 
     // Perform early GPU unmap to avoid potential deadlocks
