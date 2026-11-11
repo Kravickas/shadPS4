@@ -52,16 +52,22 @@ struct ImageInfo {
         return Extent2D{pitch >> dim, size.height >> dim};
     }
 
-    // Tiled rows are addressed through pitch and tile parameters only; height sizes the slice. Two
-    // descriptors with the same pitch and the same padded base level are the same rows even when
-    // one states the logical extent and the other the padded one.
+    // A thin-tiled 2D slice addresses its rows through pitch and tile parameters only; height just
+    // sizes the slice. Two such descriptors with the same pitch and padded base level are the same
+    // rows even when one states the logical extent and the other the padded one.
+    bool IsThinTiledSlice() const {
+        return props.is_tiled && type == AmdGpu::ImageType::Color2D && resources.layers == 1 &&
+               size.depth == 1 && AmdGpu::GetMicroTileThickness(array_mode) == 1;
+    }
+
     bool HasSameBlockLayout(const ImageInfo& info) const {
         const auto lhs = BlockDim();
         const auto rhs = info.BlockDim();
         if (lhs == rhs) {
             return true;
         }
-        if (!props.is_tiled || !info.props.is_tiled || lhs.width != rhs.width) {
+        if (!IsThinTiledSlice() || !info.IsThinTiledSlice() || lhs.width != rhs.width ||
+            (resources.levels != 1 && info.resources.levels != 1)) {
             return false;
         }
         const auto lhs_dim = props.is_block ? 2 : 0;
@@ -70,8 +76,9 @@ struct ImageInfo {
     }
 
     bool HasSameLevelLayout(const ImageInfo& info, s32 mip) const {
-        return resources.levels == 1 && props.is_tiled && info.props.is_tiled && !props.is_block &&
-               !info.props.is_block && mips_layout[0].pitch == info.mips_layout[mip].pitch &&
+        return resources.levels == 1 && IsThinTiledSlice() && info.IsThinTiledSlice() &&
+               !props.is_block && !info.props.is_block &&
+               mips_layout[0].pitch == info.mips_layout[mip].pitch &&
                mips_layout[0].height == info.mips_layout[mip].height;
     }
 
