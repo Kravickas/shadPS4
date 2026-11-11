@@ -6,6 +6,7 @@
 #include <xxhash.h>
 
 #include "common/alignment.h"
+#include "common/thread.h"
 #include "core/debug_state.h"
 #include "core/memory.h"
 #include "video_core/amdgpu/liverpool.h"
@@ -151,6 +152,7 @@ void BufferCache::ReadMemory(VAddr device_addr, u64 size, bool is_write, bool as
             memory_tracker->MarkRegionAsCpuModified(device_addr, size);
         }
     };
+    const u64 rb_t0 = AmdGpu::PerfNs();
     if (assume_locks) {
         flush_request();
     } else {
@@ -165,6 +167,9 @@ void BufferCache::ReadMemory(VAddr device_addr, u64 size, bool is_write, bool as
                !perf.max_ns.compare_exchange_weak(prev, wait_ns, std::memory_order_relaxed)) {
         }
     }
+    LOG_INFO(Render, "PERF rb addr={:#x} size={:#x} write={} gpu_thread={} t0={} t1={} thread={}",
+             device_addr, size, is_write, assume_locks, rb_t0, AmdGpu::PerfNs(),
+             Common::GetCurrentThreadName());
 }
 
 void BufferCache::DownloadMemory(const Buffer* arena, VAddr device_addr, u64 size, bool async) {
