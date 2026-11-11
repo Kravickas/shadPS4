@@ -9,6 +9,7 @@
 #include <optional>
 #include <span>
 #include <type_traits>
+#include <vector>
 
 #include "common/assert.h"
 #include "common/concepts.h"
@@ -271,6 +272,11 @@ private:
 
     uintptr_t file_mapping = 0;
     bool owns_file_mapping = false;
+    // Size of the file when file_mapping was created: a section never grows with its file
+    u64 file_mapping_size = 0;
+    // Sections replaced after the file grew: existing mappings may still map from them (a region
+    // that is split is mapped again from its handle), so they are closed with the file
+    std::vector<uintptr_t> retired_file_mappings;
 };
 
 u64 GetDirectorySize(const std::filesystem::path& path);
