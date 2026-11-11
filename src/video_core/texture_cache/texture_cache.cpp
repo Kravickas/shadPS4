@@ -967,6 +967,7 @@ void TextureCache::RegisterImage(ImageId image_id) {
     ASSERT_MSG(False(image.flags & ImageFlagBits::Registered),
                "Trying to register an already registered image");
     image.flags |= ImageFlagBits::Registered;
+    ++registry_generation;
     image.memory_usage_counter = &total_used_memory;
     total_used_memory += Common::AlignUp(image.SizeBytes(), 1024);
     image_lru_cache.Insert(image, gc_tick);
@@ -986,6 +987,7 @@ void TextureCache::UnregisterImage(ImageId image_id) {
     ASSERT_MSG(True(image.flags & ImageFlagBits::Registered),
                "Trying to unregister an already unregistered image");
     image.flags &= ~ImageFlagBits::Registered;
+    ++registry_generation;
     image.memory_usage_counter = nullptr;
     image_lru_cache.Free(image);
     total_used_memory -= Common::AlignUp(image.SizeBytes(), 1024);
@@ -1256,6 +1258,22 @@ void TextureCache::RunGarbageCollector() {
 
 void TextureCache::TouchImage(Image& image) {
     image_lru_cache.Touch(image, gc_tick);
+}
+
+bool TextureCache::IsPerfectMatch(ImageId image_id, const ImageDesc& desc) {
+    // The same tests as the perfect match in FindImage.
+    const auto& info = desc.info;
+    const auto& cache_info = slot_images[image_id].info;
+    return cache_info.guest_address == info.guest_address &&
+           cache_info.guest_size == info.guest_size && cache_info.size == info.size &&
+           IsVulkanFormatCompatible(cache_info.pixel_format, info.pixel_format) &&
+           (cache_info.type == info.type || info.size == Extent3D{1, 1, 1});
+}
+
+void TextureCache::TouchFoundImage(ImageId image_id) {
+    Image& image = slot_images[image_id];
+    image.tick_accessed_last = scheduler.CurrentTick();
+    TouchImage(image);
 }
 
 void TextureCache::DeleteImage(ImageId image_id) {

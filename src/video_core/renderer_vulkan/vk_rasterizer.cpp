@@ -20,9 +20,17 @@
 #include "video_core/texture_cache/image_view.h"
 #include "video_core/texture_cache/texture_cache.h"
 
+#include <cstring>
+#include <type_traits>
 #include <vulkan/vulkan_format_traits.hpp>
 
 namespace Vulkan {
+
+template <typename T>
+static bool SameBits(const T& a, const T& b) {
+    static_assert(std::is_trivially_copyable_v<T>);
+    return std::memcmp(&a, &b, sizeof(T)) == 0;
+}
 
 static Shader::PushData MakeUserData(const AmdGpu::Regs& regs) {
     // TODO(roamic): Add support for multiple viewports and geometry shaders when ViewportIndex
@@ -126,8 +134,24 @@ void Rasterizer::PrepareRenderState(const GraphicsPipeline* pipeline) {
             continue;
         }
         const auto& hint = liverpool->last_cb_extent[cb];
-        std::construct_at(&desc, col_buf, hint);
-        image_id = bound_images.emplace_back(texture_cache.FindImage(desc));
+        auto& lookup = cb_lookups[cb];
+        const u64 generation = texture_cache.RegistryGeneration();
+        if (lookup.generation == generation && SameBits(lookup.col_buf, col_buf) &&
+            lookup.hint.raw == hint.raw) {
+            desc = lookup.binding.desc;
+            image_id = lookup.binding.image_id;
+            texture_cache.TouchFoundImage(image_id);
+        } else {
+            std::construct_at(&desc, col_buf, hint);
+            image_id = texture_cache.FindImage(desc);
+            const bool reusable = texture_cache.RegistryGeneration() == generation &&
+                                  texture_cache.IsPerfectMatch(image_id, desc);
+            lookup.generation = reusable ? generation : 0;
+            lookup.col_buf = col_buf;
+            lookup.hint = hint;
+            lookup.binding = {image_id, desc};
+        }
+        bound_images.emplace_back(image_id);
         auto& image = texture_cache.GetImage(image_id);
         image.binding.is_target = 1u;
     }
@@ -137,9 +161,30 @@ void Rasterizer::PrepareRenderState(const GraphicsPipeline* pipeline) {
         const auto htile_address = regs.depth_htile_data_base.GetAddress();
         const auto& hint = liverpool->last_db_extent;
         auto& [image_id, desc] = db_desc;
-        std::construct_at(&desc, regs.depth_buffer, regs.depth_view, regs.depth_control,
-                          htile_address, hint);
-        image_id = bound_images.emplace_back(texture_cache.FindImage(desc));
+        auto& lookup = db_lookup;
+        const u64 generation = texture_cache.RegistryGeneration();
+        if (lookup.generation == generation && SameBits(lookup.depth_buffer, regs.depth_buffer) &&
+            SameBits(lookup.depth_view, regs.depth_view) &&
+            SameBits(lookup.depth_control, regs.depth_control) &&
+            lookup.htile_address == htile_address && lookup.hint.raw == hint.raw) {
+            desc = lookup.binding.desc;
+            image_id = lookup.binding.image_id;
+            texture_cache.TouchFoundImage(image_id);
+        } else {
+            std::construct_at(&desc, regs.depth_buffer, regs.depth_view, regs.depth_control,
+                              htile_address, hint);
+            image_id = texture_cache.FindImage(desc);
+            const bool reusable = texture_cache.RegistryGeneration() == generation &&
+                                  texture_cache.IsPerfectMatch(image_id, desc);
+            lookup.generation = reusable ? generation : 0;
+            lookup.depth_buffer = regs.depth_buffer;
+            lookup.depth_view = regs.depth_view;
+            lookup.depth_control = regs.depth_control;
+            lookup.htile_address = htile_address;
+            lookup.hint = hint;
+            lookup.binding = {image_id, desc};
+        }
+        bound_images.emplace_back(image_id);
         auto& image = texture_cache.GetImage(image_id);
         image.binding.is_target = 1u;
     } else {

@@ -172,6 +172,26 @@ private:
     std::array<ImageBinding, AmdGpu::NUM_COLOR_BUFFERS> cb_descs;
     ImageBinding db_desc;
 
+    /// Registers and result of the last render target lookup that found a perfect match. The
+    /// same registers give the same image while the texture cache registry generation is equal.
+    struct ColorTargetLookup {
+        u64 generation{};
+        AmdGpu::ColorBuffer col_buf;
+        AmdGpu::CbDbExtent hint;
+        ImageBinding binding;
+    };
+    struct DepthTargetLookup {
+        u64 generation{};
+        AmdGpu::DepthBuffer depth_buffer;
+        AmdGpu::DepthView depth_view;
+        AmdGpu::DepthControl depth_control;
+        VAddr htile_address;
+        AmdGpu::CbDbExtent hint;
+        ImageBinding binding;
+    };
+    std::array<ColorTargetLookup, AmdGpu::NUM_COLOR_BUFFERS> cb_lookups{};
+    DepthTargetLookup db_lookup{};
+
     boost::container::static_vector<vk::DescriptorImageInfo, Shader::NUM_IMAGES> image_infos;
     boost::container::static_vector<vk::DescriptorBufferInfo, Shader::NUM_BUFFERS> buffer_infos;
 

@@ -139,6 +139,18 @@ public:
     /// Retrieves the image handle of the image with the provided attributes.
     [[nodiscard]] ImageId FindImage(ImageDesc& desc, bool exact_fmt = false);
 
+    /// Changes whenever an image is registered or unregistered.
+    [[nodiscard]] u64 RegistryGeneration() const noexcept {
+        return registry_generation;
+    }
+
+    /// Whether FindImage(desc) returned image_id through its perfect match. While the registry
+    /// generation stays the same, FindImage(desc) keeps returning that image.
+    [[nodiscard]] bool IsPerfectMatch(ImageId image_id, const ImageDesc& desc);
+
+    /// Accounts the access of a FindImage result that is used again without repeating the lookup.
+    void TouchFoundImage(ImageId image_id);
+
     /// Retrieves image whose address matches provided
     [[nodiscard]] ImageId FindImageFromRange(VAddr address, size_t size, bool ensure_valid = true);
 
@@ -425,6 +437,7 @@ private:
     u64 pressure_gc_samplers = 0;
     u64 critical_gc_samplers = 0;
     u64 gc_tick = 0;
+    u64 registry_generation = 1;
     Common::LRUCache<Image> image_lru_cache;
     Common::LRUCache<Sampler> sampler_lru_cache;
     const bool readback_linear_images;
