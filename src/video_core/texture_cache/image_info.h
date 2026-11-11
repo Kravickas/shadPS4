@@ -52,6 +52,29 @@ struct ImageInfo {
         return Extent2D{pitch >> dim, size.height >> dim};
     }
 
+    // Tiled rows are addressed through pitch and tile parameters only; height sizes the slice. Two
+    // descriptors with the same pitch and the same padded base level are the same rows even when
+    // one states the logical extent and the other the padded one.
+    bool HasSameBlockLayout(const ImageInfo& info) const {
+        const auto lhs = BlockDim();
+        const auto rhs = info.BlockDim();
+        if (lhs == rhs) {
+            return true;
+        }
+        if (!props.is_tiled || !info.props.is_tiled || lhs.width != rhs.width) {
+            return false;
+        }
+        const auto lhs_dim = props.is_block ? 2 : 0;
+        const auto rhs_dim = info.props.is_block ? 2 : 0;
+        return (mips_layout[0].height >> lhs_dim) == (info.mips_layout[0].height >> rhs_dim);
+    }
+
+    bool HasSameLevelLayout(const ImageInfo& info, s32 mip) const {
+        return resources.levels == 1 && props.is_tiled && info.props.is_tiled && !props.is_block &&
+               !info.props.is_block && mips_layout[0].pitch == info.mips_layout[mip].pitch &&
+               mips_layout[0].height == info.mips_layout[mip].height;
+    }
+
     s32 MipOf(const ImageInfo& info) const;
     s32 SliceOf(const ImageInfo& info, s32 mip) const;
 
