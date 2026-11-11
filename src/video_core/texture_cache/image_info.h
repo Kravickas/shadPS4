@@ -52,12 +52,15 @@ struct ImageInfo {
         return Extent2D{pitch >> dim, size.height >> dim};
     }
 
-    // A thin-tiled 2D slice addresses its rows through pitch and tile parameters only; height just
-    // sizes the slice. Two such descriptors with the same pitch and padded base level are the same
-    // rows even when one states the logical extent and the other the padded one.
+    // A thin-tiled single-sample colour slice addresses its texels through pitch and tile
+    // parameters only; height just sizes the slice (AddrLib: sliceOffset is the only height term
+    // and is zero for slice 0 without a tile split, which a 1x colour micro tile never needs).
+    // Two such descriptors with the same pitch and padded base level are the same texels even when
+    // one states the logical extent and the other the padded one.
     bool IsThinTiledSlice() const {
-        return props.is_tiled && type == AmdGpu::ImageType::Color2D && resources.layers == 1 &&
-               size.depth == 1 && AmdGpu::GetMicroTileThickness(array_mode) == 1;
+        return props.is_tiled && !props.is_depth && type == AmdGpu::ImageType::Color2D &&
+               num_samples == 1 && resources.layers == 1 && size.depth == 1 &&
+               AmdGpu::GetMicroTileThickness(array_mode) == 1;
     }
 
     bool HasSameBlockLayout(const ImageInfo& info) const {
