@@ -4,6 +4,7 @@
 #pragma once
 
 #include <deque>
+#include <span>
 #include <unordered_map>
 #include <boost/container/small_vector.hpp>
 
@@ -145,8 +146,16 @@ private:
 
     void EnsureResident(const Buffer* arena, u64 first_block, u64 last_block);
 
-    void DownloadMemory(const Buffer* arena, VAddr device_addr, u64 size, bool async,
-                        bool ahead = false);
+    void DownloadMemory(const Buffer* arena, VAddr device_addr, u64 size, bool async);
+
+    struct DownloadWindow {
+        const Buffer* arena;
+        VAddr start;
+        u64 size;
+    };
+    /// Downloads the GPU-modified ranges of the windows in one submission ahead of the open
+    /// command buffer. Every GPU write to them must have been submitted already.
+    void DownloadAhead(std::span<const DownloadWindow> windows);
 
     /// Whether every GPU write to the range was submitted before the open command buffer.
     [[nodiscard]] bool IsGpuWriteSubmitted(VAddr device_addr, u64 size) const;
@@ -172,6 +181,10 @@ private:
     /// Scheduler tick of the last writable binding per WriteTickChunk bytes of guest memory.
     std::unordered_map<u64, u64> write_ticks;
     static constexpr u64 WriteTickChunkBits = 16;
+    /// Readback windows that held GPU-modified data recently: start -> {size, scheduler tick}.
+    /// A readback downloads all of them that are ready, so the CPU does not fault on each one.
+    std::unordered_map<VAddr, std::pair<u64, u64>> hot_windows;
+    static constexpr u64 HotWindowTicks = 4;
 
     std::unique_ptr<FaultManager> fault_manager;
     std::unique_ptr<Buffer> bda_pagetable_buffer;
