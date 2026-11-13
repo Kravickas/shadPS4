@@ -1,4 +1,4 @@
-// SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
+﻿// SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #pragma once
@@ -7,8 +7,8 @@
 #include "common/polyfill_thread.h"
 #include "core/libraries/videoout/video_out.h"
 
-#include <atomic>
 #include <condition_variable>
+#include <cstring>
 #include <mutex>
 #include <queue>
 
@@ -23,7 +23,9 @@ struct VideoOutPort {
     std::array<VideoOutBuffer, MaxDisplayBuffers> buffer_slots;
     std::array<u64, MaxDisplayBuffers> buffer_labels; // should be contiguous in memory
     static_assert(sizeof(buffer_labels[0]) == 8u);
-    std::array<std::atomic<u32>, MaxDisplayBuffers> buffer_queued{};
+    /// Flips of each buffer finished by the GPU and not yet replaced on screen. A buffer's label
+    /// is cleared when it leaves the screen only if this is zero.
+    std::array<s32, MaxDisplayBuffers> buffer_executed{};
     std::array<BufferAttributeGroup, MaxDisplayBufferGroups> groups;
     FlipStatus flip_status;
     SceVideoOutVblankStatus vblank_status;
@@ -57,9 +59,18 @@ struct VideoOutPort {
         vo_cv.wait(lk, pred);
     }
 
+    /// The GPU reached a patched flip: its label write and the flip finishing on the GPU, as one
+    /// step against the buffer being released.
+    void WriteFlipLabel(u64* address, const u32* data, u32 size) {
+        std::scoped_lock lk{port_mutex};
+        std::memcpy(address, data, size);
+        ++buffer_executed[address - buffer_labels.data()];
+        --flip_status.gc_queue_num;
+    }
+
     void SignalVoLabel() {
         std::scoped_lock lk{vo_mutex};
-        vo_cv.notify_all();
+        vo_cv.notify_one();
     }
 
     [[nodiscard]] int NumRegisteredBuffers() const {

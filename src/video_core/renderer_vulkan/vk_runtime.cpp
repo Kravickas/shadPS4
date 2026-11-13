@@ -1,4 +1,4 @@
-// SPDX-FileCopyrightText: Copyright 2025-2026 shadPS4 Emulator Project
+// SPDX-FileCopyrightText: Copyright 2025 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include "common/alignment.h"
@@ -239,12 +239,11 @@ void Runtime::CopyImage(VideoCore::Image* src, VideoCore::Image* dst) {
                   vk::to_string(src->info.pixel_format), vk::to_string(dst->info.pixel_format));
     }
 
-    const u32 base_width = src->info.size.width;
-    const u32 base_height = src->info.size.height;
+    // Both images alias the same guest surface; only the texels inside both extents are shared.
+    const u32 base_width = std::min(src->info.size.width, dst->info.size.width);
+    const u32 base_height = std::min(src->info.size.height, dst->info.size.height);
     const u32 base_depth =
         dst->info.type == AmdGpu::ImageType::Color3D ? dst->info.size.depth : src->info.size.depth;
-    const u32 dst_width = dst->info.size.width;
-    const u32 dst_height = dst->info.size.height;
 
     // Match sample count before copying
     SetBackingSamples(dst, dst->info.num_samples, false);
@@ -266,11 +265,8 @@ void Runtime::CopyImage(VideoCore::Image* src, VideoCore::Image* dst) {
     const bool is_same_type = !is_2d_to_3d && !is_3d_to_2d;
 
     for (u32 mip = 0; mip < num_mips; ++mip) {
-        // A region has to fit both subresources.
-        const u32 src_w = std::max(base_width >> mip, 1u);
-        const u32 src_h = std::max(base_height >> mip, 1u);
-        const u32 mip_w = std::min(src_w, std::max(dst_width >> mip, 1u));
-        const u32 mip_h = std::min(src_h, std::max(dst_height >> mip, 1u));
+        const u32 mip_w = std::max(base_width >> mip, 1u);
+        const u32 mip_h = std::max(base_height >> mip, 1u);
         const u32 mip_d = std::max(base_depth >> mip, 1u);
 
         const auto [src_layers, dst_layers] = SanitizeCopyLayers(src->info, dst->info, mip_d);

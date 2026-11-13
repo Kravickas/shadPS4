@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <map>
+#include <unordered_map>
 #include <magic_enum/magic_enum.hpp>
 #include <xxhash.h>
 
@@ -136,6 +137,8 @@ void BufferCache::UnmarkRegionAsGpuModified(VAddr device_addr, u64 size, bool is
 // Writable bindings seen by ObtainBuffer: start -> {size, count}. GPU thread only.
 static std::map<VAddr, std::pair<u64, u64>> perf_gpu_writes;
 static u64 perf_gpu_writes_max_size = 0;
+// Scheduler tick of the last writable binding that touched each 4 KB page. GPU thread only.
+static std::unordered_map<u64, u64> perf_page_write_tick;
 
 void BufferCache::ReadMemory(VAddr device_addr, u64 size, bool is_write, bool async,
                              bool assume_locks) {
@@ -143,8 +146,13 @@ void BufferCache::ReadMemory(VAddr device_addr, u64 size, bool is_write, bool as
     u64 writer_size = 0;
     u64 writer_count = 0;
     u64 writer_pages = 0;
+    u64 page_tick = 0;
+    u64 window_tick = 0;
+    u64 current_tick = 0;
+    bool window_done = false;
     const auto flush_request = [this, device_addr, size, is_write, async, &writer_addr,
-                                &writer_size, &writer_count, &writer_pages] {
+                                &writer_size, &writer_count, &writer_pages, &page_tick,
+                                &window_tick, &current_tick, &window_done] {
         // Writable bindings that touch the 4 KB tracking page of the address: the GPU-modified
         // state is per page, so a binding next to the address marks it too.
         const VAddr page_start = Common::AlignDown(device_addr, 4_KB);
@@ -176,6 +184,18 @@ void BufferCache::ReadMemory(VAddr device_addr, u64 size, bool is_write, bool as
             std::max<VAddr>(Common::AlignDown(device_addr, WindowSize), arena->cpu_addr);
         const VAddr window_end = std::min<VAddr>(
             std::max<VAddr>(window_start + WindowSize, device_addr + size), arena_end);
+        // When did the GPU last get work that writes the faulting page and the download window.
+        if (const auto it = perf_page_write_tick.find(device_addr >> 12);
+            it != perf_page_write_tick.end()) {
+            page_tick = it->second;
+        }
+        for (u64 page = window_start >> 12; page < (window_end + 4_KB - 1) >> 12; ++page) {
+            if (const auto it = perf_page_write_tick.find(page); it != perf_page_write_tick.end()) {
+                window_tick = std::max(window_tick, it->second);
+            }
+        }
+        current_tick = scheduler.CurrentTick();
+        window_done = scheduler.IsFree(window_tick);
         DownloadMemory(arena, window_start, window_end - window_start, async);
         if (is_write) {
             memory_tracker->MarkRegionAsCpuModified(device_addr, size);
@@ -198,9 +218,11 @@ void BufferCache::ReadMemory(VAddr device_addr, u64 size, bool is_write, bool as
     }
     LOG_INFO(Render,
              "PERF rb addr={:#x} size={:#x} write={} gpu_thread={} t0={} t1={} writer_addr={:#x} "
-             "writer_size={:#x} writer_count={} writers_in_page={} thread={}",
+             "writer_size={:#x} writer_count={} writers_in_page={} page_tick={} window_tick={} "
+             "current_tick={} window_done={} thread={}",
              device_addr, size, is_write, assume_locks, rb_t0, AmdGpu::PerfNs(), writer_addr,
-             writer_size, writer_count, writer_pages, Common::GetCurrentThreadName());
+             writer_size, writer_count, writer_pages, page_tick, window_tick, current_tick,
+             window_done, Common::GetCurrentThreadName());
 }
 
 void BufferCache::DownloadMemory(const Buffer* arena, VAddr device_addr, u64 size, bool async) {
@@ -288,6 +310,10 @@ std::pair<const Buffer*, u64> BufferCache::ObtainBuffer(VAddr device_addr, u32 s
         auto& [write_size, write_count] = perf_gpu_writes[device_addr];
         write_size = std::max<u64>(write_size, size);
         perf_gpu_writes_max_size = std::max(perf_gpu_writes_max_size, write_size);
+        const u64 tick = scheduler.CurrentTick();
+        for (u64 page = device_addr >> 12; page <= (device_addr + size - 1) >> 12; ++page) {
+            perf_page_write_tick[page] = tick;
+        }
         ++write_count;
     }
     return {arena, arena->Offset(device_addr)};

@@ -407,13 +407,7 @@ public:
 
     /// Returns the current command buffer.
     vk::CommandBuffer CommandBuffer() const {
-        has_recorded = true;
         return sessions.back().primary;
-    }
-
-    /// Returns false when nothing can have been recorded since the last submission.
-    [[nodiscard]] bool HasRecorded() const noexcept {
-        return has_recorded;
     }
 
     /// Returns the current command buffer tick.
@@ -446,16 +440,9 @@ public:
     /// Defers an operation until the gpu has reached the current cpu tick.
     /// Runs as soon as possible in another thread.
     void DeferPriorityOperation(Common::UniqueFunction<void>&& func) {
-        DeferPriorityOperation(std::move(func), CurrentTick());
-    }
-
-    /// Defers an operation until the gpu has reached the given tick, which must not be older
-    /// than the tick of any operation deferred before it.
-    /// Runs as soon as possible in another thread.
-    void DeferPriorityOperation(Common::UniqueFunction<void>&& func, u64 tick) {
         {
             std::unique_lock lk(priority_pending_ops_mutex);
-            priority_pending_ops.emplace(std::move(func), tick);
+            priority_pending_ops.emplace(std::move(func), CurrentTick());
         }
         priority_pending_ops_cv.notify_one();
     }
@@ -495,7 +482,6 @@ private:
     std::jthread priority_pending_ops_thread;
     RenderState render_state;
     bool is_rendering = false;
-    mutable bool has_recorded = false; ///< A command buffer was handed out since the last submit
     tracy::VkCtxScope* profiler_scope{};
 };
 

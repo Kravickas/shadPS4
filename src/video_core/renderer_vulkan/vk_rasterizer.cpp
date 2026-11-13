@@ -530,33 +530,6 @@ void Rasterizer::OnFence() {
     texture_cache.ProcessDownloadImages();
 }
 
-void Rasterizer::EnqueueEopFence(Common::UniqueFunction<void>&& signal) {
-    if (!scheduler.HasRecorded()) {
-        // Nothing was recorded since the last submission, so the fence lands with it.
-        scheduler.DeferPriorityOperation(std::move(signal), scheduler.CurrentTick() - 1);
-        ++AmdGpu::cp_perf.fences_merged;
-        return;
-    }
-    scheduler.DeferPriorityOperation(std::move(signal));
-    Flush();
-}
-
-void Rasterizer::EnqueueEosFence(Common::UniqueFunction<void>&& signal) {
-    if (!scheduler.HasRecorded()) {
-        // Nothing was recorded since the last submission, so the fence lands with it.
-        scheduler.DeferPriorityOperation(std::move(signal), scheduler.CurrentTick() - 1);
-        return;
-    }
-    scheduler.DeferPriorityOperation(std::move(signal));
-    unsubmitted_fence_tick = scheduler.CurrentTick();
-}
-
-void Rasterizer::SubmitFences() {
-    if (unsubmitted_fence_tick == scheduler.CurrentTick()) {
-        Flush();
-    }
-}
-
 bool Rasterizer::BindResources(const Pipeline* pipeline) {
     if (IsComputeImageCopy(pipeline) || IsComputeMetaClear(pipeline) ||
         IsComputeImageClear(pipeline)) {
@@ -1393,7 +1366,7 @@ void Rasterizer::FillBuffer(VAddr address, u32 num_bytes, u32 value, bool is_gds
                "FillBuffer address and size must be a multiple of 4 bytes");
     if (!is_gds) {
         texture_cache.ClearMeta(address);
-        if (IsCpuFill(address, num_bytes)) {
+        if (!buffer_cache.IsRegionGpuModified(address, num_bytes)) {
             u32* buffer = std::bit_cast<u32*>(address);
             std::fill(buffer, buffer + (num_bytes / sizeof(u32)), value);
             return;
@@ -1409,22 +1382,15 @@ void Rasterizer::FillBuffer(VAddr address, u32 num_bytes, u32 value, bool is_gds
     runtime.FillBuffer(buffer, offset, num_bytes, value);
 }
 
-bool Rasterizer::IsCpuFill(VAddr address, u32 num_bytes) {
-    return !buffer_cache.IsRegionGpuModified(address, num_bytes);
-}
-
-bool Rasterizer::IsCpuCopy(VAddr dst, VAddr src, u32 num_bytes) {
-    // Both buffers were not transferred to GPU yet. Can safely copy in host memory.
-    return !buffer_cache.IsRegionGpuModified(dst, num_bytes) &&
-           !buffer_cache.IsRegionGpuModified(src, num_bytes) &&
-           !texture_cache.FindImageFromRange(src, num_bytes);
-}
-
 void Rasterizer::CopyBuffer(VAddr dst, VAddr src, u32 num_bytes, bool dst_gds, bool src_gds) {
     const AmdGpu::CpPerfScope perf_copy{AmdGpu::cp_perf.copy_ns};
-    if (!dst_gds && !src_gds && IsCpuCopy(dst, src, num_bytes)) {
-        std::memcpy(std::bit_cast<void*>(dst), std::bit_cast<void*>(src), num_bytes);
-        return;
+    if (!dst_gds && !buffer_cache.IsRegionGpuModified(dst, num_bytes)) {
+        if (!src_gds && !buffer_cache.IsRegionGpuModified(src, num_bytes) &&
+            !texture_cache.FindImageFromRange(src, num_bytes)) {
+            // Both buffers were not transferred to GPU yet. Can safely copy in host memory.
+            std::memcpy(std::bit_cast<void*>(dst), std::bit_cast<void*>(src), num_bytes);
+            return;
+        }
     }
     texture_cache.InvalidateMemoryFromGPU(dst, num_bytes);
     const auto* gds_buffer = buffer_cache.GetGdsBuffer();

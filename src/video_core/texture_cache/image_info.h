@@ -52,10 +52,37 @@ struct ImageInfo {
         return Extent2D{pitch >> dim, size.height >> dim};
     }
 
-    /// Tile aligned base level dimensions.
-    Extent2D PaddedDim() const {
-        const auto dim = props.is_block ? 2 : 0;
-        return Extent2D{pitch >> dim, static_cast<u32>(mips_layout[0].height) >> dim};
+    // A thin-tiled single-sample colour slice addresses its texels through pitch and tile
+    // parameters only; height just sizes the slice (AddrLib: sliceOffset is the only height term
+    // and is zero for slice 0 without a tile split, which a 1x colour micro tile never needs).
+    // Two such descriptors with the same pitch and padded base level are the same texels even when
+    // one states the logical extent and the other the padded one.
+    bool IsThinTiledSlice() const {
+        return props.is_tiled && !props.is_depth && type == AmdGpu::ImageType::Color2D &&
+               num_samples == 1 && resources.layers == 1 && size.depth == 1 &&
+               AmdGpu::GetMicroTileThickness(array_mode) == 1;
+    }
+
+    bool HasSameBlockLayout(const ImageInfo& info) const {
+        const auto lhs = BlockDim();
+        const auto rhs = info.BlockDim();
+        if (lhs == rhs) {
+            return true;
+        }
+        if (!IsThinTiledSlice() || !info.IsThinTiledSlice() || lhs.width != rhs.width ||
+            (resources.levels != 1 && info.resources.levels != 1)) {
+            return false;
+        }
+        const auto lhs_dim = props.is_block ? 2 : 0;
+        const auto rhs_dim = info.props.is_block ? 2 : 0;
+        return (mips_layout[0].height >> lhs_dim) == (info.mips_layout[0].height >> rhs_dim);
+    }
+
+    bool HasSameLevelLayout(const ImageInfo& info, s32 mip) const {
+        return resources.levels == 1 && IsThinTiledSlice() && info.IsThinTiledSlice() &&
+               !props.is_block && !info.props.is_block &&
+               mips_layout[0].pitch == info.mips_layout[mip].pitch &&
+               mips_layout[0].height == info.mips_layout[mip].height;
     }
 
     s32 MipOf(const ImageInfo& info) const;
