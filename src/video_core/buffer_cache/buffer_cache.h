@@ -4,6 +4,7 @@
 #pragma once
 
 #include <deque>
+#include <unordered_map>
 #include <boost/container/small_vector.hpp>
 
 #include "common/enum.h"
@@ -144,7 +145,11 @@ private:
 
     void EnsureResident(const Buffer* arena, u64 first_block, u64 last_block);
 
-    void DownloadMemory(const Buffer* arena, VAddr device_addr, u64 size, bool async);
+    void DownloadMemory(const Buffer* arena, VAddr device_addr, u64 size, bool async,
+                        bool ahead = false);
+
+    /// Whether every GPU write to the range was submitted before the open command buffer.
+    [[nodiscard]] bool IsGpuWriteSubmitted(VAddr device_addr, u64 size) const;
 
     bool SynchronizeMemory(const Buffer* arena, VAddr device_addr, u32 size, bool is_written,
                            bool is_texel_buffer);
@@ -164,6 +169,9 @@ private:
     Buffer gds_buffer;
     std::unique_ptr<Buffer> null_index_buffer;
     RangeSet gpu_modified_ranges;
+    /// Scheduler tick of the last writable binding per WriteTickChunk bytes of guest memory.
+    std::unordered_map<u64, u64> write_ticks;
+    static constexpr u64 WriteTickChunkBits = 16;
 
     std::unique_ptr<FaultManager> fault_manager;
     std::unique_ptr<Buffer> bda_pagetable_buffer;

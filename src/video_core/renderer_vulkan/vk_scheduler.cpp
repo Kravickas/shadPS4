@@ -1,6 +1,8 @@
 // SPDX-FileCopyrightText: Copyright 2025 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <limits>
+
 #include "common/assert.h"
 #include "common/debug.h"
 #include "common/thread.h"
@@ -14,7 +16,8 @@ namespace Vulkan {
 std::mutex Scheduler::submit_mutex;
 
 Scheduler::Scheduler(const Instance& instance)
-    : instance{instance}, work_semaphore{instance}, command_pool{instance, &work_semaphore} {
+    : instance{instance}, work_semaphore{instance}, command_pool{instance, &work_semaphore},
+      ahead_fence{Check<"create fence">(instance.GetDevice().createFenceUnique({}))} {
 #if TRACY_GPU_ENABLED
     profiler_scope = reinterpret_cast<tracy::VkCtxScope*>(std::malloc(sizeof(tracy::VkCtxScope)));
 #endif
@@ -27,6 +30,31 @@ Scheduler::~Scheduler() {
 #if TRACY_GPU_ENABLED
     std::free(profiler_scope);
 #endif
+}
+
+vk::CommandBuffer Scheduler::BeginAhead() {
+    const vk::CommandBuffer cmdbuf = command_pool.Commit();
+    const vk::CommandBufferBeginInfo begin_info = {
+        .flags = vk::CommandBufferUsageFlagBits::eOneTimeSubmit,
+    };
+    Check(cmdbuf.begin(begin_info));
+    return cmdbuf;
+}
+
+void Scheduler::SubmitAheadAndWait(vk::CommandBuffer cmdbuf) {
+    Check(cmdbuf.end());
+    const vk::SubmitInfo submit_info = {
+        .commandBufferCount = 1,
+        .pCommandBuffers = &cmdbuf,
+    };
+    {
+        std::scoped_lock lk{submit_mutex};
+        const auto submit_result = instance.GetGraphicsQueue().submit(submit_info, *ahead_fence);
+        ASSERT_MSG(submit_result != vk::Result::eErrorDeviceLost, "Device lost during submit");
+    }
+    const vk::Device device = instance.GetDevice();
+    Check(device.waitForFences(*ahead_fence, true, std::numeric_limits<u64>::max()));
+    Check(device.resetFences(*ahead_fence));
 }
 
 void Scheduler::BeginRendering(const RenderState& new_state) {

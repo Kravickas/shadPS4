@@ -150,9 +150,10 @@ void BufferCache::ReadMemory(VAddr device_addr, u64 size, bool is_write, bool as
     u64 window_tick = 0;
     u64 current_tick = 0;
     bool window_done = false;
+    bool ahead = false;
     const auto flush_request = [this, device_addr, size, is_write, async, &writer_addr,
                                 &writer_size, &writer_count, &writer_pages, &page_tick,
-                                &window_tick, &current_tick, &window_done] {
+                                &window_tick, &current_tick, &window_done, &ahead] {
         // Writable bindings that touch the 4 KB tracking page of the address: the GPU-modified
         // state is per page, so a binding next to the address marks it too.
         const VAddr page_start = Common::AlignDown(device_addr, 4_KB);
@@ -196,7 +197,10 @@ void BufferCache::ReadMemory(VAddr device_addr, u64 size, bool is_write, bool as
         }
         current_tick = scheduler.CurrentTick();
         window_done = scheduler.IsFree(window_tick);
-        DownloadMemory(arena, window_start, window_end - window_start, async);
+        // When the GPU writes were all submitted, the download can run ahead of the open command
+        // buffer instead of flushing and draining it.
+        ahead = !async && IsGpuWriteSubmitted(window_start, window_end - window_start);
+        DownloadMemory(arena, window_start, window_end - window_start, async, ahead);
         if (is_write) {
             memory_tracker->MarkRegionAsCpuModified(device_addr, size);
         }
@@ -219,13 +223,26 @@ void BufferCache::ReadMemory(VAddr device_addr, u64 size, bool is_write, bool as
     LOG_INFO(Render,
              "PERF rb addr={:#x} size={:#x} write={} gpu_thread={} t0={} t1={} writer_addr={:#x} "
              "writer_size={:#x} writer_count={} writers_in_page={} page_tick={} window_tick={} "
-             "current_tick={} window_done={} thread={}",
+             "current_tick={} window_done={} ahead={} thread={}",
              device_addr, size, is_write, assume_locks, rb_t0, AmdGpu::PerfNs(), writer_addr,
              writer_size, writer_count, writer_pages, page_tick, window_tick, current_tick,
-             window_done, Common::GetCurrentThreadName());
+             window_done, ahead, Common::GetCurrentThreadName());
 }
 
-void BufferCache::DownloadMemory(const Buffer* arena, VAddr device_addr, u64 size, bool async) {
+bool BufferCache::IsGpuWriteSubmitted(VAddr device_addr, u64 size) const {
+    const u64 current_tick = scheduler.CurrentTick();
+    for (u64 chunk = device_addr >> WriteTickChunkBits;
+         chunk <= (device_addr + size - 1) >> WriteTickChunkBits; ++chunk) {
+        const auto it = write_ticks.find(chunk);
+        if (it != write_ticks.end() && it->second >= current_tick) {
+            return false;
+        }
+    }
+    return true;
+}
+
+void BufferCache::DownloadMemory(const Buffer* arena, VAddr device_addr, u64 size, bool async,
+                                 bool ahead) {
     boost::container::small_vector<vk::BufferCopy, 1> copies;
     u64 total_size_bytes = 0;
     const VAddr arena_base = arena->cpu_addr;
@@ -256,7 +273,34 @@ void BufferCache::DownloadMemory(const Buffer* arena, VAddr device_addr, u64 siz
     for (auto& copy : copies) {
         copy.dstOffset += download.offset;
     }
-    runtime.CopyBuffer(arena, download.buffer, copies);
+    if (ahead) {
+        scheduler.SubmitAheadAndWait([&](vk::CommandBuffer cmdbuf) {
+            const vk::MemoryBarrier2 gpu_writes = {
+                .srcStageMask = vk::PipelineStageFlagBits2::eAllCommands,
+                .srcAccessMask = vk::AccessFlagBits2::eMemoryWrite,
+                .dstStageMask = vk::PipelineStageFlagBits2::eCopy,
+                .dstAccessMask = vk::AccessFlagBits2::eTransferRead,
+            };
+            cmdbuf.pipelineBarrier2(vk::DependencyInfo{
+                .memoryBarrierCount = 1,
+                .pMemoryBarriers = &gpu_writes,
+            });
+            cmdbuf.copyBuffer(arena->Handle(), download.buffer->Handle(),
+                              std::span<const vk::BufferCopy>{copies.data(), copies.size()});
+            const vk::MemoryBarrier2 host_read = {
+                .srcStageMask = vk::PipelineStageFlagBits2::eCopy,
+                .srcAccessMask = vk::AccessFlagBits2::eTransferWrite,
+                .dstStageMask = vk::PipelineStageFlagBits2::eHost,
+                .dstAccessMask = vk::AccessFlagBits2::eHostRead,
+            };
+            cmdbuf.pipelineBarrier2(vk::DependencyInfo{
+                .memoryBarrierCount = 1,
+                .pMemoryBarriers = &host_read,
+            });
+        });
+    } else {
+        runtime.CopyBuffer(arena, download.buffer, copies);
+    }
 
     const auto write_data = [this, arena_base, device_addr, size, download, async,
                              copies = std::move(copies)] {
@@ -276,7 +320,7 @@ void BufferCache::DownloadMemory(const Buffer* arena, VAddr device_addr, u64 siz
     if (async) {
         scheduler.DeferOperation(std::move(write_data));
     } else {
-        {
+        if (!ahead) {
             const AmdGpu::CpPerfScope perf_finish{AmdGpu::cp_perf.rb_finish_ns};
             scheduler.Finish();
         }
@@ -307,10 +351,14 @@ std::pair<const Buffer*, u64> BufferCache::ObtainBuffer(VAddr device_addr, u32 s
     SynchronizeMemory(arena, device_addr, size, is_written, is_texel_buffer);
     if (is_written) {
         gpu_modified_ranges.Add(device_addr, size);
+        const u64 tick = scheduler.CurrentTick();
+        for (u64 chunk = device_addr >> WriteTickChunkBits;
+             chunk <= (device_addr + size - 1) >> WriteTickChunkBits; ++chunk) {
+            write_ticks[chunk] = tick;
+        }
         auto& [write_size, write_count] = perf_gpu_writes[device_addr];
         write_size = std::max<u64>(write_size, size);
         perf_gpu_writes_max_size = std::max(perf_gpu_writes_max_size, write_size);
-        const u64 tick = scheduler.CurrentTick();
         for (u64 page = device_addr >> 12; page <= (device_addr + size - 1) >> 12; ++page) {
             perf_page_write_tick[page] = tick;
         }
