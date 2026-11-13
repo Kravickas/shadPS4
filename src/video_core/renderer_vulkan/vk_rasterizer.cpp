@@ -23,6 +23,7 @@
 #include <cstring>
 #include <type_traits>
 #include <vulkan/vulkan_format_traits.hpp>
+#include <xxhash.h>
 
 namespace Vulkan {
 
@@ -630,7 +631,12 @@ void Rasterizer::BindVertexBuffers(const GraphicsPipeline* pipeline) {
     // Map buffers for merged ranges
     for (auto& range : ranges_merged) {
         const u64 size = memory->ClampRangeSize(range.base_address, range.GetSize());
-        std::tie(range.buffer, range.offset) = buffer_cache.ObtainBuffer(range.base_address, size);
+        {
+            const AmdGpu::CpPerfScope perf_obtain{AmdGpu::cp_perf.obtain_ns};
+            ++AmdGpu::cp_perf.obtains;
+            std::tie(range.buffer, range.offset) =
+                buffer_cache.ObtainBuffer(range.base_address, size);
+        }
         needs_barrier |= runtime.IsBufferAccessed(range.buffer, range.offset, size);
         bound_buffers.emplace_back(range.buffer, range.offset, size,
                                    vk::AccessFlagBits2::eVertexAttributeRead);
@@ -690,7 +696,10 @@ void Rasterizer::BindIndexBuffer(u32 index_offset, bool is_indirect) {
     vk::Buffer index_buffer{};
     u64 buffer_offset{};
     if (index_buffer_size != 0) {
+        const u64 obtain_t0 = AmdGpu::PerfNs();
         const auto [buffer, offset] = buffer_cache.ObtainBuffer(index_address, index_buffer_size);
+        AmdGpu::cp_perf.obtain_ns += AmdGpu::PerfNs() - obtain_t0;
+        ++AmdGpu::cp_perf.obtains;
         needs_barrier |= runtime.IsBufferAccessed(buffer, offset, index_buffer_size);
         bound_buffers.emplace_back(buffer, offset, index_buffer_size,
                                    vk::AccessFlagBits2::eIndexRead);
@@ -961,8 +970,11 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
                 if (desc.is_formatted) {
                     flags |= VideoCore::ObtainBufferFlags::IsTexelBuffer;
                 }
+                const u64 obtain_t0 = AmdGpu::PerfNs();
                 const auto [buffer, offset] =
                     buffer_cache.ObtainBuffer(vsharp.base_address, size, flags);
+                AmdGpu::cp_perf.obtain_ns += AmdGpu::PerfNs() - obtain_t0;
+                ++AmdGpu::cp_perf.obtains;
                 const u64 offset_aligned = Common::AlignDown(offset, alignment);
                 const u64 adjust = offset - offset_aligned;
                 if (adjust % 4 != 0) {
@@ -1024,18 +1036,45 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
 
         for (auto i = 0; i < num_bindings; i++) {
             auto& [image_id, desc] = image_bindings[num_images++];
-            std::construct_at(&desc, tsharp, image_desc);
+            const u64 find_t0 = AmdGpu::PerfNs();
+            ++AmdGpu::cp_perf.tex_lookups;
+            TextureKey key{};
+            key.tsharp = tsharp;
+            key.is_depth = image_desc.is_depth;
+            key.is_array = image_desc.is_array;
+            key.is_written = image_desc.is_written;
+            key.mip_level = mip_fallback_mode == Shader::MipStorageFallbackMode::ConstantIndex
+                                ? image_desc.constant_mip_index
+                            : mip_fallback_mode == Shader::MipStorageFallbackMode::DynamicIndex
+                                ? static_cast<u32>(i)
+                                : ~0U;
+            auto& lookup = texture_lookups[XXH3_64bits(&key, sizeof(key)) % texture_lookups.size()];
+            const u64 generation = texture_cache.RegistryGeneration();
+            if (lookup.generation == generation && SameBits(lookup.key, key)) {
+                ++AmdGpu::cp_perf.tex_hits;
+                desc = lookup.binding.desc;
+                image_id = lookup.binding.image_id;
+                texture_cache.TouchFoundImage(image_id);
+            } else {
+                std::construct_at(&desc, tsharp, image_desc);
 
-            if (mip_fallback_mode == Shader::MipStorageFallbackMode::ConstantIndex) {
-                ASSERT(num_bindings == 1);
-                desc.view_info.range.base.level += image_desc.constant_mip_index;
-                desc.view_info.range.extent.levels = 1;
-            } else if (mip_fallback_mode == Shader::MipStorageFallbackMode::DynamicIndex) {
-                desc.view_info.range.base.level += i;
-                desc.view_info.range.extent.levels = 1;
+                if (mip_fallback_mode == Shader::MipStorageFallbackMode::ConstantIndex) {
+                    ASSERT(num_bindings == 1);
+                    desc.view_info.range.base.level += image_desc.constant_mip_index;
+                    desc.view_info.range.extent.levels = 1;
+                } else if (mip_fallback_mode == Shader::MipStorageFallbackMode::DynamicIndex) {
+                    desc.view_info.range.base.level += i;
+                    desc.view_info.range.extent.levels = 1;
+                }
+
+                image_id = texture_cache.FindImage(desc);
+                const bool reusable = texture_cache.RegistryGeneration() == generation &&
+                                      texture_cache.IsPerfectMatch(image_id, desc);
+                lookup.generation = reusable ? generation : 0;
+                lookup.key = key;
+                lookup.binding = {image_id, desc};
             }
-
-            image_id = texture_cache.FindImage(desc);
+            AmdGpu::cp_perf.tex_find_ns += AmdGpu::PerfNs() - find_t0;
             auto* image = &texture_cache.GetImage(image_id);
             if (auto depth_image_id = texture_cache.GetAssociatedDepth(*image)) {
                 // If this image has an associated depth image, it's a stencil attachment.
@@ -1082,7 +1121,9 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
                                          vk::ImageLayout::eShaderReadOnlyOptimal);
                 continue;
             }
+            const u64 view_t0 = AmdGpu::PerfNs();
             auto& image_view = texture_cache.FindTexture(image_id, desc);
+            AmdGpu::cp_perf.tex_view_ns += AmdGpu::PerfNs() - view_t0;
             image.binding.is_storage |= is_storage;
             const auto binding = image.binding;
 

@@ -182,6 +182,23 @@ private:
     std::array<ColorTargetLookup, AmdGpu::NUM_COLOR_BUFFERS> cb_lookups{};
     DepthTargetLookup db_lookup{};
 
+    /// Inputs of a texture lookup: the T# and the shader resource fields ImageDesc reads.
+    struct TextureKey {
+        AmdGpu::Image tsharp;
+        u32 is_depth;
+        u32 is_array;
+        u32 is_written;
+        u32 mip_level; ///< Mip the binding is limited to by the storage fallback, or ~0U
+    };
+    /// Last texture lookup that found a perfect match, per hash slot of its key. The same key
+    /// gives the same image while the texture cache registry generation is equal.
+    struct TextureLookup {
+        u64 generation{};
+        TextureKey key;
+        ImageBinding binding;
+    };
+    std::array<TextureLookup, 512> texture_lookups{};
+
     boost::container::static_vector<vk::DescriptorImageInfo, Shader::NUM_IMAGES> image_infos;
     boost::container::static_vector<vk::DescriptorBufferInfo, Shader::NUM_BUFFERS> buffer_infos;
 
