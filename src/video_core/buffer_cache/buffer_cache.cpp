@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
+#include <map>
 #include <magic_enum/magic_enum.hpp>
 #include <xxhash.h>
 
@@ -132,9 +133,28 @@ void BufferCache::UnmarkRegionAsGpuModified(VAddr device_addr, u64 size, bool is
     gpu_modified_ranges.Subtract(device_addr, size);
 }
 
+// Writable bindings seen by ObtainBuffer: start -> {size, count}. GPU thread only.
+static std::map<VAddr, std::pair<u64, u64>> perf_gpu_writes;
+
 void BufferCache::ReadMemory(VAddr device_addr, u64 size, bool is_write, bool async,
                              bool assume_locks) {
-    const auto flush_request = [this, device_addr, size, is_write, async] {
+    VAddr writer_addr = 0;
+    u64 writer_size = 0;
+    u64 writer_count = 0;
+    const auto flush_request = [this, device_addr, size, is_write, async, &writer_addr,
+                                &writer_size, &writer_count] {
+        // The largest writable binding that covers the address.
+        for (auto it = perf_gpu_writes.upper_bound(device_addr); it != perf_gpu_writes.begin();) {
+            --it;
+            if (it->first + it->second.first > device_addr && it->second.first > writer_size) {
+                writer_addr = it->first;
+                writer_size = it->second.first;
+                writer_count = it->second.second;
+            }
+            if (device_addr - it->first > 64_MB) {
+                break;
+            }
+        }
         const u32 first_block = device_addr >> block_shift;
         const u32 last_block = (device_addr + size - 1) >> block_shift;
         const auto* arena = GetArena(first_block, last_block);
@@ -167,9 +187,11 @@ void BufferCache::ReadMemory(VAddr device_addr, u64 size, bool is_write, bool as
                !perf.max_ns.compare_exchange_weak(prev, wait_ns, std::memory_order_relaxed)) {
         }
     }
-    LOG_INFO(Render, "PERF rb addr={:#x} size={:#x} write={} gpu_thread={} t0={} t1={} thread={}",
-             device_addr, size, is_write, assume_locks, rb_t0, AmdGpu::PerfNs(),
-             Common::GetCurrentThreadName());
+    LOG_INFO(Render,
+             "PERF rb addr={:#x} size={:#x} write={} gpu_thread={} t0={} t1={} writer_addr={:#x} "
+             "writer_size={:#x} writer_count={} thread={}",
+             device_addr, size, is_write, assume_locks, rb_t0, AmdGpu::PerfNs(), writer_addr,
+             writer_size, writer_count, Common::GetCurrentThreadName());
 }
 
 void BufferCache::DownloadMemory(const Buffer* arena, VAddr device_addr, u64 size, bool async) {
@@ -254,6 +276,9 @@ std::pair<const Buffer*, u64> BufferCache::ObtainBuffer(VAddr device_addr, u32 s
     SynchronizeMemory(arena, device_addr, size, is_written, is_texel_buffer);
     if (is_written) {
         gpu_modified_ranges.Add(device_addr, size);
+        auto& [write_size, write_count] = perf_gpu_writes[device_addr];
+        write_size = std::max<u64>(write_size, size);
+        ++write_count;
     }
     return {arena, arena->Offset(device_addr)};
 }
