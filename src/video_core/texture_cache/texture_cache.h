@@ -91,6 +91,10 @@ public:
         ImageViewInfo view_info;
         BindingType type{BindingType::Texture};
 
+        bool IsSubrectTexture(const ImageInfo& source) const {
+            return type == BindingType::Texture && info.IsSubrectOf(source);
+        }
+
         ImageDesc() = default;
         ImageDesc(const AmdGpu::Image& image, const Shader::ImageResource& desc)
             : info{image, desc}, view_info{image, desc},
@@ -369,6 +373,9 @@ private:
     void UntrackImage(ImageId image_id);
     void UntrackImageHead(ImageId image_id);
     void UntrackImageTail(ImageId image_id);
+
+    /// Marks the image CPU dirty if the guest wrote to its untracked head or tail page.
+    void MarkDirtyIfEdgesModified(Image& image);
 
     void MarkAsMaybeDirty(ImageId image_id, Image& image);
 

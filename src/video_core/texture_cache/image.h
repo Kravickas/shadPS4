@@ -30,12 +30,11 @@ enum ImageFlagBits : u32 {
     Empty = 0,
     MaybeCpuDirty = 1 << 0, ///< The page this image is in was touched before the image address
     CpuDirty = 1 << 1,      ///< Contents have been modified from the CPU
-    GpuDirty =
-        1 << 2, ///< Image contents have been modified from the GPU (valid data in buffer cache)
+    GpuDirty = 1 << 2, ///< Image contents have been modified from the GPU (valid data in buffer
+                       ///< cache)
     Dirty = MaybeCpuDirty | CpuDirty | GpuDirty,
-    GpuModified = 1 << 3,   ///< Contents have been modified from the GPU
-    MaybeGpuDirty = 1 << 4, ///< Image contents may have been modified in the buffer cache
-    Registered = 1 << 6,    ///< True when the image is registered
+    GpuModified = 1 << 3, ///< Contents have been modified from the GPU
+    Registered = 1 << 6,  ///< True when the image is registered
 };
 DECLARE_ENUM_FLAG_OPERATORS(ImageFlagBits)
 
@@ -134,9 +133,6 @@ struct Image : public Common::LRUNode<> {
     ImageView& FindView(const ImageViewInfo& view_info, bool ensure_guest_samples = true);
 
     using Barriers = SmallVector<vk::ImageMemoryBarrier2, 32>;
-    void GetBarriers(Barriers& out_barriers, vk::ImageLayout dst_layout, vk::AccessFlags2 dst_mask,
-                     vk::PipelineStageFlags2 dst_stage,
-                     std::optional<SubresourceRange> subres_range = {});
 
 public:
     Vulkan::Runtime* runtime;
@@ -165,7 +161,20 @@ public:
         SmallVector<ImageViewInfo, 2> image_view_infos;
         SmallVector<ImageViewId, 2> image_view_ids;
         u32 num_samples;
+        bool subrect_valid{};
     };
+    BackingImage& AddBacking(const vk::ImageCreateInfo& create_info, u32 num_samples);
+    ImageView& FindView(const ImageViewInfo& view_info, BackingImage& view_backing);
+    void GetBarriers(Barriers& out_barriers, BackingImage& image_backing,
+                     vk::ImageLayout dst_layout, vk::AccessFlags2 dst_mask,
+                     vk::PipelineStageFlags2 dst_stage,
+                     std::optional<SubresourceRange> subres_range = {});
+    void InvalidateSubrects() {
+        for (auto& image_backing : backing_images) {
+            image_backing.subrect_valid = false;
+        }
+    }
+
     SmallVector<BackingImage, 2> backing_images;
     BackingImage* backing{};
     u64* memory_usage_counter{};
@@ -174,6 +183,8 @@ public:
     u64 tick_accessed_last{};
     u64 cpu_hash{};
     u64 gpu_hash{};
+    u64 head_hash{};
+    u64 tail_hash{};
 
     struct {
         u32 texture : 1;
@@ -186,6 +197,7 @@ public:
     struct {
         u32 is_bound : 1;
         u32 is_target : 1;
+        u32 is_storage : 1;
         u32 needs_rebind : 1;
         u32 force_general : 1;
     } binding{};
