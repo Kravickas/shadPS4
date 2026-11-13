@@ -152,9 +152,12 @@ void BufferCache::ReadMemory(VAddr device_addr, u64 size, bool is_write, bool as
     bool window_done = false;
     bool ahead = false;
     u64 batch_windows = 0;
+    u64 exec_t0 = 0;
     const auto flush_request = [this, device_addr, size, is_write, async, &writer_addr,
                                 &writer_size, &writer_count, &writer_pages, &page_tick,
-                                &window_tick, &current_tick, &window_done, &ahead, &batch_windows] {
+                                &window_tick, &current_tick, &window_done, &ahead, &batch_windows,
+                                &exec_t0] {
+        exec_t0 = AmdGpu::PerfNs();
         // Writable bindings that touch the 4 KB tracking page of the address: the GPU-modified
         // state is per page, so a binding next to the address marks it too.
         const VAddr page_start = Common::AlignDown(device_addr, 4_KB);
@@ -251,10 +254,10 @@ void BufferCache::ReadMemory(VAddr device_addr, u64 size, bool is_write, bool as
     LOG_INFO(Render,
              "PERF rb addr={:#x} size={:#x} write={} gpu_thread={} t0={} t1={} writer_addr={:#x} "
              "writer_size={:#x} writer_count={} writers_in_page={} page_tick={} window_tick={} "
-             "current_tick={} window_done={} ahead={} batch_windows={} thread={}",
+             "current_tick={} window_done={} ahead={} batch_windows={} exec_t0={} thread={}",
              device_addr, size, is_write, assume_locks, rb_t0, AmdGpu::PerfNs(), writer_addr,
              writer_size, writer_count, writer_pages, page_tick, window_tick, current_tick,
-             window_done, ahead, batch_windows, Common::GetCurrentThreadName());
+             window_done, ahead, batch_windows, exec_t0, Common::GetCurrentThreadName());
 }
 
 bool BufferCache::IsGpuWriteSubmitted(VAddr device_addr, u64 size) const {
