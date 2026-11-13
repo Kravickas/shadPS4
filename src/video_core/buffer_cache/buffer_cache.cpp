@@ -151,9 +151,6 @@ void BufferCache::ReadMemory(VAddr device_addr, u64 size, bool is_write, bool as
                 writer_size = it->second.first;
                 writer_count = it->second.second;
             }
-            if (device_addr - it->first > 64_MB) {
-                break;
-            }
         }
         const u32 first_block = device_addr >> block_shift;
         const u32 last_block = (device_addr + size - 1) >> block_shift;
