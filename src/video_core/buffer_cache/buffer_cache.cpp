@@ -203,7 +203,7 @@ bool BufferCache::ReadMemoryOnCallingThread(VAddr device_addr, u64 size, bool is
         }
         if (!arena) {
             // The GPU never wrote this memory through the buffer cache.
-            FinishReadback(device_addr, size, is_write);
+            FinishReadback(lk, device_addr, size, is_write, stats);
             return true;
         }
         window = GetDownloadWindow(arena, device_addr, size);
@@ -217,7 +217,7 @@ bool BufferCache::ReadMemoryOnCallingThread(VAddr device_addr, u64 size, bool is
     AddHotWindows(windows);
     stats.ahead = true;
     DownloadAhead(lk, windows, stats);
-    FinishReadback(device_addr, size, is_write);
+    FinishReadback(lk, device_addr, size, is_write, stats);
     return true;
 }
 
@@ -249,7 +249,7 @@ void BufferCache::ReadMemoryOnGpuThread(VAddr device_addr, u64 size, bool is_wri
         ++AmdGpu::cp_perf.rb_downloads;
         AmdGpu::cp_perf.rb_bytes += stats.bytes;
     }
-    FinishReadback(device_addr, size, is_write);
+    FinishReadback(lk, device_addr, size, is_write, stats);
 }
 
 BufferCache::DownloadWindow BufferCache::GetDownloadWindow(const Buffer* arena, VAddr device_addr,
@@ -266,9 +266,15 @@ BufferCache::DownloadWindow BufferCache::GetDownloadWindow(const Buffer* arena, 
 }
 
 void BufferCache::AddHotWindows(boost::container::small_vector<DownloadWindow, 16>& windows) {
-    // Download the other recently read-back windows in the same submission.
+    // Download the other recently read-back windows in the same submission, but only those whose
+    // GPU writes are done no later than the ones of the requested window, so the download does
+    // not wait longer than the request needs.
     const u64 current_tick = scheduler.CurrentTick();
     const VAddr main_start = windows.front().start;
+    auto* const work_semaphore = scheduler.GetWorkSemaphore();
+    work_semaphore->Refresh();
+    const u64 ready_tick =
+        std::max(LastWriteTick(main_start, windows.front().size), work_semaphore->KnownGpuTick());
     for (auto it = hot_windows.begin(); it != hot_windows.end();) {
         auto& [window_size, tick] = it->second;
         if (current_tick - tick > HotWindowTicks) {
@@ -281,6 +287,7 @@ void BufferCache::AddHotWindows(boost::container::small_vector<DownloadWindow, 1
             arena == address_space[(start + window_size - 1) >> ARENA_PAGE_BITS] &&
             !OverlapsDownloadInFlight(start, start + window_size) &&
             memory_tracker->IsRegionGpuModified(start, window_size) &&
+            LastWriteTick(start, window_size) <= ready_tick &&
             IsGpuWriteSubmitted(start, window_size)) {
             windows.push_back({arena, start, window_size});
             tick = current_tick;
@@ -310,6 +317,17 @@ bool BufferCache::OverlapsDownloadInFlight(VAddr start, VAddr end) const {
     });
 }
 
+bool BufferCache::OverlapsDeferredDownload(VAddr start, VAddr end) const {
+    return std::ranges::any_of(deferred_downloads, [start, end](const DownloadInFlight& d) {
+        return d.start < end && start < d.end;
+    });
+}
+
+void BufferCache::EraseDeferredDownload(u64 download_id) {
+    std::erase_if(deferred_downloads,
+                  [download_id](const DownloadInFlight& d) { return d.id == download_id; });
+}
+
 bool BufferCache::WaitDownloadsInFlight(std::unique_lock<std::mutex>& lk, VAddr start, VAddr end,
                                         ReadbackStats& stats) {
     const auto overlaps = [this, start, end, self = std::this_thread::get_id()] {
@@ -333,10 +351,13 @@ void BufferCache::UnmarkDownloadedWindow(VAddr start, u64 size, u64 download_id)
         keep.emplace_back(Common::AlignDown(range_start, BYTES_PER_PAGE),
                           Common::AlignUp(range_end, BYTES_PER_PAGE));
     });
-    for (const auto& download : downloads_in_flight) {
-        if (download.id != download_id && download.start < end && start < download.end) {
-            keep.emplace_back(Common::AlignDown(std::max(download.start, start), BYTES_PER_PAGE),
-                              Common::AlignUp(std::min(download.end, end), BYTES_PER_PAGE));
+    for (const auto* downloads : {&downloads_in_flight, &deferred_downloads}) {
+        for (const auto& download : *downloads) {
+            if (download.id != download_id && download.start < end && start < download.end) {
+                keep.emplace_back(
+                    Common::AlignDown(std::max(download.start, start), BYTES_PER_PAGE),
+                    Common::AlignUp(std::min(download.end, end), BYTES_PER_PAGE));
+            }
         }
     }
     std::ranges::sort(keep);
@@ -352,19 +373,31 @@ void BufferCache::UnmarkDownloadedWindow(VAddr start, u64 size, u64 download_id)
     }
 }
 
-void BufferCache::FinishReadback(VAddr device_addr, u64 size, bool is_write) {
-    if (!is_write) {
-        return;
-    }
-    // A GPU write recorded while the download was in flight has to be read back before the CPU
-    // write, the write faults again for it.
+void BufferCache::FinishReadback(std::unique_lock<std::mutex>& lk, VAddr device_addr, u64 size,
+                                 bool is_write, ReadbackStats& stats) {
     const VAddr page_start = Common::AlignDown(device_addr, BYTES_PER_PAGE);
     const VAddr page_end = Common::AlignUp(device_addr + size, BYTES_PER_PAGE);
-    if (memory_tracker->IsRegionGpuModified(device_addr, size) &&
-        gpu_modified_ranges.Intersects(page_start, page_end - page_start)) {
-        return;
+    // Another download in flight may still write data back to the pages.
+    WaitDownloadsInFlight(lk, page_start, page_end, stats);
+    if (memory_tracker->IsRegionGpuModified(device_addr, size)) {
+        if (gpu_modified_ranges.Intersects(page_start, page_end - page_start)) {
+            // A GPU write recorded while the download was in flight has to be read back first,
+            // the access faults again for it.
+            return;
+        }
+        if (OverlapsDeferredDownload(page_start, page_end)) {
+            // The data is written back by a deferred operation, the access faults again until
+            // it ran.
+            return;
+        }
+        // The pages are marked GPU-modified but hold no GPU data, so nothing was downloaded for
+        // them and no download unmarked them. Unmark them like a downloaded window: a page
+        // marked CPU- and GPU-modified at once would be protected write-only.
+        memory_tracker->UnmarkRegionAsGpuModified(device_addr, size, false);
     }
-    memory_tracker->MarkRegionAsCpuModified(device_addr, size);
+    if (is_write) {
+        memory_tracker->MarkRegionAsCpuModified(device_addr, size);
+    }
 }
 
 void BufferCache::DownloadMemory(std::unique_lock<std::mutex>& lk, const Buffer* arena,
@@ -395,12 +428,10 @@ void BufferCache::DownloadMemory(std::unique_lock<std::mutex>& lk, const Buffer*
     stats.bytes += total_size_bytes;
     stats.windows = 1;
     // An async download is written back by a deferred operation of the GPU thread, which a
-    // waiter must not block on, so it is not tracked as in flight.
-    const u64 download_id = async ? 0 : ++next_download_id;
-    if (!async) {
-        downloads_in_flight.push_back(
-            {download_id, device_addr, device_addr + size, std::this_thread::get_id()});
-    }
+    // waiter must not block on, so it is tracked as deferred instead of in flight.
+    const u64 download_id = ++next_download_id;
+    auto& downloads = async ? deferred_downloads : downloads_in_flight;
+    downloads.push_back({download_id, device_addr, device_addr + size, std::this_thread::get_id()});
     lk.unlock();
 
     const auto download =
@@ -421,7 +452,9 @@ void BufferCache::DownloadMemory(std::unique_lock<std::mutex>& lk, const Buffer*
         {
             std::scoped_lock modified_lk{modified_mutex};
             UnmarkDownloadedWindow(device_addr, size, download_id);
-            if (!async) {
+            if (async) {
+                EraseDeferredDownload(download_id);
+            } else {
                 std::erase_if(downloads_in_flight, [download_id](const DownloadInFlight& d) {
                     return d.id == download_id;
                 });
@@ -685,14 +718,19 @@ void BufferCache::ReadEdgeImagePages(const Image& image) {
         constexpr u64 mask = ~(align - 1ULL);
         total_size_bytes += (new_size + align - 1) & mask;
     };
+    u64 download_id = 0;
     {
         std::scoped_lock lk{modified_mutex};
         gpu_modified_ranges.ForEachInRange(page_start, image_addr - page_start, add_download);
         gpu_modified_ranges.ForEachInRange(image_end, page_end - image_end, add_download);
         gpu_modified_ranges.Subtract(page_start, page_end - page_start);
-    }
-    if (total_size_bytes == 0) {
-        return;
+        if (total_size_bytes == 0) {
+            return;
+        }
+        // The pages keep their GPU-modified state until the edge data is written back.
+        download_id = ++next_download_id;
+        deferred_downloads.push_back(
+            {download_id, page_start, page_end, std::this_thread::get_id()});
     }
     const auto download =
         staging_pool.Request(total_size_bytes, VideoCore::MemoryType::HostCached, 16, true);
@@ -703,7 +741,7 @@ void BufferCache::ReadEdgeImagePages(const Image& image) {
     scheduler.EndRendering();
     runtime.CopyBuffer(buffer, download.buffer, copies);
     scheduler.DeferOperation(
-        [this, base = buffer->CpuAddr(), download, copies = std::move(copies)]() {
+        [this, base = buffer->CpuAddr(), download, download_id, copies = std::move(copies)]() {
             download.Invalidate();
             auto* memory = Core::Memory::Instance();
             for (const auto& copy : copies) {
@@ -711,6 +749,10 @@ void BufferCache::ReadEdgeImagePages(const Image& image) {
                 const u64 dst_offset = copy.dstOffset - download.offset;
                 memory->TryWriteBacking(std::bit_cast<u8*>(copy_device_addr),
                                         download.mapped + dst_offset, copy.size);
+            }
+            {
+                std::scoped_lock lk{modified_mutex};
+                EraseDeferredDownload(download_id);
             }
             staging_pool.FreeDeferred(download);
         });

@@ -183,7 +183,8 @@ private:
     [[nodiscard]] DownloadWindow GetDownloadWindow(const Buffer* arena, VAddr device_addr,
                                                    u64 size) const;
 
-    /// Adds the recently read-back windows that are ready to the download. Lock held.
+    /// Adds the recently read-back windows whose GPU writes are done no later than those of the
+    /// requested window to the download. Lock held.
     void AddHotWindows(boost::container::small_vector<DownloadWindow, 16>& windows);
 
     /// Downloads the GPU-modified ranges of the windows with a submission of its own, queued
@@ -207,6 +208,12 @@ private:
     /// Whether a download in flight overlaps the range. Lock held.
     [[nodiscard]] bool OverlapsDownloadInFlight(VAddr start, VAddr end) const;
 
+    /// Whether a deferred download overlaps the range. Lock held.
+    [[nodiscard]] bool OverlapsDeferredDownload(VAddr start, VAddr end) const;
+
+    /// Removes a deferred download once its data is written back. Lock held.
+    void EraseDeferredDownload(u64 download_id);
+
     /// Waits until no download in flight of another thread overlaps the range. A download of
     /// the calling thread is not waited for: the GPU thread runs deferred operations inside its
     /// own download, which keeps the order of the GPU thread. Returns true if it had to wait,
@@ -216,12 +223,12 @@ private:
 
     /// Clears the GPU-modified state of the pages of a downloaded window, except pages that
     /// received GPU writes again while the download was in flight and pages another download in
-    /// flight covers. Lock held.
+    /// flight or a deferred download covers. Lock held.
     void UnmarkDownloadedWindow(VAddr start, u64 size, u64 download_id);
 
-    /// Ends a readback: a write fault may proceed unless the range got GPU writes again. Lock
-    /// held.
-    void FinishReadback(VAddr device_addr, u64 size, bool is_write);
+    /// Ends a readback: the access may proceed unless the range got GPU writes again. Lock held.
+    void FinishReadback(std::unique_lock<std::mutex>& lk, VAddr device_addr, u64 size,
+                        bool is_write, ReadbackStats& stats);
 
     ReadbackContext* AcquireReadbackContext(u64 staging_size);
     void ReleaseReadbackContext(ReadbackContext* context);
@@ -265,6 +272,9 @@ private:
         std::thread::id owner;
     };
     std::vector<DownloadInFlight> downloads_in_flight;
+    /// Downloads written back by a deferred operation of the GPU thread. They are not waited
+    /// for, a fault on their pages repeats until the operation ran.
+    std::vector<DownloadInFlight> deferred_downloads;
     u64 next_download_id{};
     std::condition_variable downloads_cv;
     /// Command buffers, fences and staging memory for downloads ahead of the open command buffer.
