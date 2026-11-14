@@ -188,42 +188,45 @@ void Liverpool::Process(std::stop_token stoken) {
             submit_done = false;
         }
         const u64 cycle_t1 = PerfNs();
-        LOG_INFO(Render,
-                 "PERF cp t0={} t1={} tasks={} submit_done={} flush_us={} vo_block_us={} "
-                 "vo_blocks={} vo_spin_us={} mem_spin_us={} mem_spins={} asc_spin_us={} "
-                 "draws={} draw_us={} draw_pipeline_us={} draw_bind_us={} dispatches={} "
-                 "dispatch_us={} dispatch_pipeline_us={} copy_us={} fence_us={} eop_us={} "
-                 "flushes={} host_flush_us={} rb_downloads={} rb_kb={} rb_finish_us={} "
-                 "img_downloads={} img_finish_us={} rbw_n={} rbw_us={} rbw_max_us={} "
-                 "draw_prep_us={} draw_begin_us={} bind_buffers_us={} bind_textures_us={} "
-                 "dma_sync_us={} eos={} eos_us={} commands={} commands_us={} draw_pre_us={} "
-                 "draw_vb_us={} draw_barrier_us={} draw_desc_us={} draw_dyn_us={} draw_rp_us={} "
-                 "draw_cmd_us={} draw_barriers={} render_passes={} zpass_dumps={} obtains={} "
-                 "obtain_stream={} obtain_stream_kb={} obtain_written={} obtain_uploads={} "
-                 "obtain_upload_kb={} obtain_texel={} obtain_texel_image={} tex_lookups={} "
-                 "tex_hits={}",
-                 cycle_t0, cycle_t1, cp_perf.tasks, was_submit_done, (cycle_t1 - flush_t0) / 1000,
-                 cp_perf.vo_block_ns / 1000, cp_perf.vo_blocks, cp_perf.vo_spin_ns / 1000,
-                 cp_perf.mem_spin_ns / 1000, cp_perf.mem_spins, cp_perf.asc_spin_ns / 1000,
-                 cp_perf.draws, cp_perf.draw_ns / 1000, cp_perf.draw_pipeline_ns / 1000,
-                 cp_perf.draw_bind_ns / 1000, cp_perf.dispatches, cp_perf.dispatch_ns / 1000,
-                 cp_perf.dispatch_pipeline_ns / 1000, cp_perf.copy_ns / 1000,
-                 cp_perf.fence_ns / 1000, cp_perf.eop_ns / 1000, cp_perf.flushes,
-                 cp_perf.flush_ns / 1000, cp_perf.rb_downloads, cp_perf.rb_bytes / 1024,
-                 cp_perf.rb_finish_ns / 1000, cp_perf.img_downloads, cp_perf.img_finish_ns / 1000,
-                 readback_wait.count.exchange(0, std::memory_order_relaxed),
-                 readback_wait.wait_ns.exchange(0, std::memory_order_relaxed) / 1000,
-                 readback_wait.max_ns.exchange(0, std::memory_order_relaxed) / 1000,
-                 cp_perf.draw_prep_ns / 1000, cp_perf.draw_begin_ns / 1000,
-                 cp_perf.bind_buffers_ns / 1000, cp_perf.bind_textures_ns / 1000,
-                 cp_perf.dma_sync_ns / 1000, cp_perf.eos, cp_perf.eos_ns / 1000, cp_perf.commands,
-                 cp_perf.commands_ns / 1000, cp_perf.draw_pre_ns / 1000, cp_perf.draw_vb_ns / 1000,
-                 cp_perf.draw_barrier_ns / 1000, cp_perf.draw_desc_ns / 1000,
-                 cp_perf.draw_dyn_ns / 1000, cp_perf.draw_rp_ns / 1000, cp_perf.draw_cmd_ns / 1000,
-                 cp_perf.draw_barriers, cp_perf.render_passes, cp_perf.zpass_dumps, cp_perf.obtains,
-                 cp_perf.obtain_stream, cp_perf.obtain_stream_bytes / 1024, cp_perf.obtain_written,
-                 cp_perf.obtain_uploads, cp_perf.obtain_upload_bytes / 1024, cp_perf.obtain_texel,
-                 cp_perf.obtain_texel_image, cp_perf.tex_lookups, cp_perf.tex_hits);
+        LOG_INFO(
+            Render,
+            "PERF cp t0={} t1={} tasks={} submit_done={} flush_us={} vo_block_us={} "
+            "vo_blocks={} vo_spin_us={} mem_spin_us={} mem_spins={} asc_spin_us={} "
+            "draws={} draw_us={} draw_pipeline_us={} draw_bind_us={} dispatches={} "
+            "dispatch_us={} dispatch_pipeline_us={} copy_us={} fence_us={} eop_us={} "
+            "flushes={} host_flush_us={} rb_downloads={} rb_kb={} rb_finish_us={} "
+            "img_downloads={} img_finish_us={} rbw_n={} rbw_us={} rbw_max_us={} "
+            "draw_prep_us={} draw_begin_us={} bind_buffers_us={} bind_textures_us={} "
+            "dma_sync_us={} eos={} eos_us={} commands={} commands_us={} draw_pre_us={} "
+            "draw_vb_us={} draw_barrier_us={} draw_desc_us={} draw_dyn_us={} draw_rp_us={} "
+            "draw_cmd_us={} draw_barriers={} render_passes={} zpass_dumps={} obtains={} "
+            "obtain_stream={} obtain_stream_kb={} obtain_written={} obtain_uploads={} "
+            "obtain_upload_kb={} obtain_texel={} obtain_texel_image={} obtain_stream_reused={} "
+            "obtain_stream_reused_kb={} tex_lookups={} "
+            "tex_hits={}",
+            cycle_t0, cycle_t1, cp_perf.tasks, was_submit_done, (cycle_t1 - flush_t0) / 1000,
+            cp_perf.vo_block_ns / 1000, cp_perf.vo_blocks, cp_perf.vo_spin_ns / 1000,
+            cp_perf.mem_spin_ns / 1000, cp_perf.mem_spins, cp_perf.asc_spin_ns / 1000,
+            cp_perf.draws, cp_perf.draw_ns / 1000, cp_perf.draw_pipeline_ns / 1000,
+            cp_perf.draw_bind_ns / 1000, cp_perf.dispatches, cp_perf.dispatch_ns / 1000,
+            cp_perf.dispatch_pipeline_ns / 1000, cp_perf.copy_ns / 1000, cp_perf.fence_ns / 1000,
+            cp_perf.eop_ns / 1000, cp_perf.flushes, cp_perf.flush_ns / 1000, cp_perf.rb_downloads,
+            cp_perf.rb_bytes / 1024, cp_perf.rb_finish_ns / 1000, cp_perf.img_downloads,
+            cp_perf.img_finish_ns / 1000,
+            readback_wait.count.exchange(0, std::memory_order_relaxed),
+            readback_wait.wait_ns.exchange(0, std::memory_order_relaxed) / 1000,
+            readback_wait.max_ns.exchange(0, std::memory_order_relaxed) / 1000,
+            cp_perf.draw_prep_ns / 1000, cp_perf.draw_begin_ns / 1000,
+            cp_perf.bind_buffers_ns / 1000, cp_perf.bind_textures_ns / 1000,
+            cp_perf.dma_sync_ns / 1000, cp_perf.eos, cp_perf.eos_ns / 1000, cp_perf.commands,
+            cp_perf.commands_ns / 1000, cp_perf.draw_pre_ns / 1000, cp_perf.draw_vb_ns / 1000,
+            cp_perf.draw_barrier_ns / 1000, cp_perf.draw_desc_ns / 1000, cp_perf.draw_dyn_ns / 1000,
+            cp_perf.draw_rp_ns / 1000, cp_perf.draw_cmd_ns / 1000, cp_perf.draw_barriers,
+            cp_perf.render_passes, cp_perf.zpass_dumps, cp_perf.obtains, cp_perf.obtain_stream,
+            cp_perf.obtain_stream_bytes / 1024, cp_perf.obtain_written, cp_perf.obtain_uploads,
+            cp_perf.obtain_upload_bytes / 1024, cp_perf.obtain_texel, cp_perf.obtain_texel_image,
+            cp_perf.obtain_stream_reused, cp_perf.obtain_stream_reused_bytes / 1024,
+            cp_perf.tex_lookups, cp_perf.tex_hits);
 
         Platform::IrqC::Instance()->Signal(Platform::InterruptId::GpuIdle);
     }

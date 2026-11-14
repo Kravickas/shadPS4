@@ -3,12 +3,14 @@
 
 #pragma once
 
+#include <array>
 #include <condition_variable>
 #include <deque>
 #include <mutex>
 #include <span>
 #include <thread>
 #include <unordered_map>
+#include <vector>
 #include <boost/container/small_vector.hpp>
 
 #include "common/enum.h"
@@ -236,6 +238,10 @@ private:
     bool SynchronizeMemory(const Buffer* arena, VAddr device_addr, u32 size, bool is_written,
                            bool is_texel_buffer);
 
+    static constexpr u64 StreamCopySlot(VAddr device_addr, u64 size) {
+        return ((device_addr ^ (size << 40)) * 0x9E3779B97F4A7C15ULL) >> (64 - StreamCopySlotBits);
+    }
+
     bool SynchronizeMemoryFromImage(const Buffer* arena, VAddr device_addr, u32 size);
 
     const Vulkan::Instance& instance;
@@ -248,6 +254,23 @@ private:
     std::unique_ptr<MemoryTracker> memory_tracker;
 
     StreamBuffer stream_buffer;
+    /// Read-only bindings copied into the stream buffer by the open command buffer. A binding
+    /// whose guest memory holds the same bytes as an earlier copy of the same range reuses that
+    /// copy. Only copies of the current scheduler tick are reused: the stream buffer keeps their
+    /// space until the command buffer of that tick is done.
+    struct StreamCopy {
+        VAddr device_addr;
+        u64 size;
+        u64 tick;
+        u64 stream_offset;
+        u64 shadow_offset;
+    };
+    static constexpr u64 StreamCopySlotBits = 12;
+    std::array<StreamCopy, 1ULL << StreamCopySlotBits> stream_copies{};
+    /// Host copy of the bytes written to the stream buffer in the current tick, to compare with.
+    std::vector<u8> stream_shadow;
+    u64 stream_shadow_used{};
+    u64 stream_shadow_tick{};
     Buffer gds_buffer;
     std::unique_ptr<Buffer> null_index_buffer;
     /// Guards the GPU-modified state against readbacks running on guest threads: the tracker's

@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <bit>
+#include <cstring>
 #include <limits>
 #include <magic_enum/magic_enum.hpp>
 #include <xxhash.h>
@@ -29,6 +30,7 @@ namespace VideoCore {
 static constexpr size_t GDS_BUFFER_SIZE = 64_KB;
 static constexpr size_t NULL_INDEX_BUFFER_SIZE = 16;
 static constexpr size_t STREAM_BUFFER_SIZE = 128_MB;
+static constexpr u64 STREAM_SHADOW_SIZE = 32_MB;
 static constexpr u64 MinReadbackStagingSize = 1_MB;
 static constexpr u64 MaxReadbackStagingSize = 32_MB;
 constexpr std::optional<u32> CmaskColorExpandedValue(u32 num_samples) {
@@ -86,7 +88,7 @@ BufferCache::BufferCache(const Vulkan::Instance& instance_, Vulkan::Scheduler& s
       memory_tracker{std::make_unique<MemoryTracker>(tracker)},
       stream_buffer{instance, scheduler, MemoryType::Stream, STREAM_BUFFER_SIZE},
       gds_buffer{instance, 0, GDS_BUFFER_SIZE, MemoryType::Stream, "GDS Buffer"},
-      memory_semaphore{instance} {
+      stream_shadow(STREAM_SHADOW_SIZE), memory_semaphore{instance} {
     const vk::BufferCreateInfo probe_ci = {
         .flags =
             vk::BufferCreateFlagBits::eSparseBinding | vk::BufferCreateFlagBits::eSparseResidency,
@@ -650,8 +652,32 @@ std::pair<const Buffer*, u64> BufferCache::ObtainBuffer(VAddr device_addr, u32 s
         !IsRegionGpuModified(device_addr, size)) {
         ++AmdGpu::cp_perf.obtain_stream;
         AmdGpu::cp_perf.obtain_stream_bytes += size;
+        auto& copy = stream_copies[StreamCopySlot(device_addr, size)];
+        if (copy.tick == scheduler.CurrentTick() && copy.device_addr == device_addr &&
+            copy.size == size &&
+            memory->CompareSparseMemory(device_addr, stream_shadow.data() + copy.shadow_offset,
+                                        size)) {
+            ++AmdGpu::cp_perf.obtain_stream_reused;
+            AmdGpu::cp_perf.obtain_stream_reused_bytes += size;
+            return {&stream_buffer, copy.stream_offset};
+        }
         const auto [data, offset] = stream_buffer.Map(size, instance.UniformMinAlignment());
-        memory->CopySparseMemory(device_addr, data, size);
+        // Mapping can wait for the GPU and submit, which starts a new tick.
+        const u64 tick = scheduler.CurrentTick();
+        if (stream_shadow_tick != tick) {
+            stream_shadow_tick = tick;
+            stream_shadow_used = 0;
+        }
+        if (stream_shadow_used + size <= stream_shadow.size()) {
+            // The stream buffer gets the very bytes that are kept to compare with.
+            u8* const shadow = stream_shadow.data() + stream_shadow_used;
+            memory->CopySparseMemory(device_addr, shadow, size);
+            std::memcpy(data, shadow, size);
+            copy = {device_addr, size, tick, offset, stream_shadow_used};
+            stream_shadow_used += size;
+        } else {
+            memory->CopySparseMemory(device_addr, data, size);
+        }
         stream_buffer.Commit();
         return {&stream_buffer, offset};
     }

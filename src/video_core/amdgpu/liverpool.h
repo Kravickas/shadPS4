@@ -82,6 +82,8 @@ struct CpPerf {
     u32 obtains;         ///< BufferCache::ObtainBuffer calls
     u32 obtain_stream;   ///< Read-only bindings copied into the stream buffer
     u64 obtain_stream_bytes;
+    u32 obtain_stream_reused; ///< ... that reused an identical copy of the same command buffer
+    u64 obtain_stream_reused_bytes;
     u32 obtain_written; ///< Writable bindings
     u32 obtain_uploads; ///< Bindings that uploaded CPU-modified pages into the arena
     u64 obtain_upload_bytes;

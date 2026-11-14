@@ -1,6 +1,8 @@
 // SPDX-FileCopyrightText: Copyright 2025-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <algorithm>
+#include <cstring>
 #include <boost/container/small_vector.hpp>
 #include "common/alignment.h"
 #include "common/assert.h"
@@ -160,6 +162,27 @@ void MemoryManager::CopySparseMemory(VAddr virtual_addr, u8* dest, u64 size) {
         virtual_addr += copy_size;
         dest += copy_size;
     }
+}
+
+bool MemoryManager::CompareSparseMemory(VAddr virtual_addr, const u8* data, u64 size) {
+    const auto& backing_pages = impl.BackingPages();
+    while (size) {
+        const u64 page = virtual_addr >> GUEST_PAGE_BITS;
+        const u64 offset_in_page = virtual_addr % GUEST_PAGE_SIZE;
+        const u64 compare_size = std::min<u64>(GUEST_PAGE_SIZE - offset_in_page, size);
+        if (auto* entry = backing_pages.find(page); entry && *entry) {
+            if (std::memcmp(data, *entry + offset_in_page, compare_size) != 0) {
+                return false;
+            }
+        } else if (std::any_of(data, data + compare_size, [](u8 byte) { return byte != 0; })) {
+            // CopySparseMemory reads memory without backing as zeroes.
+            return false;
+        }
+        size -= compare_size;
+        virtual_addr += compare_size;
+        data += compare_size;
+    }
+    return true;
 }
 
 bool MemoryManager::TryWriteBacking(void* address, const void* data, u64 size) {
