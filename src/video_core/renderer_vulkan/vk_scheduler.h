@@ -447,22 +447,14 @@ public:
         priority_pending_ops_cv.notify_one();
     }
 
-    /// Records commands with func into their own command buffer, submits it ahead of the open
-    /// command buffer and waits for it. It runs after all submitted work and before anything
-    /// recorded since, so it must not depend on that recorded work.
-    template <typename Func>
-    void SubmitAheadAndWait(Func&& func) {
-        const vk::CommandBuffer cmdbuf = BeginAhead();
-        func(cmdbuf);
-        SubmitAheadAndWait(cmdbuf);
-    }
+    /// Submits a command buffer that was recorded outside of the scheduler. It is queued after
+    /// all work submitted so far and before the open command buffer, so it must not depend on
+    /// anything recorded since the last submit. Can be called from any thread.
+    void SubmitOutOfBand(vk::CommandBuffer cmdbuf, vk::Fence fence) const;
 
     static std::mutex submit_mutex;
 
 private:
-    vk::CommandBuffer BeginAhead();
-    void SubmitAheadAndWait(vk::CommandBuffer cmdbuf);
-
     void EndSession();
 
     void SubmitExecution(SubmitInfo& info);
@@ -473,7 +465,6 @@ private:
     const Instance& instance;
     Semaphore work_semaphore;
     CommandPool command_pool;
-    vk::UniqueFence ahead_fence;
     DynamicState dynamic_state;
     SessionFunc on_session{};
     SubmitFunc on_submit{};

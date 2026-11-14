@@ -160,10 +160,11 @@ void TextureCache::DownloadImageMemory(ImageId image_id, DownloadMemoryFlags fla
 
     const auto write_data = [this, image_addr, copy_size, download, discard_buffer_cache, is_sync] {
         download.Invalidate();
-        Core::Memory::Instance()->TryWriteBacking(std::bit_cast<u8*>(image_addr), download.mapped,
-                                                  copy_size);
         if (discard_buffer_cache) {
-            buffer_cache.UnmarkRegionAsGpuModified(image_addr, copy_size, true);
+            buffer_cache.WriteAndUnmarkGpuModified(image_addr, download.mapped, copy_size);
+        } else {
+            Core::Memory::Instance()->TryWriteBacking(std::bit_cast<u8*>(image_addr),
+                                                      download.mapped, copy_size);
         }
         if (!is_sync) {
             runtime.GetStagingPool().FreeDeferred(download);

@@ -3,8 +3,11 @@
 
 #pragma once
 
+#include <condition_variable>
 #include <deque>
+#include <mutex>
 #include <span>
+#include <thread>
 #include <unordered_map>
 #include <boost/container/small_vector.hpp>
 
@@ -99,6 +102,10 @@ public:
     /// Unmark a region as modified from the GPU.
     void UnmarkRegionAsGpuModified(VAddr device_addr, u64 size, bool is_write = false);
 
+    /// Writes data that replaces the buffer cache contents of a region to guest memory and
+    /// unmarks the region as modified from the GPU, after downloads in flight to it are done.
+    void WriteAndUnmarkGpuModified(VAddr device_addr, const u8* data, u64 size);
+
     /// Flushes any GPU modified buffer in the logical page range back to CPU memory.
     void ReadMemory(VAddr device_addr, u64 size, bool is_write = false, bool async = false,
                     bool assume_locks = false);
@@ -146,19 +153,72 @@ private:
 
     void EnsureResident(const Buffer* arena, u64 first_block, u64 last_block);
 
-    void DownloadMemory(const Buffer* arena, VAddr device_addr, u64 size, bool async);
-
     struct DownloadWindow {
         const Buffer* arena;
         VAddr start;
         u64 size;
     };
-    /// Downloads the GPU-modified ranges of the windows in one submission ahead of the open
-    /// command buffer. Every GPU write to them must have been submitted already.
-    void DownloadAhead(std::span<const DownloadWindow> windows);
+    struct ReadbackStats {
+        u64 exec_t0;      ///< When the GPU thread started the readback, 0 if it did not run it
+        u64 in_flight_ns; ///< Time spent waiting for overlapping downloads in flight
+        u64 bytes;
+        u32 windows;
+        bool ahead;
+    };
+    struct ReadbackContext;
+
+    /// Runs a readback on the calling guest thread. Returns false when it needs the GPU thread,
+    /// because a GPU write to the window is still in the open command buffer.
+    bool ReadMemoryOnCallingThread(VAddr device_addr, u64 size, bool is_write,
+                                   ReadbackStats& stats);
+
+    /// Runs a readback on the GPU thread.
+    void ReadMemoryOnGpuThread(VAddr device_addr, u64 size, bool is_write, bool async,
+                               ReadbackStats& stats);
+
+    /// The download window around a readback request in its arena.
+    [[nodiscard]] DownloadWindow GetDownloadWindow(const Buffer* arena, VAddr device_addr,
+                                                   u64 size) const;
+
+    /// Adds the recently read-back windows that are ready to the download. Lock held.
+    void AddHotWindows(boost::container::small_vector<DownloadWindow, 16>& windows);
+
+    /// Downloads the GPU-modified ranges of the windows with a submission of its own, queued
+    /// after all submitted work. Every GPU write to them must have been submitted already.
+    /// Called with modified_mutex held through lk, released while the GPU copies.
+    void DownloadAhead(std::unique_lock<std::mutex>& lk, std::span<const DownloadWindow> windows,
+                       ReadbackStats& stats);
+
+    /// Downloads the GPU-modified ranges of the window in the open command buffer. GPU thread
+    /// only. Called with modified_mutex held through lk, released while the GPU copies.
+    void DownloadMemory(std::unique_lock<std::mutex>& lk, const Buffer* arena, VAddr device_addr,
+                        u64 size, bool async, ReadbackStats& stats);
 
     /// Whether every GPU write to the range was submitted before the open command buffer.
+    /// Lock held.
     [[nodiscard]] bool IsGpuWriteSubmitted(VAddr device_addr, u64 size) const;
+
+    /// Whether a download in flight overlaps the range. Lock held.
+    [[nodiscard]] bool OverlapsDownloadInFlight(VAddr start, VAddr end) const;
+
+    /// Waits until no download in flight of another thread overlaps the range. A download of
+    /// the calling thread is not waited for: the GPU thread runs deferred operations inside its
+    /// own download, which keeps the order of the GPU thread. Returns true if it had to wait,
+    /// which released the lock meanwhile. Lock held.
+    bool WaitDownloadsInFlight(std::unique_lock<std::mutex>& lk, VAddr start, VAddr end,
+                               ReadbackStats& stats);
+
+    /// Clears the GPU-modified state of the pages of a downloaded window, except pages that
+    /// received GPU writes again while the download was in flight and pages another download in
+    /// flight covers. Lock held.
+    void UnmarkDownloadedWindow(VAddr start, u64 size, u64 download_id);
+
+    /// Ends a readback: a write fault may proceed unless the range got GPU writes again. Lock
+    /// held.
+    void FinishReadback(VAddr device_addr, u64 size, bool is_write);
+
+    ReadbackContext* AcquireReadbackContext(u64 staging_size);
+    void ReleaseReadbackContext(ReadbackContext* context);
 
     bool SynchronizeMemory(const Buffer* arena, VAddr device_addr, u32 size, bool is_written,
                            bool is_texel_buffer);
@@ -177,6 +237,11 @@ private:
     StreamBuffer stream_buffer;
     Buffer gds_buffer;
     std::unique_ptr<Buffer> null_index_buffer;
+    /// Guards the GPU-modified state against readbacks running on guest threads: the tracker's
+    /// GPU bits, gpu_modified_ranges, write_ticks, hot_windows, downloads_in_flight and the
+    /// address_space entries. The GPU thread changes them with it held and other threads read
+    /// them with it held. It is never held across a scheduler call.
+    std::mutex modified_mutex;
     RangeSet gpu_modified_ranges;
     /// Scheduler tick of the last writable binding per WriteTickChunk bytes of guest memory.
     std::unordered_map<u64, u64> write_ticks;
@@ -185,6 +250,21 @@ private:
     /// A readback downloads all of them that are ready, so the CPU does not fault on each one.
     std::unordered_map<VAddr, std::pair<u64, u64>> hot_windows;
     static constexpr u64 HotWindowTicks = 4;
+    /// Windows whose GPU-modified ranges were taken out of gpu_modified_ranges and whose data
+    /// is not written back yet.
+    struct DownloadInFlight {
+        u64 id;
+        VAddr start;
+        VAddr end;
+        std::thread::id owner;
+    };
+    std::vector<DownloadInFlight> downloads_in_flight;
+    u64 next_download_id{};
+    std::condition_variable downloads_cv;
+    /// Command buffers, fences and staging memory for downloads ahead of the open command buffer.
+    std::mutex readback_contexts_mutex;
+    std::vector<std::unique_ptr<ReadbackContext>> readback_contexts;
+    std::vector<ReadbackContext*> free_readback_contexts;
 
     std::unique_ptr<FaultManager> fault_manager;
     std::unique_ptr<Buffer> bda_pagetable_buffer;
