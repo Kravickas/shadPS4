@@ -195,7 +195,7 @@ void MemoryManager::SaveFileTail(const VirtualMemoryArea& vma, VAddr virtual_add
     if (from >= to) {
         return;
     }
-    auto& tail = file_tails[file];
+    auto& tail = file_tails[host_file->GetPath().generic_string()];
     if (tail.file_size != file_size || tail.bytes.size() != page_end - tail_start) {
         tail.file_size = file_size;
         tail.bytes.assign(page_end - tail_start, 0);
@@ -213,11 +213,12 @@ void MemoryManager::SaveFileTail(const VirtualMemoryArea& vma, VAddr virtual_add
 #endif
 }
 
-void MemoryManager::RestoreFileTail(const void* file, u64 file_size, VAddr virtual_addr, u64 size,
-                                    u64 offset, const std::function<void(u8*, u64, u32)>& protect,
+void MemoryManager::RestoreFileTail(const std::string& host_path, u64 file_size, VAddr virtual_addr,
+                                    u64 size, u64 offset,
+                                    const std::function<void(u8*, u64, u32)>& protect,
                                     MemoryProt prot) {
 #ifdef _WIN32
-    const auto it = file_tails.find(file);
+    const auto it = file_tails.find(host_path);
     if (it == file_tails.end() || it->second.file_size != file_size) {
         return;
     }
@@ -232,7 +233,7 @@ void MemoryManager::RestoreFileTail(const void* file, u64 file_size, VAddr virtu
     std::memcpy(dst, it->second.bytes.data() + (from - tail_start), to - from);
     protect(dst, to - from, std::bit_cast<u32>(prot));
 #else
-    (void)file;
+    (void)host_path;
     (void)file_size;
     (void)virtual_addr;
     (void)size;
@@ -242,9 +243,9 @@ void MemoryManager::RestoreFileTail(const void* file, u64 file_size, VAddr virtu
 #endif
 }
 
-void MemoryManager::DropFileTail(const void* file) {
+void MemoryManager::DropFileTail(const std::string& host_path) {
     std::scoped_lock lk{mutex};
-    file_tails.erase(file);
+    file_tails.erase(host_path);
 }
 
 bool MemoryManager::IsInGuestAreas(VAddr virtual_addr, u64 size) {
@@ -366,6 +367,7 @@ PAddr MemoryManager::PoolExpand(PAddr search_start, PAddr search_end, u64 size, 
     // Add the allocated region to the list and commit its pages.
     auto& area = CarvePhysArea(dmem_map, mapping_start, size)->second;
     area.dma_type = PhysicalMemoryType::Pooled;
+    area.seq = ++dmem_seq;
     area.memory_type = 3;
 
     // Track how much dmem was allocated for pools.
@@ -493,6 +495,7 @@ PAddr MemoryManager::Allocate(PAddr search_start, PAddr search_end, u64 size, u6
     auto& area = CarvePhysArea(dmem_map, mapping_start, size)->second;
     area.memory_type = memory_type;
     area.dma_type = PhysicalMemoryType::Allocated;
+    area.seq = ++dmem_seq;
     MergeAdjacent(dmem_map, dmem_area);
 
     return mapping_start;
@@ -782,10 +785,12 @@ s32 MemoryManager::MapMemory(void** out_addr, VAddr virtual_addr, u64 size, Memo
     PhysHandle dmem_area;
     // Validate the requested physical address range
     if (phys_addr != -1) {
+        // Measured on hardware (DmemTest MP1, every SDK): at and across the end of direct memory
+        // this is EACCES, as for direct memory that is not allocated.
         if (total_direct_size < phys_addr + size) {
             LOG_ERROR(Kernel_Vmm, "Unable to map {:#x} bytes at physical address {:#x}", size,
                       phys_addr);
-            return ORBIS_KERNEL_ERROR_ENOMEM;
+            return ORBIS_KERNEL_ERROR_EACCES;
         }
 
         // Validate direct memory areas involved in this call.
@@ -1230,8 +1235,8 @@ s32 MemoryManager::MapFile(void** out_addr, VAddr virtual_addr, u64 size, Memory
         file->handle->Map(reinterpret_cast<u8*>(mapped_addr), size, phys_addr,
                           std::bit_cast<u32>(prot), map_ctx);
         if (host_file != nullptr) {
-            RestoreFileTail(file, file_size, mapped_addr, size, static_cast<u64>(phys_addr),
-                            map_ctx.protect, prot);
+            RestoreFileTail(host_file->GetPath().generic_string(), file_size, mapped_addr, size,
+                            static_cast<u64>(phys_addr), map_ctx.protect, prot);
         }
     }
     if (prot != Core::MemoryProt::CpuRead) {
@@ -1566,6 +1571,15 @@ s32 MemoryManager::UnmapMemory(VAddr virtual_addr, u64 size) {
     virtual_addr = Common::AlignDown(virtual_addr, GUEST_PAGE_SIZE);
     size = end - virtual_addr;
     if (!IsValidMapping(virtual_addr, size)) {
+        // Measured on hardware (DmemTest MP2): munmap at 0x7FFFFFFFC000 succeeds, it is user
+        // address space with nothing mapped. The memory map ends below USER_SPACE_END (USER_MAX, by
+        // host), and nothing can be mapped above it, so a range wholly in that gap succeeds as
+        // well.
+        const auto last = std::prev(vma_map.end());
+        const VAddr map_end = last->first + last->second.size;
+        if (virtual_addr >= map_end && end <= USER_SPACE_END) {
+            return ORBIS_OK;
+        }
         LOG_ERROR(Kernel_Vmm, "addr = {:#x} size = {:#x} is outside the memory map", virtual_addr,
                   size);
         return ORBIS_KERNEL_ERROR_EINVAL;
@@ -2068,10 +2082,26 @@ s32 MemoryManager::DirectMemoryQuery(PAddr addr, bool find_next,
     if (find_next) {
         // The first area ending at or after addr: one ending exactly at addr counts and free space
         // is skipped. Any other area that is not an allocation ends the search.
+        // Measured on hardware (DmemTest Q20-Q34, every SDK): a pool block ending exactly at addr
+        // ends it (EACCES) unless the allocation after the free space is older than the block;
+        // then that allocation is found.
         if (dmem_area->second.dma_type == PhysicalMemoryType::Free &&
             dmem_area->second.base == addr && dmem_area != dmem_map.begin() &&
             std::prev(dmem_area)->second.dma_type != PhysicalMemoryType::Free) {
-            --dmem_area;
+            const auto prev = std::prev(dmem_area);
+            bool counts = true;
+            if (prev->second.dma_type == PhysicalMemoryType::Pooled) {
+                auto next = dmem_area;
+                while (next != dmem_map.end() &&
+                       next->second.dma_type == PhysicalMemoryType::Free) {
+                    ++next;
+                }
+                counts = next == dmem_map.end() || !is_allocated(next->second) ||
+                         next->second.seq > prev->second.seq;
+            }
+            if (counts) {
+                --dmem_area;
+            }
         }
         while (dmem_area != dmem_map.end() &&
                dmem_area->second.dma_type == PhysicalMemoryType::Free) {
@@ -2334,9 +2364,12 @@ void MemoryManager::NameVirtualRange(VAddr virtual_addr, u64 size, std::string_v
     // (two inaccessible anonymous mappings from two call sites merge once they have one name, at
     // every SDK version); where they could not merge before, a rename changes nothing (CO1-CO9,
     // FW6, FW7 below 5.50).
+    // Direct mappings never merge below SDK 2.00, renamed or not (DmemTest CO4, CO10, FW8), as in
+    // MapMemory.
     it = FindVMA(aligned_addr);
     while (it != vma_map.end() && it->second.base < aligned_addr + aligned_size) {
-        if (!it->second.IsFree()) {
+        if (!it->second.IsFree() &&
+            (it->second.type != VMAType::Direct || sdk_version >= Common::ElfInfo::FW_200)) {
             it = MergeAdjacent(vma_map, it);
         }
         ++it;

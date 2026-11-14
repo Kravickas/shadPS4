@@ -84,6 +84,10 @@ struct PhysicalMemoryArea {
     // The memory type was set by MapDirectMemory2. Measured on hardware (DmemTest DT5, DT7, DT8):
     // such an area never merges with its neighbours again, until it is released.
     bool type_from_map2 = false;
+    // Order in which the area was made (allocated or added to the pool), compared by
+    // DirectMemoryQuery at the end of a pool block (DmemTest Q20-Q34). An area merged into its left
+    // neighbour takes that neighbour's.
+    u64 seq = 0;
 
     PAddr GetEnd() const {
         return base + size;
@@ -343,8 +347,8 @@ public:
 
     bool IsInGuestAreas(VAddr virtual_addr, u64 size);
 
-    // Forgets the bytes kept past the end of a file (see SaveFileTail); called when it is closed.
-    void DropFileTail(const void* file);
+    // Forgets the bytes kept past the end of a file (see SaveFileTail); called when it is deleted.
+    void DropFileTail(const std::string& host_path);
 
     void SetupMemoryRegions(u64 flexible_size, bool use_extended_mem1, bool use_extended_mem2);
 
@@ -377,8 +381,9 @@ public:
 
     void SaveFileTail(const VirtualMemoryArea& vma, VAddr virtual_addr, u64 size);
 
-    void RestoreFileTail(const void* file, u64 file_size, VAddr virtual_addr, u64 size, u64 offset,
-                         const std::function<void(u8*, u64, u32)>& protect, MemoryProt prot);
+    void RestoreFileTail(const std::string& host_path, u64 file_size, VAddr virtual_addr, u64 size,
+                         u64 offset, const std::function<void(u8*, u64, u32)>& protect,
+                         MemoryProt prot);
 
     s32 UnmapMemory(VAddr virtual_addr, u64 size);
 
@@ -492,13 +497,15 @@ private:
     std::set<PAddr> pool_flushed_blocks;
     std::map<VAddr, u64> pool_reservations;
     s32 sdk_version{};
+    u64 dmem_seq = 0;
     // Bytes past the end of a file inside its last 16 KiB page, kept from shared mappings of it
     // (Windows hosts; see SaveFileTail).
     struct FileTail {
         u64 file_size = 0;
         std::vector<u8> bytes;
     };
-    std::unordered_map<const void*, FileTail> file_tails;
+    // Keyed by the host path: on hardware the bytes outlast close and open (DmemTest MFT1).
+    std::unordered_map<std::string, FileTail> file_tails;
     Vulkan::Rasterizer* rasterizer{};
 
     struct PrtArea {

@@ -420,7 +420,6 @@ s32 PS4_SYSV_ABI close(s32 fd) {
     if (file->ref_count <= 1) {
         ReleaseFlockState(file);
         if (file->type == Core::FileSys::FileType::Regular) {
-            Core::Memory::Instance()->DropFileTail(file);
             file->handle.reset();
         }
         file->is_opened = false;
@@ -2314,6 +2313,9 @@ s32 PS4_SYSV_ABI posix_unlink(const char* path) {
     } else if (auto* host = file->GetHostFile()) {
         host->Unlink();
     }
+    // A file made again under this name is another file: the bytes kept past the end of this one
+    // (see MemoryManager::SaveFileTail) are not its.
+    Core::Memory::Instance()->DropFileTail(host_path.generic_string());
 
     mnt->InvalidateCache(path);
 

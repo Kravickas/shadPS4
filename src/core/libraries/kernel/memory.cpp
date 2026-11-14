@@ -231,13 +231,8 @@ static s32 ReserveVirtualRangeImpl(void** addr, u64 len, s32 flags, u64 alignmen
         LOG_ERROR(Kernel_Vmm, "Invalid flags {:#x}", flags);
         return ORBIS_KERNEL_ERROR_EINVAL;
     }
-    // Measured on hardware (DmemTest M4): a fixed reservation over a direct mapping is EINVAL, with
-    // or without no-overwrite.
-    if ((flags & static_cast<s32>(Core::MemoryMapFlags::Fixed)) != 0 &&
-        memory->ContainsVmaType(in_addr, len, Core::VMAType::Direct)) {
-        LOG_ERROR(Kernel_Vmm, "Fixed reservation over a direct mapping");
-        return ORBIS_KERNEL_ERROR_EINVAL;
-    }
+    // Measured on hardware (DmemTest RV7): a fixed reservation over a direct mapping replaces it;
+    // with no-overwrite it is ENOMEM (MapMemory's checks). PoolReserve refuses it (M4).
     auto map_flags = static_cast<Core::MemoryMapFlags>(flags);
 
     if (True(map_flags & Core::MemoryMapFlags::Fixed) && in_addr == 0) {
@@ -755,7 +750,12 @@ s32 PS4_SYSV_ABI sceKernelBatchMap2(OrbisKernelBatchMapEntry* entries, s32 numEn
     s32 result = ORBIS_OK;
     s32 processed = 0;
     for (s32 i = 0; i < numEntries; i++, processed++) {
-        if (entries == nullptr || entries[i].length == 0 || entries[i].operation > 4) {
+        if (entries == nullptr) {
+            // Measured on hardware (DmemTest BM5): EFAULT, none processed.
+            result = ORBIS_KERNEL_ERROR_EFAULT;
+            break;
+        }
+        if (entries[i].length == 0 || entries[i].operation > 4) {
             result = ORBIS_KERNEL_ERROR_EINVAL;
             break; // break and assign a value to numEntriesOut.
         }
@@ -825,11 +825,13 @@ s32 PS4_SYSV_ABI sceKernelClearVirtualRangeName(const void* addr, u64 len) {
 
 s32 PS4_SYSV_ABI sceKernelMemoryPoolExpand(u64 searchStart, u64 searchEnd, u64 len, u64 alignment,
                                            u64* physAddrOut) {
-    if (searchStart < 0 || searchEnd <= searchStart) {
-        LOG_ERROR(Kernel_Vmm, "Provided address range is invalid!");
-        return ORBIS_KERNEL_ERROR_EINVAL;
+    // Measured on hardware (DmemTest PE1): the start is signed, and a negative one expands as from
+    // 0; an empty or reversed range is ENOMEM; len 0 succeeds and writes 0. (PE2: a null output
+    // succeeds; whether the pool grows then is not measured yet.)
+    if (static_cast<s64>(searchStart) < 0) {
+        searchStart = 0;
     }
-    if (len <= 0 || !Common::Is64KBAligned(len)) {
+    if (!Common::Is64KBAligned(len)) {
         LOG_ERROR(Kernel_Vmm, "Provided length {:#x} is invalid!", len);
         return ORBIS_KERNEL_ERROR_EINVAL;
     }
@@ -837,9 +839,11 @@ s32 PS4_SYSV_ABI sceKernelMemoryPoolExpand(u64 searchStart, u64 searchEnd, u64 l
         LOG_ERROR(Kernel_Vmm, "Alignment {:#x} is invalid!", alignment);
         return ORBIS_KERNEL_ERROR_EINVAL;
     }
-    if (physAddrOut == nullptr) {
-        LOG_ERROR(Kernel_Vmm, "Result physical address pointer is null!");
-        return ORBIS_KERNEL_ERROR_EINVAL;
+    if (len == 0) {
+        if (physAddrOut != nullptr) {
+            *physAddrOut = 0;
+        }
+        return ORBIS_OK;
     }
 
     const bool is_in_range = searchEnd - searchStart >= len;
@@ -857,7 +861,9 @@ s32 PS4_SYSV_ABI sceKernelMemoryPoolExpand(u64 searchStart, u64 searchEnd, u64 l
         return ORBIS_KERNEL_ERROR_ENOMEM;
     }
 
-    *physAddrOut = static_cast<s64>(phys_addr);
+    if (physAddrOut != nullptr) {
+        *physAddrOut = static_cast<s64>(phys_addr);
+    }
 
     LOG_INFO(Kernel_Vmm,
              "searchStart = {:#x}, searchEnd = {:#x}, len = {:#x}, alignment = {:#x}, physAddrOut "
@@ -897,6 +903,12 @@ static s32 MemoryPoolReserveImpl(void* addr_in, u64 len, u64 alignment, s32 flag
 
     auto* memory = Core::Memory::Instance();
     const VAddr in_addr = reinterpret_cast<VAddr>(addr_in);
+    // Measured on hardware (DmemTest M4): a fixed pool reservation over a direct mapping is EINVAL,
+    // with or without no-overwrite. (ReserveVirtualRange replaces it: RV7.)
+    if ((flags & 0x10) != 0 && memory->ContainsVmaType(in_addr, len, Core::VMAType::Direct)) {
+        LOG_ERROR(Kernel_Vmm, "Fixed pool reservation over a direct mapping");
+        return ORBIS_KERNEL_ERROR_EINVAL;
+    }
     const auto map_flags = static_cast<Core::MemoryMapFlags>(flags);
     u64 map_alignment = alignment <= 1 ? 2_MB : alignment;
 
@@ -1001,7 +1013,11 @@ s32 PS4_SYSV_ABI sceKernelMemoryPoolDecommit(void* addr, u64 len, s32 flags) {
 s32 PS4_SYSV_ABI sceKernelMemoryPoolBatch(const OrbisKernelMemoryPoolBatchEntry* entries, s32 count,
                                           s32* num_processed, s32 flags) {
     if (entries == nullptr) {
-        return ORBIS_KERNEL_ERROR_EINVAL;
+        // Measured on hardware (DmemTest PB8): EFAULT, none processed.
+        if (num_processed != nullptr) {
+            *num_processed = 0;
+        }
+        return ORBIS_KERNEL_ERROR_EFAULT;
     }
     // Measured on hardware for each of the 32 bits: no flag is accepted.
     if (flags != 0) {
@@ -1245,9 +1261,9 @@ s32 PS4_SYSV_ABI posix_munmap(void* addr, u64 len) {
 }
 
 s32 PS4_SYSV_ABI posix_mlock(const void* addr, u64 len) {
-    if (!addr || len == 0) {
-        *__Error() = POSIX_EINVAL;
-        return -1;
+    // Measured on hardware (DmemTest ML3): len 0 succeeds; a null address is not mapped (ENOMEM).
+    if (len == 0) {
+        return 0;
     }
 
     const VAddr raw_addr = reinterpret_cast<VAddr>(addr);
@@ -1280,9 +1296,9 @@ s32 PS4_SYSV_ABI sceKernelMlock(void* addr, u64 len) {
 }
 
 s32 PS4_SYSV_ABI posix_munlock(const void* addr, u64 len) {
-    if (!addr || len == 0) {
-        *__Error() = POSIX_EINVAL;
-        return -1;
+    // Measured on hardware (DmemTest ML3): len 0 succeeds; a null address is not mapped (ENOMEM).
+    if (len == 0) {
+        return 0;
     }
 
     const VAddr raw_addr = reinterpret_cast<VAddr>(addr);
