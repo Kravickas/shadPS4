@@ -198,8 +198,10 @@ void Liverpool::Process(std::stop_token stoken) {
                  "draw_prep_us={} draw_begin_us={} bind_buffers_us={} bind_textures_us={} "
                  "dma_sync_us={} eos={} eos_us={} commands={} commands_us={} draw_pre_us={} "
                  "draw_vb_us={} draw_barrier_us={} draw_desc_us={} draw_dyn_us={} draw_rp_us={} "
-                 "draw_cmd_us={} draw_barriers={} render_passes={} zpass_dumps={} obtain_us={} "
-                 "obtains={} tex_find_us={} tex_view_us={} tex_lookups={} tex_hits={}",
+                 "draw_cmd_us={} draw_barriers={} render_passes={} zpass_dumps={} obtains={} "
+                 "obtain_stream={} obtain_stream_kb={} obtain_written={} obtain_uploads={} "
+                 "obtain_upload_kb={} obtain_texel={} obtain_texel_image={} tex_lookups={} "
+                 "tex_hits={}",
                  cycle_t0, cycle_t1, cp_perf.tasks, was_submit_done, (cycle_t1 - flush_t0) / 1000,
                  cp_perf.vo_block_ns / 1000, cp_perf.vo_blocks, cp_perf.vo_spin_ns / 1000,
                  cp_perf.mem_spin_ns / 1000, cp_perf.mem_spins, cp_perf.asc_spin_ns / 1000,
@@ -218,9 +220,10 @@ void Liverpool::Process(std::stop_token stoken) {
                  cp_perf.commands_ns / 1000, cp_perf.draw_pre_ns / 1000, cp_perf.draw_vb_ns / 1000,
                  cp_perf.draw_barrier_ns / 1000, cp_perf.draw_desc_ns / 1000,
                  cp_perf.draw_dyn_ns / 1000, cp_perf.draw_rp_ns / 1000, cp_perf.draw_cmd_ns / 1000,
-                 cp_perf.draw_barriers, cp_perf.render_passes, cp_perf.zpass_dumps,
-                 cp_perf.obtain_ns / 1000, cp_perf.obtains, cp_perf.tex_find_ns / 1000,
-                 cp_perf.tex_view_ns / 1000, cp_perf.tex_lookups, cp_perf.tex_hits);
+                 cp_perf.draw_barriers, cp_perf.render_passes, cp_perf.zpass_dumps, cp_perf.obtains,
+                 cp_perf.obtain_stream, cp_perf.obtain_stream_bytes / 1024, cp_perf.obtain_written,
+                 cp_perf.obtain_uploads, cp_perf.obtain_upload_bytes / 1024, cp_perf.obtain_texel,
+                 cp_perf.obtain_texel_image, cp_perf.tex_lookups, cp_perf.tex_hits);
 
         Platform::IrqC::Instance()->Signal(Platform::InterruptId::GpuIdle);
     }

@@ -79,10 +79,14 @@ struct CpPerf {
     u32 draw_barriers;   ///< Draws that flushed barriers
     u32 render_passes;   ///< Dynamic rendering passes begun
     u32 zpass_dumps;     ///< ZPASS_DONE occlusion counter dumps (results are synthesized)
-    u64 obtain_ns;       ///< BufferCache::ObtainBuffer for buffer, vertex and index bindings
-    u32 obtains;
-    u64 tex_find_ns; ///< Texture desc + FindImage (or its reuse)
-    u64 tex_view_ns; ///< FindTexture (image view)
+    u32 obtains;         ///< BufferCache::ObtainBuffer calls
+    u32 obtain_stream;   ///< Read-only bindings copied into the stream buffer
+    u64 obtain_stream_bytes;
+    u32 obtain_written; ///< Writable bindings
+    u32 obtain_uploads; ///< Bindings that uploaded CPU-modified pages into the arena
+    u64 obtain_upload_bytes;
+    u32 obtain_texel;       ///< Read-only texel bindings checked against images
+    u32 obtain_texel_image; ///< ... that were filled from metadata or an image
     u32 tex_lookups;
     u32 tex_hits;
     u32 rb_downloads; ///< Buffer readbacks downloaded

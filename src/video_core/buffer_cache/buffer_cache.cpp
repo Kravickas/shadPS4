@@ -419,9 +419,12 @@ std::pair<const Buffer*, u64> BufferCache::ObtainBuffer(VAddr device_addr, u32 s
     const bool is_written = True(flags & ObtainBufferFlags::IsWritten);
     const bool is_texel_buffer = True(flags & ObtainBufferFlags::IsTexelBuffer);
     const bool skip_stream_buffer = True(flags & ObtainBufferFlags::IgnoreStreamBuffer);
+    ++AmdGpu::cp_perf.obtains;
     // For read-only buffers use device local stream buffer to reduce renderpass breaks.
     if (!is_written && !skip_stream_buffer && size <= STREAM_THRESHOLD &&
         !IsRegionGpuModified(device_addr, size)) {
+        ++AmdGpu::cp_perf.obtain_stream;
+        AmdGpu::cp_perf.obtain_stream_bytes += size;
         const auto [data, offset] = stream_buffer.Map(size, instance.UniformMinAlignment());
         memory->CopySparseMemory(device_addr, data, size);
         stream_buffer.Commit();
@@ -432,6 +435,7 @@ std::pair<const Buffer*, u64> BufferCache::ObtainBuffer(VAddr device_addr, u32 s
     const auto* arena = GetArena(first_block, last_block);
     EnsureResident(arena, first_block, last_block);
     if (is_written) {
+        ++AmdGpu::cp_perf.obtain_written;
         texture_cache.MarkAsMaybeGpuDirty(device_addr, size);
     }
     SynchronizeMemory(arena, device_addr, size, is_written, is_texel_buffer);
@@ -670,6 +674,8 @@ bool BufferCache::SynchronizeMemory(const Buffer* arena, VAddr device_addr, u32 
         total_size_bytes += size;
     });
     if (!copies.empty()) {
+        ++AmdGpu::cp_perf.obtain_uploads;
+        AmdGpu::cp_perf.obtain_upload_bytes += total_size_bytes;
         const auto staging = staging_pool.Request(total_size_bytes, MemoryType::HostUncached);
         for (auto& copy : copies) {
             memory->CopySparseMemory(copy.dstOffset, staging.mapped + copy.srcOffset, copy.size);
@@ -680,7 +686,10 @@ bool BufferCache::SynchronizeMemory(const Buffer* arena, VAddr device_addr, u32 
         runtime.CopyBuffer(staging.buffer, arena, copies);
     }
     if (is_texel_buffer && !is_written) {
-        return SynchronizeMemoryFromImage(arena, device_addr, size);
+        ++AmdGpu::cp_perf.obtain_texel;
+        const bool from_image = SynchronizeMemoryFromImage(arena, device_addr, size);
+        AmdGpu::cp_perf.obtain_texel_image += from_image ? 1 : 0;
+        return from_image;
     }
     return false;
 }
