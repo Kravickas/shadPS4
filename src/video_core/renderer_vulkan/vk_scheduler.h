@@ -447,10 +447,11 @@ public:
         priority_pending_ops_cv.notify_one();
     }
 
-    /// Submits a command buffer that was recorded outside of the scheduler. It is queued after
-    /// all work submitted so far and before the open command buffer, so it must not depend on
-    /// anything recorded since the last submit. Can be called from any thread.
-    void SubmitOutOfBand(vk::CommandBuffer cmdbuf, vk::Fence fence) const;
+    /// Submits a buffer readback command buffer that was recorded outside of the scheduler. It
+    /// runs once the GPU reached wait_tick and must not depend on anything recorded later. With
+    /// a readback queue it waits for wait_tick only; otherwise it is queued after all work
+    /// submitted to the graphics queue so far. Can be called from any thread.
+    void SubmitOutOfBand(vk::CommandBuffer cmdbuf, vk::Fence fence, u64 wait_tick) const;
 
     static std::mutex submit_mutex;
 

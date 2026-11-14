@@ -183,10 +183,11 @@ void BufferCache::ReadMemory(VAddr device_addr, u64 size, bool is_write, bool as
     }
     LOG_INFO(Render,
              "PERF rb addr={:#x} size={:#x} write={} gpu_thread={} path={} t0={} t1={} "
-             "exec_t0={} in_flight_us={} ahead={} batch_windows={} dl_bytes={} thread={}",
+             "exec_t0={} in_flight_us={} ahead={} batch_windows={} dl_bytes={} wait_tick={} "
+             "gpu_tick={} gpu_us={} thread={}",
              device_addr, size, is_write, assume_locks, path, rb_t0, rb_t1, stats.exec_t0,
-             stats.in_flight_ns / 1000, stats.ahead, stats.windows, stats.bytes,
-             Common::GetCurrentThreadName());
+             stats.in_flight_ns / 1000, stats.ahead, stats.windows, stats.bytes, stats.wait_tick,
+             stats.gpu_tick, stats.gpu_ns / 1000, Common::GetCurrentThreadName());
 }
 
 bool BufferCache::ReadMemoryOnCallingThread(VAddr device_addr, u64 size, bool is_write,
@@ -289,15 +290,18 @@ void BufferCache::AddHotWindows(boost::container::small_vector<DownloadWindow, 1
 }
 
 bool BufferCache::IsGpuWriteSubmitted(VAddr device_addr, u64 size) const {
-    const u64 current_tick = scheduler.CurrentTick();
+    return LastWriteTick(device_addr, size) < scheduler.CurrentTick();
+}
+
+u64 BufferCache::LastWriteTick(VAddr device_addr, u64 size) const {
+    u64 last_tick = 0;
     for (u64 chunk = device_addr >> WriteTickChunkBits;
          chunk <= (device_addr + size - 1) >> WriteTickChunkBits; ++chunk) {
-        const auto it = write_ticks.find(chunk);
-        if (it != write_ticks.end() && it->second >= current_tick) {
-            return false;
+        if (const auto it = write_ticks.find(chunk); it != write_ticks.end()) {
+            last_tick = std::max(last_tick, it->second);
         }
     }
-    return true;
+    return last_tick;
 }
 
 bool BufferCache::OverlapsDownloadInFlight(VAddr start, VAddr end) const {
@@ -473,8 +477,10 @@ void BufferCache::DownloadAhead(std::unique_lock<std::mutex>& lk,
         return;
     }
     const u64 download_id = ++next_download_id;
+    u64 wait_tick = 0;
     for (size_t i = 0; i < windows.size(); ++i) {
         if (!window_copies[i].copies.empty()) {
+            wait_tick = std::max(wait_tick, LastWriteTick(windows[i].start, windows[i].size));
             downloads_in_flight.push_back({download_id, windows[i].start,
                                            windows[i].start + windows[i].size,
                                            std::this_thread::get_id()});
@@ -482,6 +488,7 @@ void BufferCache::DownloadAhead(std::unique_lock<std::mutex>& lk,
         }
     }
     stats.bytes += total_size_bytes;
+    stats.wait_tick = wait_tick;
     lk.unlock();
 
     ReadbackContext* context = AcquireReadbackContext(total_size_bytes);
@@ -491,8 +498,9 @@ void BufferCache::DownloadAhead(std::unique_lock<std::mutex>& lk,
     Vulkan::Check<"begin readback command buffer">(cmdbuf.begin(vk::CommandBufferBeginInfo{
         .flags = vk::CommandBufferUsageFlagBits::eOneTimeSubmit,
     }));
-    // The barrier's first scope holds every command submitted to the queue before this one,
-    // which includes all GPU writes to the windows.
+    // Without a readback queue, the barrier's first scope holds every command submitted to the
+    // graphics queue before this one, which includes all GPU writes to the windows. With one,
+    // the wait for wait_tick orders the copies after them.
     const vk::MemoryBarrier2 gpu_writes = {
         .srcStageMask = vk::PipelineStageFlagBits2::eAllCommands,
         .srcAccessMask = vk::AccessFlagBits2::eMemoryWrite,
@@ -521,9 +529,14 @@ void BufferCache::DownloadAhead(std::unique_lock<std::mutex>& lk,
         .pMemoryBarriers = &host_read,
     });
     Vulkan::Check<"end readback command buffer">(cmdbuf.end());
-    scheduler.SubmitOutOfBand(cmdbuf, *context->fence);
+    auto* const work_semaphore = scheduler.GetWorkSemaphore();
+    work_semaphore->Refresh();
+    stats.gpu_tick = work_semaphore->KnownGpuTick();
+    const u64 gpu_t0 = AmdGpu::PerfNs();
+    scheduler.SubmitOutOfBand(cmdbuf, *context->fence, wait_tick);
     Vulkan::Check<"wait for readback">(
         device.waitForFences(*context->fence, true, std::numeric_limits<u64>::max()));
+    stats.gpu_ns = AmdGpu::PerfNs() - gpu_t0;
     Vulkan::Check<"reset readback fence">(device.resetFences(*context->fence));
 
     context->staging->Invalidate(0, total_size_bytes);

@@ -29,13 +29,27 @@ Scheduler::~Scheduler() {
 #endif
 }
 
-void Scheduler::SubmitOutOfBand(vk::CommandBuffer cmdbuf, vk::Fence fence) const {
+void Scheduler::SubmitOutOfBand(vk::CommandBuffer cmdbuf, vk::Fence fence, u64 wait_tick) const {
+    // The submission signalling wait_tick makes the GPU writes before it available, the wait
+    // makes them visible to the copies.
+    const vk::Semaphore timeline = work_semaphore.Handle();
+    const vk::PipelineStageFlags wait_stage = vk::PipelineStageFlagBits::eTransfer;
+    const vk::TimelineSemaphoreSubmitInfo timeline_si = {
+        .waitSemaphoreValueCount = 1,
+        .pWaitSemaphoreValues = &wait_tick,
+    };
+    const bool own_queue = instance.HasReadbackQueue();
     const vk::SubmitInfo submit_info = {
+        .pNext = own_queue ? &timeline_si : nullptr,
+        .waitSemaphoreCount = own_queue ? 1U : 0U,
+        .pWaitSemaphores = &timeline,
+        .pWaitDstStageMask = &wait_stage,
         .commandBufferCount = 1,
         .pCommandBuffers = &cmdbuf,
     };
+    // Both queues are externally synchronized; without a readback queue it is the graphics one.
     std::scoped_lock lk{submit_mutex};
-    const auto submit_result = instance.GetGraphicsQueue().submit(submit_info, fence);
+    const auto submit_result = instance.GetReadbackQueue().submit(submit_info, fence);
     ASSERT_MSG(submit_result != vk::Result::eErrorDeviceLost, "Device lost during submit");
 }
 

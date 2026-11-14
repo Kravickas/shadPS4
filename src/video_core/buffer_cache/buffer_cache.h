@@ -162,6 +162,9 @@ private:
         u64 exec_t0;      ///< When the GPU thread started the readback, 0 if it did not run it
         u64 in_flight_ns; ///< Time spent waiting for overlapping downloads in flight
         u64 bytes;
+        u64 wait_tick; ///< Tick of the last GPU write to the downloaded windows
+        u64 gpu_tick;  ///< Tick the GPU had reached when the download was submitted
+        u64 gpu_ns;    ///< Download submit to fence signalled
         u32 windows;
         bool ahead;
     };
@@ -197,6 +200,9 @@ private:
     /// Whether every GPU write to the range was submitted before the open command buffer.
     /// Lock held.
     [[nodiscard]] bool IsGpuWriteSubmitted(VAddr device_addr, u64 size) const;
+
+    /// Scheduler tick of the last writable binding of the range, 0 if there was none. Lock held.
+    [[nodiscard]] u64 LastWriteTick(VAddr device_addr, u64 size) const;
 
     /// Whether a download in flight overlaps the range. Lock held.
     [[nodiscard]] bool OverlapsDownloadInFlight(VAddr start, VAddr end) const;
