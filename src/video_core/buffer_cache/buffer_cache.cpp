@@ -5,6 +5,7 @@
 #include <bit>
 #include <cstring>
 #include <limits>
+#include <Zydis/Zydis.h>
 #include <magic_enum/magic_enum.hpp>
 #include <xxhash.h>
 
@@ -160,6 +161,13 @@ void BufferCache::ReadMemory(VAddr device_addr, u64 size, bool is_write, bool as
                              bool assume_locks) {
     ReadbackStats stats{};
     const u64 rb_t0 = AmdGpu::PerfNs();
+    // Whether the faulting access itself touches GPU-modified bytes, or only shares the page.
+    const FaultAccess access = current_fault_access;
+    int touches_gpu = -1;
+    if (access.valid && access.bytes != 0) {
+        std::scoped_lock lk{modified_mutex};
+        touches_gpu = gpu_modified_ranges.Intersects(device_addr, access.bytes) ? 1 : 0;
+    }
     // 0: on the calling thread, 1: sent to the GPU thread, 2: already on the GPU thread.
     u32 path = 0;
     if (assume_locks) {
@@ -186,10 +194,16 @@ void BufferCache::ReadMemory(VAddr device_addr, u64 size, bool is_write, bool as
     LOG_INFO(Render,
              "PERF rb addr={:#x} size={:#x} write={} gpu_thread={} path={} t0={} t1={} "
              "exec_t0={} in_flight_us={} ahead={} batch_windows={} dl_bytes={} wait_tick={} "
-             "gpu_tick={} gpu_us={} thread={}",
+             "gpu_tick={} gpu_us={} insn={} acc_bytes={} lock={} rep={} touches_gpu={} rip={:#x} "
+             "thread={}",
              device_addr, size, is_write, assume_locks, path, rb_t0, rb_t1, stats.exec_t0,
              stats.in_flight_ns / 1000, stats.ahead, stats.windows, stats.bytes, stats.wait_tick,
-             stats.gpu_tick, stats.gpu_ns / 1000, Common::GetCurrentThreadName());
+             stats.gpu_tick, stats.gpu_ns / 1000,
+             access.mnemonic != 0
+                 ? ZydisMnemonicGetString(static_cast<ZydisMnemonic>(access.mnemonic))
+                 : "none",
+             access.bytes, access.lock, access.rep, touches_gpu, access.rip,
+             Common::GetCurrentThreadName());
 }
 
 bool BufferCache::ReadMemoryOnCallingThread(VAddr device_addr, u64 size, bool is_write,

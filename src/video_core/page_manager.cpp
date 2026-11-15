@@ -6,6 +6,7 @@
 #include "common/adaptive_mutex.h"
 #include "common/assert.h"
 #include "common/debug.h"
+#include "common/decoder.h"
 #include "common/div_ceil.h"
 #include "common/error.h"
 #include "common/multi_level_page_table.h"
@@ -436,12 +437,42 @@ struct SignalImpl : public PageManager::Impl {
         const auto size = std::min<u64>(8, PageManager::GetNextPageAddr(addr) - addr);
         const auto is_gpu_thread =
             std::this_thread::get_id() == rasterizer->GetGpuCommandProcessorThread();
+        DecodeFaultAccess(context);
+        bool handled;
         if (Common::IsWriteError(context)) {
-            return rasterizer->InvalidateMemory(addr, size, is_gpu_thread);
+            handled = rasterizer->InvalidateMemory(addr, size, is_gpu_thread);
         } else {
-            return rasterizer->ReadMemory(addr, size, is_gpu_thread);
+            handled = rasterizer->ReadMemory(addr, size, is_gpu_thread);
         }
-        return false;
+        current_fault_access.valid = false;
+        return handled;
+    }
+
+    /// Records which instruction faulted and the size of its memory access, for the readback
+    /// trace.
+    static void DecodeFaultAccess(void* context) {
+        auto& access = current_fault_access;
+        access = {};
+        access.rip = reinterpret_cast<VAddr>(Common::GetRip(context));
+        access.valid = true;
+        ZydisDecodedInstruction inst;
+        ZydisDecodedOperand operands[ZYDIS_MAX_OPERAND_COUNT];
+        if (!ZYAN_SUCCESS(Common::Decoder::Instance()->decodeInstruction(
+                inst, operands, reinterpret_cast<void*>(access.rip)))) {
+            return;
+        }
+        access.mnemonic = inst.mnemonic;
+        access.lock = (inst.attributes & ZYDIS_ATTRIB_HAS_LOCK) != 0;
+        access.rep = (inst.attributes &
+                      (ZYDIS_ATTRIB_HAS_REP | ZYDIS_ATTRIB_HAS_REPE | ZYDIS_ATTRIB_HAS_REPNE)) != 0;
+        for (u32 i = 0; i < inst.operand_count; ++i) {
+            const auto& operand = operands[i];
+            if (operand.type == ZYDIS_OPERAND_TYPE_MEMORY &&
+                operand.mem.type == ZYDIS_MEMOP_TYPE_MEM) {
+                access.bytes = operand.size / 8;
+                break;
+            }
+        }
     }
 };
 
