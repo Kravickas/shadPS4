@@ -232,7 +232,7 @@ static s32 ReserveVirtualRangeImpl(void** addr, u64 len, s32 flags, u64 alignmen
         return ORBIS_KERNEL_ERROR_EINVAL;
     }
     // Measured on hardware (DmemTest RV7): a fixed reservation over a direct mapping replaces it;
-    // with no-overwrite it is ENOMEM (MapMemory's checks). PoolReserve refuses it (M4).
+    // with no-overwrite it is ENOMEM (MapMemory's checks). PoolReserve does the same (M5, N5).
     auto map_flags = static_cast<Core::MemoryMapFlags>(flags);
 
     if (True(map_flags & Core::MemoryMapFlags::Fixed) && in_addr == 0) {
@@ -903,12 +903,9 @@ static s32 MemoryPoolReserveImpl(void* addr_in, u64 len, u64 alignment, s32 flag
 
     auto* memory = Core::Memory::Instance();
     const VAddr in_addr = reinterpret_cast<VAddr>(addr_in);
-    // Measured on hardware (DmemTest M4): a fixed pool reservation over a direct mapping is EINVAL,
-    // with or without no-overwrite. (ReserveVirtualRange replaces it: RV7.)
-    if ((flags & 0x10) != 0 && memory->ContainsVmaType(in_addr, len, Core::VMAType::Direct)) {
-        LOG_ERROR(Kernel_Vmm, "Fixed pool reservation over a direct mapping");
-        return ORBIS_KERNEL_ERROR_EINVAL;
-    }
+    // Measured on hardware (DmemTest M5, N5): a fixed pool reservation over a direct mapping
+    // replaces it; with no-overwrite it is ENOMEM (PoolReserve's checks), as for
+    // ReserveVirtualRange (RV7).
     const auto map_flags = static_cast<Core::MemoryMapFlags>(flags);
     u64 map_alignment = alignment <= 1 ? 2_MB : alignment;
 
