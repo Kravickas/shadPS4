@@ -381,7 +381,10 @@ PipelineCache::~PipelineCache() = default;
 
 const GraphicsPipeline* PipelineCache::GetGraphicsPipeline(const DrawIndirectParams params) {
     draw_indirect_params = params;
-    if (!RefreshGraphicsKey()) {
+    const u64 key_t0 = AmdGpu::PerfNs();
+    const bool key_valid = RefreshGraphicsKey();
+    AmdGpu::cp_perf.pipe_key_ns += AmdGpu::PerfNs() - key_t0;
+    if (!key_valid) {
         return nullptr;
     }
     const auto [it, is_new] = graphics_pipelines.try_emplace(graphics_key);

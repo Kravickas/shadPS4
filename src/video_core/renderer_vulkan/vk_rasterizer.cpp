@@ -254,6 +254,10 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset) {
     if (!pipeline) {
         return;
     }
+    if (pipeline != perf_last_pipeline) {
+        ++AmdGpu::cp_perf.pipe_changes;
+        perf_last_pipeline = pipeline;
+    }
 
     const u64 bind_t0 = AmdGpu::PerfNs();
     PrepareRenderState(pipeline);
@@ -270,7 +274,9 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset) {
 
     BindVertexBuffers(pipeline);
     if (is_indexed) {
+        const u64 index_t0 = AmdGpu::PerfNs();
         BindIndexBuffer(index_offset);
+        AmdGpu::cp_perf.index_ns += AmdGpu::PerfNs() - index_t0;
     }
     const u64 vb_t1 = AmdGpu::PerfNs();
     AmdGpu::cp_perf.draw_vb_ns += vb_t1 - bind_t3;
@@ -307,6 +313,7 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset) {
                     instance_offset);
     }
     DebugState.IncDrawCall();
+    AmdGpu::cp_perf.cmd_record_ns += AmdGpu::PerfNs() - rp_t1;
 
     ResetBindings(false);
     AmdGpu::cp_perf.draw_cmd_ns += AmdGpu::PerfNs() - rp_t1;
@@ -573,6 +580,7 @@ bool Rasterizer::BindResources(const Pipeline* pipeline) {
 }
 
 void Rasterizer::BindVertexBuffers(const GraphicsPipeline* pipeline) {
+    const u64 vi_t0 = AmdGpu::PerfNs();
     const auto& regs = liverpool->regs;
     VertexInputs<vk::VertexInputAttributeDescription2EXT> attributes;
     VertexInputs<vk::VertexInputBindingDescription2EXT> bindings;
@@ -586,6 +594,8 @@ void Rasterizer::BindVertexBuffers(const GraphicsPipeline* pipeline) {
         const auto cmdbuf = scheduler.CommandBuffer();
         cmdbuf.setVertexInputEXT(bindings, attributes);
     }
+    const u64 vi_t1 = AmdGpu::PerfNs();
+    AmdGpu::cp_perf.vi_inputs_ns += vi_t1 - vi_t0;
 
     if (bindings.empty()) {
         // If there are no bindings, there is nothing further to do.
@@ -637,6 +647,9 @@ void Rasterizer::BindVertexBuffers(const GraphicsPipeline* pipeline) {
                                    vk::AccessFlagBits2::eVertexAttributeRead);
     }
 
+    const u64 vi_t2 = AmdGpu::PerfNs();
+    AmdGpu::cp_perf.vi_obtain_ns += vi_t2 - vi_t1;
+
     // Bind vertex buffers
     VertexInputs<vk::Buffer> host_buffers;
     VertexInputs<vk::DeviceSize> host_offsets;
@@ -669,6 +682,7 @@ void Rasterizer::BindVertexBuffers(const GraphicsPipeline* pipeline) {
         cmdbuf.bindVertexBuffers2(0, num_buffers, host_buffers.data(), host_offsets.data(),
                                   host_sizes.data(), host_strides.data());
     }
+    AmdGpu::cp_perf.vi_bind_ns += AmdGpu::PerfNs() - vi_t2;
 }
 
 void Rasterizer::BindIndexBuffer(u32 index_offset, bool is_indirect) {
@@ -715,6 +729,9 @@ void Rasterizer::BindIndexBuffer(u32 index_offset, bool is_indirect) {
 }
 
 void Rasterizer::ResetBindings(bool is_compute) {
+    const u64 reset_t0 = AmdGpu::PerfNs();
+    AmdGpu::cp_perf.bound_images += static_cast<u32>(bound_images.size());
+    AmdGpu::cp_perf.bound_buffers += static_cast<u32>(bound_buffers.size());
     for (auto& image_id : bound_images) {
         auto& image = texture_cache.GetImage(image_id);
         if (image.binding.is_target || image.binding.is_storage) {
@@ -722,6 +739,8 @@ void Rasterizer::ResetBindings(bool is_compute) {
         }
         image.binding = {};
     }
+    const u64 reset_t1 = AmdGpu::PerfNs();
+    AmdGpu::cp_perf.reset_images_ns += reset_t1 - reset_t0;
     for (const auto [buffer, offset, size, src_access] : bound_buffers) {
         const auto dst_stage = is_compute ? vk::PipelineStageFlagBits2::eComputeShader
                                           : vk::PipelineStageFlagBits2::eAllGraphics;
@@ -730,6 +749,7 @@ void Rasterizer::ResetBindings(bool is_compute) {
     bound_images.clear();
     bound_buffers.clear();
     needs_barrier = false;
+    AmdGpu::cp_perf.reset_buffers_ns += AmdGpu::PerfNs() - reset_t1;
 }
 
 bool Rasterizer::IsComputeMetaClear(const Pipeline* pipeline) {

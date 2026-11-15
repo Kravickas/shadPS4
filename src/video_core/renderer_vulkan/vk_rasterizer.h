@@ -153,6 +153,7 @@ private:
     const u32 submit_draw_interval;
     u64 last_submit_tick{};
     u32 draws_since_submit{};
+    const GraphicsPipeline* perf_last_pipeline{};
 
     struct ImageBinding {
         VideoCore::ImageId image_id;

@@ -89,6 +89,17 @@ struct CpPerf {
     u64 obtain_upload_bytes;
     u32 obtain_texel;       ///< Read-only texel bindings checked against images
     u32 obtain_texel_image; ///< ... that were filled from metadata or an image
+    u64 pipe_key_ns;        ///< Pipeline lookup: RefreshGraphicsKey
+    u32 pipe_changes;       ///< Draws whose pipeline differs from the previous draw's
+    u64 vi_inputs_ns;       ///< Vertex buffers: GetVertexInputs and setVertexInputEXT
+    u64 vi_obtain_ns;       ///< Vertex buffers: range merge and ObtainBuffer
+    u64 vi_bind_ns;         ///< Vertex buffers: bindVertexBuffers
+    u64 index_ns;           ///< BindIndexBuffer
+    u64 cmd_record_ns;      ///< Draw offsets, bindPipeline and draw call
+    u64 reset_images_ns;    ///< ResetBindings: bound images
+    u64 reset_buffers_ns;   ///< ResetBindings: AccessBuffer of bound buffers
+    u32 bound_buffers;      ///< Buffers tracked for barriers
+    u32 bound_images;
     u32 tex_lookups;
     u32 tex_hits;
     u32 rb_downloads; ///< Buffer readbacks downloaded
