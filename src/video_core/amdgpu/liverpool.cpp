@@ -203,6 +203,8 @@ void Liverpool::Process(std::stop_token stoken) {
             "obtain_stream={} obtain_stream_kb={} obtain_written={} obtain_uploads={} "
             "obtain_upload_kb={} obtain_texel={} obtain_texel_image={} obtain_stream_reused={} "
             "obtain_stream_reused_kb={} pipe_key_us={} pipe_stages_us={} pipe_changes={} "
+            "stg_params_us={} stg_runtime_us={} stg_lookup_us={} stg_flatbuf_us={} "
+            "stg_spec_us={} stg_find_us={} stg_calls={} stg_perms_scanned={} "
             "vi_inputs_us={} "
             "vi_obtain_us={} vi_bind_us={} index_us={} cmd_record_us={} reset_images_us={} "
             "reset_buffers_us={} bound_buffers={} bound_images={} tex_lookups={} tex_hits={}",
@@ -229,6 +231,9 @@ void Liverpool::Process(std::stop_token stoken) {
             cp_perf.obtain_upload_bytes / 1024, cp_perf.obtain_texel, cp_perf.obtain_texel_image,
             cp_perf.obtain_stream_reused, cp_perf.obtain_stream_reused_bytes / 1024,
             cp_perf.pipe_key_ns / 1000, cp_perf.pipe_stages_ns / 1000, cp_perf.pipe_changes,
+            cp_perf.stg_params_ns / 1000, cp_perf.stg_runtime_ns / 1000,
+            cp_perf.stg_lookup_ns / 1000, cp_perf.stg_flatbuf_ns / 1000, cp_perf.stg_spec_ns / 1000,
+            cp_perf.stg_find_ns / 1000, cp_perf.stg_calls, cp_perf.stg_perms_scanned,
             cp_perf.vi_inputs_ns / 1000, cp_perf.vi_obtain_ns / 1000, cp_perf.vi_bind_ns / 1000,
             cp_perf.index_ns / 1000, cp_perf.cmd_record_ns / 1000, cp_perf.reset_images_ns / 1000,
             cp_perf.reset_buffers_ns / 1000, cp_perf.bound_buffers, cp_perf.bound_images,

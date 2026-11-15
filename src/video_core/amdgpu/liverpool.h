@@ -92,14 +92,23 @@ struct CpPerf {
     u64 pipe_key_ns;        ///< Pipeline lookup: RefreshGraphicsKey
     u64 pipe_stages_ns;     ///< Pipeline lookup: RefreshGraphicsStages
     u32 pipe_changes;       ///< Draws whose pipeline differs from the previous draw's
-    u64 vi_inputs_ns;       ///< Vertex buffers: GetVertexInputs and setVertexInputEXT
-    u64 vi_obtain_ns;       ///< Vertex buffers: range merge and ObtainBuffer
-    u64 vi_bind_ns;         ///< Vertex buffers: bindVertexBuffers
-    u64 index_ns;           ///< BindIndexBuffer
-    u64 cmd_record_ns;      ///< Draw offsets, bindPipeline and draw call
-    u64 reset_images_ns;    ///< ResetBindings: bound images
-    u64 reset_buffers_ns;   ///< ResetBindings: AccessBuffer of bound buffers
-    u32 bound_buffers;      ///< Buffers tracked for barriers
+    /// Shader stage sub-steps, timed on every 8th draw and scaled by 8
+    u64 stg_params_ns;
+    u64 stg_runtime_ns;
+    u64 stg_lookup_ns;
+    u64 stg_flatbuf_ns;
+    u64 stg_spec_ns;
+    u64 stg_find_ns;
+    u32 stg_calls;         ///< GetProgram calls for an existing program
+    u32 stg_perms_scanned; ///< Permutations compared before the match, scaled
+    u64 vi_inputs_ns;      ///< Vertex buffers: GetVertexInputs and setVertexInputEXT
+    u64 vi_obtain_ns;      ///< Vertex buffers: range merge and ObtainBuffer
+    u64 vi_bind_ns;        ///< Vertex buffers: bindVertexBuffers
+    u64 index_ns;          ///< BindIndexBuffer
+    u64 cmd_record_ns;     ///< Draw offsets, bindPipeline and draw call
+    u64 reset_images_ns;   ///< ResetBindings: bound images
+    u64 reset_buffers_ns;  ///< ResetBindings: AccessBuffer of bound buffers
+    u32 bound_buffers;     ///< Buffers tracked for barriers
     u32 bound_images;
     u32 tex_lookups;
     u32 tex_hits;

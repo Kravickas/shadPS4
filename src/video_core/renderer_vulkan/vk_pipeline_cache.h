@@ -144,6 +144,10 @@ private:
     tsl::robin_map<vk::ShaderModule,
                    std::vector<std::variant<GraphicsPipelineKey, ComputePipelineKey>>>
         module_related_pipelines;
+
+    static constexpr u32 PerfSampleRate = 8;
+    u32 perf_sample_counter{};
+    bool perf_sample{};
 };
 
 } // namespace Vulkan

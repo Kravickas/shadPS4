@@ -550,6 +550,7 @@ bool PipelineCache::RefreshGraphicsStages() {
     const auto& regs = liverpool->regs;
     auto& key = graphics_key;
     fetch_shader = nullptr;
+    perf_sample = (perf_sample_counter++ & (PerfSampleRate - 1)) == 0;
 
     Shader::Backend::Bindings binding{};
     const auto bind_stage = [&](HwStage stage_in, SwStage stage_out) -> bool {
@@ -568,7 +569,11 @@ bool PipelineCache::RefreshGraphicsStages() {
             return false;
         }
 
+        const u64 params_t0 = perf_sample ? AmdGpu::PerfNs() : 0;
         const auto params = AmdGpu::GetParams(*pgm);
+        if (perf_sample) {
+            AmdGpu::cp_perf.stg_params_ns += (AmdGpu::PerfNs() - params_t0) * PerfSampleRate;
+        }
         std::tie(infos[stage_out_idx], modules[stage_out_idx], key.stage_hashes[stage_out_idx]) =
             GetProgram(stage_in, stage_out, params, binding);
         return true;
@@ -669,6 +674,8 @@ bool PipelineCache::RefreshComputeKey() {
     Shader::Backend::Bindings binding{};
     const auto& cs_pgm = liverpool->GetCsRegs();
     const auto cs_params = AmdGpu::GetParams(cs_pgm);
+    // The shader stage timers sample graphics draws only.
+    perf_sample = false;
     std::tie(infos[0], modules[0], compute_key.value) =
         GetProgram(HwStage::Compute, SwStage::Compute, cs_params, binding);
     return true;
@@ -710,8 +717,12 @@ vk::ShaderModule PipelineCache::CompileModule(Shader::Info& info, Shader::Runtim
 PipelineCache::Result PipelineCache::GetProgram(HwStage hw_stage, SwStage sw_stage,
                                                 const Shader::ShaderParams& params,
                                                 Shader::Backend::Bindings& binding) {
+    const bool sample = perf_sample;
+    const u64 t0 = sample ? AmdGpu::PerfNs() : 0;
     auto runtime_info = BuildRuntimeInfo(hw_stage, sw_stage);
+    const u64 t1 = sample ? AmdGpu::PerfNs() : 0;
     auto [it_pgm, new_program] = program_cache.try_emplace(params.hash);
+    const u64 t2 = sample ? AmdGpu::PerfNs() : 0;
     if (new_program) {
         it_pgm.value() = std::make_unique<Program>(hw_stage, sw_stage, params);
         auto& program = it_pgm.value();
@@ -733,7 +744,9 @@ PipelineCache::Result PipelineCache::GetProgram(HwStage hw_stage, SwStage sw_sta
     info.pgm_base = params.Base(); // Needs to be actualized for inline cbuffer address fixup
     info.user_data = params.user_data;
     info.RefreshFlatBuf();
+    const u64 t3 = sample ? AmdGpu::PerfNs() : 0;
     auto spec = Shader::StageSpecialization(info, runtime_info, profile, binding);
+    const u64 t4 = sample ? AmdGpu::PerfNs() : 0;
 
     size_t perm_idx = program->modules.size();
     u64 perm_hash = HashCombine(params.hash, perm_idx);
@@ -741,6 +754,17 @@ PipelineCache::Result PipelineCache::GetProgram(HwStage hw_stage, SwStage sw_sta
     vk::ShaderModule module{};
 
     const auto it = std::ranges::find(program->modules, spec, &Program::Module::spec);
+    ++AmdGpu::cp_perf.stg_calls;
+    if (sample) {
+        auto& perf = AmdGpu::cp_perf;
+        perf.stg_runtime_ns += (t1 - t0) * PerfSampleRate;
+        perf.stg_lookup_ns += (t2 - t1) * PerfSampleRate;
+        perf.stg_flatbuf_ns += (t3 - t2) * PerfSampleRate;
+        perf.stg_spec_ns += (t4 - t3) * PerfSampleRate;
+        perf.stg_find_ns += (AmdGpu::PerfNs() - t4) * PerfSampleRate;
+        perf.stg_perms_scanned +=
+            static_cast<u32>((std::distance(program->modules.begin(), it) + 1) * PerfSampleRate);
+    }
     if (it == program->modules.end()) {
         auto new_info = Shader::Info(hw_stage, sw_stage, params);
         module = CompileModule(new_info, runtime_info, params.code, perm_idx, binding);
