@@ -1,4 +1,4 @@
-// SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
+// SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include "common/assert.h"
@@ -1715,17 +1715,17 @@ constexpr std::array<InstFormat, 883> InstructionFormatVOP3 = {
      {InstClass::VectorConv, InstCategory::VectorALU, 1, 1, ScalarType::Float32,
       ScalarType::Float64},
      // 401 = V_CVT_F32_UBYTE0
-     {InstClass::VectorConv, InstCategory::VectorALU, 1, 1, ScalarType::Undefined,
-      ScalarType::Undefined},
+     {InstClass::VectorConv, InstCategory::VectorALU, 1, 1, ScalarType::Uint32,
+      ScalarType::Float32},
      // 402 = V_CVT_F32_UBYTE1
-     {InstClass::VectorConv, InstCategory::VectorALU, 1, 1, ScalarType::Undefined,
-      ScalarType::Undefined},
+     {InstClass::VectorConv, InstCategory::VectorALU, 1, 1, ScalarType::Uint32,
+      ScalarType::Float32},
      // 403 = V_CVT_F32_UBYTE2
-     {InstClass::VectorConv, InstCategory::VectorALU, 1, 1, ScalarType::Undefined,
-      ScalarType::Undefined},
+     {InstClass::VectorConv, InstCategory::VectorALU, 1, 1, ScalarType::Uint32,
+      ScalarType::Float32},
      // 404 = V_CVT_F32_UBYTE3
-     {InstClass::VectorConv, InstCategory::VectorALU, 1, 1, ScalarType::Undefined,
-      ScalarType::Undefined},
+     {InstClass::VectorConv, InstCategory::VectorALU, 1, 1, ScalarType::Uint32,
+      ScalarType::Float32},
      // 405 = V_CVT_U32_F64
      {InstClass::VectorConv, InstCategory::VectorALU, 1, 1, ScalarType::Float64,
       ScalarType::Uint32},
@@ -4032,11 +4032,11 @@ constexpr std::array<InstFormat, 114> InstructionFormatMUBUF = {{
     {},
     {},
     // 112 = BUFFER_WBINVL1_SC
-    {InstClass::VectorMemL1Cache, InstCategory::VectorMemory, 4, 1, ScalarType::Undefined,
-     ScalarType::Undefined},
+    {InstClass::VectorMemL1Cache, InstCategory::VectorMemory, 0, 0, ScalarType::Any,
+     ScalarType::Any},
     // 113 = BUFFER_WBINVL1
-    {InstClass::VectorMemL1Cache, InstCategory::VectorMemory, 4, 1, ScalarType::Undefined,
-     ScalarType::Undefined},
+    {InstClass::VectorMemL1Cache, InstCategory::VectorMemory, 0, 0, ScalarType::Any,
+     ScalarType::Any},
 }};
 
 constexpr std::array<InstFormat, 8> InstructionFormatMTBUF = {{
