@@ -17,9 +17,9 @@
 #include "core/emulator_settings.h"
 #include "core/libraries/error_codes.h"
 #include "core/libraries/libs.h"
+#include "core/libraries/net/net_util.h"
 #include "core/libraries/network/net_ctl_codes.h"
 #include "core/libraries/network/netctl.h"
-#include "net_util.h"
 
 namespace Libraries::NetCtl {
 
@@ -96,7 +96,7 @@ int PS4_SYSV_ABI sceNetCtlUnregisterCallbackV6() {
 }
 
 int PS4_SYSV_ABI sceNetCtlCheckCallback() {
-    LOG_DEBUG(Lib_NetCtl, "(STUBBED) called");
+    netctl.CheckCallback();
     return ORBIS_OK;
 }
 
@@ -426,9 +426,8 @@ int PS4_SYSV_ABI sceNetCtlTerm() {
     return ORBIS_OK;
 }
 
-int PS4_SYSV_ABI sceNetCtlUnregisterCallback() {
-    LOG_ERROR(Lib_NetCtl, "(STUBBED) called");
-    return ORBIS_OK;
+int PS4_SYSV_ABI sceNetCtlUnregisterCallback(int cid) {
+    return netctl.UnregisterCallback(cid);
 }
 
 int PS4_SYSV_ABI sceNetCtlUnregisterCallbackForLibIpcInt() {
@@ -457,7 +456,7 @@ int PS4_SYSV_ABI Func_D8DCB6973537A3DC() {
 }
 
 int PS4_SYSV_ABI sceNetCtlCheckCallbackForNpToolkit() {
-    LOG_DEBUG(Lib_NetCtl, "(STUBBED) called");
+    netctl.CheckNpToolkitCallback();
     return ORBIS_OK;
 }
 
@@ -480,9 +479,8 @@ int PS4_SYSV_ABI sceNetCtlRegisterCallbackForNpToolkit(OrbisNetCtlCallbackForNpT
     return ORBIS_OK;
 }
 
-int PS4_SYSV_ABI sceNetCtlUnregisterCallbackForNpToolkit() {
-    LOG_ERROR(Lib_NetCtl, "(STUBBED) called");
-    return ORBIS_OK;
+int PS4_SYSV_ABI sceNetCtlUnregisterCallbackForNpToolkit(int cid) {
+    return netctl.UnregisterNpToolkitCallback(cid);
 }
 
 int PS4_SYSV_ABI sceNetCtlApCheckCallback() {

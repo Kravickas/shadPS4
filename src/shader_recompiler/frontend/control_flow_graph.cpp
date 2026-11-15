@@ -1,4 +1,4 @@
-// SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
+// SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
@@ -55,6 +55,9 @@ static bool IgnoresExecMask(const GcnInst& inst) {
         return true;
     default:
         break;
+    }
+    if (inst.category == InstCategory::Export && inst.control.exp.vm) {
+        return true;
     }
     // Read/Write Lane instructions are not affected either.
     switch (inst.opcode) {
@@ -192,7 +195,7 @@ void CFG::SplitDivergenceScopes() {
             if ((is_close || index == blk->end_index) && curr_begin != -1) {
                 // If there are no instructions inside scope don't do anything.
                 if (index - curr_begin == 1 && is_close) {
-                    curr_begin = -1;
+                    curr_begin = is_open_scope(inst) ? static_cast<s32>(index) : -1;
                     continue;
                 }
                 // If all instructions in the scope ignore exec masking, we shouldn't insert a
@@ -323,6 +326,7 @@ void CFG::LinkBlocks() {
         // need to link with the next block.
         if (!end_inst.IsTerminateInstruction()) {
             auto* next_block = get_block(block.end);
+            block.cond = IR::Condition::True;
             block.branch_true = next_block;
             block.end_class = EndClass::Branch;
             next_block->num_predecessors++;

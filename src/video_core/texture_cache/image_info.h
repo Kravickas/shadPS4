@@ -5,15 +5,15 @@
 
 #include "common/types.h"
 #include "video_core/amdgpu/cb_db_extent.h"
+#include "video_core/amdgpu/resource.h"
 #include "video_core/amdgpu/tiling.h"
 #include "video_core/renderer_vulkan/vk_common.h"
+#include "video_core/texture_cache/tile.h"
 #include "video_core/texture_cache/types.h"
 
 namespace AmdGpu {
 struct ColorBuffer;
 struct DepthBuffer;
-struct Image;
-enum class ImageType : u64;
 } // namespace AmdGpu
 
 namespace Libraries::VideoOut {
@@ -41,7 +41,7 @@ struct ImageInfo {
     ImageInfo(const AmdGpu::ColorBuffer& buffer, AmdGpu::CbDbExtent hint) noexcept;
     ImageInfo(const AmdGpu::DepthBuffer& buffer, u32 num_slices, VAddr htile_address,
               AmdGpu::CbDbExtent hint, bool write_buffer = false) noexcept;
-    ImageInfo(const AmdGpu::Image& image, const Shader::ImageResource& desc) noexcept;
+    ImageInfo(const AmdGpu::Image& sharp, const Shader::ImageResource& desc) noexcept;
 
     bool IsTiled() const {
         return tile_mode != AmdGpu::TileMode::DisplayLinearAligned;
@@ -56,7 +56,21 @@ struct ImageInfo {
     s32 SliceOf(const ImageInfo& info, s32 mip) const;
 
     bool IsCompatible(const ImageInfo& info) const;
-    void UpdateSize();
+
+    bool IsSubrectOf(const ImageInfo& info) const {
+        return (size.width < info.size.width || size.height < info.size.height) &&
+               size.width <= info.size.width && size.height <= info.size.height &&
+               size.depth == 1 && info.size.depth == 1 && guest_address == info.guest_address &&
+               guest_size <= info.guest_size && type == AmdGpu::ImageType::Color2D &&
+               type == info.type && resources.levels == 1 && resources.layers == 1 &&
+               info.resources.levels == 1 && info.resources.layers == 1 && !props.is_depth &&
+               !info.props.is_depth && !props.is_block && !info.props.is_block &&
+               pixel_format == info.pixel_format && num_bits == info.num_bits &&
+               num_samples == info.num_samples && pitch == info.pitch &&
+               tile_mode == info.tile_mode && bank_swizzle == info.bank_swizzle &&
+               alt_tile == info.alt_tile && mips_layout[0].pitch == info.mips_layout[0].pitch;
+    }
+    void UpdateSize() noexcept;
 
     struct {
         VAddr cmask_addr;
@@ -65,29 +79,22 @@ struct ImageInfo {
         s32 htile_clear_mask = -1;
     } meta_info{};
 
-    ImageProperties props{};
-    vk::Format pixel_format = vk::Format::eUndefined;
+    ImageProperties props;
+    vk::Format pixel_format;
     AmdGpu::ImageType type;
     SubresourceExtent resources;
-    Extent3D size{1, 1, 1};
-    u32 num_bits{};
-    u32 num_samples = 1;
-    u32 pitch{};
-    AmdGpu::TileMode tile_mode = AmdGpu::TileMode::DisplayLinearAligned;
-    AmdGpu::ArrayMode array_mode = AmdGpu::ArrayMode::ArrayLinearAligned;
-    struct MipInfo {
-        u32 size;
-        u32 pitch;
-        u32 height;
-        u32 offset;
-    };
-    std::array<MipInfo, 16> mips_layout;
+    Extent3D size;
+    u32 num_bits;
+    u32 num_samples;
+    u32 pitch;
+    AmdGpu::TileMode tile_mode;
+    AmdGpu::ArrayMode array_mode;
+    std::array<MipInfo, MAX_MIPS> mips_layout;
     u32 micro_tiled_mips{};
-    VAddr guest_address{};
-    u32 guest_size{};
+    VAddr guest_address;
+    u32 guest_size;
     u8 bank_swizzle{};
     bool alt_tile{};
-
     VAddr stencil_addr{};
     u32 stencil_size{};
 };

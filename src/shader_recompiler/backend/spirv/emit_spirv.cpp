@@ -1,4 +1,4 @@
-// SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
+// SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <mutex>
@@ -145,6 +145,8 @@ Id TypeId(const EmitContext& ctx, IR::Type type) {
         return ctx.U32[4];
     case IR::Type::F32:
         return ctx.F32[1];
+    case IR::Type::F32x2:
+        return ctx.F32[2];
     case IR::Type::U64:
         return ctx.U64;
     default:
@@ -291,7 +293,8 @@ void SetupCapabilities(const Info& info, const Profile& profile, const RuntimeIn
         ctx.AddCapability(spv::Capability::ImageQuery);
     }
     if ((info.uses_image_atomic_float_min_max && profile.supports_image_fp32_atomic_min_max) ||
-        (info.uses_buffer_atomic_float_min_max && profile.supports_buffer_fp32_atomic_min_max)) {
+        (info.uses_buffer_atomic_float_min_max && profile.supports_buffer_fp32_atomic_min_max) ||
+        (info.uses_shared_atomic_float_min_max && profile.supports_shared_fp32_atomic_min_max)) {
         ctx.AddExtension("SPV_EXT_shader_atomic_float_min_max");
         ctx.AddCapability(spv::Capability::AtomicFloat32MinMaxEXT);
     }
@@ -367,8 +370,7 @@ void SetupCapabilities(const Info& info, const Profile& profile, const RuntimeIn
         ctx.AddCapability(spv::Capability::PhysicalStorageBufferAddresses);
         ctx.AddExtension("SPV_KHR_physical_storage_buffer");
     }
-    const auto shared_type_count = std::popcount(static_cast<u32>(info.shared_types));
-    if (shared_type_count > 1 && profile.supports_workgroup_explicit_memory_layout) {
+    if (info.uses_aliased_shared_memory && profile.supports_workgroup_explicit_memory_layout) {
         ctx.AddExtension("SPV_KHR_workgroup_memory_explicit_layout");
         ctx.AddCapability(spv::Capability::WorkgroupMemoryExplicitLayoutKHR);
         ctx.AddCapability(spv::Capability::WorkgroupMemoryExplicitLayout16BitAccessKHR);
@@ -388,7 +390,8 @@ void SetupCapabilities(const Info& info, const Profile& profile, const RuntimeIn
     }
 }
 
-void DefineEntryPoint(const Info& info, EmitContext& ctx, Id main) {
+void DefineEntryPoint(const Info& info, const RuntimeInfo& runtime_info, EmitContext& ctx,
+                      Id main) {
     const std::span interfaces(ctx.interfaces.data(), ctx.interfaces.size());
     spv::ExecutionModel execution_model{};
     switch (info.sw_stage) {
@@ -418,7 +421,7 @@ void DefineEntryPoint(const Info& info, EmitContext& ctx, Id main) {
                                        : spv::ExecutionMode::VertexOrderCw);
         break;
     }
-    case SwStage::Fragment:
+    case SwStage::Fragment: {
         execution_model = spv::ExecutionModel::Fragment;
         if (ctx.profile.lower_left_origin_mode) {
             ctx.AddExecutionMode(main, spv::ExecutionMode::OriginLowerLeft);
@@ -428,10 +431,16 @@ void DefineEntryPoint(const Info& info, EmitContext& ctx, Id main) {
         if (info.has_discard) {
             ctx.AddCapability(spv::Capability::DemoteToHelperInvocation);
         }
-        if (info.stores.GetAny(IR::Attribute::Depth)) {
+        const bool stores_depth = info.stores.Get(IR::Attribute::Depth);
+        if (stores_depth) {
             ctx.AddExecutionMode(main, spv::ExecutionMode::DepthReplacing);
         }
+        if (runtime_info.hw.fs.depth_before_shader) {
+            ctx.AddExecutionMode(main, spv::ExecutionMode::EarlyFragmentTests);
+            ASSERT_MSG(!stores_depth, "DEPTH_BEFORE_SHADER enabled with depth exporting shader");
+        }
         break;
+    }
     case SwStage::Geometry:
         execution_model = spv::ExecutionModel::Geometry;
         ctx.AddExecutionMode(main, GetInputPrimitiveType(ctx.runtime_info.hw.gs.in_primitive));
@@ -586,6 +595,9 @@ void SetupRoundingMode(EmitContext& ctx, const Profile& profile, const RuntimeIn
 
 void SetupInfNanPreserveMode(EmitContext& ctx, const Profile& profile,
                              const RuntimeInfo& runtime_info, Id main_func) {
+    if (profile.fast_shader_math) {
+        return;
+    }
     if (profile.support_fp16_signed_zero_inf_nan_preserve ||
         profile.support_fp32_signed_zero_inf_nan_preserve ||
         profile.support_fp64_signed_zero_inf_nan_preserve) {
@@ -659,7 +671,7 @@ std::vector<u32> EmitSPIRV(const Profile& profile, const RuntimeInfo& runtime_in
                            const IR::Program& program, Bindings& binding) {
     EmitContext ctx{profile, runtime_info, program.info, binding};
     const Id main{DefineMain(ctx, program)};
-    DefineEntryPoint(program.info, ctx, main);
+    DefineEntryPoint(program.info, runtime_info, ctx, main);
     SetupCapabilities(program.info, profile, runtime_info, ctx);
     SetupFloatMode(ctx, profile, runtime_info, main);
     PatchPhiNodes(program, ctx);

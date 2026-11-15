@@ -1,7 +1,8 @@
 // SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
-#include <ranges>
+#include <memory>
+#include "common/alignment.h"
 #include "common/assert.h"
 #include "video_core/renderer_vulkan/liverpool_to_vk.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
@@ -103,7 +104,7 @@ void UniqueImage::Destroy() {
 void UniqueImage::Create(const vk::ImageCreateInfo& image_ci) {
     this->image_ci = image_ci;
     ASSERT(!image);
-    const VmaAllocationCreateInfo alloc_ci = {
+    VmaAllocationCreateInfo alloc_ci = {
         .flags = VMA_ALLOCATION_CREATE_WITHIN_BUDGET_BIT,
         .usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE,
         .requiredFlags = 0,
@@ -117,6 +118,13 @@ void UniqueImage::Create(const vk::ImageCreateInfo& image_ci) {
     VmaAllocationInfo alloc_info{};
     VkResult result = vmaCreateImage(allocator, &image_ci_unsafe, &alloc_ci, &unsafe_image,
                                      &allocation, &alloc_info);
+    if (result == VK_ERROR_OUT_OF_DEVICE_MEMORY) {
+        alloc_ci.flags &= ~VMA_ALLOCATION_CREATE_WITHIN_BUDGET_BIT;
+        LOG_WARNING(Render_Vulkan, "Allocating image of size {} bytes over budget.",
+                    alloc_info.size);
+        result = vmaCreateImage(allocator, &image_ci_unsafe, &alloc_ci, &unsafe_image, &allocation,
+                                &alloc_info);
+    }
     ASSERT_MSG(result == VK_SUCCESS, "Failed allocating image with error {}",
                vk::to_string(vk::Result{result}));
     image = vk::Image{unsafe_image};
@@ -131,7 +139,6 @@ Image::Image(const Vulkan::Instance& instance, Vulkan::Runtime& runtime_,
     }
 
     image_uid = global_image_uid.Next();
-    mip_hashes.resize(info.resources.levels);
     vk::ImageCreateFlags flags{vk::ImageCreateFlagBits::eMutableFormat |
                                vk::ImageCreateFlagBits::eExtendedUsage};
     if (info.props.is_volume) {
@@ -190,10 +197,7 @@ Image::Image(const Vulkan::Instance& instance, Vulkan::Runtime& runtime_,
         .initialLayout = vk::ImageLayout::eUndefined,
     };
 
-    backing = &backing_images.emplace_back();
-    backing->num_samples = info.num_samples;
-    backing->image = UniqueImage{instance.GetDevice(), instance.GetAllocator()};
-    backing->image.Create(image_ci);
+    backing = &AddBacking(image_ci, info.num_samples);
 
     Vulkan::SetObjectName(instance.GetDevice(), GetImage(),
                           "Image {}x{}x{} {} {} {:#x}:{:#x} L:{} M:{} S:{}", info.size.width,
@@ -204,27 +208,48 @@ Image::Image(const Vulkan::Instance& instance, Vulkan::Runtime& runtime_,
 
 Image::~Image() = default;
 
+Image::BackingImage& Image::AddBacking(const vk::ImageCreateInfo& create_info, u32 num_samples) {
+    const auto previous_size = memory_usage_counter ? Common::AlignUp(SizeBytes(), 1024) : 0;
+    const size_t backing_index = backing ? backing - backing_images.data() : 0;
+    auto& added_backing = backing_images.emplace_back();
+    backing = &backing_images[backing_index];
+
+    const auto& instance = runtime->GetInstance();
+    added_backing.num_samples = num_samples;
+    added_backing.image = UniqueImage{instance.GetDevice(), instance.GetAllocator()};
+    added_backing.image.Create(create_info);
+    if (memory_usage_counter) {
+        *memory_usage_counter += Common::AlignUp(SizeBytes(), 1024) - previous_size;
+    }
+    return added_backing;
+}
+
 ImageView& Image::FindView(const ImageViewInfo& view_info, bool ensure_guest_samples) {
     if (ensure_guest_samples && backing->num_samples > 1 != info.num_samples > 1) {
         runtime->SetBackingSamples(this, info.num_samples);
     }
-    const auto& view_infos = backing->image_view_infos;
+    return FindView(view_info, *backing);
+}
+
+ImageView& Image::FindView(const ImageViewInfo& view_info, BackingImage& view_backing) {
+    const auto& view_infos = view_backing.image_view_infos;
     const auto it = std::ranges::find(view_infos, view_info);
     if (it != view_infos.end()) {
-        const auto view_id = backing->image_view_ids[std::distance(view_infos.begin(), it)];
+        const auto view_id = view_backing.image_view_ids[std::distance(view_infos.begin(), it)];
         return (*slot_image_views)[view_id];
     }
-    const auto view_id = slot_image_views->Insert(runtime->GetInstance(), view_info, *this);
-    backing->image_view_infos.emplace_back(view_info);
-    backing->image_view_ids.emplace_back(view_id);
+    const auto view_id = slot_image_views->Insert(runtime->GetInstance(), view_info, *this,
+                                                  view_backing.image.image);
+    view_backing.image_view_infos.emplace_back(view_info);
+    view_backing.image_view_ids.emplace_back(view_id);
     return (*slot_image_views)[view_id];
 }
 
-void Image::GetBarriers(Barriers& barriers, vk::ImageLayout dst_layout, vk::AccessFlags2 dst_mask,
-                        vk::PipelineStageFlags2 dst_stage,
+void Image::GetBarriers(Barriers& barriers, BackingImage& image_backing, vk::ImageLayout dst_layout,
+                        vk::AccessFlags2 dst_mask, vk::PipelineStageFlags2 dst_stage,
                         std::optional<SubresourceRange> subres_range) {
-    auto& last_state = backing->state;
-    auto& subresource_states = backing->subresource_states;
+    auto& last_state = image_backing.state;
+    auto& subresource_states = image_backing.subresource_states;
 
     const bool needs_partial_transition =
         subres_range &&
@@ -240,19 +265,16 @@ void Image::GetBarriers(Barriers& barriers, vk::ImageLayout dst_layout, vk::Acce
         // In case of partial transition, we need to change the specified subresources only.
         // Otherwise all subresources need to be set to the same state so we can use a full
         // resource transition for the next time.
-        const auto mips =
-            needs_partial_transition
-                ? std::ranges::views::iota(subres_range->base.level,
-                                           subres_range->base.level + subres_range->extent.levels)
-                : std::views::iota(0u, info.resources.levels);
-        const auto layers =
-            needs_partial_transition
-                ? std::ranges::views::iota(subres_range->base.layer,
-                                           subres_range->base.layer + subres_range->extent.layers)
-                : std::views::iota(0u, info.resources.layers);
-
-        for (u32 mip : mips) {
-            for (u32 layer : layers) {
+        const u32 start_mip = needs_partial_transition ? subres_range->base.level : u16{0};
+        const u32 end_mip = needs_partial_transition
+                                ? subres_range->base.level + subres_range->extent.levels
+                                : info.resources.levels;
+        const u32 start_layer = needs_partial_transition ? subres_range->base.layer : u16{0};
+        const u32 end_layer = needs_partial_transition
+                                  ? subres_range->base.layer + subres_range->extent.layers
+                                  : info.resources.layers;
+        for (u32 mip = start_mip; mip < end_mip; ++mip) {
+            for (u32 layer = start_layer; layer < end_layer; ++layer) {
                 // NOTE: these loops may produce a lot of small barriers.
                 // If this becomes a problem, we can optimize it by merging adjacent barriers.
                 const auto subres_idx = mip * info.resources.layers + layer;
@@ -273,7 +295,7 @@ void Image::GetBarriers(Barriers& barriers, vk::ImageLayout dst_layout, vk::Acce
                         .newLayout = dst_layout,
                         .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
                         .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-                        .image = GetImage(),
+                        .image = image_backing.image.image,
                         .subresourceRange{
                             .aspectMask = aspect_mask,
                             .baseMipLevel = mip,
@@ -309,7 +331,7 @@ void Image::GetBarriers(Barriers& barriers, vk::ImageLayout dst_layout, vk::Acce
             .newLayout = dst_layout,
             .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
             .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-            .image = GetImage(),
+            .image = image_backing.image.image,
             .subresourceRange{
                 .aspectMask = aspect_mask,
                 .baseMipLevel = 0,

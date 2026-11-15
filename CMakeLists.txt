@@ -6,6 +6,7 @@ cmake_minimum_required(VERSION 3.24)
 
 set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED True)
+set(CMAKE_CXX_SCAN_FOR_MODULES OFF)
 
 if(APPLE)
     list(APPEND ADDITIONAL_LANGUAGES OBJC)
@@ -213,7 +214,7 @@ execute_process(
 
 # Set Version
 set(EMULATOR_VERSION_MAJOR "0")
-set(EMULATOR_VERSION_MINOR "18")
+set(EMULATOR_VERSION_MINOR "21")
 set(EMULATOR_VERSION_PATCH "1")
 
 set_source_files_properties(src/dist/shadps4.rc PROPERTIES COMPILE_DEFINITIONS "EMULATOR_VERSION_MAJOR=${EMULATOR_VERSION_MAJOR};EMULATOR_VERSION_MINOR=${EMULATOR_VERSION_MINOR};EMULATOR_VERSION_PATCH=${EMULATOR_VERSION_PATCH}")
@@ -259,6 +260,7 @@ if (ENABLE_SYSTEM_LIBRARIES)
     find_package(ZArchive 0.1.2 MODULE)
     find_package(ZLIB 1.3 MODULE)
     find_package(Zydis 5.0.0 MODULE)
+    find_package(zstd 1.5.6 CONFIG)
     find_package(pugixml 1.14 CONFIG)
     find_package(absl 20250512.1 CONFIG)
     if (APPLE)
@@ -297,6 +299,7 @@ set(AUDIO_LIB src/core/libraries/audio/audioin.cpp
               src/core/libraries/audio/sdl_audio_in.cpp
               src/core/libraries/voice/voice.cpp
               src/core/libraries/voice/voice.h
+              src/core/libraries/voice/voice_error.h
               src/core/libraries/audio/audioout.cpp
               src/core/libraries/audio/audioout.h
               src/core/libraries/audio/audioout_backend.h
@@ -325,6 +328,7 @@ set(KERNEL_LIB src/core/libraries/kernel/coredump/coredump.cpp
                src/core/libraries/kernel/sync/mutex.cpp
                src/core/libraries/kernel/sync/mutex.h
                src/core/libraries/kernel/sync/semaphore.h
+               src/core/libraries/kernel/threads/barrier.cpp
                src/core/libraries/kernel/threads/condvar.cpp
                src/core/libraries/kernel/threads/event_flag.cpp
                src/core/libraries/kernel/threads/exception.cpp
@@ -375,32 +379,15 @@ set(NETWORK_LIBS src/core/libraries/network/http.cpp
                  src/core/libraries/network/http_error.h
                  src/core/libraries/network/http2.cpp
                  src/core/libraries/network/http2.h
-                 src/core/libraries/network/net.cpp
                  src/core/libraries/network/netctl.cpp
                  src/core/libraries/network/netctl.h
                  src/core/libraries/network/net_ctl_obj.cpp
                  src/core/libraries/network/net_ctl_obj.h
                  src/core/libraries/network/net_ctl_codes.h
-                 src/core/libraries/network/net_util.cpp
-                 src/core/libraries/network/net_util.h
-                 src/core/libraries/network/net_epoll.cpp
-                 src/core/libraries/network/net_epoll.h
-                 src/core/libraries/network/net_resolver.cpp
-                 src/core/libraries/network/net_resolver.h
-                 src/core/libraries/network/net_upnp.cpp
-                 src/core/libraries/network/net_upnp.h
-                 src/core/libraries/network/net_error.h
-                 src/core/libraries/network/net.h
                  src/core/libraries/network/ssl.cpp
                  src/core/libraries/network/ssl.h
                  src/core/libraries/network/ssl2.cpp
                  src/core/libraries/network/ssl2.h
-                 src/core/libraries/network/sys_net.cpp
-                 src/core/libraries/network/sys_net.h
-                 src/core/libraries/network/posix_sockets.cpp
-                 src/core/libraries/network/p2p_sockets.cpp
-                 src/core/libraries/network/unix_sockets.cpp
-                 src/core/libraries/network/sockets.h
 )
 
 set(AVPLAYER_LIB src/core/libraries/avplayer/avplayer_common.cpp
@@ -520,6 +507,10 @@ set(SYSTEM_LIBS src/core/libraries/system/commondialog.cpp
                 src/core/libraries/video_recording/video_recording.cpp
                 src/core/libraries/video_recording/video_recording.h
                 src/core/libraries/video_recording/video_recording_error.h
+                src/core/libraries/game_custom_data_dialog/game_custom_data_dialog.cpp
+                src/core/libraries/game_custom_data_dialog/game_custom_data_dialog.h
+                src/core/libraries/game_custom_data_dialog/game_custom_data_dialog_ui.cpp
+                src/core/libraries/game_custom_data_dialog/game_custom_data_dialog_ui.h
                 src/core/libraries/invitation_dialog/invitation_dialog.cpp
                 src/core/libraries/invitation_dialog/invitation_dialog.h
                 src/core/libraries/invitation_dialog/invitation_dialog_ui.cpp
@@ -586,6 +577,8 @@ set(PNG_LIB src/core/libraries/libpng/pngdec.cpp
 )
 
 set(JPEG_LIB src/core/libraries/jpeg/jpeg_error.h
+             src/core/libraries/jpeg/jpegdec.cpp
+             src/core/libraries/jpeg/jpegdec.h
              src/core/libraries/jpeg/jpegenc.cpp
              src/core/libraries/jpeg/jpegenc.h
 )
@@ -605,12 +598,18 @@ set(RANDOM_LIB src/core/libraries/random/random.cpp
 set(USBD_LIB src/core/libraries/usbd/usbd.cpp
              src/core/libraries/usbd/usbd.h
              src/core/libraries/usbd/usb_backend.h
+             src/core/libraries/usbd/usbstorage.cpp
+             src/core/libraries/usbd/usbstorage.h
              src/core/libraries/usbd/emulated/dimensions.cpp
              src/core/libraries/usbd/emulated/dimensions.h
              src/core/libraries/usbd/emulated/infinity.cpp
              src/core/libraries/usbd/emulated/infinity.h
              src/core/libraries/usbd/emulated/skylander.cpp
              src/core/libraries/usbd/emulated/skylander.h
+)
+
+set(MUSIC_LIB src/core/libraries/music/music_player_service.cpp
+              src/core/libraries/music/music_player_service.h
 )
 
 set(FIBER_LIB src/core/libraries/fiber/fiber_context.cpp
@@ -621,10 +620,14 @@ set(FIBER_LIB src/core/libraries/fiber/fiber_context.cpp
 
 set(VDEC_LIB src/core/libraries/videodec/video_utils.cpp
              src/core/libraries/videodec/video_utils.h
+             src/core/libraries/videodec/vdeccore.cpp
+             src/core/libraries/videodec/vdeccore.h
              src/core/libraries/videodec/vdecsw.cpp
              src/core/libraries/videodec/vdecsw.h
              src/core/libraries/videodec/vdecsw_impl.cpp
              src/core/libraries/videodec/vdecsw_impl.h
+             src/core/libraries/videodec/videocore_server.cpp
+             src/core/libraries/videodec/videocore_server.h
              src/core/libraries/videodec/videodec2_impl.cpp
              src/core/libraries/videodec/videodec2_impl.h
              src/core/libraries/videodec/videodec2.cpp
@@ -656,19 +659,33 @@ set(NP_LIBS src/core/libraries/np/np_error.h
             src/core/libraries/np/trophy_ui.h
             src/core/libraries/np/np_party.cpp
             src/core/libraries/np/np_party.h
-            src/core/libraries/np/np_auth.cpp
-            src/core/libraries/np/np_auth.h
+            src/core/libraries/np/np_auth/np_auth.cpp
+            src/core/libraries/np/np_auth/np_auth.h
+            src/core/libraries/np/np_auth/np_auth_ctx.h
             src/core/libraries/np/np_sns_facebook_dialog.cpp
             src/core/libraries/np/np_sns_facebook_dialog.h
             src/core/libraries/np/np_partner.cpp
             src/core/libraries/np/np_partner.h
             src/core/libraries/np/object_manager.h
-            src/core/libraries/np/np_handler.cpp
-            src/core/libraries/np/np_handler.h
+            src/core/libraries/np/np_handler/np_handler.cpp
+            src/core/libraries/np/np_handler/np_handler.h
+            src/core/libraries/np/np_handler/np_handler_friends.cpp
+            src/core/libraries/np/np_handler/np_handler_auth.cpp
+            src/core/libraries/np/np_handler/np_handler_invitation.cpp
+            src/core/libraries/np/np_handler/np_handler_game_custom_data.cpp
+            src/core/libraries/np/np_handler/np_handler_score.cpp
+            src/core/libraries/np/np_handler/np_handler_trophy.cpp
+            src/core/libraries/np/np_handler/np_handler_tus.cpp
+            src/core/libraries/np/np_handler/np_handler_web_api.cpp
+            src/core/libraries/np/signaling_handler.cpp
+            src/core/libraries/np/signaling_handler.h
             src/core/libraries/np/np_commerce/np_commerce.cpp
             src/core/libraries/np/np_commerce/np_commerce.h
             src/core/libraries/np/np_commerce/np_commerce_ui.cpp
             src/core/libraries/np/np_commerce/np_commerce_ui.h
+            src/core/libraries/np/np_entitlement_access.cpp
+            src/core/libraries/np/np_entitlement_access.h
+            src/core/libraries/np/np_entitlement_access_error.h
             src/core/libraries/np/np_profile_dialog/np_profile_dialog.cpp
             src/core/libraries/np/np_profile_dialog/np_profile_dialog.h
             src/core/libraries/np/np_profile_dialog/np_profile_dialog_ui.cpp
@@ -682,8 +699,8 @@ set(NP_LIBS src/core/libraries/np/np_error.h
             src/core/libraries/np/np_signaling/np_signaling_state.h
             src/core/libraries/np/np_signaling/np_signaling_helpers.cpp
             src/core/libraries/np/np_signaling/np_signaling_helpers.h
-            src/core/libraries/np/np_signaling/np_signaling_stubs.cpp
-            src/core/libraries/np/np_signaling/np_signaling_stubs.h
+            src/core/libraries/np/np_signaling/np_signaling_transport.cpp
+            src/core/libraries/np/np_signaling/np_signaling_transport.h
             src/core/libraries/np/np_web_api/np_web_api.cpp
             src/core/libraries/np/np_web_api/np_web_api.h
             src/core/libraries/np/np_web_api/np_web_api_internal.cpp
@@ -715,6 +732,8 @@ set(VR_LIBS  src/core/libraries/hmd/hmd.cpp
              src/core/libraries/hmd/hmd.h
              src/core/libraries/hmd/hmd_setup_dialog.cpp
              src/core/libraries/hmd/hmd_setup_dialog.h
+             src/core/libraries/hmd/vrservicedialog.cpp
+             src/core/libraries/hmd/vrservicedialog.h
              src/core/libraries/vr_tracker/vr_tracker.cpp
              src/core/libraries/vr_tracker/vr_tracker.h
 )
@@ -728,10 +747,18 @@ set(MISC_LIBS  src/core/libraries/screenshot/screenshot.cpp
                src/core/libraries/ulobjmgr/ulobjmgr.h
                src/core/libraries/signin_dialog/signindialog.cpp
                src/core/libraries/signin_dialog/signindialog.h
+               src/core/libraries/signin_dialog/signindialog_error.h
 )
 
 set(CAMERA_LIBS  src/core/libraries/camera/camera.cpp
                  src/core/libraries/camera/camera.h
+                 src/core/libraries/camera/camera_helpers.h
+                 src/core/libraries/camera/camera_helpers.cpp
+                 src/core/libraries/camera/camera_audio.cpp
+                 src/core/libraries/camera/camera_calibration.cpp
+                 src/core/libraries/camera/camera_config.cpp
+                 src/core/libraries/camera/camera_config_types.h
+                 src/core/libraries/camera/camera_device.cpp
                  src/core/libraries/camera/camera_error.h
 )
 
@@ -854,6 +881,44 @@ if (ENABLE_DISCORD_RPC)
     list(APPEND COMMON src/common/discord_rpc_handler.cpp src/common/discord_rpc_handler.h)
 endif()
 
+set(NET_CORE  src/core/net/guest_net.cpp
+              src/core/net/guest_net.h
+              src/core/net/host_net.cpp
+              src/core/net/host_net.h
+              src/core/net/p2p_codec.cpp
+              src/core/net/p2p_codec.h
+              src/core/net/p2p_crypto.cpp
+              src/core/net/p2p_crypto.h
+              src/core/net/p2p_tcp.cpp
+              src/core/net/p2p_tcp.h
+              src/core/net/p2p_transport.cpp
+              src/core/net/p2p_transport.h
+)
+
+set(NET_LIB   src/core/libraries/net/net.cpp
+              src/core/libraries/net/net.h
+              src/core/libraries/net/net_discovery.cpp
+              src/core/libraries/net/net_discovery.h
+              src/core/libraries/net/net_error.h
+              src/core/libraries/net/net_kernel.cpp
+              src/core/libraries/net/net_kernel.h
+              src/core/libraries/net/net_log.cpp
+              src/core/libraries/net/net_log.h
+              src/core/libraries/net/net_p2p.cpp
+              src/core/libraries/net/net_p2p.h
+              src/core/libraries/net/net_p2p_ioctl.cpp
+              src/core/libraries/net/net_p2p_ioctl.h
+              src/core/libraries/net/net_resolver.cpp
+              src/core/libraries/net/net_resolver.h
+              src/core/libraries/net/net_translate.cpp
+              src/core/libraries/net/net_translate.h
+              src/core/libraries/net/net_types.h
+              src/core/libraries/net/net_util.cpp
+              src/core/libraries/net/net_util.h
+              src/core/libraries/net/net_upnp.cpp
+              src/core/libraries/net/net_upnp.h
+)
+
 set(CORE src/core/aerolib/stubs.cpp
          src/core/aerolib/stubs.h
          src/core/aerolib/aerolib.cpp
@@ -932,6 +997,7 @@ set(CORE src/core/aerolib/stubs.cpp
          ${PLAYGO_LIB}
          ${RANDOM_LIB}
          ${USBD_LIB}
+         ${MUSIC_LIB}
          ${ZLIB_LIB}
          ${MISC_LIBS}
          ${IME_LIB}
@@ -965,6 +1031,8 @@ set(CORE src/core/aerolib/stubs.cpp
          src/core/user_manager.h
          src/core/user_settings.cpp
          src/core/user_settings.h
+         ${NET_CORE}
+         ${NET_LIB}
 )
 
 if (ARCHITECTURE STREQUAL "x86_64")
@@ -1055,6 +1123,7 @@ set(SHADER_RECOMPILER src/shader_recompiler/profile.h
                       src/shader_recompiler/ir/passes/shared_memory_simplify_pass.cpp
                       src/shader_recompiler/ir/passes/shared_memory_to_storage_pass.cpp
                       src/shader_recompiler/ir/passes/lower_phis_to_regs_pass.cpp
+                      src/shader_recompiler/ir/passes/lower_movrel_pass.cpp
                       src/shader_recompiler/ir/passes/ssa_repair_pass.cpp
                       src/shader_recompiler/ir/passes/ssa_rewrite_pass.cpp
                       src/shader_recompiler/ir/abstract_syntax_list.cpp
@@ -1289,12 +1358,13 @@ add_executable(shadps4
 create_target_directory_groups(shadps4)
 
 target_link_libraries(shadps4 PRIVATE spdlog::spdlog)
-target_link_libraries(shadps4 PRIVATE magic_enum::magic_enum fmt::fmt toml11::toml11 tsl::robin_map xbyak::xbyak Tracy::TracyClient RenderDoc::API FFmpeg::ffmpeg Dear_ImGui ImGuiFileDialog gcn half::half ZLIB::ZLIB PNG::PNG minimp3)
+target_link_libraries(shadps4 PRIVATE magic_enum::magic_enum fmt::fmt toml11::toml11 tsl::robin_map xbyak::xbyak Tracy::TracyClient RenderDoc::API FFmpeg::ffmpeg Dear_ImGui ImGuiFileDialog gcn half::half ZLIB::ZLIB PNG::PNG minimp3 dr_flac)
 target_link_libraries(shadps4 PRIVATE Boost::headers GPUOpen::VulkanMemoryAllocator LibAtrac9 sirit Vulkan::Headers xxHash::xxhash Zydis::Zydis SDL3::SDL3 pugixml::pugixml)
 target_link_libraries(shadps4 PRIVATE stb::headers lfreist-hwinfo::hwinfo nlohmann_json::nlohmann_json miniz::miniz fdk-aac CLI11::CLI11 OpenAL::OpenAL Cpp_Httplib miniupnpc::miniupnpc)
 target_link_libraries(shadps4 PRIVATE Freetype::Freetype)
 target_link_libraries(shadps4 PRIVATE libprotobuf)
 target_link_libraries(shadps4 PRIVATE ZArchive::zarchive)
+target_link_libraries(shadps4 PRIVATE zstd::libzstd)
 target_include_directories(shadps4 PRIVATE "${SHADNET_PROTO_OUT}")
 
 if (${CMAKE_SYSTEM_NAME} STREQUAL "FreeBSD")
@@ -1439,7 +1509,9 @@ cmrc_add_resource_library(embedded-resources
         src/resources/platinum.png
         src/resources/shadps4.png
         src/resources/silver.png
-        src/resources/trophy.wav)
+        src/resources/trophy.wav
+        src/resources/amd_rcp_index_table.bin.zstd
+        src/resources/amd_rsqrt_index_table.bin.zstd)
 target_link_libraries(shadps4 PRIVATE res::embedded)
 
 # ImGui resources

@@ -30,6 +30,7 @@ enum class OrbisSaveDataEventType : u32 {
 
 struct BackupRequest {
     bool done{};
+    s32 error_code{};
 
     Libraries::UserService::OrbisUserServiceUserId user_id{};
     std::string title_id{};
@@ -52,6 +53,8 @@ bool Restore(const std::filesystem::path& save_path);
 WorkerStatus GetWorkerStatus();
 
 bool IsBackupExecutingFor(const std::filesystem::path& save_path);
+
+bool HasPendingEvents();
 
 std::filesystem::path MakeBackupPath(const std::filesystem::path& save_path);
 

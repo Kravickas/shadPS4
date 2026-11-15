@@ -110,16 +110,25 @@ void Translator::EmitPrologue(IR::Block* first_block) {
                             ir.GetAttributeU32(IR::Attribute::BaseInstance));
         }
 
-        // v0: vertex ID, always present
+        const bool is_indirect = runtime_info.sw.vs.is_indirect;
+
         IR::U32 vertex_id = ir.GetAttributeU32(IR::Attribute::VertexId);
-        if (base_vertex_sgpr != -1) {
-            if (!fetch_data.Empty() || fetch_data.vertex_offset_sgpr == -1) {
-                vertex_id = ir.ISub(vertex_id, ir.GetAttributeU32(IR::Attribute::BaseVertex));
-            } else {
-                ASSERT_MSG(fetch_data.vertex_offset_sgpr == base_vertex_sgpr,
-                           "Fetch shader in indirect draw uses wrong base vertex");
-            }
+        if (is_indirect && (fetch_data.Empty() || fetch_data.vertex_offset_sgpr == -1)) {
+            vertex_id = ir.ISub(vertex_id, ir.GetAttributeU32(IR::Attribute::BaseVertex));
+        } else if (base_vertex_sgpr != -1) {
+            ASSERT_MSG(fetch_data.vertex_offset_sgpr == base_vertex_sgpr,
+                       "Fetch shader in indirect draw uses wrong base vertex");
         }
+
+        IR::U32 instance_id = ir.GetAttributeU32(IR::Attribute::InstanceId);
+        if (is_indirect && (fetch_data.Empty() || fetch_data.instance_offset_sgpr == -1)) {
+            instance_id = ir.ISub(instance_id, ir.GetAttributeU32(IR::Attribute::BaseInstance));
+        } else if (base_instance_sgpr != -1) {
+            ASSERT_MSG(fetch_data.instance_offset_sgpr == base_instance_sgpr,
+                       "Fetch shader in indirect draw uses wrong base instance");
+        }
+
+        // v0: vertex ID, always present
         ir.SetVectorReg(dst_vreg++, vertex_id);
 
         if (info.hw_stage == HwStage::Local) {
@@ -136,8 +145,7 @@ void Translator::EmitPrologue(IR::Block* first_block) {
             if (runtime_info.props.num_input_vgprs > 0) {
                 if (runtime_info.sw.vs.step_rate_0 != 0) {
                     ir.SetVectorReg(dst_vreg++,
-                                    ir.IDiv(ir.GetAttributeU32(IR::Attribute::InstanceId),
-                                            ir.Imm32(runtime_info.sw.vs.step_rate_0)));
+                                    ir.IDiv(instance_id, ir.Imm32(runtime_info.sw.vs.step_rate_0)));
                 } else {
                     ir.SetVectorReg(dst_vreg++, ir.Imm32(0));
                 }
@@ -146,8 +154,7 @@ void Translator::EmitPrologue(IR::Block* first_block) {
             if (runtime_info.props.num_input_vgprs > 1) {
                 if (runtime_info.sw.vs.step_rate_1 != 0) {
                     ir.SetVectorReg(dst_vreg++,
-                                    ir.IDiv(ir.GetAttributeU32(IR::Attribute::InstanceId),
-                                            ir.Imm32(runtime_info.sw.vs.step_rate_1)));
+                                    ir.IDiv(instance_id, ir.Imm32(runtime_info.sw.vs.step_rate_1)));
                 } else {
                     ir.SetVectorReg(dst_vreg++, ir.Imm32(0));
                 }
@@ -156,16 +163,6 @@ void Translator::EmitPrologue(IR::Block* first_block) {
 
         // v3: instance ID, plain
         if (runtime_info.props.num_input_vgprs > 2) {
-            IR::U32 instance_id = ir.GetAttributeU32(IR::Attribute::InstanceId);
-            if (base_instance_sgpr != -1) {
-                if (!fetch_data.Empty() || fetch_data.instance_offset_sgpr == -1) {
-                    instance_id =
-                        ir.ISub(instance_id, ir.GetAttributeU32(IR::Attribute::BaseInstance));
-                } else {
-                    ASSERT_MSG(fetch_data.instance_offset_sgpr == base_instance_sgpr,
-                               "Fetch shader in indirect draw uses wrong base instance");
-                }
-            }
             ir.SetVectorReg(dst_vreg++, instance_id);
         }
         break;
@@ -180,6 +177,18 @@ void Translator::EmitPrologue(IR::Block* first_block) {
             });
         const auto addr_flags = runtime_info.hw.fs.addr_flags;
         const auto en_flags = runtime_info.hw.fs.en_flags;
+        IR::U32 aa_mask;
+        if (runtime_info.hw.fs.aa_mask_per_pixel) {
+            const auto& masks = runtime_info.hw.fs.aa_mask;
+            const IR::U32 x{ir.ConvertFToU(32, ir.GetAttribute(IR::Attribute::FragCoord, 0))};
+            const IR::U32 y{ir.ConvertFToU(32, ir.GetAttribute(IR::Attribute::FragCoord, 1))};
+            const IR::U32 row{ir.Select(ir.IEqual(ir.BitwiseAnd(y, ir.Imm32(1u)), ir.Imm32(0u)),
+                                        ir.Imm32(u32{masks[0]} | (u32{masks[1]} << 16)),
+                                        ir.Imm32(u32{masks[2]} | (u32{masks[3]} << 16)))};
+            const IR::U32 offset{ir.ShiftLeftLogical(ir.BitwiseAnd(x, ir.Imm32(1u)), ir.Imm32(4u))};
+            aa_mask = ir.BitFieldExtract(row, offset, ir.Imm32(16u));
+            ir.Discard(ir.IEqual(aa_mask, ir.Imm32(0u)));
+        }
         if (addr_flags.pos_x_float_ena) {
             if (en_flags.pos_x_float_ena) {
                 ir.SetVectorReg(dst_vreg++, ir.GetAttribute(IR::Attribute::FragCoord, 0));
@@ -239,11 +248,17 @@ void Translator::EmitPrologue(IR::Block* first_block) {
                     coverage = ir.BitwiseAnd(ir.GetAttributeU32(IR::Attribute::SampleMask),
                                              ir.Imm32(valid_samples));
                 }
+                if (!aa_mask.IsEmpty()) {
+                    coverage = ir.BitwiseAnd(coverage, aa_mask);
+                }
                 const IR::U1 is_helper = ir.GetAttributeU1(IR::Attribute::IsHelperInvocation);
                 ir.SetVectorReg(dst_vreg++, IR::U32{ir.Select(is_helper, ir.Imm32(0U), coverage)});
             } else {
                 ir.SetVectorReg(dst_vreg++, ir.Imm32(0));
             }
+        }
+        if (!aa_mask.IsEmpty()) {
+            ir.SetAttribute(IR::Attribute::SampleMask, ir.BitCast<IR::F32>(aa_mask));
         }
         break;
     }
@@ -973,7 +988,11 @@ void Translator::SetDst(const InstOperand& operand, const IR::U32F32& value) {
             result = ir.FPMul(result, ir.Imm32(operand.output_modifier.multiplier));
         }
         if (operand.output_modifier.clamp) {
-            result = ir.FPSaturate(result);
+            if (runtime_info.props.dx10_clamp) {
+                result = ir.FPSaturate(result);
+            } else {
+                result = ir.FPClamp(result, ir.Imm32(0.f), ir.Imm32(1.f));
+            }
         }
     }
 
@@ -1001,7 +1020,11 @@ void Translator::SetDst16(const InstOperand& operand, const IR::U32F32& value) {
             result = ir.FPMul(result, ir.Imm32(operand.output_modifier.multiplier));
         }
         if (operand.output_modifier.clamp) {
-            result = ir.FPSaturate(result);
+            if (runtime_info.props.dx10_clamp) {
+                result = ir.FPSaturate(result);
+            } else {
+                result = ir.FPClamp(result, ir.Imm32(0.f), ir.Imm32(1.f));
+            }
         }
     } else {
         if (operand.output_modifier.clamp) {
@@ -1058,7 +1081,11 @@ void Translator::SetDst64(const InstOperand& operand, const IR::U64F64& value_ra
                 ir.FPMul(value_untyped, ir.Imm64(f64(operand.output_modifier.multiplier)));
         }
         if (operand.output_modifier.clamp) {
-            value_untyped = ir.FPSaturate(value_untyped);
+            if (runtime_info.props.dx10_clamp) {
+                value_untyped = ir.FPSaturate(value_untyped);
+            } else {
+                value_untyped = ir.FPClamp(value_untyped, ir.Imm32(0.f), ir.Imm32(1.f));
+            }
         }
     }
 
@@ -1102,7 +1129,12 @@ void Translator::SetDstPk(const InstOperand& operand, const pk_type<T>& value) {
 
     if constexpr (std::is_same_v<T, IR::F32>) {
         if (operand.output_modifier.clamp) {
-            v = {ir.FPSaturate(v.first), ir.FPSaturate(v.second)};
+            if (runtime_info.props.dx10_clamp) {
+                v = {ir.FPSaturate(v.first), ir.FPSaturate(v.second)};
+            } else {
+                v = {ir.FPClamp(v.first, ir.Imm32(0.f), ir.Imm32(1.f)),
+                     ir.FPClamp(v.second, ir.Imm32(0.f), ir.Imm32(1.f))};
+            }
         }
     } else {
         if (operand.output_modifier.clamp) {

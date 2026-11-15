@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include "video_core/amdgpu/pixel_format.h"
 #include "video_core/amdgpu/regs_depth.h"
 #include "video_core/amdgpu/resource.h"
 #include "video_core/renderer_vulkan/vk_common.h"
@@ -33,17 +34,18 @@ struct ImageViewInfo {
     AmdGpu::ImageType type = AmdGpu::ImageType::Color2D;
     vk::Format format = vk::Format::eR8G8B8A8Unorm;
     SubresourceRange range;
-    vk::ComponentMapping mapping{};
+    AmdGpu::CompMapping mapping{AmdGpu::IdentityMapping};
     u32 min_lod = 0;
     bool is_storage = false;
 
-    auto operator<=>(const ImageViewInfo&) const = default;
+    bool operator==(const ImageViewInfo&) const = default;
 };
 
 struct Image;
 
 struct ImageView {
-    ImageView(const Vulkan::Instance& instance, const ImageViewInfo& info, const Image& image);
+    ImageView(const Vulkan::Instance& instance, const ImageViewInfo& info, const Image& image,
+              vk::Image view_image);
     ~ImageView();
 
     ImageView(const ImageView&) = delete;
