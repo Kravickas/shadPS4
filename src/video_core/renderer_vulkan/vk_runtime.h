@@ -78,6 +78,12 @@ public:
 
     void FlushBarriers();
 
+    /// Adds the stage of a buffer access that no hazard check needs to track to the source
+    /// scope of the next barrier, like AccessBuffer does for any access.
+    void AccessStage(vk::PipelineStageFlags2 stage) {
+        memory_barrier.srcStageMask |= stage;
+    }
+
 private:
     void MakeCurrent(const VideoCore::Buffer* handle);
 

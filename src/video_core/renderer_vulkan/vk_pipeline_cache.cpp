@@ -495,7 +495,10 @@ bool PipelineCache::RefreshGraphicsKey() {
     }
 
     // Compile and bind shader stages
-    if (!RefreshGraphicsStages()) {
+    const u64 stages_t0 = AmdGpu::PerfNs();
+    const bool stages_valid = RefreshGraphicsStages();
+    AmdGpu::cp_perf.pipe_stages_ns += AmdGpu::PerfNs() - stages_t0;
+    if (!stages_valid) {
         return false;
     }
 

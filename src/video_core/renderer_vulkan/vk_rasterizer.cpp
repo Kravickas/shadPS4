@@ -741,9 +741,16 @@ void Rasterizer::ResetBindings(bool is_compute) {
     }
     const u64 reset_t1 = AmdGpu::PerfNs();
     AmdGpu::cp_perf.reset_images_ns += reset_t1 - reset_t0;
+    // Only the host writes the stream buffer, so no hazard check ever looks at its read
+    // ranges; reads of it only add their stage to the next barrier.
+    const VideoCore::Buffer* const stream_buffer = &buffer_cache.GetStreamBuffer();
     for (const auto [buffer, offset, size, src_access] : bound_buffers) {
         const auto dst_stage = is_compute ? vk::PipelineStageFlagBits2::eComputeShader
                                           : vk::PipelineStageFlagBits2::eAllGraphics;
+        if (buffer == stream_buffer && !(src_access & vk::AccessFlagBits2::eShaderWrite)) {
+            runtime.AccessStage(dst_stage);
+            continue;
+        }
         runtime.AccessBuffer(buffer, offset, size, dst_stage, src_access);
     }
     bound_images.clear();

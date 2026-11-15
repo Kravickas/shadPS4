@@ -202,7 +202,8 @@ void Liverpool::Process(std::stop_token stoken) {
             "draw_cmd_us={} draw_barriers={} render_passes={} zpass_dumps={} obtains={} "
             "obtain_stream={} obtain_stream_kb={} obtain_written={} obtain_uploads={} "
             "obtain_upload_kb={} obtain_texel={} obtain_texel_image={} obtain_stream_reused={} "
-            "obtain_stream_reused_kb={} pipe_key_us={} pipe_changes={} vi_inputs_us={} "
+            "obtain_stream_reused_kb={} pipe_key_us={} pipe_stages_us={} pipe_changes={} "
+            "vi_inputs_us={} "
             "vi_obtain_us={} vi_bind_us={} index_us={} cmd_record_us={} reset_images_us={} "
             "reset_buffers_us={} bound_buffers={} bound_images={} tex_lookups={} tex_hits={}",
             cycle_t0, cycle_t1, cp_perf.tasks, was_submit_done, (cycle_t1 - flush_t0) / 1000,
@@ -227,9 +228,9 @@ void Liverpool::Process(std::stop_token stoken) {
             cp_perf.obtain_stream_bytes / 1024, cp_perf.obtain_written, cp_perf.obtain_uploads,
             cp_perf.obtain_upload_bytes / 1024, cp_perf.obtain_texel, cp_perf.obtain_texel_image,
             cp_perf.obtain_stream_reused, cp_perf.obtain_stream_reused_bytes / 1024,
-            cp_perf.pipe_key_ns / 1000, cp_perf.pipe_changes, cp_perf.vi_inputs_ns / 1000,
-            cp_perf.vi_obtain_ns / 1000, cp_perf.vi_bind_ns / 1000, cp_perf.index_ns / 1000,
-            cp_perf.cmd_record_ns / 1000, cp_perf.reset_images_ns / 1000,
+            cp_perf.pipe_key_ns / 1000, cp_perf.pipe_stages_ns / 1000, cp_perf.pipe_changes,
+            cp_perf.vi_inputs_ns / 1000, cp_perf.vi_obtain_ns / 1000, cp_perf.vi_bind_ns / 1000,
+            cp_perf.index_ns / 1000, cp_perf.cmd_record_ns / 1000, cp_perf.reset_images_ns / 1000,
             cp_perf.reset_buffers_ns / 1000, cp_perf.bound_buffers, cp_perf.bound_images,
             cp_perf.tex_lookups, cp_perf.tex_hits);
 

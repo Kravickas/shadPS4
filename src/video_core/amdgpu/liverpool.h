@@ -90,6 +90,7 @@ struct CpPerf {
     u32 obtain_texel;       ///< Read-only texel bindings checked against images
     u32 obtain_texel_image; ///< ... that were filled from metadata or an image
     u64 pipe_key_ns;        ///< Pipeline lookup: RefreshGraphicsKey
+    u64 pipe_stages_ns;     ///< Pipeline lookup: RefreshGraphicsStages
     u32 pipe_changes;       ///< Draws whose pipeline differs from the previous draw's
     u64 vi_inputs_ns;       ///< Vertex buffers: GetVertexInputs and setVertexInputEXT
     u64 vi_obtain_ns;       ///< Vertex buffers: range merge and ObtainBuffer
