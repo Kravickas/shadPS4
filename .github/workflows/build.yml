@@ -466,3 +466,51 @@ jobs:
             echo "Skipping pre-release: $release_id (newer or same date)"
           fi
         done
+
+  # Overtime Roster (Kravickas build on Setup's Boost card) reads the newest NHL19-Build-* release with no sign-in:
+  # one shadps4-win64-nhl19.zip holding shadPS4.exe, its sha256 is the one GitHub shows for the file.
+  nhl19-release:
+    if: github.repository == 'Kravickas/shadPS4' && github.ref == 'refs/heads/NHL19-Build' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
+    needs: [get-info, windows-sdl]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    concurrency:
+      group: nhl19-release
+      cancel-in-progress: false
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      GH_REPO: ${{ github.repository }}
+      TAG: NHL19-Build-${{ needs.get-info.outputs.date }}-${{ needs.get-info.outputs.shorthash }}
+      ASSET: shadps4-win64-nhl19.zip
+      KEEP: 5
+    steps:
+    - name: Download Windows SDL artifact
+      uses: actions/download-artifact@v8
+      with:
+        name: shadps4-win64-sdl-${{ needs.get-info.outputs.date }}-${{ needs.get-info.outputs.shorthash }}
+        path: ./win64
+
+    - name: Pack shadPS4.exe
+      run: |
+        test -f ./win64/shadPS4.exe
+        (cd ./win64 && zip -9 "../$ASSET" shadPS4.exe)
+        sha256sum "$ASSET"
+
+    - name: Publish the release
+      run: |
+        notes="NHL19-Build ${{ needs.get-info.outputs.shorthash }}: https://github.com/${{ github.repository }}/commit/${{ needs.get-info.outputs.fullhash }}"
+        if gh release view "$TAG" > /dev/null 2>&1; then
+          gh release upload "$TAG" "$ASSET" --clobber
+        else
+          gh release create "$TAG" "$ASSET" --target "${{ needs.get-info.outputs.fullhash }}" --title "$TAG" --notes "$notes" --latest
+        fi
+
+    - name: Delete older NHL19-Build releases (keep the newest KEEP)
+      run: |
+        gh release list --limit 100 --json tagName,publishedAt \
+          --jq "[.[] | select(.tagName | startswith(\"NHL19-Build-\"))] | sort_by(.publishedAt) | reverse | .[$KEEP:][] | .tagName" |
+        while read -r tag; do
+          echo "Deleting $tag"
+          gh release delete "$tag" --yes --cleanup-tag
+        done
