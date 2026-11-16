@@ -339,7 +339,7 @@ s32 PS4_SYSV_ABI sceKernelMapNamedDirectMemory(void** addr, u64 len, s32 prot, s
     }
 
     auto map_flags = static_cast<Core::MemoryMapFlags>(flags);
-    const VAddr in_addr = reinterpret_cast<VAddr>(*addr);
+    VAddr in_addr = reinterpret_cast<VAddr>(*addr);
 
     auto* memory = Core::Memory::Instance();
     bool should_check = false;
@@ -355,6 +355,16 @@ s32 PS4_SYSV_ABI sceKernelMapNamedDirectMemory(void** addr, u64 len, s32 prot, s
             in_addr + len >= SystemAreaStart) {
             LOG_ERROR(Kernel_Vmm, "Fixed direct mapping at {:#x} reaches the system area", in_addr);
             return ORBIS_KERNEL_ERROR_EINVAL;
+        }
+        // Measured on hardware with the SDK chain (DmemTest K1b, K1c): from SDK 2.50 a searched
+        // direct mapping whose range from the given address reaches the system library area, a
+        // page ending exactly at 0x7F0000000 included, is searched from 0xFF0000000 instead (one
+        // ending a page earlier is mapped at its address; flexible mappings are not moved). Not
+        // measured: a search that starts below the area and reaches it because the address is
+        // taken.
+        if (False(map_flags & Core::MemoryMapFlags::Fixed) && in_addr < SystemAreaEnd &&
+            in_addr + len >= SystemAreaStart) {
+            in_addr = SystemAreaEnd;
         }
     }
 
@@ -508,8 +518,9 @@ s32 PS4_SYSV_ABI sceKernelMapFlexibleMemory(void** addr_in_out, u64 len, s32 pro
     return sceKernelMapNamedFlexibleMemory(addr_in_out, len, prot, flags, "anon");
 }
 
-s32 PS4_SYSV_ABI sceKernelMapNamedSystemFlexibleMemory(void** addr_in_out, u64 len, s32 prot,
-                                                       s32 flags, const char* name) {
+// system_caller: called by code in the system library area (a system module), see VirtualQueryImpl.
+static s32 MapNamedSystemFlexibleMemoryImpl(void** addr_in_out, u64 len, s32 prot, s32 flags,
+                                            const char* name, bool system_caller) {
     // name is checked below (EFAULT); fmt throws on a null const char*
     LOG_INFO(Kernel_Vmm, "in_addr = {}, len = {:#x}, prot = {:#x}, flags = {:#x}, name = '{}'",
              fmt::ptr(*addr_in_out), len, prot, flags, name != nullptr ? name : "(null)");
@@ -537,7 +548,12 @@ s32 PS4_SYSV_ABI sceKernelMapNamedSystemFlexibleMemory(void** addr_in_out, u64 l
         return ORBIS_KERNEL_ERROR_ENAMETOOLONG;
     }
 
-    if (in_addr == 0) {
+    // Measured on hardware (DmemTest SY1, every SDK): called by the application without an
+    // address, it is placed like other flexible memory, by the search from the default base (the
+    // first free space from 0x200000000), and VirtualQuery reports it with prot and flags as
+    // flexible memory. Where it goes when a system module calls it is not measured; that keeps
+    // the system area address used since the function was added for LLE modules.
+    if (in_addr == 0 && system_caller) {
         in_addr = 0x880000000;
     }
     const auto mem_prot = static_cast<Core::MemoryProt>(prot);
@@ -546,6 +562,12 @@ s32 PS4_SYSV_ABI sceKernelMapNamedSystemFlexibleMemory(void** addr_in_out, u64 l
                                        Core::VMAType::System, name);
     LOG_INFO(Kernel_Vmm, "out_addr = {}", fmt::ptr(*addr_in_out));
     return ret;
+}
+
+// For the emulator's own HLE libraries (system modules on the PS4).
+s32 PS4_SYSV_ABI sceKernelMapNamedSystemFlexibleMemory(void** addr_in_out, u64 len, s32 prot,
+                                                       s32 flags, const char* name) {
+    return MapNamedSystemFlexibleMemoryImpl(addr_in_out, len, prot, flags, name, true);
 }
 
 s32 PS4_SYSV_ABI sceKernelQueryMemoryProtection(void* addr, void** start, void** end, u32* prot) {
@@ -1422,6 +1444,13 @@ static s32 PS4_SYSV_ABI VirtualQueryFromGuest(VAddr caller, const void* addr, s3
     return VirtualQueryImpl(addr, flags, info, caller - 0x7F0000000ULL < 0x800000000ULL);
 }
 
+static s32 PS4_SYSV_ABI MapNamedSystemFlexibleMemoryFromGuest(VAddr caller, void** addr_in_out,
+                                                              u64 len, s32 prot, s32 flags,
+                                                              const char* name) {
+    return MapNamedSystemFlexibleMemoryImpl(addr_in_out, len, prot, flags, name,
+                                            caller - 0x7F0000000ULL < 0x800000000ULL);
+}
+
 // Measured on hardware: an empty name gives the mapping its caller-based name.
 static s32 PS4_SYSV_ABI MapNamedDirectMemoryFromGuest(VAddr caller, void** addr, u64 len, s32 prot,
                                                       s32 flags, s64 phys_addr, u64 alignment,
@@ -1485,7 +1514,8 @@ void RegisterMemory(Core::Loader::SymbolsResolver* sym) {
     LIB_FUNCTION("cQke9UuBQOk", "libkernel", 1, "libkernel", sceKernelMunmap);
     LIB_FUNCTION_WITH_CALLER("mL8NDH86iQI", "libkernel", 1, "libkernel",
                              MapNamedFlexibleMemoryFromGuest);
-    LIB_FUNCTION("kc+LEEIYakc", "libkernel", 1, "libkernel", sceKernelMapNamedSystemFlexibleMemory);
+    LIB_FUNCTION_WITH_CALLER("kc+LEEIYakc", "libkernel", 1, "libkernel",
+                             MapNamedSystemFlexibleMemoryFromGuest);
     LIB_FUNCTION("aNz11fnnzi4", "libkernel", 1, "libkernel", sceKernelAvailableFlexibleMemorySize);
     LIB_FUNCTION("aNz11fnnzi4", "libkernel_avlfmem", 1, "libkernel",
                  sceKernelAvailableFlexibleMemorySize);
