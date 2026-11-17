@@ -4,6 +4,7 @@
 #pragma once
 
 #include <array>
+#include <atomic>
 #include <condition_variable>
 #include <deque>
 #include <mutex>
@@ -103,6 +104,13 @@ public:
 
     /// Unmark a region as modified from the GPU.
     void UnmarkRegionAsGpuModified(VAddr device_addr, u64 size, bool is_write = false);
+
+    /// Performs a CPU access that faulted on a GPU-modified page directly on guest memory, when
+    /// the accessed bytes hold no GPU data: the page only shares them with GPU-modified bytes,
+    /// so the access needs nothing from the GPU. A write is uploaded when the GPU next uses the
+    /// bytes. Returns false if the access has to go through a readback. The access must lie in
+    /// one page.
+    bool AccessBesideGpuData(VAddr device_addr, u32 size, bool is_write, u8* data);
 
     /// Writes data that replaces the buffer cache contents of a region to guest memory and
     /// unmarks the region as modified from the GPU, after downloads in flight to it are done.
@@ -279,6 +287,14 @@ private:
     /// them with it held. It is never held across a scheduler call.
     std::mutex modified_mutex;
     RangeSet gpu_modified_ranges;
+    /// CPU writes performed by AccessBesideGpuData that the arenas do not hold yet. Their pages
+    /// are not marked CPU-modified, so they are uploaded by range.
+    RangeSet emulated_writes;
+    std::atomic<bool> emulated_writes_pending{};
+    /// Accesses performed by AccessBesideGpuData per page since its last readback. A page that
+    /// is accessed often gets a readback, which unprotects it.
+    std::unordered_map<u64, u32> emulated_accesses;
+    static constexpr u32 MaxEmulatedAccesses = 16;
     /// Scheduler tick of the last writable binding per WriteTickChunk bytes of guest memory.
     std::unordered_map<u64, u64> write_ticks;
     static constexpr u64 WriteTickChunkBits = 16;

@@ -74,6 +74,9 @@ public:
     u32 ReadDataFromGds(u32 gsd_offset);
     bool InvalidateMemory(VAddr addr, u64 size, bool assume_locks = false);
     bool ReadMemory(VAddr addr, u64 size, bool assume_locks = false);
+    /// Performs a faulting CPU access that touches no GPU data directly on guest memory.
+    /// Returns false if the fault has to be handled by InvalidateMemory or ReadMemory.
+    bool AccessBesideGpuData(VAddr addr, u32 size, bool is_write, u8* data);
     bool IsMapped(VAddr addr, u64 size);
     void MapMemory(VAddr addr, u64 size);
     void RegisterMemory(VAddr addr, u64 size);

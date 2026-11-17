@@ -147,6 +147,42 @@ void BufferCache::UnmarkRegionAsGpuModified(VAddr device_addr, u64 size, bool is
     gpu_modified_ranges.Subtract(device_addr, size);
 }
 
+bool BufferCache::AccessBesideGpuData(VAddr device_addr, u32 size, bool is_write, u8* data) {
+    const VAddr page_start = Common::AlignDown(device_addr, BYTES_PER_PAGE);
+    const VAddr page_end = page_start + BYTES_PER_PAGE;
+    ASSERT(device_addr + size <= page_end);
+    std::scoped_lock lk{modified_mutex};
+    if (!memory_tracker->IsRegionGpuModified(device_addr, size)) {
+        // Not a fault on GPU-modified memory.
+        return false;
+    }
+    if (gpu_modified_ranges.Intersects(device_addr, size)) {
+        // The access needs the GPU data.
+        return false;
+    }
+    if (OverlapsDownloadInFlight(page_start, page_end) ||
+        OverlapsDeferredDownload(page_start, page_end)) {
+        // GPU data of the page is being written back, its ranges are not tracked meanwhile.
+        return false;
+    }
+    u32& accesses = emulated_accesses[page_start / BYTES_PER_PAGE];
+    if (++accesses > MaxEmulatedAccesses) {
+        // The page is accessed often, a readback unprotects it.
+        accesses = 0;
+        return false;
+    }
+    if (is_write) {
+        if (!memory->TryWriteBacking(std::bit_cast<u8*>(device_addr), data, size)) {
+            return false;
+        }
+        emulated_writes.Add(device_addr, size);
+        emulated_writes_pending.store(true, std::memory_order_relaxed);
+    } else {
+        memory->CopySparseMemory(device_addr, data, size);
+    }
+    return true;
+}
+
 void BufferCache::WriteAndUnmarkGpuModified(VAddr device_addr, const u8* data, u64 size) {
     std::unique_lock lk{modified_mutex};
     // A download in flight would write the older buffer cache data over this data.
@@ -938,14 +974,32 @@ bool BufferCache::SynchronizeMemory(const Buffer* arena, VAddr device_addr, u32 
     size_t total_size_bytes{};
     {
         // A written range becomes GPU-modified, which readbacks on guest threads look at.
+        const bool emulated_pending = emulated_writes_pending.load(std::memory_order_relaxed);
         std::unique_lock lk{modified_mutex, std::defer_lock};
-        if (is_written) {
+        if (is_written || emulated_pending) {
             lk.lock();
         }
         memory_tracker->ForEachUploadRange(device_addr, size, is_written, [&](u64 addr, u64 size) {
             copies.emplace_back(total_size_bytes, addr, size);
             total_size_bytes += size;
         });
+        if (emulated_pending) {
+            // Upload the CPU writes done beside GPU data, unless their page is uploaded anyway.
+            const size_t num_page_copies = copies.size();
+            emulated_writes.ForEachInRange(device_addr, size, [&](VAddr start, VAddr end) {
+                const auto in_page_copy = [&](const vk::BufferCopy& copy) {
+                    return copy.dstOffset <= start && end <= copy.dstOffset + copy.size;
+                };
+                if (std::none_of(copies.begin(), copies.begin() + num_page_copies, in_page_copy)) {
+                    copies.emplace_back(total_size_bytes, start, end - start);
+                    total_size_bytes += end - start;
+                }
+            });
+            emulated_writes.Subtract(device_addr, size);
+            if (emulated_writes.Empty()) {
+                emulated_writes_pending.store(false, std::memory_order_relaxed);
+            }
+        }
         if (is_written) {
             gpu_modified_ranges.Add(device_addr, size);
             const u64 tick = scheduler.CurrentTick();
