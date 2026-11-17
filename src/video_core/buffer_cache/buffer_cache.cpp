@@ -165,6 +165,11 @@ bool BufferCache::AccessBesideGpuData(VAddr device_addr, u32 size, bool is_write
         // GPU data of the page is being written back, its ranges are not tracked meanwhile.
         return false;
     }
+    if (IsGpuWriteSubmitted(page_start, BYTES_PER_PAGE)) {
+        // The readback of the page runs ahead of the open command buffer and unprotects the
+        // page, which serves further accesses better than faulting on each one.
+        return false;
+    }
     u32& accesses = emulated_accesses[page_start / BYTES_PER_PAGE];
     if (++accesses > MaxEmulatedAccesses) {
         // The page is accessed often, a readback unprotects it.
@@ -260,11 +265,19 @@ bool BufferCache::ReadMemoryOnCallingThread(VAddr device_addr, u64 size, bool is
         }
         window = GetDownloadWindow(arena, device_addr, size);
     } while (WaitDownloadsInFlight(lk, window.start, window.start + window.size, stats));
-    if (!IsGpuWriteSubmitted(window.start, window.size)) {
-        // A GPU write to the window is still in the open command buffer.
-        return false;
+    if (IsGpuWriteSubmitted(window.start, window.size)) {
+        hot_windows[window.start] = {window.size, scheduler.CurrentTick()};
+    } else {
+        // A GPU write to the window is still in the open command buffer. The faulting pages
+        // alone can still be downloaded ahead when their own GPU writes were all submitted.
+        const VAddr page_start = Common::AlignDown(device_addr, BYTES_PER_PAGE);
+        const VAddr page_end = Common::AlignUp(device_addr + size, BYTES_PER_PAGE);
+        if (page_end - page_start > MaxPageTickRange ||
+            !IsGpuWriteSubmitted(page_start, page_end - page_start)) {
+            return false;
+        }
+        window = {window.arena, page_start, page_end - page_start};
     }
-    hot_windows[window.start] = {window.size, scheduler.CurrentTick()};
     boost::container::small_vector<DownloadWindow, 16> windows{window};
     AddHotWindows(windows);
     stats.ahead = true;
@@ -354,6 +367,15 @@ bool BufferCache::IsGpuWriteSubmitted(VAddr device_addr, u64 size) const {
 
 u64 BufferCache::LastWriteTick(VAddr device_addr, u64 size) const {
     u64 last_tick = 0;
+    if (size <= MaxPageTickRange) {
+        for (u64 page = device_addr / BYTES_PER_PAGE;
+             page <= (device_addr + size - 1) / BYTES_PER_PAGE; ++page) {
+            if (const auto it = page_write_ticks.find(page); it != page_write_ticks.end()) {
+                last_tick = std::max(last_tick, it->second);
+            }
+        }
+        return last_tick;
+    }
     for (u64 chunk = device_addr >> WriteTickChunkBits;
          chunk <= (device_addr + size - 1) >> WriteTickChunkBits; ++chunk) {
         if (const auto it = write_ticks.find(chunk); it != write_ticks.end()) {
@@ -1006,6 +1028,10 @@ bool BufferCache::SynchronizeMemory(const Buffer* arena, VAddr device_addr, u32 
             for (u64 chunk = device_addr >> WriteTickChunkBits;
                  chunk <= (device_addr + size - 1) >> WriteTickChunkBits; ++chunk) {
                 write_ticks[chunk] = tick;
+            }
+            for (u64 page = device_addr / BYTES_PER_PAGE;
+                 page <= (device_addr + size - 1) / BYTES_PER_PAGE; ++page) {
+                page_write_ticks[page] = tick;
             }
         }
     }

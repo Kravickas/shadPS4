@@ -212,7 +212,8 @@ private:
     /// Lock held.
     [[nodiscard]] bool IsGpuWriteSubmitted(VAddr device_addr, u64 size) const;
 
-    /// Scheduler tick of the last writable binding of the range, 0 if there was none. Lock held.
+    /// Scheduler tick of the last writable binding of the range, 0 if there was none. Exact to
+    /// the page for ranges up to MaxPageTickRange, to WriteTickChunk bytes above. Lock held.
     [[nodiscard]] u64 LastWriteTick(VAddr device_addr, u64 size) const;
 
     /// Whether a download in flight overlaps the range. Lock held.
@@ -291,13 +292,16 @@ private:
     /// are not marked CPU-modified, so they are uploaded by range.
     RangeSet emulated_writes;
     std::atomic<bool> emulated_writes_pending{};
-    /// Accesses performed by AccessBesideGpuData per page since its last readback. A page that
-    /// is accessed often gets a readback, which unprotects it.
+    /// Accesses performed by AccessBesideGpuData per page. A page that is accessed often gets a
+    /// readback, which unprotects it.
     std::unordered_map<u64, u32> emulated_accesses;
-    static constexpr u32 MaxEmulatedAccesses = 16;
+    static constexpr u32 MaxEmulatedAccesses = 256;
     /// Scheduler tick of the last writable binding per WriteTickChunk bytes of guest memory.
     std::unordered_map<u64, u64> write_ticks;
     static constexpr u64 WriteTickChunkBits = 16;
+    /// The same per page, to tell for a few pages whether their own GPU writes were submitted.
+    std::unordered_map<u64, u64> page_write_ticks;
+    static constexpr u64 MaxPageTickRange = 1ULL << WriteTickChunkBits;
     /// Readback windows that held GPU-modified data recently: start -> {size, scheduler tick}.
     /// A readback downloads all of them that are ready, so the CPU does not fault on each one.
     std::unordered_map<VAddr, std::pair<u64, u64>> hot_windows;
