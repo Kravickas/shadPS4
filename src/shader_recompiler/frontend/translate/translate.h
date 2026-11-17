@@ -65,8 +65,8 @@ class Translator {
 public:
     explicit Translator(Info& info, const RuntimeInfo& runtime_info, const Profile& profile);
 
-    void Translate(IR::Block* block, u32 pc, IR::Condition cond,
-                   std::span<const GcnInst> inst_list);
+    void Translate(IR::Block* block, u32 pc, IR::Condition cond, std::span<const GcnInst> inst_list,
+                   std::span<const u8> exec_masked_list);
     void TranslateInstruction(const GcnInst& inst);
 
     // Instruction categories
@@ -376,6 +376,7 @@ private:
     template <typename T = IR::U32, bool is_signed = false>
     [[nodiscard]] pk_type<T> GetSrcPk(const InstOperand& operand);
     void SetDst(const InstOperand& operand, const IR::U32F32& value);
+    void SetVectorDst(IR::VectorReg reg, const IR::U32F32& value);
     template <bool is_signed = false>
     void SetDst16(const InstOperand& operand, const IR::U32F32& value);
     void SetDst64(const InstOperand& operand, const IR::U64F64& value_raw);
@@ -408,6 +409,7 @@ private:
     FetchShaderData fetch_data{};
     bool opcode_missing = false;
     bool valid_mask_exported = false;
+    bool exec_masked = false;
     u32 pc{};
 };
 

@@ -1,4 +1,4 @@
-// SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
+// SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include "shader_recompiler/backend/spirv/emit_spirv_instructions.h"
@@ -188,7 +188,17 @@ Id EmitBitFieldInsert32(EmitContext& ctx, Id base, Id insert, Id offset, Id coun
 }
 
 Id EmitBitFieldInsert64(EmitContext& ctx, Id base, Id insert, Id offset, Id count) {
-    return ctx.OpBitFieldInsert(ctx.U64, base, insert, offset, count);
+    // Vulkan restricts OpBitFieldInsert to a 32-bit base, so build the field mask with
+    // 64-bit shifts and insert with bitwise operations. A count of zero returns the base.
+    const Id all_ones{ctx.Constant(ctx.U64, ~0ULL)};
+    const Id ones{ctx.OpShiftRightLogical(ctx.U64, all_ones,
+                                          ctx.OpISub(ctx.U32[1], ctx.ConstU32(64U), count))};
+    const Id mask{ctx.OpShiftLeftLogical(ctx.U64, ones, offset)};
+    const Id kept{ctx.OpBitwiseAnd(ctx.U64, base, ctx.OpNot(ctx.U64, mask))};
+    const Id inserted{
+        ctx.OpBitwiseAnd(ctx.U64, ctx.OpShiftLeftLogical(ctx.U64, insert, offset), mask)};
+    const Id is_empty{ctx.OpIEqual(ctx.U1[1], count, ctx.u32_zero_value)};
+    return ctx.OpSelect(ctx.U64, is_empty, base, ctx.OpBitwiseOr(ctx.U64, kept, inserted));
 }
 
 Id EmitBitFieldSExtract(EmitContext& ctx, IR::Inst* inst, Id base, Id offset, Id count) {

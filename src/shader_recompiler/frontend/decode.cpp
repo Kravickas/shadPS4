@@ -1,4 +1,4 @@
-// SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
+// SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
@@ -412,24 +412,36 @@ void GcnDecodeContext::decodeInstruction64(InstEncoding encoding, GcnCodeSlice& 
 }
 
 void GcnDecodeContext::decodeLiteralConstant(InstEncoding encoding, GcnCodeSlice& code) {
+    // There is one literal dword per instruction; every source encoded as a literal reads it.
     if (HasAdditionalLiteral(encoding, m_instruction.opcode)) {
         u32 encoding_op = mapEncodingOp(encoding, m_instruction.opcode);
         InstFormat instFormat = InstructionFormat(encoding, encoding_op);
+        const u32 literal = code.readu32();
+        for (u32 i = 0; i < m_instruction.src_count; ++i) {
+            if (m_instruction.src[i].field == OperandField::LiteralConst) {
+                m_instruction.src[i].code = literal;
+            }
+        }
         m_instruction.src[m_instruction.src_count].field = OperandField::LiteralConst;
         m_instruction.src[m_instruction.src_count].type = instFormat.src_type;
-        m_instruction.src[m_instruction.src_count].code = code.readu32();
+        m_instruction.src[m_instruction.src_count].code = literal;
         ++m_instruction.src_count;
         m_instruction.length += sizeof(u32);
         return;
     }
 
-    // Find if the instruction contains a literal constant
-    const auto it = std::ranges::find_if(m_instruction.src, [](InstOperand& src) {
-        return src.field == OperandField::LiteralConst;
-    });
-    if (it != m_instruction.src.end()) {
-        it->code = code.readu32();
-        m_instruction.length += sizeof(u32);
+    bool has_literal = false;
+    u32 literal = 0;
+    for (auto& src : m_instruction.src) {
+        if (src.field != OperandField::LiteralConst) {
+            continue;
+        }
+        if (!has_literal) {
+            literal = code.readu32();
+            m_instruction.length += sizeof(u32);
+            has_literal = true;
+        }
+        src.code = literal;
     }
 }
 

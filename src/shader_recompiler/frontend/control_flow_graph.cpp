@@ -2,6 +2,9 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
+#include <map>
+#include <optional>
+#include <unordered_map>
 #include "common/assert.h"
 #include "common/logging/log.h"
 #include "shader_recompiler/frontend/control_flow_graph.h"
@@ -57,6 +60,10 @@ static bool IgnoresExecMask(const GcnInst& inst) {
         break;
     }
     if (inst.category == InstCategory::Export && inst.control.exp.vm) {
+        return true;
+    }
+    // Compares run in every lane, they clear the bits of the lanes with EXEC clear themselves.
+    if (inst.opcode >= Opcode::V_CMP_F_F32 && inst.opcode <= Opcode::V_CMPX_T_U64) {
         return true;
     }
     // Read/Write Lane instructions are not affected either.
@@ -162,124 +169,360 @@ void CFG::EmitLabels() {
     std::ranges::sort(labels);
 }
 
-void CFG::SplitDivergenceScopes() {
-    const auto is_open_scope = [](const GcnInst& inst) {
-        // An open scope instruction is an instruction that modifies EXEC
-        // but also saves the previous value to restore later. This indicates
-        // we are entering a scope.
-        return inst.opcode == Opcode::S_AND_SAVEEXEC_B64 ||
-               // While this instruction does not save EXEC it is often used paired
-               // with SAVEEXEC to mask the threads that didn't pass the condition
-               // of initial branch.
-               (inst.opcode == Opcode::S_ANDN2_B64 && inst.dst[0].field == OperandField::ExecLo) ||
-               inst.IsCmpx();
-    };
-    const auto is_close_scope = [](const GcnInst& inst) {
-        // Closing an EXEC scope can be either a branch instruction
-        // (typical case when S_AND_SAVEEXEC_B64 is right before a branch)
-        // or by a move instruction to EXEC that restores the backup.
-        return (inst.opcode == Opcode::S_MOV_B64 && inst.dst[0].field == OperandField::ExecLo) ||
-               // Sometimes compiler might insert instructions between the SAVEEXEC and the branch.
-               // Those instructions need to be wrapped in the condition as well so allow branch
-               // as end scope instruction.
-               inst.opcode == Opcode::S_CBRANCH_EXECZ || inst.opcode == Opcode::S_ENDPGM ||
-               (inst.opcode == Opcode::S_ANDN2_B64 && inst.dst[0].field == OperandField::ExecLo);
-    };
+// Vector ALU instructions only write registers: under a partial EXEC they run in every lane and
+// the lanes with EXEC clear keep the old value of the destination.
+static bool MasksOwnWrites(const GcnInst& inst) {
+    if (inst.category != InstCategory::VectorALU || IgnoresExecMask(inst)) {
+        return false;
+    }
+    switch (inst.opcode) {
+    // The register accessed is selected by M0.
+    case Opcode::V_MOVRELD_B32:
+    case Opcode::V_MOVRELS_B32:
+    case Opcode::V_MOVRELSD_B32:
+        return false;
+    default:
+        return true;
+    }
+}
 
-    for (auto blk = blocks.begin(); blk != blocks.end(); blk++) {
-        auto next_blk = std::next(blk);
-        s32 curr_begin = -1;
-        for (size_t index = blk->begin_index; index <= blk->end_index; index++) {
-            const auto& inst = inst_list[index];
-            const bool is_close = is_close_scope(inst);
-            if ((is_close || index == blk->end_index) && curr_begin != -1) {
-                // If there are no instructions inside scope don't do anything.
-                if (index - curr_begin == 1 && is_close) {
-                    curr_begin = is_open_scope(inst) ? static_cast<s32>(index) : -1;
-                    continue;
-                }
-                // If all instructions in the scope ignore exec masking, we shouldn't insert a
-                // scope.
-                const auto start = inst_list.begin() + curr_begin + 1;
-                if (!std::ranges::all_of(start, inst_list.begin() + index + !is_close,
-                                         IgnoresExecMask)) {
-                    // Determine the first instruction affected by the exec mask.
-                    do {
-                        ++curr_begin;
-                    } while (IgnoresExecMask(inst_list[curr_begin]));
+// Scalar registers are shared by the wave, an instruction writing one has to run in every lane.
+static bool WritesScalarRegister(const GcnInst& inst) {
+    return std::ranges::any_of(inst.dst, [](const InstOperand& dst) {
+        return dst.field == OperandField::ScalarGPR || dst.field == OperandField::VccLo ||
+               dst.field == OperandField::VccHi;
+    });
+}
 
-                    // Determine the last instruction affected by the exec mask.
-                    s32 curr_end = index;
-                    while (IgnoresExecMask(inst_list[curr_end])) {
-                        --curr_end;
-                    }
+// Instructions without any effect, they can stay inside an EXEC scope.
+static bool IsExecNeutral(const GcnInst& inst) {
+    switch (inst.opcode) {
+    case Opcode::S_NOP:
+    case Opcode::S_WAITCNT:
+    case Opcode::S_SETPRIO:
+        return true;
+    default:
+        return false;
+    }
+}
 
-                    // Create a new block for the divergence scope.
-                    Block* block = block_pool.Create();
-                    block->begin = index_to_pc[curr_begin];
-                    block->end = index_to_pc[curr_end];
-                    block->begin_index = curr_begin;
-                    block->end_index = curr_end;
-                    block->end_inst = inst_list[curr_end];
-                    block->num_predecessors = 1;
-                    blocks.insert_before(next_blk, *block);
+static bool IsSaveExec(const GcnInst& inst) {
+    return inst.opcode >= Opcode::S_AND_SAVEEXEC_B64 && inst.opcode <= Opcode::S_XNOR_SAVEEXEC_B64;
+}
 
-                    // If we are inside the parent block, make an epilogue block and jump to it.
-                    if (curr_end != blk->end_index) {
-                        Block* epi_block = block_pool.Create();
-                        epi_block->begin = index_to_pc[curr_end + 1];
-                        epi_block->end = blk->end;
-                        epi_block->begin_index = curr_end + 1;
-                        epi_block->end_index = blk->end_index;
-                        epi_block->end_inst = blk->end_inst;
-                        epi_block->cond = blk->cond;
-                        epi_block->end_class = blk->end_class;
-                        epi_block->branch_true = blk->branch_true;
-                        epi_block->branch_false = blk->branch_false;
-                        epi_block->num_predecessors = 2;
-                        blocks.insert_before(next_blk, *epi_block);
+static bool WritesExec(const GcnInst& inst) {
+    // S_WQM_B64 is translated as a no-op, it does not change the EXEC of an invocation.
+    if (inst.opcode == Opcode::S_WQM_B64) {
+        return false;
+    }
+    return IsSaveExec(inst) || inst.IsCmpx() ||
+           (inst.dst_count > 0 && (inst.dst[0].field == OperandField::ExecLo ||
+                                   inst.dst[0].field == OperandField::ExecHi));
+}
 
-                        // Have divergence block always jump to epilogue block.
-                        block->cond = IR::Condition::True;
-                        block->branch_true = epi_block;
-                        block->branch_false = nullptr;
+// Registers written by a scalar memory instruction.
+static u32 ScalarLoadWidth(Opcode opcode) {
+    switch (opcode) {
+    case Opcode::S_LOAD_DWORD:
+    case Opcode::S_BUFFER_LOAD_DWORD:
+        return 1;
+    case Opcode::S_LOAD_DWORDX2:
+    case Opcode::S_BUFFER_LOAD_DWORDX2:
+    case Opcode::S_MEMTIME:
+        return 2;
+    case Opcode::S_LOAD_DWORDX4:
+    case Opcode::S_BUFFER_LOAD_DWORDX4:
+        return 4;
+    case Opcode::S_LOAD_DWORDX8:
+    case Opcode::S_BUFFER_LOAD_DWORDX8:
+        return 8;
+    default:
+        return 16;
+    }
+}
 
-                        // If the parent block fails to enter divergence block make it jump to
-                        // epilogue too
-                        blk->branch_false = epi_block;
-                    } else {
-                        // No epilogue block is needed since the divergence block
-                        // also ends the parent block. Inherit the end condition.
-                        auto& parent_blk = *blk;
-                        ASSERT(blk->cond == IR::Condition::True && blk->branch_true);
-                        block->cond = IR::Condition::True;
-                        block->branch_true = blk->branch_true;
-                        block->branch_false = nullptr;
+namespace {
+// What is known about EXEC at a program point: whether every lane that executes it has its EXEC
+// bit set, and which registers hold a half of a copy of such a full mask. A tag is
+// (copy id << 1) | half; the copy id is the index of the instruction that saved it.
+struct ExecState {
+    bool full{};
+    std::array<u32, 128> sgpr_tag{}; // SGPRs and VCC (106, 107)
+    std::map<u32, u32> lane_tag{};   // VGPR lanes holding a spilled half: vgpr * 64 + lane
 
-                        // If the parent block didn't enter the divergence scope
-                        // have it jump directly to the next one
-                        blk->branch_false = blk->branch_true;
-                        blk->branch_true->num_predecessors++;
-                    }
+    bool operator==(const ExecState&) const = default;
 
-                    // Shrink parent block to end right before curr_begin
-                    // and make it jump to divergence block
-                    --curr_begin;
-                    blk->end = index_to_pc[curr_begin];
-                    blk->end_index = curr_begin;
-                    blk->end_inst = inst_list[curr_begin];
-                    blk->cond = IR::Condition::Execnz;
-                    blk->end_class = EndClass::Branch;
-                    blk->branch_true = block;
-                }
-                // Reset scope begin.
-                curr_begin = -1;
-            }
-            // Mark a potential start of an exec scope.
-            if (is_open_scope(inst)) {
-                curr_begin = index;
+    bool HoldsFullCopy(u32 reg) const {
+        return reg + 1 < sgpr_tag.size() && sgpr_tag[reg] != 0 && (sgpr_tag[reg] & 1) == 0 &&
+               sgpr_tag[reg + 1] == sgpr_tag[reg] + 1;
+    }
+
+    static ExecState Merge(const ExecState& a, const ExecState& b) {
+        ExecState merged{.full = a.full && b.full};
+        for (u32 i = 0; i < merged.sgpr_tag.size(); ++i) {
+            merged.sgpr_tag[i] = a.sgpr_tag[i] == b.sgpr_tag[i] ? a.sgpr_tag[i] : 0;
+        }
+        for (const auto& [key, tag] : a.lane_tag) {
+            const auto it = b.lane_tag.find(key);
+            if (it != b.lane_tag.end() && it->second == tag) {
+                merged.lane_tag.emplace(key, tag);
             }
         }
+        return merged;
+    }
+};
+} // Anonymous namespace
+
+// The value of an inline integer constant operand, if it is one.
+static std::optional<u32> InlineInt(const InstOperand& op) {
+    if (op.field == OperandField::ConstZero) {
+        return 0;
+    }
+    if (op.field == OperandField::SignedConstIntPos) {
+        return op.code - static_cast<u32>(OperandField::ConstZero);
+    }
+    return std::nullopt;
+}
+
+static void ExecTransfer(const GcnInst& inst, u32 index, ExecState& state) {
+    const bool full_before = state.full;
+    const auto is_full_copy = [&](const InstOperand& op) {
+        return (op.field == OperandField::ScalarGPR || op.field == OperandField::VccLo) &&
+               state.HoldsFullCopy(op.code);
+    };
+    if (WritesExec(inst)) {
+        // Restoring a copy of the full mask, s_mov_b64 exec, -1 and the s_or_b64 exec, exec, copy
+        // that ends an if/else make EXEC full again; any other write can leave lanes off.
+        bool full = false;
+        if (inst.opcode == Opcode::S_MOV_B64) {
+            full =
+                is_full_copy(inst.src[0]) ||
+                (inst.src[0].field == OperandField::SignedConstIntNeg && inst.src[0].code == 193);
+        } else if (inst.opcode == Opcode::S_OR_B64) {
+            full = is_full_copy(inst.src[0]) || is_full_copy(inst.src[1]);
+        } else if (inst.opcode == Opcode::S_ORN2_SAVEEXEC_B64) {
+            // EXEC = src | ~EXEC: with src = EXEC every lane is on.
+            full = inst.src[0].field == OperandField::ExecLo || is_full_copy(inst.src[0]);
+        } else if (inst.opcode == Opcode::S_AND_B64) {
+            // Ending whole quad mode: a full EXEC and a copy of the full mask stay full.
+            const auto is_exec = [](const InstOperand& op) {
+                return op.field == OperandField::ExecLo;
+            };
+            full = full_before && ((is_exec(inst.src[0]) && is_full_copy(inst.src[1])) ||
+                                   (is_exec(inst.src[1]) && is_full_copy(inst.src[0])));
+        }
+        state.full = full;
+    }
+
+    // A half of a copy moved through a VGPR lane: v_writelane / v_readlane with a constant lane.
+    if (inst.opcode == Opcode::V_READLANE_B32 && inst.dst[0].field == OperandField::ScalarGPR &&
+        inst.dst[0].code < 128) {
+        const auto lane = InlineInt(inst.src[1]);
+        u32 tag = 0;
+        if (lane && inst.src[0].field == OperandField::VectorGPR) {
+            const auto it = state.lane_tag.find(inst.src[0].code * 64 + *lane);
+            tag = it != state.lane_tag.end() ? it->second : 0;
+        }
+        state.sgpr_tag[inst.dst[0].code] = tag;
+        return;
+    }
+    if (inst.opcode == Opcode::V_WRITELANE_B32 && inst.dst[0].field == OperandField::VectorGPR) {
+        const auto lane = InlineInt(inst.src[1]);
+        if (!lane) {
+            std::erase_if(state.lane_tag,
+                          [&](const auto& entry) { return entry.first / 64 == inst.dst[0].code; });
+            return;
+        }
+        const u32 key = inst.dst[0].code * 64 + *lane;
+        const bool from_sgpr = inst.src[0].field == OperandField::ScalarGPR ||
+                               inst.src[0].field == OperandField::VccLo ||
+                               inst.src[0].field == OperandField::VccHi;
+        const u32 tag = from_sgpr && inst.src[0].code < 128 ? state.sgpr_tag[inst.src[0].code] : 0;
+        if (tag != 0) {
+            state.lane_tag[key] = tag;
+        } else {
+            state.lane_tag.erase(key);
+        }
+        return;
+    }
+
+    // Registers written here no longer hold a half of a copy. Every destination slot is checked:
+    // an implicit VCC write is stored in dst[1] without being counted in dst_count.
+    for (const InstOperand& dst : inst.dst) {
+        if (dst.field == OperandField::VccLo || dst.field == OperandField::VccHi) {
+            state.sgpr_tag[static_cast<u32>(OperandField::VccLo)] = 0;
+            state.sgpr_tag[static_cast<u32>(OperandField::VccHi)] = 0;
+            continue;
+        }
+        if (dst.field == OperandField::VectorGPR) {
+            // Vector memory writes up to four VGPRs (dwordx4, four image components, read2_b64).
+            u32 vwidth = 1;
+            if (inst.category == InstCategory::VectorMemory ||
+                inst.category == InstCategory::DataShare) {
+                vwidth = 4;
+            } else if (dst.type == ScalarType::Uint64 || dst.type == ScalarType::Sint64 ||
+                       dst.type == ScalarType::Float64) {
+                vwidth = 2;
+            }
+            std::erase_if(state.lane_tag, [&](const auto& entry) {
+                return entry.first / 64 >= dst.code && entry.first / 64 < dst.code + vwidth;
+            });
+            continue;
+        }
+        if (dst.field != OperandField::ScalarGPR) {
+            continue;
+        }
+        u32 width = 2;
+        if (inst.category == InstCategory::ScalarMemory) {
+            width = ScalarLoadWidth(inst.opcode);
+        } else if (dst.type == ScalarType::Uint32 || dst.type == ScalarType::Sint32 ||
+                   dst.type == ScalarType::Float32 || dst.type == ScalarType::Uint16 ||
+                   dst.type == ScalarType::Sint16 || dst.type == ScalarType::Float16) {
+            width = 1;
+        }
+        for (u32 reg = dst.code; reg < std::min<u32>(dst.code + width, 128); ++reg) {
+            state.sgpr_tag[reg] = 0;
+        }
+    }
+    // A save of the full mask: saveexec stores the old EXEC, as does s_mov_b64 sdst, exec.
+    if (full_before && inst.dst_count > 0 &&
+        (inst.dst[0].field == OperandField::ScalarGPR ||
+         inst.dst[0].field == OperandField::VccLo) &&
+        inst.dst[0].code + 1 < 128 &&
+        (IsSaveExec(inst) ||
+         (inst.opcode == Opcode::S_MOV_B64 && inst.src[0].field == OperandField::ExecLo))) {
+        state.sgpr_tag[inst.dst[0].code] = (index + 1) << 1;
+        state.sgpr_tag[inst.dst[0].code + 1] = ((index + 1) << 1) | 1;
+    }
+}
+
+void CFG::SplitDivergenceScopes() {
+    // Which instructions can run with lanes off in EXEC: forward over the CFG from the entry,
+    // where EXEC is full; paths merge to "partial" when any of them is.
+    std::unordered_map<const Block*, ExecState> block_in;
+    block_in[&*blocks.begin()] = ExecState{.full = true};
+    for (bool changed = true; changed;) {
+        changed = false;
+        for (const Block& blk : blocks) {
+            const auto it = block_in.find(&blk);
+            if (it == block_in.end()) {
+                continue;
+            }
+            ExecState state = it->second;
+            for (u32 i = blk.begin_index; i <= blk.end_index; ++i) {
+                ExecTransfer(inst_list[i], i, state);
+            }
+            for (const Block* succ : {blk.branch_true, blk.branch_false}) {
+                if (!succ) {
+                    continue;
+                }
+                const auto [succ_it, inserted] = block_in.try_emplace(succ, state);
+                if (inserted) {
+                    changed = true;
+                    continue;
+                }
+                const ExecState merged = ExecState::Merge(succ_it->second, state);
+                if (merged != succ_it->second) {
+                    succ_it->second = merged;
+                    changed = true;
+                }
+            }
+        }
+    }
+    std::vector<bool> exec_partial(inst_list.size(), false);
+    exec_masked.assign(inst_list.size(), false);
+    for (const Block& blk : blocks) {
+        const auto it = block_in.find(&blk);
+        if (it == block_in.end()) {
+            continue;
+        }
+        ExecState state = it->second;
+        for (u32 i = blk.begin_index; i <= blk.end_index; ++i) {
+            exec_partial[i] = !state.full;
+            exec_masked[i] = exec_partial[i] && MasksOwnWrites(inst_list[i]);
+            ExecTransfer(inst_list[i], i, state);
+        }
+    }
+    // EXEC masks the vector instructions only; scalar instructions and branches run in every
+    // lane. A vector instruction with other effects than register writes (memory, LDS, exports)
+    // that can execute with lanes off goes into a block which only the lanes with EXEC set enter.
+    const auto needs_scope = [&](u32 i) {
+        return exec_partial[i] && !IgnoresExecMask(inst_list[i]) && !MasksOwnWrites(inst_list[i]);
+    };
+    // Instructions in between can stay inside that block when they write no scalar register.
+    const auto fits_scope = [&](u32 i) {
+        return IsExecNeutral(inst_list[i]) || (exec_partial[i] && MasksOwnWrites(inst_list[i]) &&
+                                               !WritesScalarRegister(inst_list[i]));
+    };
+    for (auto blk = blocks.begin(); blk != blocks.end(); blk++) {
+        if (blk->is_exec_scope) {
+            continue;
+        }
+        u32 first = blk->begin_index;
+        while (first <= blk->end_index && !needs_scope(first)) {
+            ++first;
+        }
+        if (first > blk->end_index) {
+            continue;
+        }
+        u32 last = first;
+        while (last < blk->end_index && (needs_scope(last + 1) || fits_scope(last + 1))) {
+            ++last;
+        }
+        while (!needs_scope(last)) {
+            --last;
+        }
+        const auto next_blk = std::next(blk);
+
+        // Create a new block for the run.
+        Block* block = block_pool.Create();
+        block->begin = index_to_pc[first];
+        block->end = index_to_pc[last + 1];
+        block->begin_index = first;
+        block->end_index = last;
+        block->end_inst = inst_list[last];
+        block->num_predecessors = 1;
+        block->is_exec_scope = true;
+        // Only lanes with EXEC set are inside, nothing to mask there.
+        std::fill(exec_masked.begin() + first, exec_masked.begin() + last + 1, false);
+        block->cond = IR::Condition::True;
+        block->end_class = EndClass::Branch;
+        blocks.insert_before(next_blk, *block);
+
+        if (last != blk->end_index) {
+            // The rest of the parent block follows the run, the lanes that skipped it join there.
+            Block* epi_block = block_pool.Create();
+            epi_block->begin = index_to_pc[last + 1];
+            epi_block->end = blk->end;
+            epi_block->begin_index = last + 1;
+            epi_block->end_index = blk->end_index;
+            epi_block->end_inst = blk->end_inst;
+            epi_block->cond = blk->cond;
+            epi_block->end_class = blk->end_class;
+            epi_block->branch_true = blk->branch_true;
+            epi_block->branch_false = blk->branch_false;
+            epi_block->num_predecessors = 2;
+            blocks.insert_before(next_blk, *epi_block);
+            block->branch_true = epi_block;
+            blk->branch_false = epi_block;
+        } else {
+            // The run ends the parent block, both paths continue at its successor.
+            ASSERT(blk->cond == IR::Condition::True && blk->branch_true);
+            block->branch_true = blk->branch_true;
+            blk->branch_false = blk->branch_true;
+            blk->branch_true->num_predecessors++;
+        }
+
+        // The parent block ends right before the run (it is empty when the run starts it) and
+        // enters the run with the lane's EXEC bit.
+        blk->end = index_to_pc[first];
+        blk->end_index = first - 1;
+        if (first != blk->begin_index) {
+            blk->end_inst = inst_list[first - 1];
+        }
+        blk->cond = IR::Condition::LaneExec;
+        blk->end_class = EndClass::Branch;
+        blk->branch_true = block;
     }
 }
 

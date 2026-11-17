@@ -1257,7 +1257,8 @@ void Translator::V_CMP_F32(ConditionOp op, bool ordered, bool set_exec, const Gc
         SetDst64(inst.dst[1], ir.Ballot(masked));
         return;
     }
-    SetDst64(inst.dst[1], ir.Ballot(result));
+    // Inactive lanes' bits are zero in the destination.
+    SetDst64(inst.dst[1], ir.Ballot(ir.LogicalAnd(ir.GetExec(), result)));
 }
 
 void Translator::V_CMP_F64(ConditionOp op, bool ordered, bool set_exec, const GcnInst& inst) {
@@ -1292,7 +1293,8 @@ void Translator::V_CMP_F64(ConditionOp op, bool ordered, bool set_exec, const Gc
         SetDst64(inst.dst[1], ir.Ballot(masked));
         return;
     }
-    SetDst64(inst.dst[1], ir.Ballot(result));
+    // Inactive lanes' bits are zero in the destination.
+    SetDst64(inst.dst[1], ir.Ballot(ir.LogicalAnd(ir.GetExec(), result)));
 }
 
 void Translator::V_CMP_U32(ConditionOp op, bool is_signed, bool set_exec, const GcnInst& inst) {
@@ -1327,7 +1329,8 @@ void Translator::V_CMP_U32(ConditionOp op, bool is_signed, bool set_exec, const 
         SetDst64(inst.dst[1], ir.Ballot(masked));
         return;
     }
-    SetDst64(inst.dst[1], ir.Ballot(result));
+    // Inactive lanes' bits are zero in the destination.
+    SetDst64(inst.dst[1], ir.Ballot(ir.LogicalAnd(ir.GetExec(), result)));
 }
 
 void Translator::V_CMP_U64(ConditionOp op, bool is_signed, bool set_exec, const GcnInst& inst) {
@@ -1362,7 +1365,8 @@ void Translator::V_CMP_U64(ConditionOp op, bool is_signed, bool set_exec, const 
         SetDst64(inst.dst[1], ir.Ballot(masked));
         return;
     }
-    SetDst64(inst.dst[1], ir.Ballot(result));
+    // Inactive lanes' bits are zero in the destination.
+    SetDst64(inst.dst[1], ir.Ballot(ir.LogicalAnd(ir.GetExec(), result)));
 }
 
 void Translator::V_CMP_CLASS_F32(const GcnInst& inst) {
@@ -1384,7 +1388,8 @@ void Translator::V_CMP_CLASS_F32(const GcnInst& inst) {
         // We don't know the type yet, delay its resolution.
         value = ir.FPCmpClass32(src0, src1);
     }
-    SetDst64(inst.dst[1], ir.Ballot(value));
+    // Inactive lanes' bits are zero in the destination.
+    SetDst64(inst.dst[1], ir.Ballot(ir.LogicalAnd(ir.GetExec(), value)));
 }
 
 // VOP3a
@@ -1650,7 +1655,9 @@ void Translator::V_MAD_U64_U32(const GcnInst& inst) {
     const IR::U1 less_src1 = ir.ILessThan(sum_result, src2, false);
     const IR::U1 did_overflow = ir.LogicalOr(less_src0, less_src1);
 
-    const auto unpacked = ir.UnpackUint2x32(ir.Ballot(did_overflow));
+    const IR::U1 lane_overflow{exec_masked ? ir.LogicalAnd(ir.GetExec(), did_overflow)
+                                           : did_overflow};
+    const auto unpacked = ir.UnpackUint2x32(ir.Ballot(lane_overflow));
     const IR::U32 lo{ir.CompositeExtract(unpacked, 0U)};
     const IR::U32 hi{ir.CompositeExtract(unpacked, 1U)};
     ir.SetVccLo(lo);
@@ -1982,10 +1989,12 @@ IR::U32 Translator::GetCarryIn(const GcnInst& inst) {
 }
 
 void Translator::SetCarryOut(const GcnInst& inst, const IR::U1& carry) {
+    // The lanes with EXEC clear get a zero bit.
+    const IR::U1 lane_carry{exec_masked ? ir.LogicalAnd(ir.GetExec(), carry) : carry};
     if (inst.dst_count == 2) { // VOP3
-        SetDst64(inst.dst[1], ir.Ballot(carry));
+        SetDst64(inst.dst[1], ir.Ballot(lane_carry));
     } else { // VOP2
-        const auto unpacked = ir.UnpackUint2x32(ir.Ballot(carry));
+        const auto unpacked = ir.UnpackUint2x32(ir.Ballot(lane_carry));
         const IR::U32 lo{ir.CompositeExtract(unpacked, 0U)};
         const IR::U32 hi{ir.CompositeExtract(unpacked, 1U)};
         ir.SetVccLo(lo);

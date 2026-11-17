@@ -1,4 +1,4 @@
-// SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
+// SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include "shader_recompiler/backend/spirv/emit_spirv_instructions.h"
@@ -28,8 +28,17 @@ Id EmitQuadBroadcast(EmitContext& ctx, Id value, Id index) {
     return ctx.OpGroupNonUniformQuadBroadcast(ctx.U32[1], SubgroupScope(ctx), value, index);
 }
 
-Id EmitReadFirstLane(EmitContext& ctx, Id value) {
-    return ctx.OpGroupNonUniformBroadcastFirst(ctx.U32[1], SubgroupScope(ctx), value);
+Id EmitReadFirstLane(EmitContext& ctx, Id value, Id exec) {
+    // The first lane with EXEC set, lane 0 when EXEC is empty.
+    const Id ballot{ctx.OpGroupNonUniformBallot(ctx.U32[4], SubgroupScope(ctx), exec)};
+    const Id lsb{ctx.OpGroupNonUniformBallotFindLSB(ctx.U32[1], SubgroupScope(ctx), ballot)};
+    const Id any{
+        ctx.OpINotEqual(ctx.U1[1],
+                        ctx.OpBitwiseOr(ctx.U32[1], ctx.OpCompositeExtract(ctx.U32[1], ballot, 0U),
+                                        ctx.OpCompositeExtract(ctx.U32[1], ballot, 1U)),
+                        ctx.u32_zero_value)};
+    const Id lane{ctx.OpSelect(ctx.U32[1], any, lsb, ctx.u32_zero_value)};
+    return ctx.OpGroupNonUniformBroadcast(ctx.U32[1], SubgroupScope(ctx), value, lane);
 }
 
 Id EmitShuffle(EmitContext& ctx, Id value, Id index) {

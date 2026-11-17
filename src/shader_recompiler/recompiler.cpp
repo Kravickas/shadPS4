@@ -43,7 +43,8 @@ void EmitControlFlowGraph(IR::Program& program, Pools& pools, Gcn::CFG& cfg,
         ir_block->cfg_block = &block;
         block.ir_block = ir_block;
         translator.Translate(ir_block, block.begin, block.cond,
-                             std::span{program.ins_list}.subspan(start, size));
+                             std::span{program.ins_list}.subspan(start, size),
+                             std::span{cfg.exec_masked}.subspan(start, size));
         program.blocks.push_back(ir_block);
     }
     translator.EmitPrologue(program.blocks.front());

@@ -1000,7 +1000,7 @@ void Translator::SetDst(const InstOperand& operand, const IR::U32F32& value) {
     case OperandField::ScalarGPR:
         return ir.SetScalarReg(IR::ScalarReg(operand.code), result);
     case OperandField::VectorGPR:
-        return ir.SetVectorReg(IR::VectorReg(operand.code), result);
+        return SetVectorDst(IR::VectorReg(operand.code), result);
     case OperandField::VccLo:
         return ir.SetVccLo(result);
     case OperandField::VccHi:
@@ -1010,6 +1010,17 @@ void Translator::SetDst(const InstOperand& operand, const IR::U32F32& value) {
     default:
         UNREACHABLE_MSG("Unknown field {}", u32(operand.field));
     }
+}
+
+void Translator::SetVectorDst(IR::VectorReg reg, const IR::U32F32& value) {
+    if (!exec_masked) {
+        return ir.SetVectorReg(reg, value);
+    }
+    // The lanes with EXEC clear keep their value.
+    const IR::U32 new_value{value.Type() == IR::Type::F32 ? ir.BitCast<IR::U32>(IR::F32{value})
+                                                          : IR::U32{value}};
+    const IR::U32 old_value{ir.GetVectorReg<IR::U32>(reg)};
+    ir.SetVectorReg(reg, IR::U32{ir.Select(ir.GetExec(), new_value, old_value)});
 }
 
 template <bool is_signed>
@@ -1061,7 +1072,7 @@ void Translator::SetDst16(const InstOperand& operand, const IR::U32F32& value) {
         const auto result_16 = cast(result);
         const auto new_dst =
             ir.BitFieldInsert(prev_dst, result_16, ir.Imm32(op_sel ? 16 : 0), ir.Imm32(16));
-        return ir.SetVectorReg(IR::VectorReg(operand.code), new_dst);
+        return SetVectorDst(IR::VectorReg(operand.code), new_dst);
     }
     default:
         UNREACHABLE_MSG("Unexpected operand: {}", std::to_underlying(operand.field));
@@ -1105,8 +1116,8 @@ void Translator::SetDst64(const InstOperand& operand, const IR::U64F64& value_ra
     }
     case OperandField::VectorGPR: {
         const auto [lo, hi] = split();
-        ir.SetVectorReg(IR::VectorReg(operand.code + 1), hi);
-        ir.SetVectorReg(IR::VectorReg(operand.code), lo);
+        SetVectorDst(IR::VectorReg(operand.code + 1), hi);
+        SetVectorDst(IR::VectorReg(operand.code), lo);
         break;
     }
     case OperandField::VccLo: {
@@ -1232,13 +1243,14 @@ void Translator::LogMissingOpcode(const GcnInst& inst) {
 }
 
 void Translator::Translate(IR::Block* block, u32 start_pc, IR::Condition cond,
-                           std::span<const GcnInst> inst_list) {
-    if (inst_list.empty()) {
-        return;
-    }
+                           std::span<const GcnInst> inst_list,
+                           std::span<const u8> exec_masked_list) {
+    // A block can be empty when it only enters an EXEC scope; it still needs its condition.
     ir = IR::IREmitter{*block, block->begin()};
     pc = start_pc;
-    for (const auto& inst : inst_list) {
+    for (size_t i = 0; i < inst_list.size(); ++i) {
+        const auto& inst = inst_list[i];
+        exec_masked = exec_masked_list[i] != 0;
         pc += inst.length;
 
         // Special case for emitting fetch shader.
