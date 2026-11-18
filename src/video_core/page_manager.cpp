@@ -649,9 +649,6 @@ struct SignalImpl : public PageManager::Impl {
             return false;
         }
         Common::SkipInstruction(context, inst.length);
-        LOG_INFO(Render, "PERF em addr={:#x} size={} write={} insn={} rip={:#x} thread={}", address,
-                 size, is_write_fault, ZydisMnemonicGetString(inst.mnemonic), rip,
-                 Common::GetCurrentThreadName());
         return true;
     }
 

@@ -207,7 +207,8 @@ void Liverpool::Process(std::stop_token stoken) {
             "stg_spec_us={} stg_find_us={} stg_calls={} stg_perms_scanned={} "
             "vi_inputs_us={} "
             "vi_obtain_us={} vi_bind_us={} index_us={} cmd_record_us={} reset_images_us={} "
-            "reset_buffers_us={} bound_buffers={} bound_images={} tex_lookups={} tex_hits={}",
+            "reset_buffers_us={} bound_buffers={} bound_images={} tex_lookups={} tex_hits={} "
+            "emulated={} stg_same_inputs={}",
             cycle_t0, cycle_t1, cp_perf.tasks, was_submit_done, (cycle_t1 - flush_t0) / 1000,
             cp_perf.vo_block_ns / 1000, cp_perf.vo_blocks, cp_perf.vo_spin_ns / 1000,
             cp_perf.mem_spin_ns / 1000, cp_perf.mem_spins, cp_perf.asc_spin_ns / 1000,
@@ -237,7 +238,8 @@ void Liverpool::Process(std::stop_token stoken) {
             cp_perf.vi_inputs_ns / 1000, cp_perf.vi_obtain_ns / 1000, cp_perf.vi_bind_ns / 1000,
             cp_perf.index_ns / 1000, cp_perf.cmd_record_ns / 1000, cp_perf.reset_images_ns / 1000,
             cp_perf.reset_buffers_ns / 1000, cp_perf.bound_buffers, cp_perf.bound_images,
-            cp_perf.tex_lookups, cp_perf.tex_hits);
+            cp_perf.tex_lookups, cp_perf.tex_hits,
+            readback_wait.emulated.exchange(0, std::memory_order_relaxed), cp_perf.stg_same_inputs);
 
         Platform::IrqC::Instance()->Signal(Platform::InterruptId::GpuIdle);
     }

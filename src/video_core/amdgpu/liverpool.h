@@ -100,6 +100,7 @@ struct CpPerf {
     u64 stg_spec_ns;
     u64 stg_find_ns;
     u32 stg_calls;         ///< GetProgram calls for an existing program
+    u32 stg_same_inputs;   ///< Stage lookups with the shader and user data of the previous draw
     u32 stg_perms_scanned; ///< Permutations compared before the match, scaled
     u64 vi_inputs_ns;      ///< Vertex buffers: GetVertexInputs and setVertexInputEXT
     u64 vi_obtain_ns;      ///< Vertex buffers: range merge and ObtainBuffer
@@ -125,6 +126,7 @@ struct ReadbackWaitPerf {
     std::atomic<u64> count;
     std::atomic<u64> wait_ns;
     std::atomic<u64> max_ns;
+    std::atomic<u64> emulated; ///< Accesses done beside GPU data without a readback
 };
 inline ReadbackWaitPerf readback_wait;
 

@@ -291,7 +291,24 @@ private:
     /// CPU writes performed by AccessBesideGpuData that the arenas do not hold yet. Their pages
     /// are not marked CPU-modified, so they are uploaded by range.
     RangeSet emulated_writes;
-    std::atomic<bool> emulated_writes_pending{};
+    /// One bit per EmulatedChunk bytes of the address space, set while emulated_writes holds a
+    /// range in the chunk. Changed with the lock held; the GPU thread reads it without the lock
+    /// to skip bindings that have none.
+    static constexpr u64 EmulatedChunkBits = 16;
+    static constexpr u64 NumEmulatedChunkWords = u64{1}
+                                                 << (ADDRESS_SPACE_BITS - EmulatedChunkBits - 6);
+    std::unique_ptr<std::atomic<u64>[]> emulated_chunks;
+
+    /// Whether a CPU write done beside GPU data may be pending in the range. Lock-free.
+    [[nodiscard]] bool HasEmulatedWrites(VAddr device_addr, u64 size) const {
+        for (u64 chunk = device_addr >> EmulatedChunkBits;
+             chunk <= (device_addr + size - 1) >> EmulatedChunkBits; ++chunk) {
+            if ((emulated_chunks[chunk >> 6].load(std::memory_order_relaxed) >> (chunk & 63)) & 1) {
+                return true;
+            }
+        }
+        return false;
+    }
     /// Accesses performed by AccessBesideGpuData per page. A page that is accessed often gets a
     /// readback, which unprotects it.
     std::unordered_map<u64, u32> emulated_accesses;

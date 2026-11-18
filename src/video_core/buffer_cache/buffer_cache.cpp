@@ -89,7 +89,9 @@ BufferCache::BufferCache(const Vulkan::Instance& instance_, Vulkan::Scheduler& s
       memory_tracker{std::make_unique<MemoryTracker>(tracker)},
       stream_buffer{instance, scheduler, MemoryType::Stream, STREAM_BUFFER_SIZE},
       gds_buffer{instance, 0, GDS_BUFFER_SIZE, MemoryType::Stream, "GDS Buffer"},
-      stream_shadow(STREAM_SHADOW_SIZE), memory_semaphore{instance} {
+      stream_shadow(STREAM_SHADOW_SIZE),
+      emulated_chunks{std::make_unique<std::atomic<u64>[]>(NumEmulatedChunkWords)},
+      memory_semaphore{instance} {
     const vk::BufferCreateInfo probe_ci = {
         .flags =
             vk::BufferCreateFlagBits::eSparseBinding | vk::BufferCreateFlagBits::eSparseResidency,
@@ -176,12 +178,14 @@ bool BufferCache::AccessBesideGpuData(VAddr device_addr, u32 size, bool is_write
         accesses = 0;
         return false;
     }
+    AmdGpu::readback_wait.emulated.fetch_add(1, std::memory_order_relaxed);
     if (is_write) {
         if (!memory->TryWriteBacking(std::bit_cast<u8*>(device_addr), data, size)) {
             return false;
         }
         emulated_writes.Add(device_addr, size);
-        emulated_writes_pending.store(true, std::memory_order_relaxed);
+        const u64 chunk = device_addr >> EmulatedChunkBits;
+        emulated_chunks[chunk >> 6].fetch_or(1ULL << (chunk & 63), std::memory_order_relaxed);
     } else {
         memory->CopySparseMemory(device_addr, data, size);
     }
@@ -996,7 +1000,7 @@ bool BufferCache::SynchronizeMemory(const Buffer* arena, VAddr device_addr, u32 
     size_t total_size_bytes{};
     {
         // A written range becomes GPU-modified, which readbacks on guest threads look at.
-        const bool emulated_pending = emulated_writes_pending.load(std::memory_order_relaxed);
+        const bool emulated_pending = HasEmulatedWrites(device_addr, size);
         std::unique_lock lk{modified_mutex, std::defer_lock};
         if (is_written || emulated_pending) {
             lk.lock();
@@ -1018,8 +1022,13 @@ bool BufferCache::SynchronizeMemory(const Buffer* arena, VAddr device_addr, u32 
                 }
             });
             emulated_writes.Subtract(device_addr, size);
-            if (emulated_writes.Empty()) {
-                emulated_writes_pending.store(false, std::memory_order_relaxed);
+            for (u64 chunk = device_addr >> EmulatedChunkBits;
+                 chunk <= (device_addr + size - 1) >> EmulatedChunkBits; ++chunk) {
+                if (!emulated_writes.Intersects(chunk << EmulatedChunkBits,
+                                                1ULL << EmulatedChunkBits)) {
+                    emulated_chunks[chunk >> 6].fetch_and(~(1ULL << (chunk & 63)),
+                                                          std::memory_order_relaxed);
+                }
             }
         }
         if (is_written) {

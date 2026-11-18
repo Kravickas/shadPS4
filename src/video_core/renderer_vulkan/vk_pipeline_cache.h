@@ -145,6 +145,11 @@ private:
                    std::vector<std::variant<GraphicsPipelineKey, ComputePipelineKey>>>
         module_related_pipelines;
 
+    struct PerfLastStage {
+        u64 hash;
+        std::array<u32, Shader::ShaderParams::NumShaderUserData> user_data;
+    };
+    std::array<PerfLastStage, MaxShaderStages> perf_last_stages{};
     static constexpr u32 PerfSampleRate = 8;
     u32 perf_sample_counter{};
     bool perf_sample{};

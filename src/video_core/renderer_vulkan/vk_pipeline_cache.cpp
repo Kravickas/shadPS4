@@ -574,6 +574,14 @@ bool PipelineCache::RefreshGraphicsStages() {
         if (perf_sample) {
             AmdGpu::cp_perf.stg_params_ns += (AmdGpu::PerfNs() - params_t0) * PerfSampleRate;
         }
+        // How often a stage keeps the shader and user data registers of the previous draw.
+        auto& last = perf_last_stages[stage_out_idx];
+        if (last.hash == params.hash && std::ranges::equal(last.user_data, params.user_data)) {
+            ++AmdGpu::cp_perf.stg_same_inputs;
+        } else {
+            last.hash = params.hash;
+            std::ranges::copy(params.user_data, last.user_data.begin());
+        }
         std::tie(infos[stage_out_idx], modules[stage_out_idx], key.stage_hashes[stage_out_idx]) =
             GetProgram(stage_in, stage_out, params, binding);
         return true;
