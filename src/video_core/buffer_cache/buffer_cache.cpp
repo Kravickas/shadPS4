@@ -172,10 +172,13 @@ bool BufferCache::AccessBesideGpuData(VAddr device_addr, u32 size, bool is_write
         // page, which serves further accesses better than faulting on each one.
         return false;
     }
-    u32& accesses = emulated_accesses[page_start / BYTES_PER_PAGE];
-    if (++accesses > MaxEmulatedAccesses) {
+    auto& accesses = emulated_accesses[page_start / BYTES_PER_PAGE];
+    if (const u64 tick = scheduler.CurrentTick(); accesses.tick != tick) {
+        accesses = {tick, 0};
+    }
+    if (++accesses.count > MaxEmulatedAccesses) {
         // The page is accessed often, a readback unprotects it.
-        accesses = 0;
+        accesses.count = 0;
         return false;
     }
     AmdGpu::readback_wait.emulated.fetch_add(1, std::memory_order_relaxed);

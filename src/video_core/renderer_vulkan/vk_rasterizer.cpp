@@ -258,6 +258,7 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset) {
         ++AmdGpu::cp_perf.pipe_changes;
         perf_last_pipeline = pipeline;
     }
+    AmdGpu::perf_vk_sample = (perf_vk_counter++ & (AmdGpu::PerfVkSampleRate - 1)) == 0;
 
     const u64 bind_t0 = AmdGpu::PerfNs();
     PrepareRenderState(pipeline);
@@ -303,19 +304,23 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset) {
     const auto [vertex_offset, instance_offset] = GetDrawOffsets(regs, vs_info, fetch_shader);
 
     const auto cmdbuf = scheduler.CommandBuffer();
-    cmdbuf.bindPipeline(vk::PipelineBindPoint::eGraphics, pipeline->Handle());
+    {
+        const AmdGpu::VkCallPerf vk_perf{AmdGpu::cp_perf.vk_draw_ns};
+        cmdbuf.bindPipeline(vk::PipelineBindPoint::eGraphics, pipeline->Handle());
 
-    if (is_indexed) {
-        cmdbuf.drawIndexed(regs.num_indices, regs.num_instances.NumInstances(), 0,
-                           s32(vertex_offset), instance_offset);
-    } else {
-        cmdbuf.draw(regs.num_indices, regs.num_instances.NumInstances(), vertex_offset,
-                    instance_offset);
+        if (is_indexed) {
+            cmdbuf.drawIndexed(regs.num_indices, regs.num_instances.NumInstances(), 0,
+                               s32(vertex_offset), instance_offset);
+        } else {
+            cmdbuf.draw(regs.num_indices, regs.num_instances.NumInstances(), vertex_offset,
+                        instance_offset);
+        }
     }
     DebugState.IncDrawCall();
     AmdGpu::cp_perf.cmd_record_ns += AmdGpu::PerfNs() - rp_t1;
 
     ResetBindings(false);
+    AmdGpu::perf_vk_sample = false;
     AmdGpu::cp_perf.draw_cmd_ns += AmdGpu::PerfNs() - rp_t1;
 }
 
@@ -592,6 +597,7 @@ void Rasterizer::BindVertexBuffers(const GraphicsPipeline* pipeline) {
     if (instance.IsVertexInputDynamicState()) {
         // Update current vertex inputs.
         const auto cmdbuf = scheduler.CommandBuffer();
+        const AmdGpu::VkCallPerf vk_perf{AmdGpu::cp_perf.vk_vi_ns};
         cmdbuf.setVertexInputEXT(bindings, attributes);
     }
     const u64 vi_t1 = AmdGpu::PerfNs();
@@ -721,6 +727,7 @@ void Rasterizer::BindIndexBuffer(u32 index_offset, bool is_indirect) {
     }
 
     const auto cmdbuf = scheduler.CommandBuffer();
+    const AmdGpu::VkCallPerf vk_perf{AmdGpu::cp_perf.vk_index_ns};
     if (instance.IsMaintenance5Supported()) {
         cmdbuf.bindIndexBuffer2KHR(index_buffer, buffer_offset, index_buffer_size, index_type);
     } else {
@@ -1550,6 +1557,7 @@ void Rasterizer::UpdateDynamicState(const GraphicsPipeline* pipeline, const bool
     UpdateColorBlendingState(pipeline);
 
     auto& dynamic_state = scheduler.GetDynamicState();
+    const AmdGpu::VkCallPerf vk_perf{AmdGpu::cp_perf.vk_dyn_ns};
     dynamic_state.Commit(instance, scheduler.CommandBuffer());
 }
 

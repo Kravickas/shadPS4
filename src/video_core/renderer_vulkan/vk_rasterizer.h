@@ -157,6 +157,7 @@ private:
     u64 last_submit_tick{};
     u32 draws_since_submit{};
     const GraphicsPipeline* perf_last_pipeline{};
+    u32 perf_vk_counter{};
 
     struct ImageBinding {
         VideoCore::ImageId image_id;

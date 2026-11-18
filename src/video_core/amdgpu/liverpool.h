@@ -99,8 +99,14 @@ struct CpPerf {
     u64 stg_flatbuf_ns;
     u64 stg_spec_ns;
     u64 stg_find_ns;
-    u32 stg_calls;         ///< GetProgram calls for an existing program
-    u32 stg_same_inputs;   ///< Stage lookups with the shader and user data of the previous draw
+    u32 stg_calls;       ///< GetProgram calls for an existing program
+    u32 stg_same_inputs; ///< Stage lookups with the shader and user data of the previous draw
+    /// Time inside the Vulkan calls of a draw, timed on every 8th draw and scaled by 8
+    u64 vk_vi_ns;          ///< setVertexInputEXT
+    u64 vk_index_ns;       ///< bindIndexBuffer
+    u64 vk_desc_ns;        ///< pushConstants and pushDescriptorSet
+    u64 vk_dyn_ns;         ///< Dynamic state commit
+    u64 vk_draw_ns;        ///< bindPipeline and draw
     u32 stg_perms_scanned; ///< Permutations compared before the match, scaled
     u64 vi_inputs_ns;      ///< Vertex buffers: GetVertexInputs and setVertexInputEXT
     u64 vi_obtain_ns;      ///< Vertex buffers: range merge and ObtainBuffer
@@ -129,6 +135,22 @@ struct ReadbackWaitPerf {
     std::atomic<u64> emulated; ///< Accesses done beside GPU data without a readback
 };
 inline ReadbackWaitPerf readback_wait;
+
+/// Whether the current draw is one whose Vulkan calls are timed.
+inline bool perf_vk_sample = false;
+inline constexpr u64 PerfVkSampleRate = 8;
+
+/// Adds the lifetime of the object to a CpPerf field on sampled draws, scaled by the rate.
+struct VkCallPerf {
+    explicit VkCallPerf(u64& field_) : field{field_}, t0{perf_vk_sample ? PerfNs() : 0} {}
+    ~VkCallPerf() {
+        if (perf_vk_sample) {
+            field += (PerfNs() - t0) * PerfVkSampleRate;
+        }
+    }
+    u64& field;
+    u64 t0;
+};
 
 /// Adds the lifetime of the object to a CpPerf field.
 struct CpPerfScope {

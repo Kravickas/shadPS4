@@ -309,10 +309,14 @@ private:
         }
         return false;
     }
-    /// Accesses performed by AccessBesideGpuData per page. A page that is accessed often gets a
-    /// readback, which unprotects it.
-    std::unordered_map<u64, u32> emulated_accesses;
-    static constexpr u32 MaxEmulatedAccesses = 256;
+    /// Accesses performed by AccessBesideGpuData per page while one command buffer is open. A
+    /// page that is accessed more often than that gets a readback, which unprotects it.
+    struct EmulatedAccesses {
+        u64 tick;
+        u32 count;
+    };
+    std::unordered_map<u64, EmulatedAccesses> emulated_accesses;
+    static constexpr u32 MaxEmulatedAccesses = 512;
     /// Scheduler tick of the last writable binding per WriteTickChunk bytes of guest memory.
     std::unordered_map<u64, u64> write_ticks;
     static constexpr u64 WriteTickChunkBits = 16;
