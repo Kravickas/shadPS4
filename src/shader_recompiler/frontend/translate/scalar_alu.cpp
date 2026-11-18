@@ -328,6 +328,12 @@ void Translator::S_CSELECT_B32(const GcnInst& inst) {
     SetDst(inst.dst[0], IR::U32{ir.Select(ir.GetScc(), src0, src1)});
 }
 
+void Translator::SetMaskScc(const IR::U64& result, bool as_exec) {
+    // EXEC only holds the lanes that exist, a mask written to it is tested as EXEC holds it.
+    const IR::U64 mask{as_exec ? ir.Ballot(ir.GetExec()) : result};
+    ir.SetScc(ir.INotEqual(mask, ir.Imm64(u64(0))));
+}
+
 void Translator::S_CSELECT_B64(const GcnInst& inst) {
     const IR::U64 src0{GetSrc64(inst.src[0])};
     const IR::U64 src1{GetSrc64(inst.src[1])};
@@ -359,8 +365,8 @@ void Translator::S_AND_B64(NegateMode negate, const GcnInst& inst) {
     if (negate == NegateMode::Result) {
         result = ir.BitwiseNot(result);
     }
-    ir.SetScc(ir.INotEqual(result, ir.Imm64(u64(0))));
     SetDst64(inst.dst[0], result);
+    SetMaskScc(result, inst.dst[0].field == OperandField::ExecLo);
 }
 
 void Translator::S_OR_B32(const GcnInst& inst) {
@@ -381,8 +387,8 @@ void Translator::S_OR_B64(NegateMode negate, bool is_xor, const GcnInst& inst) {
     if (negate == NegateMode::Result) {
         result = ir.BitwiseNot(result);
     }
-    ir.SetScc(ir.INotEqual(result, ir.Imm64(u64(0))));
     SetDst64(inst.dst[0], result);
+    SetMaskScc(result, inst.dst[0].field == OperandField::ExecLo);
 }
 
 void Translator::S_XOR_B32(const GcnInst& inst) {
@@ -557,8 +563,8 @@ void Translator::S_MOV_B64(const GcnInst& inst) {
 void Translator::S_NOT_B64(const GcnInst& inst) {
     const IR::U64 src0{GetSrc64(inst.src[0])};
     const IR::U64 result = ir.BitwiseNot(src0);
-    ir.SetScc(ir.INotEqual(result, ir.Imm64(u64(0))));
     SetDst64(inst.dst[0], result);
+    SetMaskScc(result, inst.dst[0].field == OperandField::ExecLo);
 }
 
 void Translator::S_BREV_B32(const GcnInst& inst) {
@@ -640,7 +646,8 @@ void Translator::S_SAVEEXEC_B64(NegateMode negate, bool is_or, const GcnInst& in
         result = ir.BitwiseNot(result);
     }
     ir.SetExec(ir.InverseBallot(result));
-    ir.SetScc(ir.INotEqual(result, ir.Imm64(u64(0))));
+    // A plain AND with the old EXEC has no bits of other lanes.
+    SetMaskScc(result, is_or || negate != NegateMode::None);
 }
 
 void Translator::S_ABS_I32(const GcnInst& inst) {
