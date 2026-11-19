@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <atomic>
 #include <map>
+#include <tuple>
 #include <utility>
 #include "common/adaptive_mutex.h"
 #include "common/assert.h"
@@ -12,8 +13,10 @@
 #include "common/error.h"
 #include "common/multi_level_page_table.h"
 #include "common/signal_context.h"
+#include "common/singleton.h"
 #include "common/thread.h"
 #include "core/emulator_settings.h"
+#include "core/linker.h"
 #include "core/memory.h"
 #include "core/signals.h"
 #include "video_core/page_manager.h"
@@ -45,9 +48,8 @@ namespace VideoCore {
 
 // PADDIAG: test build only. Records the first CPU writer of every page of the GPU pool.
 namespace {
-constexpr VAddr PAD_DIAG_EBOOT_BASE = 0x5340000;
-constexpr VAddr PAD_DIAG_EBOOT_END = 0x5340000 + 0x6320000;
-constexpr u64 PAD_DIAG_GPU_WRITER = 1;
+VAddr pad_eboot_base{};
+VAddr pad_eboot_end{};
 
 struct PadDiagPool {
     VAddr base{};
@@ -55,6 +57,7 @@ struct PadDiagPool {
     std::unique_ptr<std::atomic<u8>[]> armed;
     std::unique_ptr<std::atomic<u64>[]> writer;
     std::unique_ptr<std::atomic<u64>[]> caller;
+    std::unique_ptr<std::atomic<u8>[]> sources;
 };
 PadDiagPool pad_pool;
 std::atomic<bool> pad_pool_ready{false};
@@ -77,7 +80,7 @@ u64 PadDiagFindCaller(void* ctx) {
     const u64* stack = reinterpret_cast<const u64*>(rsp);
     for (u32 i = 0; i < 256; ++i) {
         const u64 value = stack[i];
-        if (value >= PAD_DIAG_EBOOT_BASE && value < PAD_DIAG_EBOOT_END) {
+        if (value >= pad_eboot_base && value < pad_eboot_end) {
             return value;
         }
     }
@@ -492,6 +495,7 @@ struct SignalImpl : public PageManager::Impl {
         }
         pad_pool.writer[index].store(reinterpret_cast<u64>(Common::GetRip(context)));
         pad_pool.caller[index].store(PadDiagFindCaller(context));
+        pad_pool.sources[index].fetch_or(1);
         const u64 page = addr >> PageManager::PM_PAGE_BITS;
         auto& lock = instance->locks[page];
         std::scoped_lock lk{lock};
@@ -547,6 +551,12 @@ void PageManager::PadDiagArmPool(VAddr address, size_t size) {
     if (pad_pool_ready.load()) {
         return;
     }
+    if (const auto* eboot = Common::Singleton<Core::Linker>::Instance()->GetModule(0)) {
+        pad_eboot_base = eboot->GetBaseAddress();
+        pad_eboot_end = pad_eboot_base + eboot->aligned_base_size;
+        LOG_WARNING(Render, "PADDIAG module 0 {} {:#x}-{:#x}", eboot->name, pad_eboot_base,
+                    pad_eboot_end);
+    }
     const VAddr base = Common::AlignDown(address, PM_PAGE_SIZE);
     const u64 num_pages = Common::AlignUp(address + size, PM_PAGE_SIZE) - base >> PM_PAGE_BITS;
     pad_pool.base = base;
@@ -554,27 +564,27 @@ void PageManager::PadDiagArmPool(VAddr address, size_t size) {
     pad_pool.armed = std::make_unique<std::atomic<u8>[]>(num_pages);
     pad_pool.writer = std::make_unique<std::atomic<u64>[]>(num_pages);
     pad_pool.caller = std::make_unique<std::atomic<u64>[]>(num_pages);
+    pad_pool.sources = std::make_unique<std::atomic<u8>[]>(num_pages);
     for (u64 i = 0; i < num_pages; ++i) {
         pad_pool.armed[i].store(1, std::memory_order_relaxed);
     }
     pad_pool_ready.store(true, std::memory_order_release);
     Core::Memory::Instance()->GetAddressSpace().Protect(base, num_pages << PM_PAGE_BITS,
                                                         Core::MemoryPermission::Read);
-    LOG_WARNING(Render, "PADDIAG armed pool {:#x} size {:#x} eboot {:#x}-{:#x}", base,
-                num_pages << PM_PAGE_BITS, PAD_DIAG_EBOOT_BASE, PAD_DIAG_EBOOT_END);
+    LOG_WARNING(Render, "PADDIAG armed pool {:#x} size {:#x}", base, num_pages << PM_PAGE_BITS);
 }
 
-void PageManager::PadDiagRecordGpuWrite(VAddr address, size_t size) {
-    if (!pad_pool_ready.load(std::memory_order_acquire)) {
+// Sources: 1 CPU write fault, 2 GPU DMA/copy, 4 shader storage write, 8 readback to guest,
+// 16 marked GPU modified.
+void PageManager::PadDiagRecord(VAddr address, size_t size, u8 source) {
+    if (!pad_pool_ready.load(std::memory_order_acquire) || size == 0) {
         return;
     }
-    const VAddr end =
-        std::min<VAddr>(address + size, pad_pool.base + (pad_pool.num_pages << PM_PAGE_BITS));
+    const VAddr pool_end = pad_pool.base + (pad_pool.num_pages << PM_PAGE_BITS);
+    const VAddr end = std::min<VAddr>(address + size, pool_end);
     for (VAddr page = std::max(GetPageAddr(address), pad_pool.base); page < end;
          page += PM_PAGE_SIZE) {
-        const u64 index = (page - pad_pool.base) >> PM_PAGE_BITS;
-        u64 expected = 0;
-        pad_pool.writer[index].compare_exchange_strong(expected, PAD_DIAG_GPU_WRITER);
+        pad_pool.sources[(page - pad_pool.base) >> PM_PAGE_BITS].fetch_or(source);
     }
 }
 
@@ -584,24 +594,19 @@ void PageManager::PadDiagReport(VAddr image, VAddr address, size_t size, const c
         LOG_WARNING(Render, "PADDIAG writers image={:#x} {}: outside armed pool", image, label);
         return;
     }
-    std::map<std::pair<u64, u64>, u32> writers;
+    std::map<std::tuple<u8, u64, u64>, u32> writers;
     for (VAddr page = GetPageAddr(address); page < address + size; page += PM_PAGE_SIZE) {
         const u64 index = (page - pad_pool.base) >> PM_PAGE_BITS;
-        ++writers[{pad_pool.writer[index].load(), pad_pool.caller[index].load()}];
+        ++writers[{pad_pool.sources[index].load(), pad_pool.writer[index].load(),
+                   pad_pool.caller[index].load()}];
     }
     for (const auto& [key, pages] : writers) {
-        const auto [rip, caller] = key;
-        const bool in_eboot = rip >= PAD_DIAG_EBOOT_BASE && rip < PAD_DIAG_EBOOT_END;
+        const auto [sources, rip, caller] = key;
         LOG_WARNING(Render,
-                    "PADDIAG writers image={:#x} {}: rip={:#x} ({}) eboot_off={:#x} "
-                    "caller={:#x} caller_off={:#x} pages={}",
-                    image, label, rip,
-                    rip == 0                     ? "never written"
-                    : rip == PAD_DIAG_GPU_WRITER ? "gpu"
-                    : in_eboot                   ? "eboot"
-                                                 : "other module/host",
-                    in_eboot ? rip - PAD_DIAG_EBOOT_BASE : 0, caller,
-                    caller ? caller - PAD_DIAG_EBOOT_BASE : 0, pages);
+                    "PADDIAG writers image={:#x} {}: sources={:#x} rip={:#x} caller={:#x} "
+                    "caller_off={:#x} pages={}",
+                    image, label, sources, rip, caller, caller ? caller - pad_eboot_base : 0,
+                    pages);
     }
 }
 

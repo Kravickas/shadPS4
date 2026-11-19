@@ -313,7 +313,7 @@ void TextureCache::InvalidateMemory(VAddr addr, size_t size) {
 }
 
 void TextureCache::InvalidateMemoryFromGPU(VAddr address, size_t max_size) {
-    PageManager::PadDiagRecordGpuWrite(address, max_size);
+    PageManager::PadDiagRecord(address, max_size, 2);
     // Mark the image at the written address, then follow images stored right after it
     // (e.g. the chroma planes after a luma plane).
     const VAddr end = address + max_size;
@@ -343,6 +343,7 @@ void TextureCache::InvalidateMemoryFromGPU(VAddr address, size_t max_size) {
 }
 
 void TextureCache::MarkAsMaybeGpuDirty(VAddr addr, size_t size) {
+    PageManager::PadDiagRecord(addr, size, 4);
     ForEachImageInRegion(addr, size, [&](ImageId image_id, Image& image) {
         if (IsPadDiagImage(image.info)) {
             LOG_WARNING(Render_Vulkan,
