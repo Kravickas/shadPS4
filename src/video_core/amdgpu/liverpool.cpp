@@ -230,10 +230,11 @@ void Liverpool::Process(std::stop_token stoken) {
             "sa_checks={} sa_diffs={} tx_first_us={} tx_second_us={} tx_samplers_us={} "
             "dispatch_hle_us={} dispatch_bind_us={} dispatch_hles={} dispatch_skips={} "
             "dispatch_bindbuf_us={} dispatch_bindtex_us={} ow_obtain_us={} ow_inval_us={} "
-            "bc_on={} bc_buffers={} bc_buffers_same={} bc_buffers_tick={} bc_buffers_equal={} "
-            "bc_buffers_uploaded={} bc_images={} bc_images_same={} bc_images_equal={} "
+            "ow_kb={} ow_dirty_us={} ow_sync_us={} oa_repeats={} oa_checks={} oa_diffs={} "
+            "oa_diffs_stream={} oa_uploads={} oa_new_tick={} oa_new_epoch={} oa_gpu_writes={} "
+            "oa_emulated={} bc_on={} bc_images={} bc_images_same={} bc_images_equal={} "
             "bc_image_stages={} bc_image_stages_same={} bc_image_stages_quiet={} bc_draws={} "
-            "bc_draws_state_same={}",
+            "bc_draws_state_same={} bc_flats={} bc_flats_same={} bc_flat_kb={}",
             cycle_t0, cycle_t1, cp_perf.tasks, was_submit_done, (cycle_t1 - flush_t0) / 1000,
             cp_perf.vo_block_ns / 1000, cp_perf.vo_blocks, cp_perf.vo_spin_ns / 1000,
             cp_perf.mem_spin_ns / 1000, cp_perf.mem_spins, cp_perf.asc_spin_ns / 1000,
@@ -288,11 +289,14 @@ void Liverpool::Process(std::stop_token stoken) {
             cp_perf.dispatch_hle_ns / 1000, cp_perf.dispatch_bind_ns / 1000, cp_perf.dispatch_hles,
             cp_perf.dispatch_skips, cp_perf.dispatch_bindbuf_ns / 1000,
             cp_perf.dispatch_bindtex_ns / 1000, cp_perf.ow_obtain_ns / 1000,
-            cp_perf.ow_inval_ns / 1000, perf_bind_check ? 1 : 0, cp_perf.bc_buffers,
-            cp_perf.bc_buffers_same, cp_perf.bc_buffers_tick, cp_perf.bc_buffers_equal,
-            cp_perf.bc_buffers_uploaded, cp_perf.bc_images, cp_perf.bc_images_same,
-            cp_perf.bc_images_equal, cp_perf.bc_image_stages, cp_perf.bc_image_stages_same,
-            cp_perf.bc_image_stages_quiet, cp_perf.bc_draws, cp_perf.bc_draws_state_same);
+            cp_perf.ow_inval_ns / 1000, cp_perf.ow_bytes / 1024, cp_perf.ow_dirty_ns / 1000,
+            cp_perf.ow_sync_ns / 1000, cp_perf.oa_repeats, cp_perf.oa_checks, cp_perf.oa_diffs,
+            cp_perf.oa_diffs_stream, cp_perf.oa_uploads, cp_perf.oa_new_tick, cp_perf.oa_new_epoch,
+            cp_perf.oa_gpu_writes, cp_perf.oa_emulated, perf_bind_check ? 1 : 0, cp_perf.bc_images,
+            cp_perf.bc_images_same, cp_perf.bc_images_equal, cp_perf.bc_image_stages,
+            cp_perf.bc_image_stages_same, cp_perf.bc_image_stages_quiet, cp_perf.bc_draws,
+            cp_perf.bc_draws_state_same, cp_perf.bc_flats, cp_perf.bc_flats_same,
+            cp_perf.bc_flat_bytes / 1024);
         if (++perf_run_log_cycles == 2048) {
             perf_run_log_cycles = 0;
             std::string enders;

@@ -143,12 +143,14 @@ void BufferCache::InvalidateMemory(VAddr device_addr, u64 size, bool assume_lock
     memory_tracker->InvalidateRegion(device_addr, size, [this, device_addr, size, assume_locks] {
         ReadMemory(device_addr, size, true, false, assume_locks);
     });
+    ++binding_epoch;
 }
 
 void BufferCache::UnmarkRegionAsGpuModified(VAddr device_addr, u64 size, bool is_write) {
     std::scoped_lock lk{modified_mutex};
     memory_tracker->UnmarkRegionAsGpuModified(device_addr, size, is_write);
     gpu_modified_ranges.Subtract(device_addr, size);
+    ++binding_epoch;
 }
 
 bool BufferCache::AccessBesideGpuData(VAddr device_addr, u32 size, bool is_write, u8* data) {
@@ -205,6 +207,7 @@ void BufferCache::WriteAndUnmarkGpuModified(VAddr device_addr, const u8* data, u
     memory->WriteBackingFromGpu(std::bit_cast<u8*>(device_addr), data, size);
     memory_tracker->UnmarkRegionAsGpuModified(device_addr, size, true);
     gpu_modified_ranges.Subtract(device_addr, size);
+    ++binding_epoch;
 }
 
 void BufferCache::ReadMemory(VAddr device_addr, u64 size, bool is_write, bool async,
@@ -454,6 +457,7 @@ void BufferCache::UnmarkDownloadedWindow(VAddr start, u64 size, u64 download_id)
     if (cursor < end) {
         memory_tracker->UnmarkRegionAsGpuModified(cursor, end - cursor, false);
     }
+    ++binding_epoch;
 }
 
 void BufferCache::FinishReadback(std::unique_lock<std::mutex>& lk, VAddr device_addr, u64 size,
@@ -477,9 +481,11 @@ void BufferCache::FinishReadback(std::unique_lock<std::mutex>& lk, VAddr device_
         // them and no download unmarked them. Unmark them like a downloaded window: a page
         // marked CPU- and GPU-modified at once would be protected write-only.
         memory_tracker->UnmarkRegionAsGpuModified(device_addr, size, false);
+        ++binding_epoch;
     }
     if (is_write) {
         memory_tracker->MarkRegionAsCpuModified(device_addr, size);
+        ++binding_epoch;
     }
 }
 
@@ -815,28 +821,82 @@ std::pair<const Buffer*, u64> BufferCache::ObtainBuffer(VAddr device_addr, u32 s
     EnsureResident(arena, first_block, last_block);
     if (is_written) {
         ++AmdGpu::cp_perf.obtain_written;
+        AmdGpu::cp_perf.ow_bytes += size;
+        const u64 dirty_t0 = AmdGpu::PerfNs();
         texture_cache.MarkAsMaybeGpuDirty(device_addr, size);
+        const u64 sync_t0 = AmdGpu::PerfNs();
+        SynchronizeMemory(arena, device_addr, size, true, is_texel_buffer);
+        AmdGpu::cp_perf.ow_dirty_ns += sync_t0 - dirty_t0;
+        AmdGpu::cp_perf.ow_sync_ns += AmdGpu::PerfNs() - sync_t0;
+        ++binding_epoch;
+        return {arena, arena->Offset(device_addr)};
     }
-    SynchronizeMemory(arena, device_addr, size, is_written, is_texel_buffer);
+    SynchronizeMemory(arena, device_addr, size, false, is_texel_buffer);
     return {arena, arena->Offset(device_addr)};
+}
+
+std::pair<const Buffer*, u64> BufferCache::ObtainBufferAgain(ObtainedBuffer& last,
+                                                             VAddr device_addr, u32 size, u64 run) {
+    const u64 epoch = binding_epoch.load();
+    // The guest gets no signal from the GPU inside a run, so what it writes there is not
+    // ordered against the draws of the run, and only the GPU can have changed what they read.
+    // In the same tick a stream buffer copy is still there. With the same epoch the range is on
+    // the same side of the stream buffer decision, in the same arena, and has no page to upload
+    // that the last binding did not upload. Emulated writes are uploaded by range.
+    bool is_same = false;
+    if (run != 0 && last.run == run && last.device_addr == device_addr && last.size == size) {
+        auto& perf = AmdGpu::cp_perf;
+        if (last.tick != scheduler.CurrentTick()) {
+            ++perf.oa_new_tick;
+        } else if (last.binding_epoch != epoch) {
+            ++perf.oa_new_epoch;
+        } else if (!memory->IsFreeOfGpuWrites(last.gpu_write_epoch)) {
+            ++perf.oa_gpu_writes;
+        } else if (HasEmulatedWrites(device_addr, size)) {
+            ++perf.oa_emulated;
+        } else {
+            is_same = true;
+        }
+    }
+    if (is_same && (++obtain_again_uses & (ObtainAgainCheckInterval - 1)) != 0) {
+        ++AmdGpu::cp_perf.oa_repeats;
+        return {last.buffer, last.offset};
+    }
+    const u64 gpu_write_epoch = memory->GpuWriteEpoch();
+    const u32 uploads = AmdGpu::cp_perf.obtain_uploads;
+    const auto [buffer, offset] = ObtainBuffer(device_addr, size);
+    if (is_same) {
+        auto& perf = AmdGpu::cp_perf;
+        ++perf.oa_checks;
+        if (buffer != last.buffer || offset != last.offset) {
+            // The stream buffer gets another copy when the lookahead thread made one.
+            ++(buffer == &stream_buffer && last.buffer == &stream_buffer ? perf.oa_diffs_stream
+                                                                         : perf.oa_diffs);
+        } else if (perf.obtain_uploads != uploads) {
+            ++perf.oa_uploads;
+        }
+    }
+    // Mapping the stream buffer can start a new tick.
+    last = {device_addr,     size,   run,   scheduler.CurrentTick(), epoch,
+            gpu_write_epoch, buffer, offset};
+    return {buffer, offset};
 }
 
 const BufferCache::StreamHint* BufferCache::FindStreamHint(VAddr device_addr, u32 size) {
     const auto is_for_binding = [&](const StreamHint& hint) {
         return hint.device_addr == device_addr && hint.size == size;
     };
-    const StreamHint* hint;
-    if (stream_hint_cursor < stream_hints.size() &&
-        is_for_binding(stream_hints[stream_hint_cursor])) {
-        // The bindings of a draw come in the order their hints were made in.
-        hint = &stream_hints[stream_hint_cursor++];
-    } else {
+    // The bindings of a draw come in the order their hints were made in, but not all of them
+    // look their hint up.
+    if (stream_hint_cursor >= stream_hints.size() ||
+        !is_for_binding(stream_hints[stream_hint_cursor])) {
         const auto it = std::ranges::find_if(stream_hints, is_for_binding);
         if (it == stream_hints.end()) {
             return nullptr;
         }
-        hint = &*it;
+        stream_hint_cursor = static_cast<u32>(it - stream_hints.begin());
     }
+    const StreamHint* const hint = &stream_hints[stream_hint_cursor++];
     // Bytes the GPU wrote to guest memory since the hint was made are missing from it.
     if (!memory->IsFreeOfGpuWrites(stream_hints_epoch) &&
         memory->IsGpuWrittenSince(stream_hints_epoch, device_addr, size)) {
@@ -930,6 +990,7 @@ void BufferCache::MarkRegionAsGpuModified(VAddr addr, size_t size) {
     std::scoped_lock lk{modified_mutex};
     memory_tracker->MarkRegionAsGpuModified(addr, size);
     gpu_modified_ranges.Add(addr, size);
+    ++binding_epoch;
 }
 
 void BufferCache::ReadEdgeImagePages(const Image& image) {
@@ -1026,6 +1087,7 @@ const Buffer* BufferCache::GetArena(u64 first_block, u64 last_block) {
             std::scoped_lock lk{modified_mutex};
             address_space[first_page] = new_arena;
             address_space[last_page] = new_arena;
+            ++binding_epoch;
         }
         return address_space[first_page];
     }
@@ -1062,6 +1124,7 @@ const Buffer* BufferCache::GetArena(u64 first_block, u64 last_block) {
     for (u32 page = 0; page < (last_size >> ARENA_PAGE_BITS); ++page) {
         address_space[base_page + page] = new_arena;
     }
+    ++binding_epoch;
     return new_arena;
 }
 

@@ -175,19 +175,28 @@ struct CpPerf {
     u64 dispatch_bindtex_ns; ///< DispatchDirect and DispatchIndirect: BindTextures
     u64 ow_obtain_ns;        ///< ObtainBuffer of written bindings
     u64 ow_inval_ns;         ///< Invalidating images under written bindings
-    // Checked cycles only. Read-only buffer bindings of graphics stages:
-    u32 bc_buffers;
-    u32 bc_buffers_same;     ///< Same V# as the same slot of the draw before, in the same run
-    u32 bc_buffers_tick;     ///< ...and in the same scheduler tick
-    u32 bc_buffers_equal;    ///< ...and resolved to the same buffer and offset
-    u32 bc_buffers_uploaded; ///< Same V#, and guest memory was uploaded for the binding
-    // Image bindings of graphics stages:
+    u64 ow_bytes;            ///< ObtainBuffer of written ranges: their sizes
+    u64 ow_dirty_ns;         ///< ...marking images under them
+    u64 ow_sync_ns;          ///< ...uploads and tracking
+    u32 oa_repeats;          ///< Bindings that took what the slot's last binding resolved to
+    u32 oa_checks;           ///< Repeats that obtained the buffer anyway to compare
+    u32 oa_diffs;            ///< Compared repeats that resolved to something else
+    u32 oa_diffs_stream;     ///< Compared repeats with another copy in the stream buffer
+    u32 oa_uploads;          ///< Compared repeats that had guest memory to upload
+    u32 oa_new_tick;         ///< Same range as the slot's last binding, but in another tick
+    u32 oa_new_epoch;        ///< ...but the tracking of some range changed
+    u32 oa_gpu_writes;       ///< ...but the GPU wrote to guest memory
+    u32 oa_emulated;         ///< ...but with a CPU write beside GPU data to upload
+    // Checked cycles only. Image bindings of graphics stages:
     u32 bc_images;
     u32 bc_images_same;  ///< Same T# and use as the same slot of the draw before, same run
     u32 bc_images_equal; ///< ...and resolved to the same view and layout
     u32 bc_image_stages;
     u32 bc_image_stages_same;  ///< Stages with all image bindings as in the draw before
     u32 bc_image_stages_quiet; ///< ...equal results, nothing recorded, same registry
+    u32 bc_flats;              ///< Flattened user data bindings of graphics stages
+    u32 bc_flats_same;         ///< ...with the words of the stage's last one, same run and tick
+    u64 bc_flat_bytes;
     u32 bc_draws;
     u32 bc_draws_state_same; ///< Draws with no context or uconfig register changed since the last
     u32 dispatch_skips;      ///< DispatchDirect: dispatches BindResources handled itself
@@ -383,9 +392,9 @@ public:
         return gpu_id;
     }
 
-    /// Names the current run of state packets and draws. For the GPU thread.
+    /// Names the run of state packets and draws the GPU thread is in, 0 outside of one.
     u64 LookaheadRun() const noexcept {
-        return lookahead_run;
+        return is_lookahead_running ? lookahead_run : 0;
     }
 
 #ifdef __linux__
