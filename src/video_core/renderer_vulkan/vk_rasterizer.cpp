@@ -185,7 +185,7 @@ const GraphicsPipeline* Rasterizer::LookupPipeline(const DrawIndirectParams& par
 }
 
 void Rasterizer::LookAhead(DrawAhead& ahead, const AmdGpu::Regs& regs, bool is_indexed,
-                           u32 index_offset, AmdGpu::CpPerf& perf) {
+                           u32 index_offset, u64 run, AmdGpu::CpPerf& perf) {
     ahead.lookup.pipeline = nullptr;
     ahead.stream_hints.clear();
     if (!NeedsPipeline(regs) || !pipeline_cache.RecordsLookupReads(regs)) {
@@ -200,12 +200,12 @@ void Rasterizer::LookAhead(DrawAhead& ahead, const AmdGpu::Regs& regs, bool is_i
         return;
     }
     const u64 stream_t0 = AmdGpu::PerfNs();
-    ReadStreamAhead(ahead, regs, is_indexed, index_offset, perf);
+    ReadStreamAhead(ahead, regs, is_indexed, index_offset, run, perf);
     perf.la_stream_ns += AmdGpu::PerfNs() - stream_t0;
 }
 
 void Rasterizer::ReadStreamAhead(DrawAhead& ahead, const AmdGpu::Regs& regs, bool is_indexed,
-                                 u32 index_offset, AmdGpu::CpPerf& perf) {
+                                 u32 index_offset, u64 run, AmdGpu::CpPerf& perf) {
     using Result = VideoCore::BufferCache::StreamAheadResult;
     const PipelineLookup& lookup = ahead.lookup;
     ahead.stream_position = buffer_cache.StreamAheadPosition();
@@ -218,7 +218,11 @@ void Rasterizer::ReadStreamAhead(DrawAhead& ahead, const AmdGpu::Regs& regs, boo
             return;
         }
         VideoCore::BufferCache::StreamHint hint;
-        switch (buffer_cache.ReadStreamAhead(address, size, hint)) {
+        switch (buffer_cache.ReadStreamAhead(address, size, run, ahead.gpu_write_epoch, hint)) {
+        case Result::Known:
+            ++perf.sa_ahead_known;
+            ahead.stream_hints.push_back(hint);
+            break;
         case Result::Same:
             ++perf.sa_ahead_same;
             ahead.stream_hints.push_back(hint);
@@ -847,13 +851,16 @@ bool Rasterizer::BindResources(const Pipeline* pipeline) {
         }
         set_writes.resize(set_writes.size() + stage->buffers.size() + stage->images.size() +
                           stage->samplers.size());
-        {
-            const AmdGpu::CpPerfScope perf_buffers{AmdGpu::cp_perf.bind_buffers_ns};
-            BindBuffers(*stage, binding, push_data);
-        }
-        {
-            const AmdGpu::CpPerfScope perf_textures{AmdGpu::cp_perf.bind_textures_ns};
-            BindTextures(*stage, binding);
+        const u64 buffers_t0 = AmdGpu::PerfNs();
+        BindBuffers(*stage, binding, push_data);
+        const u64 textures_t0 = AmdGpu::PerfNs();
+        BindTextures(*stage, binding);
+        const u64 textures_t1 = AmdGpu::PerfNs();
+        AmdGpu::cp_perf.bind_buffers_ns += textures_t0 - buffers_t0;
+        AmdGpu::cp_perf.bind_textures_ns += textures_t1 - textures_t0;
+        if (pipeline->IsCompute()) {
+            AmdGpu::cp_perf.dispatch_bindbuf_ns += textures_t0 - buffers_t0;
+            AmdGpu::cp_perf.dispatch_bindtex_ns += textures_t1 - textures_t0;
         }
         uses_dma |= stage->uses_dma;
     }
@@ -1319,8 +1326,29 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
                 if (desc.is_formatted) {
                     flags |= VideoCore::ObtainBufferFlags::IsTexelBuffer;
                 }
+                const u32 uploads_before = AmdGpu::cp_perf.obtain_uploads;
+                const u64 obtain_t0 = desc.is_written ? AmdGpu::PerfNs() : 0;
                 const auto [buffer, offset] =
                     buffer_cache.ObtainBuffer(vsharp.base_address, size, flags);
+                if (desc.is_written) {
+                    AmdGpu::cp_perf.ow_obtain_ns += AmdGpu::PerfNs() - obtain_t0;
+                }
+                if (const u32 slot = static_cast<u32>(&desc - stage.buffers.data());
+                    AmdGpu::perf_bind_check && !desc.is_written && !desc.is_formatted &&
+                    stage.sw_stage != Shader::SwStage::Compute && slot < MaxCheckedSlots) {
+                    auto& perf = AmdGpu::cp_perf;
+                    auto& last = checked_buffers[u32(stage.sw_stage)][slot];
+                    const u64 run = liverpool->LookaheadRun();
+                    const u64 tick = scheduler.CurrentTick();
+                    ++perf.bc_buffers;
+                    if (last.info == &stage && last.run == run && SameBits(last.vsharp, vsharp)) {
+                        ++perf.bc_buffers_same;
+                        perf.bc_buffers_tick += last.tick == tick;
+                        perf.bc_buffers_equal += last.buffer == buffer && last.offset == offset;
+                        perf.bc_buffers_uploaded += perf.obtain_uploads != uploads_before;
+                    }
+                    last = {&stage, run, tick, vsharp, buffer, offset};
+                }
                 const u64 offset_aligned = Common::AlignDown(offset, alignment);
                 const u64 adjust = offset - offset_aligned;
                 if (adjust % 4 != 0) {
@@ -1332,7 +1360,9 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
                 bound_buffers.emplace_back(buffer, offset, size, src_access);
                 if (desc.is_written) {
                     // Raw storage-buffer writes can also make an aliased cached image stale.
+                    const u64 inval_t0 = AmdGpu::PerfNs();
                     texture_cache.InvalidateMemoryFromGPU(vsharp.base_address, size);
+                    AmdGpu::cp_perf.ow_inval_ns += AmdGpu::PerfNs() - inval_t0;
                 }
                 needs_barrier |= runtime.IsBufferAccessed(buffer, offset, size, desc.is_written);
             }
@@ -1352,6 +1382,15 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
 void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindings& binding) {
     const bool is_timed = AmdGpu::perf_vk_sample;
     const u64 first_t0 = is_timed ? AmdGpu::PerfNs() : 0;
+    const bool is_checked = AmdGpu::perf_bind_check && stage.sw_stage != Shader::SwStage::Compute;
+    if (is_checked) {
+        checked_image_has_key.fill(false);
+    }
+    const u32 check_cmds_before = AmdGpu::cp_perf.rec_cmds;
+    const u64 check_generation = texture_cache.RegistryGeneration();
+    u32 check_images = 0;
+    u32 check_same = 0;
+    u32 check_equal = 0;
     const auto& user_data = stage_user_data[u32(stage.sw_stage)];
     const u32 first_image_idx = image_infos.size();
     // To emulate storing to explicit mip levels, build a descriptor array with each mip level.
@@ -1396,6 +1435,10 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
                             : mip_fallback_mode == Shader::MipStorageFallbackMode::DynamicIndex
                                 ? static_cast<u32>(i)
                                 : ~0U;
+            if (const u32 slot = num_images - 1; is_checked && slot < MaxCheckedSlots) {
+                checked_image_keys[slot] = key;
+                checked_image_has_key[slot] = true;
+            }
             auto& lookup = texture_lookups[XXH3_64bits(&key, sizeof(key)) % texture_lookups.size()];
             const u64 generation = texture_cache.RegistryGeneration();
             if (lookup.generation == generation && SameBits(lookup.key, key)) {
@@ -1507,6 +1550,32 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
 
             image_infos.emplace_back(VK_NULL_HANDLE, *image_view.image_view,
                                      image.backing->state.layout);
+            if (is_checked && i < MaxCheckedSlots && checked_image_has_key[i]) {
+                auto& last = checked_images[u32(stage.sw_stage)][i];
+                const auto& info = image_infos.back();
+                const vk::ImageView view = info.imageView;
+                const u64 run = liverpool->LookaheadRun();
+                ++check_images;
+                if (last.info == &stage && last.run == run &&
+                    SameBits(last.key, checked_image_keys[i])) {
+                    ++check_same;
+                    check_equal += last.view == view && last.layout == info.imageLayout;
+                }
+                last = {&stage, run, checked_image_keys[i], view, info.imageLayout};
+            }
+        }
+    }
+    if (is_checked && check_images != 0) {
+        auto& perf = AmdGpu::cp_perf;
+        perf.bc_images += check_images;
+        perf.bc_images_same += check_same;
+        perf.bc_images_equal += check_equal;
+        ++perf.bc_image_stages;
+        if (check_same == check_images) {
+            ++perf.bc_image_stages_same;
+            perf.bc_image_stages_quiet += check_equal == check_images &&
+                                          perf.rec_cmds == check_cmds_before &&
+                                          texture_cache.RegistryGeneration() == check_generation;
         }
     }
 

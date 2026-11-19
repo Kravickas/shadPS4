@@ -135,11 +135,15 @@ public:
         const u8* data;
     };
 
-    enum class StreamAheadResult { None, Same, Copied, Full };
+    enum class StreamAheadResult { None, Known, Same, Copied, Full };
 
     /// For the lookahead thread: reads the bytes of a binding the stream buffer could serve.
     /// The bytes stay where the hint points until the hints of a later draw are released.
-    StreamAheadResult ReadStreamAhead(VAddr device_addr, u64 size, StreamHint& hint);
+    /// run names the run of draws the binding belongs to, gpu_write_epoch is the count of GPU
+    /// writes to guest memory from before the draw's reads. A range already read in the same
+    /// run with no GPU write to guest memory since is not read again.
+    StreamAheadResult ReadStreamAhead(VAddr device_addr, u64 size, u64 run, u64 gpu_write_epoch,
+                                      StreamHint& hint);
 
     /// For the lookahead thread: where its next bytes go. Hints made after this was read point
     /// to bytes not more than StreamAheadWindow behind it.
@@ -344,6 +348,9 @@ private:
         u64 size;
         u64 position;
         u64 id;
+        /// The run the bytes were last read or compared in, and the epoch of that read.
+        u64 run;
+        u64 gpu_write_epoch;
     };
     static constexpr u64 StreamAheadSlotBits = 15;
     alignas(64) std::unique_ptr<u8[]> stream_ahead_data;

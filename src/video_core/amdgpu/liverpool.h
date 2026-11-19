@@ -156,6 +156,7 @@ struct CpPerf {
     u32 la_lookups_checked;  ///< Lookups made ahead whose inputs were read again at the draw
     u64 la_lookup_ns;        ///< Time the lookahead thread's lookups took
     u64 la_stream_ns;        ///< Time the lookahead thread's reads of binding bytes took
+    u32 sa_ahead_known;      ///< Bindings read ahead already read in the same run
     u32 sa_ahead_same;       ///< Bindings read ahead that held the bytes of their last read
     u32 sa_ahead_copied;     ///< Bindings read ahead whose bytes were copied
     u64 sa_ahead_bytes;
@@ -170,7 +171,26 @@ struct CpPerf {
     u64 dispatch_hle_ns;  ///< DispatchDirect: shaders run by the host instead
     u64 dispatch_bind_ns; ///< DispatchDirect: BindResources
     u32 dispatch_hles;
-    u32 dispatch_skips; ///< DispatchDirect: dispatches BindResources handled itself
+    u64 dispatch_bindbuf_ns; ///< DispatchDirect and DispatchIndirect: BindBuffers
+    u64 dispatch_bindtex_ns; ///< DispatchDirect and DispatchIndirect: BindTextures
+    u64 ow_obtain_ns;        ///< ObtainBuffer of written bindings
+    u64 ow_inval_ns;         ///< Invalidating images under written bindings
+    // Checked cycles only. Read-only buffer bindings of graphics stages:
+    u32 bc_buffers;
+    u32 bc_buffers_same;     ///< Same V# as the same slot of the draw before, in the same run
+    u32 bc_buffers_tick;     ///< ...and in the same scheduler tick
+    u32 bc_buffers_equal;    ///< ...and resolved to the same buffer and offset
+    u32 bc_buffers_uploaded; ///< Same V#, and guest memory was uploaded for the binding
+    // Image bindings of graphics stages:
+    u32 bc_images;
+    u32 bc_images_same;  ///< Same T# and use as the same slot of the draw before, same run
+    u32 bc_images_equal; ///< ...and resolved to the same view and layout
+    u32 bc_image_stages;
+    u32 bc_image_stages_same;  ///< Stages with all image bindings as in the draw before
+    u32 bc_image_stages_quiet; ///< ...equal results, nothing recorded, same registry
+    u32 bc_draws;
+    u32 bc_draws_state_same; ///< Draws with no context or uconfig register changed since the last
+    u32 dispatch_skips;      ///< DispatchDirect: dispatches BindResources handled itself
 };
 inline CpPerf cp_perf;
 
@@ -204,6 +224,10 @@ inline ReadbackWaitPerf readback_wait;
 
 /// Whether the current draw is one whose Vulkan calls are timed.
 inline bool perf_vk_sample = false;
+/// Probe, on for one command processor cycle in PerfBindCheckRate: whether the bindings of a
+/// draw resolve to what the same bindings of the draw before it resolved to.
+inline bool perf_bind_check = false;
+inline constexpr u32 PerfBindCheckRate = 8;
 inline constexpr u64 PerfVkSampleRate = 8;
 
 /// Adds the lifetime of the object to a CpPerf field on sampled draws, scaled by the rate.
@@ -359,6 +383,11 @@ public:
         return gpu_id;
     }
 
+    /// Names the current run of state packets and draws. For the GPU thread.
+    u64 LookaheadRun() const noexcept {
+        return lookahead_run;
+    }
+
 #ifdef __linux__
     u32 GetGpuCommandProcessorThreadId() {
         return gpu_tid;
@@ -473,6 +502,9 @@ private:
 
     enum class PacketClass { State, Draw, Other };
 
+    /// Probe: whether a state packet gives a config, context or uconfig register a new value.
+    bool ChangesStateRegs(const PM4Header* header) const;
+
     /// Whether a packet only sets state, is a draw or dispatch, or does anything else.
     static PacketClass ClassifyPacket(const PM4Header* header, bool guest_markers_enabled);
 
@@ -521,6 +553,9 @@ private:
     u32 lookahead_compare_countdown{};
     u32 lookahead_logged_mismatches{};
     u64 lookahead_run{};
+    u32 perf_cycles{};
+    /// Probe: a context, uconfig or config register changed since the last draw.
+    bool perf_state_changed{};
     u64 lookahead_taken{};
     alignas(64) std::atomic<u64> lookahead_started_run{};
     alignas(64) std::atomic<u64> lookahead_stopped_run{};

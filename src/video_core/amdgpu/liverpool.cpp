@@ -151,6 +151,7 @@ void Liverpool::Process(std::stop_token stoken) {
 
         const u64 cycle_t0 = PerfNs();
         cp_perf = {};
+        perf_bind_check = (perf_cycles++ & (PerfBindCheckRate - 1)) == 0;
         curr_qid = -1;
 
         while ((num_submits || num_commands) && !stoken.stop_requested()) {
@@ -223,10 +224,16 @@ void Liverpool::Process(std::stop_token stoken) {
             "state_packets={} state_words={} la_runs={} la_results={} la_waits={} la_wait_us={} "
             "la_sync_waits={} la_sync_us={} la_copies={} la_compares={} la_mismatches={} "
             "la_early={} la_scan_us={} la_sleeps={} la_lookups_used={} la_lookups_rejected={} "
-            "la_lookup_us={} la_lookups_checked={} la_stream_us={} sa_ahead_same={} "
+            "la_lookup_us={} la_lookups_checked={} la_stream_us={} sa_ahead_known={} "
+            "sa_ahead_same={} "
             "sa_ahead_copied={} sa_ahead_kb={} sa_ahead_full={} sa_used={} sa_stale={} "
             "sa_checks={} sa_diffs={} tx_first_us={} tx_second_us={} tx_samplers_us={} "
-            "dispatch_hle_us={} dispatch_bind_us={} dispatch_hles={} dispatch_skips={}",
+            "dispatch_hle_us={} dispatch_bind_us={} dispatch_hles={} dispatch_skips={} "
+            "dispatch_bindbuf_us={} dispatch_bindtex_us={} ow_obtain_us={} ow_inval_us={} "
+            "bc_on={} bc_buffers={} bc_buffers_same={} bc_buffers_tick={} bc_buffers_equal={} "
+            "bc_buffers_uploaded={} bc_images={} bc_images_same={} bc_images_equal={} "
+            "bc_image_stages={} bc_image_stages_same={} bc_image_stages_quiet={} bc_draws={} "
+            "bc_draws_state_same={}",
             cycle_t0, cycle_t1, cp_perf.tasks, was_submit_done, (cycle_t1 - flush_t0) / 1000,
             cp_perf.vo_block_ns / 1000, cp_perf.vo_blocks, cp_perf.vo_spin_ns / 1000,
             cp_perf.mem_spin_ns / 1000, cp_perf.mem_spins, cp_perf.asc_spin_ns / 1000,
@@ -274,12 +281,18 @@ void Liverpool::Process(std::stop_token stoken) {
             lookahead_perf.scan_ns.exchange(0, std::memory_order_relaxed) / 1000,
             lookahead_perf.sleeps.exchange(0, std::memory_order_relaxed), cp_perf.la_lookups_used,
             cp_perf.la_lookups_rejected, cp_perf.la_lookup_ns / 1000, cp_perf.la_lookups_checked,
-            cp_perf.la_stream_ns / 1000, cp_perf.sa_ahead_same, cp_perf.sa_ahead_copied,
-            cp_perf.sa_ahead_bytes / 1024, cp_perf.sa_ahead_full, cp_perf.sa_used, cp_perf.sa_stale,
-            cp_perf.sa_checks, cp_perf.sa_diffs, cp_perf.tx_first_ns / 1000,
-            cp_perf.tx_second_ns / 1000, cp_perf.tx_samplers_ns / 1000,
+            cp_perf.la_stream_ns / 1000, cp_perf.sa_ahead_known, cp_perf.sa_ahead_same,
+            cp_perf.sa_ahead_copied, cp_perf.sa_ahead_bytes / 1024, cp_perf.sa_ahead_full,
+            cp_perf.sa_used, cp_perf.sa_stale, cp_perf.sa_checks, cp_perf.sa_diffs,
+            cp_perf.tx_first_ns / 1000, cp_perf.tx_second_ns / 1000, cp_perf.tx_samplers_ns / 1000,
             cp_perf.dispatch_hle_ns / 1000, cp_perf.dispatch_bind_ns / 1000, cp_perf.dispatch_hles,
-            cp_perf.dispatch_skips);
+            cp_perf.dispatch_skips, cp_perf.dispatch_bindbuf_ns / 1000,
+            cp_perf.dispatch_bindtex_ns / 1000, cp_perf.ow_obtain_ns / 1000,
+            cp_perf.ow_inval_ns / 1000, perf_bind_check ? 1 : 0, cp_perf.bc_buffers,
+            cp_perf.bc_buffers_same, cp_perf.bc_buffers_tick, cp_perf.bc_buffers_equal,
+            cp_perf.bc_buffers_uploaded, cp_perf.bc_images, cp_perf.bc_images_same,
+            cp_perf.bc_images_equal, cp_perf.bc_image_stages, cp_perf.bc_image_stages_same,
+            cp_perf.bc_image_stages_quiet, cp_perf.bc_draws, cp_perf.bc_draws_state_same);
         if (++perf_run_log_cycles == 2048) {
             perf_run_log_cycles = 0;
             std::string enders;
@@ -471,6 +484,28 @@ Liverpool::PacketClass Liverpool::ClassifyPacket(const PM4Header* header,
     default:
         return PacketClass::Other;
     }
+}
+
+bool Liverpool::ChangesStateRegs(const PM4Header* header) const {
+    u32 base;
+    switch (header->type3.opcode) {
+    case PM4ItOpcode::ClearState:
+        return true;
+    case PM4ItOpcode::SetConfigReg:
+        base = Regs::ConfigRegWordOffset;
+        break;
+    case PM4ItOpcode::SetContextReg:
+        base = Regs::ContextRegWordOffset;
+        break;
+    case PM4ItOpcode::SetUconfigReg:
+        base = Regs::UconfigRegWordOffset;
+        break;
+    default:
+        return false;
+    }
+    const auto* set_data = reinterpret_cast<const PM4CmdSetData*>(header);
+    return std::memcmp(&regs.reg_array[base + set_data->reg_offset], header + 2,
+                       (header->type3.NumWords() - 1) * sizeof(u32)) != 0;
 }
 
 void Liverpool::ApplyPacketState(const GfxState& state, const PM4Header* header) {
@@ -819,6 +854,7 @@ void Liverpool::WaitLookaheadStopped() {
     CpPerf& ahead = *lookahead_cp_perf;
     cp_perf.la_lookup_ns += ahead.pipe_key_ns;
     cp_perf.la_stream_ns += ahead.la_stream_ns;
+    cp_perf.sa_ahead_known += ahead.sa_ahead_known;
     cp_perf.sa_ahead_same += ahead.sa_ahead_same;
     cp_perf.sa_ahead_copied += ahead.sa_ahead_copied;
     cp_perf.sa_ahead_bytes += ahead.sa_ahead_bytes;
@@ -982,16 +1018,16 @@ void Liverpool::LookaheadThread(std::stop_token stoken) {
                 Vulkan::DrawAhead& ahead = lookahead_draws[produced % NumLookaheadResults];
                 switch (header->type3.opcode) {
                 case PM4ItOpcode::DrawIndex2:
-                    rasterizer->LookAhead(ahead, state.regs, true, 0, *lookahead_cp_perf);
+                    rasterizer->LookAhead(ahead, state.regs, true, 0, run, *lookahead_cp_perf);
                     break;
                 case PM4ItOpcode::DrawIndexOffset2:
                     rasterizer->LookAhead(
                         ahead, state.regs, true,
-                        reinterpret_cast<const PM4CmdDrawIndexOffset2*>(header)->index_offset,
+                        reinterpret_cast<const PM4CmdDrawIndexOffset2*>(header)->index_offset, run,
                         *lookahead_cp_perf);
                     break;
                 case PM4ItOpcode::DrawIndexAuto:
-                    rasterizer->LookAhead(ahead, state.regs, false, 0, *lookahead_cp_perf);
+                    rasterizer->LookAhead(ahead, state.regs, false, 0, run, *lookahead_cp_perf);
                     break;
                 default:
                     ahead.lookup.pipeline = nullptr;
@@ -1049,6 +1085,7 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb) {
             if (packet_class == PacketClass::Other) {
                 end_run(static_cast<u32>(opcode) & 0xff);
                 EndLookaheadRun(dcb.data());
+                perf_state_changed = true;
             } else {
                 if (rasterizer) {
                     if (!is_lookahead_running) {
@@ -1060,9 +1097,17 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb) {
                 }
                 if (packet_class == PacketClass::Draw) {
                     ++run_length;
+                    if (perf_bind_check) {
+                        ++cp_perf.bc_draws;
+                        cp_perf.bc_draws_state_same += !perf_state_changed;
+                        perf_state_changed = false;
+                    }
                 } else {
                     ++cp_perf.state_packets;
                     cp_perf.state_words += count;
+                    if (perf_bind_check && !perf_state_changed) {
+                        perf_state_changed = ChangesStateRegs(header);
+                    }
                 }
             }
             ApplyPacketState(gfx_state, header);

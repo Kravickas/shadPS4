@@ -104,8 +104,9 @@ public:
 
     /// For the lookahead thread: prepares a draw from the registers it will run with. perf
     /// gets the probe timings.
+    /// run names the run of draws the draw belongs to.
     void LookAhead(DrawAhead& ahead, const AmdGpu::Regs& regs, bool is_indexed, u32 index_offset,
-                   AmdGpu::CpPerf& perf);
+                   u64 run, AmdGpu::CpPerf& perf);
 
     /// Hands over what the lookahead thread prepared for the next draw, if anything.
     void SetDrawAhead(const DrawAhead* ahead) {
@@ -163,7 +164,7 @@ private:
 
     /// For the lookahead thread: reads the bytes of the draw's bindings.
     void ReadStreamAhead(DrawAhead& ahead, const AmdGpu::Regs& regs, bool is_indexed,
-                         u32 index_offset, AmdGpu::CpPerf& perf);
+                         u32 index_offset, u64 run, AmdGpu::CpPerf& perf);
 
     void BindBuffers(const Shader::Info& stage, Shader::Backend::Bindings& binding,
                      Shader::PushData& push_data);
@@ -256,6 +257,28 @@ private:
         ImageBinding binding;
     };
     std::array<TextureLookup, 512> texture_lookups{};
+
+    /// Probe: what the binding slots of each graphics stage resolved to in the last draw.
+    struct CheckedBuffer {
+        const Shader::Info* info;
+        u64 run;
+        u64 tick;
+        AmdGpu::Buffer vsharp;
+        const VideoCore::Buffer* buffer;
+        u64 offset;
+    };
+    struct CheckedImage {
+        const Shader::Info* info;
+        u64 run;
+        TextureKey key;
+        vk::ImageView view;
+        vk::ImageLayout layout;
+    };
+    static constexpr u32 MaxCheckedSlots = 32;
+    std::array<std::array<CheckedBuffer, MaxCheckedSlots>, MaxShaderStages> checked_buffers{};
+    std::array<std::array<CheckedImage, MaxCheckedSlots>, MaxShaderStages> checked_images{};
+    std::array<TextureKey, MaxCheckedSlots> checked_image_keys{};
+    std::array<bool, MaxCheckedSlots> checked_image_has_key{};
 
     boost::container::static_vector<vk::DescriptorImageInfo, Shader::NUM_IMAGES> image_infos;
     boost::container::static_vector<vk::DescriptorBufferInfo, Shader::NUM_BUFFERS> buffer_infos;

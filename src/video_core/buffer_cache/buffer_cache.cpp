@@ -859,8 +859,8 @@ const BufferCache::StreamHint* BufferCache::FindStreamHint(VAddr device_addr, u3
     return hint;
 }
 
-BufferCache::StreamAheadResult BufferCache::ReadStreamAhead(VAddr device_addr, u64 size,
-                                                            StreamHint& hint) {
+BufferCache::StreamAheadResult BufferCache::ReadStreamAhead(VAddr device_addr, u64 size, u64 run,
+                                                            u64 gpu_write_epoch, StreamHint& hint) {
     if (device_addr == 0 || size == 0 || size > STREAM_THRESHOLD ||
         device_addr + size > (1ULL << ADDRESS_SPACE_BITS)) {
         return StreamAheadResult::None;
@@ -869,7 +869,15 @@ BufferCache::StreamAheadResult BufferCache::ReadStreamAhead(VAddr device_addr, u
     if (copy.id != 0 && copy.device_addr == device_addr && copy.size == size &&
         stream_ahead_position - copy.position <= StreamAheadWindow) {
         const u8* const data = stream_ahead_data.get() + copy.position % StreamAheadSize;
+        if (copy.run == run && memory->IsFreeOfGpuWrites(copy.gpu_write_epoch)) {
+            // The guest gets no signal from the GPU inside a run, so only the GPU can have
+            // changed what a draw of the run reads.
+            hint = {device_addr, static_cast<u32>(size), copy.id, data};
+            return StreamAheadResult::Known;
+        }
         if (memory->CompareSparseMemory(device_addr, data, size)) {
+            copy.run = run;
+            copy.gpu_write_epoch = gpu_write_epoch;
             hint = {device_addr, static_cast<u32>(size), copy.id, data};
             return StreamAheadResult::Same;
         }
@@ -885,7 +893,7 @@ BufferCache::StreamAheadResult BufferCache::ReadStreamAhead(VAddr device_addr, u
     }
     u8* const data = stream_ahead_data.get() + position % StreamAheadSize;
     memory->CopySparseMemory(device_addr, data, size);
-    copy = {device_addr, size, position, ++stream_ahead_last_id};
+    copy = {device_addr, size, position, ++stream_ahead_last_id, run, gpu_write_epoch};
     stream_ahead_position = position + size;
     hint = {device_addr, static_cast<u32>(size), copy.id, data};
     return StreamAheadResult::Copied;
