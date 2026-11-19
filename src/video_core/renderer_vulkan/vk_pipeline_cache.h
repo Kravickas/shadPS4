@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include <mutex>
 #include <variant>
 #include <tsl/robin_map.h>
 #include "shader_recompiler/profile.h"
@@ -22,7 +23,10 @@ struct std::hash<vk::ShaderModule> {
 
 namespace AmdGpu {
 class Liverpool;
-}
+struct ComputeProgram;
+struct CpPerf;
+union Regs;
+} // namespace AmdGpu
 
 namespace Serialization {
 struct Archive;
@@ -70,6 +74,24 @@ struct DrawIndirectParams {
     bool is_indirect;
 };
 
+/// A graphics pipeline lookup together with what it read from guest memory, so that a lookup
+/// made ahead of its draw can be checked against that memory when the draw runs.
+struct PipelineLookup {
+    struct Stage {
+        const Shader::Info* info;
+        u32 hw_stage; ///< Index of the program registers the stage was looked up from
+        VAddr pgm_base;
+        u32 flat_begin; ///< Position of the stage's flattened user data in flats
+        u32 flat_size;
+    };
+
+    const GraphicsPipeline* pipeline{};
+    u32 num_stages{};
+    std::array<Stage, MaxShaderStages> stages;
+    std::vector<u32> flats;
+    Shader::VsInputsRead vs_reads;
+};
+
 class PipelineCache {
 public:
     explicit PipelineCache(const Instance& instance, Scheduler& scheduler,
@@ -83,9 +105,26 @@ public:
     bool LoadGraphicsPipeline(Serialization::Archive& ar);
     bool LoadPipelineStage(Serialization::Archive& ar, size_t stage);
 
-    const GraphicsPipeline* GetGraphicsPipeline(const DrawIndirectParams params = {});
+    /// Lookups come from the GPU thread and from its lookahead thread; whoever makes one holds
+    /// this. The lookahead thread can wait for the GPU thread while it holds it (a readback of
+    /// memory its lookup reads), so the GPU thread must not block on it.
+    std::mutex& LookupMutex() {
+        return lookup_mutex;
+    }
 
-    const ComputePipeline* GetComputePipeline();
+    /// Whether a PipelineLookup holds all that a lookup with these registers reads from guest
+    /// memory.
+    bool RecordsLookupReads(const AmdGpu::Regs& regs) const;
+
+    /// Looks the pipeline of a draw up from the given registers. perf gets the probe timings.
+    /// With lookup, also records what the lookup read from guest memory.
+    const GraphicsPipeline* GetGraphicsPipeline(const AmdGpu::Regs& regs, AmdGpu::CpPerf& perf,
+                                                const DrawIndirectParams params = {},
+                                                PipelineLookup* lookup = nullptr);
+
+    const ComputePipeline* GetComputePipeline(const AmdGpu::Regs& regs,
+                                              const AmdGpu::ComputeProgram& cs_program,
+                                              AmdGpu::CpPerf& perf);
 
     using Result = std::tuple<const Shader::Info*, vk::ShaderModule, u64>;
     Result GetProgram(Shader::HwStage hw_stage, Shader::SwStage sw_stage,
@@ -123,6 +162,15 @@ private:
     const Instance& instance;
     Scheduler& scheduler;
     AmdGpu::Liverpool* liverpool;
+    std::mutex lookup_mutex;
+    /// State and probes of the lookup in progress.
+    const AmdGpu::Regs* lookup_regs{};
+    const AmdGpu::ComputeProgram* lookup_cs_program{};
+    AmdGpu::CpPerf* lookup_perf{};
+    /// Where the lookup in progress leaves what its vertex stage read, if anywhere.
+    Shader::VsInputsRead* lookup_vs_reads{};
+    /// Program registers each stage of the lookup in progress came from.
+    std::array<u32, MaxShaderStages> lookup_hw_stages{};
     DescriptorHeap desc_heap;
     vk::UniquePipelineCache pipeline_cache;
     vk::UniquePipelineLayout pipeline_layout;

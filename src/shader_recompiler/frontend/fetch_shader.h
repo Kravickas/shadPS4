@@ -3,6 +3,9 @@
 
 #pragma once
 
+#include <span>
+#include <vector>
+
 #include "common/small_vector.h"
 #include "common/types.h"
 #include "shader_recompiler/info.h"
@@ -34,8 +37,8 @@ struct VertexAttribute {
         return static_cast<InstanceIdType>(instance_data);
     }
 
-    constexpr AmdGpu::Buffer GetSharp(const Shader::Info& info) const noexcept {
-        auto buffer = info.ReadUdReg<AmdGpu::Buffer>(sgpr_base, dword_offset);
+    constexpr AmdGpu::Buffer GetSharp(const auto& info) const noexcept {
+        auto buffer = info.template ReadUdReg<AmdGpu::Buffer>(sgpr_base, dword_offset);
         buffer.base_address += inst_offset;
         if (data_format) {
             buffer.data_format = data_format;
@@ -66,8 +69,12 @@ struct FetchShaderData {
     bool Deserialize(Serialization::Archive& buffer);
 };
 
+const u32* GetFetchShaderCode(std::span<const u32> user_data, u32 sgpr_base);
+
 const u32* GetFetchShaderCode(const Info& info, u32 sgpr_base);
 
-bool ParseFetchShader(const Shader::Info& info, FetchShaderData& out_fetch_data);
+/// With code_read, also returns the words of code it read.
+bool ParseFetchShader(const Shader::Info& info, FetchShaderData& out_fetch_data,
+                      std::vector<u32>* code_read = nullptr);
 
 } // namespace Shader::Gcn

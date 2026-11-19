@@ -10,14 +10,16 @@ union Regs;
 
 namespace Shader {
 struct Info;
-}
+struct StageUserData;
+} // namespace Shader
 
 namespace Vulkan {
 
 class Rasterizer;
 
 /// Attempts to execute a shader using HLE if possible.
-bool ExecuteShaderHLE(const Shader::Info& info, const AmdGpu::Regs& regs,
-                      const AmdGpu::ComputeProgram& cs_program, Rasterizer& rasterizer);
+bool ExecuteShaderHLE(const Shader::Info& info, const Shader::StageUserData& user_data,
+                      const AmdGpu::Regs& regs, const AmdGpu::ComputeProgram& cs_program,
+                      Rasterizer& rasterizer);
 
 } // namespace Vulkan

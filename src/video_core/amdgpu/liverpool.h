@@ -26,7 +26,8 @@
 
 namespace Vulkan {
 class Rasterizer;
-}
+struct DrawAhead;
+} // namespace Vulkan
 
 namespace Libraries::VideoOut {
 struct VideoOutPort;
@@ -146,10 +147,30 @@ struct CpPerf {
     u64 la_wait_ns;
     u32 la_sync_waits; ///< Run ends that had to wait for the lookahead thread to stop
     u64 la_sync_ns;
-    u32 la_copies;     ///< Full copies of the state into the lookahead thread's
-    u32 la_compares;   ///< Comparisons of the lookahead thread's state with the real one
-    u32 la_mismatches; ///< Comparisons or positions that differed
-    u32 la_early;      ///< Runs the lookahead thread stopped before their end
+    u32 la_copies;           ///< Full copies of the state into the lookahead thread's
+    u32 la_compares;         ///< Comparisons of the lookahead thread's state with the real one
+    u32 la_mismatches;       ///< Comparisons or positions that differed
+    u32 la_early;            ///< Runs the lookahead thread stopped before their end
+    u32 la_lookups_used;     ///< Draws that used the pipeline looked up ahead
+    u32 la_lookups_rejected; ///< Lookups made ahead whose inputs had changed by the draw
+    u32 la_lookups_checked;  ///< Lookups made ahead whose inputs were read again at the draw
+    u64 la_lookup_ns;        ///< Time the lookahead thread's lookups took
+    u64 la_stream_ns;        ///< Time the lookahead thread's reads of binding bytes took
+    u32 sa_ahead_same;       ///< Bindings read ahead that held the bytes of their last read
+    u32 sa_ahead_copied;     ///< Bindings read ahead whose bytes were copied
+    u64 sa_ahead_bytes;
+    u32 sa_ahead_full;    ///< Bindings not read ahead for lack of space
+    u32 sa_used;          ///< Stream buffer bindings served from a read ahead
+    u32 sa_stale;         ///< Reads ahead dropped because the GPU wrote the range since
+    u32 sa_checks;        ///< Reads ahead compared with guest memory at the draw
+    u32 sa_diffs;         ///< Compared reads ahead that differed
+    u64 tx_first_ns;      ///< Sampled draws: BindTextures up to the images being found
+    u64 tx_second_ns;     ///< Sampled draws: BindTextures views, layouts and descriptors
+    u64 tx_samplers_ns;   ///< Sampled draws: BindTextures samplers
+    u64 dispatch_hle_ns;  ///< DispatchDirect: shaders run by the host instead
+    u64 dispatch_bind_ns; ///< DispatchDirect: BindResources
+    u32 dispatch_hles;
+    u32 dispatch_skips; ///< DispatchDirect: dispatches BindResources handled itself
 };
 inline CpPerf cp_perf;
 
@@ -240,6 +261,12 @@ struct Liverpool {
     u32 index_buffer_num_indices{};
     std::array<CbDbExtent, NUM_COLOR_BUFFERS> last_cb_extent{};
     CbDbExtent last_db_extent{};
+
+    /// Runs the commands other threads sent. For the GPU thread while it waits for a thread
+    /// that may itself be waiting for one of those commands.
+    void RunPendingCommands() {
+        ProcessCommands();
+    }
 
     /// What the state packets of the graphics queue set and its draws read.
     struct GfxState {
@@ -434,6 +461,7 @@ private:
     struct LookaheadResult {
         const u32* packet;
     };
+    static constexpr std::size_t NumLookaheadResults = 4096;
 
     static constexpr u32 LookaheadCompareInterval = 64;
     static constexpr u32 LookaheadIdleSpins = 4096;
@@ -468,12 +496,21 @@ private:
 
     void WaitLookaheadStopped();
 
+    /// The lookahead thread can be waiting for this thread to run a command for it (a readback
+    /// of memory its lookup reads), so this thread keeps running commands while it waits.
+    void PauseForLookahead();
+
     bool CompareLookaheadState();
 
     void LookaheadThread(std::stop_token stoken);
 
     std::unique_ptr<GfxStateCopy> lookahead_state;
-    std::array<LookaheadResult, 4096> lookahead_results;
+    std::array<LookaheadResult, NumLookaheadResults> lookahead_results;
+    /// What was prepared for the draw of each result. An entry is not rewritten while it is
+    /// the last one taken, so the draw it belongs to can use it.
+    std::unique_ptr<Vulkan::DrawAhead[]> lookahead_draws;
+    /// Probe timings of the lookahead thread's lookups, read while it is stopped.
+    std::unique_ptr<CpPerf> lookahead_cp_perf;
     /// Run the lookahead thread scans. Only changes while it is stopped.
     const u32* lookahead_run_begin{};
     const u32* lookahead_run_end{};

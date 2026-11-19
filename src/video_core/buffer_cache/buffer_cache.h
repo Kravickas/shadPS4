@@ -127,6 +127,42 @@ public:
     [[nodiscard]] std::pair<const Buffer*, u64> ObtainBuffer(
         VAddr device_addr, u32 size, ObtainBufferFlags flags = ObtainBufferFlags::None);
 
+    /// Bytes of a read-only binding, read from guest memory ahead of the draw that binds it.
+    struct StreamHint {
+        VAddr device_addr;
+        u32 size;
+        u64 id; ///< Names the bytes: hints with the same id hold the same bytes
+        const u8* data;
+    };
+
+    enum class StreamAheadResult { None, Same, Copied, Full };
+
+    /// For the lookahead thread: reads the bytes of a binding the stream buffer could serve.
+    /// The bytes stay where the hint points until the hints of a later draw are released.
+    StreamAheadResult ReadStreamAhead(VAddr device_addr, u64 size, StreamHint& hint);
+
+    /// For the lookahead thread: where its next bytes go. Hints made after this was read point
+    /// to bytes not more than StreamAheadWindow behind it.
+    u64 StreamAheadPosition() const noexcept {
+        return stream_ahead_position;
+    }
+
+    /// Lets the lookahead thread reuse the space of bytes no hint made at position or later
+    /// can point to. Nothing recorded for the GPU may still read hints made before position.
+    void ReleaseStreamAhead(u64 position);
+
+    /// Hints for the ObtainBuffer calls of the draw in progress, made when the count of GPU
+    /// writes to guest memory was gpu_write_epoch.
+    void SetStreamHints(std::span<const StreamHint> hints, u64 gpu_write_epoch) {
+        stream_hints = hints;
+        stream_hint_cursor = 0;
+        stream_hints_epoch = gpu_write_epoch;
+    }
+
+    void ClearStreamHints() {
+        stream_hints = {};
+    }
+
     /// Attempts to obtain a buffer without modifying the cache contents.
     [[nodiscard]] std::pair<const Buffer*, u64> ObtainBufferForImage(VAddr device_addr, u32 size);
 
@@ -251,6 +287,13 @@ private:
         return ((device_addr ^ (size << 40)) * 0x9E3779B97F4A7C15ULL) >> (64 - StreamCopySlotBits);
     }
 
+    static constexpr u64 StreamAheadSlot(VAddr device_addr, u64 size) {
+        return ((device_addr ^ (size << 40)) * 0x9E3779B97F4A7C15ULL) >> (64 - StreamAheadSlotBits);
+    }
+
+    /// The hint of the draw in progress for a binding, if it has one that still holds.
+    const StreamHint* FindStreamHint(VAddr device_addr, u32 size);
+
     bool SynchronizeMemoryFromImage(const Buffer* arena, VAddr device_addr, u32 size);
 
     const Vulkan::Instance& instance;
@@ -273,6 +316,8 @@ private:
         u64 tick;
         u64 stream_offset;
         u64 shadow_offset;
+        /// Id of the hint the copy was made from, 0 when its bytes are in the shadow.
+        u64 ahead_id;
     };
     static constexpr u64 StreamCopySlotBits = 12;
     std::array<StreamCopy, 1ULL << StreamCopySlotBits> stream_copies{};
@@ -280,6 +325,33 @@ private:
     std::vector<u8> stream_shadow;
     u64 stream_shadow_used{};
     u64 stream_shadow_tick{};
+    std::span<const StreamHint> stream_hints;
+    u32 stream_hint_cursor{};
+    u64 stream_hints_epoch{};
+    u32 stream_hint_uses{};
+    /// One hint in this many is compared with guest memory when it is used.
+    static constexpr u32 StreamHintCheckInterval = 64;
+    static constexpr u32 MaxStreamHintDiffsLogged = 64;
+    u32 stream_hint_diffs_logged{};
+
+    /// Bytes the lookahead thread read, in a ring it fills in order. A position is a count of
+    /// bytes since the start; the bytes at a position are at position % StreamAheadSize.
+    static constexpr u64 StreamAheadSize = 128_MB;
+    static constexpr u64 StreamAheadWindow = 32_MB;
+    /// The last read of each range, to give equal bytes the same id. Lookahead thread only.
+    struct StreamAheadCopy {
+        VAddr device_addr;
+        u64 size;
+        u64 position;
+        u64 id;
+    };
+    static constexpr u64 StreamAheadSlotBits = 15;
+    alignas(64) std::unique_ptr<u8[]> stream_ahead_data;
+    std::unique_ptr<StreamAheadCopy[]> stream_ahead_copies;
+    u64 stream_ahead_position{};
+    u64 stream_ahead_last_id{};
+    /// Positions below this are free. Set by the GPU thread, read by the lookahead thread.
+    alignas(64) std::atomic<u64> stream_ahead_released{};
     Buffer gds_buffer;
     std::unique_ptr<Buffer> null_index_buffer;
     /// Guards the GPU-modified state against readbacks running on guest threads: the tracker's

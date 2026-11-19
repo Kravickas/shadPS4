@@ -24,6 +24,17 @@ namespace Vulkan {
 class GraphicsPipeline;
 class Runtime;
 
+/// What the lookahead thread prepares for a draw it reaches before the GPU thread does.
+struct DrawAhead {
+    PipelineLookup lookup;
+    /// Count of the GPU's writes to guest memory before any of this was read from it.
+    u64 gpu_write_epoch{};
+    /// Position of the buffer cache's reads ahead before those of this draw.
+    u64 stream_position{};
+    /// The bytes of the draw's read-only bindings the stream buffer could serve.
+    std::vector<VideoCore::BufferCache::StreamHint> stream_hints;
+};
+
 class Rasterizer {
 public:
     explicit Rasterizer(const Instance& instance, Scheduler& scheduler, Runtime& runtime,
@@ -91,6 +102,19 @@ public:
         return pipeline_cache;
     }
 
+    /// For the lookahead thread: prepares a draw from the registers it will run with. perf
+    /// gets the probe timings.
+    void LookAhead(DrawAhead& ahead, const AmdGpu::Regs& regs, bool is_indexed, u32 index_offset,
+                   AmdGpu::CpPerf& perf);
+
+    /// Hands over what the lookahead thread prepared for the next draw, if anything.
+    void SetDrawAhead(const DrawAhead* ahead) {
+        draw_ahead = ahead;
+    }
+
+    /// Whether a draw with these registers gets as far as looking its pipeline up.
+    static bool NeedsPipeline(const AmdGpu::Regs& regs);
+
     template <typename Func>
     void ForEachMappedRangeInRange(VAddr addr, u64 size, Func&& func) {
         const auto range = decltype(mapped_ranges)::interval_type::right_open(addr, addr + size);
@@ -120,6 +144,26 @@ private:
     void UpdateColorBlendingState(const GraphicsPipeline* pipeline) const;
 
     bool FilterDraw();
+
+    /// Returns the pipeline of the draw and loads its stages' user data, using the lookup made
+    /// ahead when its inputs still hold.
+    const GraphicsPipeline* LookupPipeline(const DrawIndirectParams& params);
+
+    /// Takes the lock of the pipeline cache's lookups, running the commands of other threads
+    /// while the lookahead thread holds it.
+    std::unique_lock<std::mutex> LockPipelineLookups();
+
+    /// Loads the user data of the stages of the GPU thread's own lookup.
+    void LoadStageUserData(const PipelineLookup& lookup);
+
+    /// Loads the user data of the stages of a lookup made ahead, if the lookup holds for the
+    /// draw. Without GPU writes to guest memory since, what the lookup read is what the draw
+    /// reads; else, and for one lookup in LookupCheckInterval, all of it is read again.
+    bool LoadStageUserDataAhead(const DrawAhead& ahead);
+
+    /// For the lookahead thread: reads the bytes of the draw's bindings.
+    void ReadStreamAhead(DrawAhead& ahead, const AmdGpu::Regs& regs, bool is_indexed,
+                         u32 index_offset, AmdGpu::CpPerf& perf);
 
     void BindBuffers(const Shader::Info& stage, Shader::Backend::Bindings& binding,
                      Shader::PushData& push_data);
@@ -151,6 +195,15 @@ private:
     boost::icl::interval_set<VAddr> mapped_ranges;
     Common::SharedFirstMutex mapped_ranges_mutex;
     PipelineCache pipeline_cache;
+    std::array<Shader::StageUserData, MaxShaderStages> stage_user_data;
+    PipelineLookup own_lookup;
+    const DrawAhead* draw_ahead{};
+    static constexpr u32 LookupCheckInterval = 64;
+    u32 lookups_ahead{};
+    /// For releasing the buffer cache's reads ahead: the tick the last draw prepared ahead
+    /// started in, and where the reads stood before those of that draw.
+    u64 stream_ahead_tick{};
+    u64 stream_ahead_position{};
     const bool host_markers_enabled;
     const bool guest_markers_enabled;
     const u32 submit_draw_interval;

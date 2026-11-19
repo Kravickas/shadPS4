@@ -13,6 +13,18 @@
 
 namespace Shader {
 
+/// What the specialization of a vertex stage read from guest memory besides the flattened
+/// user data.
+struct VsInputsRead {
+    std::vector<u32> fetch_code;
+    std::vector<AmdGpu::Buffer> sharps; ///< V# of each attribute of the fetch shader
+
+    void Clear() {
+        fetch_code.clear();
+        sharps.clear();
+    }
+};
+
 struct VsAttribSpecialization {
     u32 divisor{};
     AmdGpu::NumberClass num_class{};
@@ -91,25 +103,37 @@ struct StageSpecialization {
     Backend::Bindings start{};
 
     StageSpecialization() = default;
+    /// With vs_reads, a vertex stage also returns what it read from guest memory.
     StageSpecialization(const Info& info_, RuntimeInfo runtime_info_, const Profile& profile_,
-                        Backend::Bindings start_)
+                        Backend::Bindings start_, VsInputsRead* vs_reads = nullptr)
         : info{&info_}, runtime_info{runtime_info_}, start{start_} {
-        if (info_.sw_stage == SwStage::Vertex && Gcn::ParseFetchShader(info_, fetch_shader_data)) {
+        if (vs_reads) {
+            vs_reads->Clear();
+        }
+        if (info_.sw_stage == SwStage::Vertex &&
+            Gcn::ParseFetchShader(info_, fetch_shader_data,
+                                  vs_reads ? &vs_reads->fetch_code : nullptr)) {
             // Specialize shader on VS input number types to follow spec.
-            ForEachSharp(vs_attribs, fetch_shader_data.attributes,
-                         [this](auto& spec, const auto& desc, AmdGpu::Buffer sharp) {
-                             using InstanceIdType = Shader::Gcn::VertexAttribute::InstanceIdType;
-                             if (const auto step_rate = desc.GetStepRate();
-                                 step_rate != InstanceIdType::None) {
-                                 spec.divisor = step_rate == InstanceIdType::OverStepRate0
-                                                    ? runtime_info.sw.vs.step_rate_0
-                                                    : (step_rate == InstanceIdType::OverStepRate1
-                                                           ? runtime_info.sw.vs.step_rate_1
-                                                           : 1);
-                             }
-                             spec.num_class = AmdGpu::GetNumberClass(sharp.GetNumberFmt());
-                             spec.dst_select = sharp.DstSelect();
-                         });
+            for (const auto& desc : fetch_shader_data.attributes) {
+                auto& spec = vs_attribs.emplace_back();
+                const auto sharp = desc.GetSharp(*info);
+                if (vs_reads) {
+                    vs_reads->sharps.push_back(sharp);
+                }
+                if (!sharp) {
+                    continue;
+                }
+                using InstanceIdType = Shader::Gcn::VertexAttribute::InstanceIdType;
+                if (const auto step_rate = desc.GetStepRate(); step_rate != InstanceIdType::None) {
+                    spec.divisor = step_rate == InstanceIdType::OverStepRate0
+                                       ? runtime_info.sw.vs.step_rate_0
+                                       : (step_rate == InstanceIdType::OverStepRate1
+                                              ? runtime_info.sw.vs.step_rate_1
+                                              : 1);
+                }
+                spec.num_class = AmdGpu::GetNumberClass(sharp.GetNumberFmt());
+                spec.dst_select = sharp.DstSelect();
+            }
         }
         u32 binding{};
         ForEachSharp(binding, buffers, info->buffers,

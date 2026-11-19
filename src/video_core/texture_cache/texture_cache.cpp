@@ -163,8 +163,8 @@ void TextureCache::DownloadImageMemory(ImageId image_id, DownloadMemoryFlags fla
         if (discard_buffer_cache) {
             buffer_cache.WriteAndUnmarkGpuModified(image_addr, download.mapped, copy_size);
         } else {
-            Core::Memory::Instance()->TryWriteBacking(std::bit_cast<u8*>(image_addr),
-                                                      download.mapped, copy_size);
+            Core::Memory::Instance()->WriteBackingFromGpu(std::bit_cast<u8*>(image_addr),
+                                                          download.mapped, copy_size);
         }
         if (!is_sync) {
             runtime.GetStagingPool().FreeDeferred(download);

@@ -34,13 +34,21 @@ namespace Shader::Gcn {
  * We take the reverse way, extract the original input semantics from these instructions.
  **/
 
-const u32* GetFetchShaderCode(const Info& info, u32 sgpr_base) {
+const u32* GetFetchShaderCode(std::span<const u32> user_data, u32 sgpr_base) {
     const u32* code;
-    std::memcpy(&code, &info.user_data[sgpr_base], sizeof(code));
+    std::memcpy(&code, &user_data[sgpr_base], sizeof(code));
     return code;
 }
 
-bool ParseFetchShader(const Shader::Info& info, FetchShaderData& out_fetch_data) {
+const u32* GetFetchShaderCode(const Info& info, u32 sgpr_base) {
+    return GetFetchShaderCode(info.user_data, sgpr_base);
+}
+
+bool ParseFetchShader(const Shader::Info& info, FetchShaderData& out_fetch_data,
+                      std::vector<u32>* code_read) {
+    if (code_read) {
+        code_read->clear();
+    }
     if (!info.has_fetch_shader) {
         return false;
     }
@@ -55,8 +63,15 @@ bool ParseFetchShader(const Shader::Info& info, FetchShaderData& out_fetch_data)
 
     const auto* code = GetFetchShaderCode(info, info.fetch_shader_sgpr_base);
     const u32* ptr = code;
+    const auto next_word = [&] {
+        const u32 word = *(ptr++);
+        if (code_read) {
+            code_read->push_back(word);
+        }
+        return word;
+    };
     while (true) {
-        const u32 word0 = *(ptr++);
+        const u32 word0 = next_word();
         const auto encoding = GetInstructionEncoding(word0);
 
         if (encoding == InstEncoding::SOP1) {
@@ -87,7 +102,7 @@ bool ParseFetchShader(const Shader::Info& info, FetchShaderData& out_fetch_data)
             }
         } else if (encoding == InstEncoding::MUBUF || encoding == InstEncoding::MTBUF) {
             // SRSRC is in units of 4 SPGRs while SBASE is in pairs of SGPRs
-            const u32 word1 = *(ptr++);
+            const u32 word1 = next_word();
             const u32 srsrc = ((word1 >> 16) & 0x1f) * 4;
             auto& attrib = out_fetch_data.attributes.emplace_back();
             attrib.dest_vgpr = (word1 >> 8) & 0xff;

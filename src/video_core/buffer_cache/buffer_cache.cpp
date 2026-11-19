@@ -90,6 +90,8 @@ BufferCache::BufferCache(const Vulkan::Instance& instance_, Vulkan::Scheduler& s
       stream_buffer{instance, scheduler, MemoryType::Stream, STREAM_BUFFER_SIZE},
       gds_buffer{instance, 0, GDS_BUFFER_SIZE, MemoryType::Stream, "GDS Buffer"},
       stream_shadow(STREAM_SHADOW_SIZE),
+      stream_ahead_data{std::make_unique_for_overwrite<u8[]>(StreamAheadSize)},
+      stream_ahead_copies{std::make_unique<StreamAheadCopy[]>(1ULL << StreamAheadSlotBits)},
       emulated_chunks{std::make_unique<std::atomic<u64>[]>(NumEmulatedChunkWords)},
       memory_semaphore{instance} {
     const vk::BufferCreateInfo probe_ci = {
@@ -200,7 +202,7 @@ void BufferCache::WriteAndUnmarkGpuModified(VAddr device_addr, const u8* data, u
     // A download in flight would write the older buffer cache data over this data.
     ReadbackStats stats{};
     WaitDownloadsInFlight(lk, device_addr, device_addr + size, stats);
-    memory->TryWriteBacking(std::bit_cast<u8*>(device_addr), data, size);
+    memory->WriteBackingFromGpu(std::bit_cast<u8*>(device_addr), data, size);
     memory_tracker->UnmarkRegionAsGpuModified(device_addr, size, true);
     gpu_modified_ranges.Subtract(device_addr, size);
 }
@@ -527,8 +529,8 @@ void BufferCache::DownloadMemory(std::unique_lock<std::mutex>& lk, const Buffer*
         download.Invalidate();
         for (const auto& copy : copies) {
             auto* dst_addr = std::bit_cast<u8*>(arena_base + copy.srcOffset);
-            memory->TryWriteBacking(dst_addr, download.mapped + (copy.dstOffset - download.offset),
-                                    copy.size);
+            memory->WriteBackingFromGpu(
+                dst_addr, download.mapped + (copy.dstOffset - download.offset), copy.size);
         }
         {
             std::scoped_lock modified_lk{modified_mutex};
@@ -658,8 +660,8 @@ void BufferCache::DownloadAhead(std::unique_lock<std::mutex>& lk,
     for (size_t i = 0; i < windows.size(); ++i) {
         const VAddr arena_base = windows[i].arena->cpu_addr;
         for (const auto& copy : window_copies[i].copies) {
-            memory->TryWriteBacking(std::bit_cast<u8*>(arena_base + copy.srcOffset),
-                                    staging_data + copy.dstOffset, copy.size);
+            memory->WriteBackingFromGpu(std::bit_cast<u8*>(arena_base + copy.srcOffset),
+                                        staging_data + copy.dstOffset, copy.size);
         }
     }
     if (context->staging->SizeBytes() > MaxReadbackStagingSize) {
@@ -733,8 +735,32 @@ std::pair<const Buffer*, u64> BufferCache::ObtainBuffer(VAddr device_addr, u32 s
         AmdGpu::cp_perf.obtain_stream_bytes += size;
         const AmdGpu::VkCallPerf stream_perf{AmdGpu::cp_perf.sc_total_ns};
         auto& copy = stream_copies[StreamCopySlot(device_addr, size)];
-        if (copy.tick == scheduler.CurrentTick() && copy.device_addr == device_addr &&
-            copy.size == size) {
+        const bool is_copied = copy.tick == scheduler.CurrentTick() &&
+                               copy.device_addr == device_addr && copy.size == size;
+        if (const StreamHint* const hint = FindStreamHint(device_addr, size)) {
+            ++AmdGpu::cp_perf.sa_used;
+            if (is_copied && copy.ahead_id == hint->id) {
+                ++AmdGpu::cp_perf.obtain_stream_reused;
+                AmdGpu::cp_perf.obtain_stream_reused_bytes += size;
+                return {&stream_buffer, copy.stream_offset};
+            }
+            const auto [data, offset] = stream_buffer.Map(size, instance.UniformMinAlignment());
+            const AmdGpu::VkCallPerf write_perf{AmdGpu::cp_perf.sc_write_ns};
+            if (stream_buffer.is_coherent) {
+                // The hint keeps its bytes until the tick ends, and the commands that read the
+                // stream buffer are recorded after this one.
+                scheduler.Record([data = data, bytes = hint->data, size](vk::CommandBuffer) {
+                    std::memcpy(data, bytes, size);
+                });
+            } else {
+                std::memcpy(data, hint->data, size);
+            }
+            // Mapping can wait for the GPU and submit, which starts a new tick.
+            copy = {device_addr, size, scheduler.CurrentTick(), offset, 0, hint->id};
+            stream_buffer.Commit();
+            return {&stream_buffer, offset};
+        }
+        if (is_copied && copy.ahead_id == 0) {
             const AmdGpu::VkCallPerf compare_perf{AmdGpu::cp_perf.sc_compare_ns};
             if (memory->CompareSparseMemory(device_addr, stream_shadow.data() + copy.shadow_offset,
                                             size)) {
@@ -774,7 +800,7 @@ std::pair<const Buffer*, u64> BufferCache::ObtainBuffer(VAddr device_addr, u32 s
             } else {
                 std::memcpy(data, shadow, size);
             }
-            copy = {device_addr, size, tick, offset, stream_shadow_used};
+            copy = {device_addr, size, tick, offset, stream_shadow_used, 0};
             stream_shadow_used += size;
         } else {
             const AmdGpu::VkCallPerf guest_perf{AmdGpu::cp_perf.sc_guest_ns};
@@ -793,6 +819,83 @@ std::pair<const Buffer*, u64> BufferCache::ObtainBuffer(VAddr device_addr, u32 s
     }
     SynchronizeMemory(arena, device_addr, size, is_written, is_texel_buffer);
     return {arena, arena->Offset(device_addr)};
+}
+
+const BufferCache::StreamHint* BufferCache::FindStreamHint(VAddr device_addr, u32 size) {
+    const auto is_for_binding = [&](const StreamHint& hint) {
+        return hint.device_addr == device_addr && hint.size == size;
+    };
+    const StreamHint* hint;
+    if (stream_hint_cursor < stream_hints.size() &&
+        is_for_binding(stream_hints[stream_hint_cursor])) {
+        // The bindings of a draw come in the order their hints were made in.
+        hint = &stream_hints[stream_hint_cursor++];
+    } else {
+        const auto it = std::ranges::find_if(stream_hints, is_for_binding);
+        if (it == stream_hints.end()) {
+            return nullptr;
+        }
+        hint = &*it;
+    }
+    // Bytes the GPU wrote to guest memory since the hint was made are missing from it.
+    if (!memory->IsFreeOfGpuWrites(stream_hints_epoch) &&
+        memory->IsGpuWrittenSince(stream_hints_epoch, device_addr, size)) {
+        ++AmdGpu::cp_perf.sa_stale;
+        return nullptr;
+    }
+    if ((++stream_hint_uses & (StreamHintCheckInterval - 1)) == 0) {
+        // Whether the guest itself changed the bytes between the read ahead and the draw.
+        ++AmdGpu::cp_perf.sa_checks;
+        if (!memory->CompareSparseMemory(device_addr, hint->data, size)) {
+            ++AmdGpu::cp_perf.sa_diffs;
+            if (stream_hint_diffs_logged < MaxStreamHintDiffsLogged) {
+                ++stream_hint_diffs_logged;
+                LOG_INFO(Render, "PERF sa_diff addr={:#x} size={:#x} id={} hints={}", device_addr,
+                         size, hint->id, stream_hints.size());
+            }
+            return nullptr;
+        }
+    }
+    return hint;
+}
+
+BufferCache::StreamAheadResult BufferCache::ReadStreamAhead(VAddr device_addr, u64 size,
+                                                            StreamHint& hint) {
+    if (device_addr == 0 || size == 0 || size > STREAM_THRESHOLD ||
+        device_addr + size > (1ULL << ADDRESS_SPACE_BITS)) {
+        return StreamAheadResult::None;
+    }
+    auto& copy = stream_ahead_copies[StreamAheadSlot(device_addr, size)];
+    if (copy.id != 0 && copy.device_addr == device_addr && copy.size == size &&
+        stream_ahead_position - copy.position <= StreamAheadWindow) {
+        const u8* const data = stream_ahead_data.get() + copy.position % StreamAheadSize;
+        if (memory->CompareSparseMemory(device_addr, data, size)) {
+            hint = {device_addr, static_cast<u32>(size), copy.id, data};
+            return StreamAheadResult::Same;
+        }
+    }
+    u64 position = stream_ahead_position;
+    if (position % StreamAheadSize + size > StreamAheadSize) {
+        // The bytes of a hint are contiguous.
+        position = Common::AlignUp(position, StreamAheadSize);
+    }
+    if (position + size - stream_ahead_released.load(std::memory_order_acquire) > StreamAheadSize) {
+        // The space is still in use. The draw reads guest memory itself.
+        return StreamAheadResult::Full;
+    }
+    u8* const data = stream_ahead_data.get() + position % StreamAheadSize;
+    memory->CopySparseMemory(device_addr, data, size);
+    copy = {device_addr, size, position, ++stream_ahead_last_id};
+    stream_ahead_position = position + size;
+    hint = {device_addr, static_cast<u32>(size), copy.id, data};
+    return StreamAheadResult::Copied;
+}
+
+void BufferCache::ReleaseStreamAhead(u64 position) {
+    const u64 released = position > StreamAheadWindow ? position - StreamAheadWindow : 0;
+    if (released > stream_ahead_released.load(std::memory_order_relaxed)) {
+        stream_ahead_released.store(released, std::memory_order_release);
+    }
 }
 
 std::pair<const Buffer*, u64> BufferCache::ObtainBufferForImage(VAddr device_addr, u32 size) {
@@ -875,8 +978,8 @@ void BufferCache::ReadEdgeImagePages(const Image& image) {
             for (const auto& copy : copies) {
                 const VAddr copy_device_addr = base + copy.srcOffset;
                 const u64 dst_offset = copy.dstOffset - download.offset;
-                memory->TryWriteBacking(std::bit_cast<u8*>(copy_device_addr),
-                                        download.mapped + dst_offset, copy.size);
+                memory->WriteBackingFromGpu(std::bit_cast<u8*>(copy_device_addr),
+                                            download.mapped + dst_offset, copy.size);
             }
             {
                 std::scoped_lock lk{modified_mutex};

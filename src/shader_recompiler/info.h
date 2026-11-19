@@ -210,4 +210,53 @@ struct Info : InfoPersistent {
 };
 DECLARE_ENUM_FLAG_OPERATORS(Info::ReadConstType);
 
+/// The user data of one stage for one draw: what a lookup leaves in the pgm_base, user_data and
+/// flattened_ud_buf of Info. Readers that can run while a later draw is looked up use this.
+struct StageUserData {
+    VAddr pgm_base{};
+    std::span<const u32> user_data;
+    std::vector<u32> flattened_ud_buf;
+
+    /// Takes what the last lookup of the stage left in its Info.
+    void Load(const Info& info) {
+        pgm_base = info.pgm_base;
+        user_data = info.user_data;
+        flattened_ud_buf = info.flattened_ud_buf;
+    }
+
+    /// Reads the user data of the stage again.
+    void Refresh(const Info& info, const ShaderParams& params) {
+        pgm_base = params.Base();
+        user_data = params.user_data;
+        flattened_ud_buf.resize(info.srt_info.flattened_bufsize_dw);
+        std::memcpy(flattened_ud_buf.data(), user_data.data(), user_data.size_bytes());
+        if (info.srt_info.walker_func) {
+            info.srt_info.walker_func(user_data.data(), flattened_ud_buf.data());
+        }
+    }
+
+    template <typename T>
+    inline T ReadUdSharp(u32 sharp_idx) const noexcept {
+        return *reinterpret_cast<const T*>(&flattened_ud_buf[sharp_idx]);
+    }
+
+    template <typename T>
+    T ReadUdReg(u32 ptr_index, u32 dword_offset) const noexcept {
+        T data;
+        const u32* base = user_data.data();
+        if (ptr_index != IR::NumScalarRegs) {
+            std::memcpy(&base, &user_data[ptr_index], sizeof(base));
+            base = reinterpret_cast<const u32*>(VAddr(base) & 0xFFFFFFFFFFFFULL);
+        }
+        std::memcpy(&data, base + dword_offset, sizeof(T));
+        return data;
+    }
+};
+
+/// The flattened user data of one stage as a lookup read it, where it is kept.
+struct StageUserDataView {
+    VAddr pgm_base{};
+    std::span<const u32> flattened_ud_buf;
+};
+
 } // namespace Shader

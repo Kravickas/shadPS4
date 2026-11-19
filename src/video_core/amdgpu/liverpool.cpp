@@ -222,7 +222,11 @@ void Liverpool::Process(std::stop_token stoken) {
             "run_n={} run_d1={} run_d2={} run_d4={} run_d8={} run_d16={} run_d32={} "
             "state_packets={} state_words={} la_runs={} la_results={} la_waits={} la_wait_us={} "
             "la_sync_waits={} la_sync_us={} la_copies={} la_compares={} la_mismatches={} "
-            "la_early={} la_scan_us={} la_sleeps={}",
+            "la_early={} la_scan_us={} la_sleeps={} la_lookups_used={} la_lookups_rejected={} "
+            "la_lookup_us={} la_lookups_checked={} la_stream_us={} sa_ahead_same={} "
+            "sa_ahead_copied={} sa_ahead_kb={} sa_ahead_full={} sa_used={} sa_stale={} "
+            "sa_checks={} sa_diffs={} tx_first_us={} tx_second_us={} tx_samplers_us={} "
+            "dispatch_hle_us={} dispatch_bind_us={} dispatch_hles={} dispatch_skips={}",
             cycle_t0, cycle_t1, cp_perf.tasks, was_submit_done, (cycle_t1 - flush_t0) / 1000,
             cp_perf.vo_block_ns / 1000, cp_perf.vo_blocks, cp_perf.vo_spin_ns / 1000,
             cp_perf.mem_spin_ns / 1000, cp_perf.mem_spins, cp_perf.asc_spin_ns / 1000,
@@ -268,7 +272,14 @@ void Liverpool::Process(std::stop_token stoken) {
             cp_perf.la_wait_ns / 1000, cp_perf.la_sync_waits, cp_perf.la_sync_ns / 1000,
             cp_perf.la_copies, cp_perf.la_compares, cp_perf.la_mismatches, cp_perf.la_early,
             lookahead_perf.scan_ns.exchange(0, std::memory_order_relaxed) / 1000,
-            lookahead_perf.sleeps.exchange(0, std::memory_order_relaxed));
+            lookahead_perf.sleeps.exchange(0, std::memory_order_relaxed), cp_perf.la_lookups_used,
+            cp_perf.la_lookups_rejected, cp_perf.la_lookup_ns / 1000, cp_perf.la_lookups_checked,
+            cp_perf.la_stream_ns / 1000, cp_perf.sa_ahead_same, cp_perf.sa_ahead_copied,
+            cp_perf.sa_ahead_bytes / 1024, cp_perf.sa_ahead_full, cp_perf.sa_used, cp_perf.sa_stale,
+            cp_perf.sa_checks, cp_perf.sa_diffs, cp_perf.tx_first_ns / 1000,
+            cp_perf.tx_second_ns / 1000, cp_perf.tx_samplers_ns / 1000,
+            cp_perf.dispatch_hle_ns / 1000, cp_perf.dispatch_bind_ns / 1000, cp_perf.dispatch_hles,
+            cp_perf.dispatch_skips);
         if (++perf_run_log_cycles == 2048) {
             perf_run_log_cycles = 0;
             std::string enders;
@@ -389,8 +400,47 @@ constexpr std::size_t PacketWords = sizeof(Packet) / sizeof(u32);
 
 } // Anonymous namespace
 
+namespace {
+
+// Values of Liverpool::PacketClass.
+constexpr u8 PacketState = 0;
+constexpr u8 PacketDraw = 1;
+constexpr u8 PacketOther = 2;
+constexpr u8 PacketDependsOnPayload = 0xff;
+
+/// Class of the packets of each opcode, unless it depends on their payload.
+constexpr std::array<u8, 256> PacketClasses = [] {
+    using enum PM4ItOpcode;
+    std::array<u8, 256> classes{};
+    classes.fill(PacketOther);
+    for (const PM4ItOpcode opcode : {Nop, EventWrite, DmaData}) {
+        classes[static_cast<u32>(opcode)] = PacketDependsOnPayload;
+    }
+    for (const PM4ItOpcode opcode :
+         {ContextControl, ClearState, SetConfigReg, SetContextReg, SetShReg, SetUconfigReg,
+          IndexType, NumInstances, IndexBase, IndexBufferSize, SetBase, AcquireMem, PfpSyncMe}) {
+        classes[static_cast<u32>(opcode)] = PacketState;
+    }
+    for (const PM4ItOpcode opcode :
+         {DrawIndex2, DrawIndexOffset2, DrawIndexAuto, DrawIndirect, DrawIndirectCountMulti,
+          DrawIndirectMulti, DrawIndexIndirect, DrawIndexIndirectMulti, DrawIndexIndirectCountMulti,
+          DispatchDirect, DispatchIndirect}) {
+        classes[static_cast<u32>(opcode)] = PacketDraw;
+    }
+    return classes;
+}();
+
+} // Anonymous namespace
+
 Liverpool::PacketClass Liverpool::ClassifyPacket(const PM4Header* header,
                                                  bool guest_markers_enabled) {
+    static_assert(static_cast<u8>(PacketClass::State) == PacketState &&
+                  static_cast<u8>(PacketClass::Draw) == PacketDraw &&
+                  static_cast<u8>(PacketClass::Other) == PacketOther);
+    const u8 fixed_class = PacketClasses[static_cast<u32>(header->type3.opcode.Value()) & 0xff];
+    if (fixed_class != PacketDependsOnPayload) [[likely]] {
+        return static_cast<PacketClass>(fixed_class);
+    }
     switch (header->type3.opcode) {
     case PM4ItOpcode::Nop: {
         const auto* nop = reinterpret_cast<const PM4CmdNop*>(header);
@@ -418,32 +468,6 @@ Liverpool::PacketClass Liverpool::ClassifyPacket(const PM4Header* header,
         const auto* dma_data = reinterpret_cast<const PM4DmaData*>(header);
         return dma_data->dst_addr_lo == 0x3022C ? PacketClass::State : PacketClass::Other;
     }
-    case PM4ItOpcode::ContextControl:
-    case PM4ItOpcode::ClearState:
-    case PM4ItOpcode::SetConfigReg:
-    case PM4ItOpcode::SetContextReg:
-    case PM4ItOpcode::SetShReg:
-    case PM4ItOpcode::SetUconfigReg:
-    case PM4ItOpcode::IndexType:
-    case PM4ItOpcode::NumInstances:
-    case PM4ItOpcode::IndexBase:
-    case PM4ItOpcode::IndexBufferSize:
-    case PM4ItOpcode::SetBase:
-    case PM4ItOpcode::AcquireMem:
-    case PM4ItOpcode::PfpSyncMe:
-        return PacketClass::State;
-    case PM4ItOpcode::DrawIndex2:
-    case PM4ItOpcode::DrawIndexOffset2:
-    case PM4ItOpcode::DrawIndexAuto:
-    case PM4ItOpcode::DrawIndirect:
-    case PM4ItOpcode::DrawIndirectCountMulti:
-    case PM4ItOpcode::DrawIndirectMulti:
-    case PM4ItOpcode::DrawIndexIndirect:
-    case PM4ItOpcode::DrawIndexIndirectMulti:
-    case PM4ItOpcode::DrawIndexIndirectCountMulti:
-    case PM4ItOpcode::DispatchDirect:
-    case PM4ItOpcode::DispatchIndirect:
-        return PacketClass::Draw;
     default:
         return PacketClass::Other;
     }
@@ -732,6 +756,8 @@ bool Liverpool::IsSafePacket(const PM4Header* header, std::size_t words_availabl
 void Liverpool::StartLookaheadRun(std::span<const u32> dcb) {
     if (!lookahead_thread.joinable()) {
         lookahead_state = std::make_unique<GfxStateCopy>();
+        lookahead_draws = std::make_unique<Vulkan::DrawAhead[]>(NumLookaheadResults);
+        lookahead_cp_perf = std::make_unique<CpPerf>();
         lookahead_thread = std::jthread{std::bind_front(&Liverpool::LookaheadThread, this)};
     }
     // The lookahead thread is stopped here, so its state has to be the real one.
@@ -783,11 +809,28 @@ void Liverpool::WaitLookaheadStopped() {
         ++cp_perf.la_sync_waits;
         do {
             drop_results();
-            ThreadPause();
+            PauseForLookahead();
         } while (lookahead_stopped_run.load(std::memory_order_acquire) != lookahead_run);
         cp_perf.la_sync_ns += PerfNs() - sync_t0;
     }
     drop_results();
+
+    // The thread is stopped, so the probes of its work can be taken.
+    CpPerf& ahead = *lookahead_cp_perf;
+    cp_perf.la_lookup_ns += ahead.pipe_key_ns;
+    cp_perf.la_stream_ns += ahead.la_stream_ns;
+    cp_perf.sa_ahead_same += ahead.sa_ahead_same;
+    cp_perf.sa_ahead_copied += ahead.sa_ahead_copied;
+    cp_perf.sa_ahead_bytes += ahead.sa_ahead_bytes;
+    cp_perf.sa_ahead_full += ahead.sa_ahead_full;
+    ahead = {};
+}
+
+void Liverpool::PauseForLookahead() {
+    if (num_commands) {
+        ProcessCommands();
+    }
+    ThreadPause();
 }
 
 void Liverpool::EndLookaheadRun(const u32* packet) {
@@ -822,15 +865,16 @@ void Liverpool::TakeLookaheadResult(std::span<const u32> dcb) {
             ++cp_perf.la_waits;
             while (lookahead_stopped_run.load(std::memory_order_acquire) != lookahead_run &&
                    lookahead_produced.load(std::memory_order_acquire) == lookahead_taken) {
-                ThreadPause();
+                PauseForLookahead();
             }
             produced = lookahead_produced.load(std::memory_order_acquire);
             cp_perf.la_wait_ns += PerfNs() - wait_t0;
         }
         if (produced != lookahead_taken) {
             const LookaheadResult& result =
-                lookahead_results[lookahead_taken % lookahead_results.size()];
+                lookahead_results[lookahead_taken % NumLookaheadResults];
             if (result.packet == dcb.data()) {
+                rasterizer->SetDrawAhead(&lookahead_draws[lookahead_taken % NumLookaheadResults]);
                 lookahead_consumed.store(++lookahead_taken, std::memory_order_release);
                 ++cp_perf.la_results;
                 return;
@@ -845,6 +889,7 @@ void Liverpool::TakeLookaheadResult(std::span<const u32> dcb) {
             ++cp_perf.la_early;
         }
         // The lookahead thread is not at this draw: restart it here with the real state.
+        rasterizer->SetDrawAhead(nullptr);
         is_lookahead_running = false;
         WaitLookaheadStopped();
         lookahead_needs_copy = true;
@@ -926,14 +971,33 @@ void Liverpool::LookaheadThread(std::stop_token stoken) {
             }
             ApplyPacketState(state, header);
             if (packet_class == PacketClass::Draw) {
-                while (produced - lookahead_consumed.load(std::memory_order_acquire) ==
-                       lookahead_results.size()) {
+                // The entry of the last result taken stays as it is: its draw may be using it.
+                while (produced - lookahead_consumed.load(std::memory_order_acquire) >=
+                       NumLookaheadResults - 1) {
                     if (stoken.stop_requested()) {
                         return;
                     }
                     ThreadPause();
                 }
-                lookahead_results[produced % lookahead_results.size()] = {packet};
+                Vulkan::DrawAhead& ahead = lookahead_draws[produced % NumLookaheadResults];
+                switch (header->type3.opcode) {
+                case PM4ItOpcode::DrawIndex2:
+                    rasterizer->LookAhead(ahead, state.regs, true, 0, *lookahead_cp_perf);
+                    break;
+                case PM4ItOpcode::DrawIndexOffset2:
+                    rasterizer->LookAhead(
+                        ahead, state.regs, true,
+                        reinterpret_cast<const PM4CmdDrawIndexOffset2*>(header)->index_offset,
+                        *lookahead_cp_perf);
+                    break;
+                case PM4ItOpcode::DrawIndexAuto:
+                    rasterizer->LookAhead(ahead, state.regs, false, 0, *lookahead_cp_perf);
+                    break;
+                default:
+                    ahead.lookup.pipeline = nullptr;
+                    break;
+                }
+                lookahead_results[produced % NumLookaheadResults] = {packet};
                 lookahead_produced.store(++produced, std::memory_order_release);
             }
             packet += header->type3.NumWords() + 1;
