@@ -131,15 +131,28 @@ struct CpPerf {
     u32 rec_syncs;       ///< Waits for the recorder thread to run everything recorded
     u64 rec_sync_ns;     ///< Time in those waits
     u32 rec_space_waits; ///< Waits for space in the record ring
+    u64 sc_total_ns;     ///< Sampled draws: stream buffer path of ObtainBuffer
+    u64 sc_compare_ns;   ///< Sampled draws: comparing guest memory with the kept copy
+    u64 sc_guest_ns;     ///< Sampled draws: copying guest memory
+    u64 sc_write_ns;     ///< Sampled draws: writing or recording the stream buffer write
+    u32 run_n;           ///< Runs of draws and dispatches with only state packets between them
+    std::array<u32, 6> run_draws; ///< Draws in runs of 1, 2-3, 4-7, 8-15, 16-31 and 32+ draws
+    u32 state_packets;            ///< Packets that only set state
+    u32 state_words;
 };
 inline CpPerf cp_perf;
 
 /// Work of the command recorder thread.
 struct RecorderPerf {
-    std::atomic<u64> run_ns; ///< Time running recorded commands
-    std::atomic<u64> sleeps; ///< Times the thread went to sleep with nothing to run
+    std::atomic<u64> run_ns;          ///< Time running recorded commands
+    std::atomic<u64> sleeps;          ///< Times the thread went to sleep with nothing to run
+    std::atomic<u64> stream_write_ns; ///< Sampled draws: stream buffer writes
 };
 inline RecorderPerf recorder_perf;
+
+/// Packets that ended a run of draws, by opcode. The last entry counts commands of other threads.
+inline std::array<u64, 257> perf_run_enders{};
+inline u32 perf_run_log_cycles = 0;
 
 /// Time guest threads spend waiting for a buffer readback done by the GPU thread.
 struct ReadbackWaitPerf {

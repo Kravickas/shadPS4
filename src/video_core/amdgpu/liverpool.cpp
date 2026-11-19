@@ -210,7 +210,10 @@ void Liverpool::Process(std::stop_token stoken) {
             "reset_buffers_us={} bound_buffers={} bound_images={} tex_lookups={} tex_hits={} "
             "emulated={} stg_same_inputs={} vk_vi_us={} vk_index_us={} vk_desc_us={} "
             "vk_dyn_us={} vk_draw_us={} rec_cmds={} rec_kb={} rec_publishes={} rec_wakes={} "
-            "rec_syncs={} rec_sync_us={} rec_space_waits={} rec_run_us={} rec_sleeps={}",
+            "rec_syncs={} rec_sync_us={} rec_space_waits={} rec_run_us={} rec_sleeps={} "
+            "sc_total_us={} sc_compare_us={} sc_guest_us={} sc_write_us={} rec_stream_write_us={} "
+            "run_n={} run_d1={} run_d2={} run_d4={} run_d8={} run_d16={} run_d32={} "
+            "state_packets={} state_words={}",
             cycle_t0, cycle_t1, cp_perf.tasks, was_submit_done, (cycle_t1 - flush_t0) / 1000,
             cp_perf.vo_block_ns / 1000, cp_perf.vo_blocks, cp_perf.vo_spin_ns / 1000,
             cp_perf.mem_spin_ns / 1000, cp_perf.mem_spins, cp_perf.asc_spin_ns / 1000,
@@ -247,7 +250,23 @@ void Liverpool::Process(std::stop_token stoken) {
             cp_perf.rec_bytes / 1024, cp_perf.rec_publishes, cp_perf.rec_wakes, cp_perf.rec_syncs,
             cp_perf.rec_sync_ns / 1000, cp_perf.rec_space_waits,
             recorder_perf.run_ns.exchange(0, std::memory_order_relaxed) / 1000,
-            recorder_perf.sleeps.exchange(0, std::memory_order_relaxed));
+            recorder_perf.sleeps.exchange(0, std::memory_order_relaxed), cp_perf.sc_total_ns / 1000,
+            cp_perf.sc_compare_ns / 1000, cp_perf.sc_guest_ns / 1000, cp_perf.sc_write_ns / 1000,
+            recorder_perf.stream_write_ns.exchange(0, std::memory_order_relaxed) / 1000,
+            cp_perf.run_n, cp_perf.run_draws[0], cp_perf.run_draws[1], cp_perf.run_draws[2],
+            cp_perf.run_draws[3], cp_perf.run_draws[4], cp_perf.run_draws[5], cp_perf.state_packets,
+            cp_perf.state_words);
+        if (++perf_run_log_cycles == 2048) {
+            perf_run_log_cycles = 0;
+            std::string enders;
+            for (u32 op = 0; op < perf_run_enders.size(); ++op) {
+                if (perf_run_enders[op] != 0) {
+                    enders += fmt::format(" {:#x}={}", op, perf_run_enders[op]);
+                }
+            }
+            perf_run_enders.fill(0);
+            LOG_INFO(Render, "PERF run_enders{}", enders);
+        }
 
         Platform::IrqC::Instance()->Signal(Platform::InterruptId::GpuIdle);
     }
@@ -340,11 +359,79 @@ Liverpool::Task Liverpool::ProcessCeUpdate(std::span<const u32> ccb) {
     FIBER_EXIT;
 }
 
+namespace {
+
+enum class PerfPacketClass { State, Draw, Other };
+
+/// Whether a packet only sets state, is a draw or dispatch, or does anything else.
+PerfPacketClass PerfClassifyPacket(const PM4Header* header, bool guest_markers_enabled) {
+    switch (header->type3.opcode) {
+    case PM4ItOpcode::Nop: {
+        const auto* nop = reinterpret_cast<const PM4CmdNop*>(header);
+        if (nop->header.count.Value() == 0) {
+            return PerfPacketClass::State;
+        }
+        switch (nop->data_block[0]) {
+        case PM4CmdNop::PayloadType::PatchedFlip:
+            return PerfPacketClass::Other;
+        case PM4CmdNop::PayloadType::DebugMarkerPush:
+        case PM4CmdNop::PayloadType::DebugColorMarkerPush:
+        case PM4CmdNop::PayloadType::DebugMarkerPop:
+            return guest_markers_enabled ? PerfPacketClass::Other : PerfPacketClass::State;
+        default:
+            return PerfPacketClass::State;
+        }
+    }
+    case PM4ItOpcode::ContextControl:
+    case PM4ItOpcode::ClearState:
+    case PM4ItOpcode::SetConfigReg:
+    case PM4ItOpcode::SetContextReg:
+    case PM4ItOpcode::SetShReg:
+    case PM4ItOpcode::SetUconfigReg:
+    case PM4ItOpcode::IndexType:
+    case PM4ItOpcode::NumInstances:
+    case PM4ItOpcode::IndexBase:
+    case PM4ItOpcode::IndexBufferSize:
+    case PM4ItOpcode::SetBase:
+        return PerfPacketClass::State;
+    case PM4ItOpcode::DrawIndex2:
+    case PM4ItOpcode::DrawIndexOffset2:
+    case PM4ItOpcode::DrawIndexAuto:
+    case PM4ItOpcode::DrawIndirect:
+    case PM4ItOpcode::DrawIndirectCountMulti:
+    case PM4ItOpcode::DrawIndirectMulti:
+    case PM4ItOpcode::DrawIndexIndirect:
+    case PM4ItOpcode::DrawIndexIndirectMulti:
+    case PM4ItOpcode::DrawIndexIndirectCountMulti:
+    case PM4ItOpcode::DispatchDirect:
+    case PM4ItOpcode::DispatchIndirect:
+        return PerfPacketClass::Draw;
+    default:
+        return PerfPacketClass::Other;
+    }
+}
+
+} // Anonymous namespace
+
 Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb) {
     FIBER_ENTER(dcb_task_name);
 
+    u32 run_length = 0;
+    const auto end_run = [&run_length](u32 ender) {
+        if (run_length == 0) {
+            return;
+        }
+        ++cp_perf.run_n;
+        cp_perf.run_draws[std::min(std::bit_width(run_length) - 1, 5)] += run_length;
+        ++perf_run_enders[ender];
+        run_length = 0;
+    };
+
     auto base_addr = reinterpret_cast<uintptr_t>(dcb.data());
     while (!dcb.empty()) {
+        if (num_commands) {
+            end_run(256);
+        }
         ProcessCommands();
 
         const auto* header = reinterpret_cast<const PM4Header*>(dcb.data());
@@ -365,6 +452,18 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb) {
         case 3:
             const u32 count = header->type3.NumWords();
             const PM4ItOpcode opcode = header->type3.opcode;
+            switch (PerfClassifyPacket(header, guest_markers_enabled)) {
+            case PerfPacketClass::State:
+                ++cp_perf.state_packets;
+                cp_perf.state_words += count;
+                break;
+            case PerfPacketClass::Draw:
+                ++run_length;
+                break;
+            case PerfPacketClass::Other:
+                end_run(static_cast<u32>(opcode) & 0xff);
+                break;
+            }
             switch (opcode) {
             case PM4ItOpcode::Nop: {
                 const auto* nop = reinterpret_cast<const PM4CmdNop*>(header);
@@ -1060,6 +1159,7 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb) {
             break;
         }
     }
+    end_run(0);
 
     FIBER_EXIT;
 }

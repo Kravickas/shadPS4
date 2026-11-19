@@ -731,14 +731,17 @@ std::pair<const Buffer*, u64> BufferCache::ObtainBuffer(VAddr device_addr, u32 s
         !IsRegionGpuModified(device_addr, size)) {
         ++AmdGpu::cp_perf.obtain_stream;
         AmdGpu::cp_perf.obtain_stream_bytes += size;
+        const AmdGpu::VkCallPerf stream_perf{AmdGpu::cp_perf.sc_total_ns};
         auto& copy = stream_copies[StreamCopySlot(device_addr, size)];
         if (copy.tick == scheduler.CurrentTick() && copy.device_addr == device_addr &&
-            copy.size == size &&
-            memory->CompareSparseMemory(device_addr, stream_shadow.data() + copy.shadow_offset,
-                                        size)) {
-            ++AmdGpu::cp_perf.obtain_stream_reused;
-            AmdGpu::cp_perf.obtain_stream_reused_bytes += size;
-            return {&stream_buffer, copy.stream_offset};
+            copy.size == size) {
+            const AmdGpu::VkCallPerf compare_perf{AmdGpu::cp_perf.sc_compare_ns};
+            if (memory->CompareSparseMemory(device_addr, stream_shadow.data() + copy.shadow_offset,
+                                            size)) {
+                ++AmdGpu::cp_perf.obtain_stream_reused;
+                AmdGpu::cp_perf.obtain_stream_reused_bytes += size;
+                return {&stream_buffer, copy.stream_offset};
+            }
         }
         const auto [data, offset] = stream_buffer.Map(size, instance.UniformMinAlignment());
         // Mapping can wait for the GPU and submit, which starts a new tick.
@@ -750,11 +753,31 @@ std::pair<const Buffer*, u64> BufferCache::ObtainBuffer(VAddr device_addr, u32 s
         if (stream_shadow_used + size <= stream_shadow.size()) {
             // The stream buffer gets the very bytes that are kept to compare with.
             u8* const shadow = stream_shadow.data() + stream_shadow_used;
-            memory->CopySparseMemory(device_addr, shadow, size);
-            std::memcpy(data, shadow, size);
+            {
+                const AmdGpu::VkCallPerf guest_perf{AmdGpu::cp_perf.sc_guest_ns};
+                memory->CopySparseMemory(device_addr, shadow, size);
+            }
+            const AmdGpu::VkCallPerf write_perf{AmdGpu::cp_perf.sc_write_ns};
+            if (stream_buffer.is_coherent) {
+                // The shadow keeps these bytes until the tick ends, and the commands that read
+                // the stream buffer are recorded after this one.
+                scheduler.Record([data = data, shadow, size,
+                                  is_timed = AmdGpu::perf_vk_sample](vk::CommandBuffer) {
+                    const u64 write_t0 = is_timed ? AmdGpu::PerfNs() : 0;
+                    std::memcpy(data, shadow, size);
+                    if (is_timed) {
+                        AmdGpu::recorder_perf.stream_write_ns.fetch_add(
+                            (AmdGpu::PerfNs() - write_t0) * AmdGpu::PerfVkSampleRate,
+                            std::memory_order_relaxed);
+                    }
+                });
+            } else {
+                std::memcpy(data, shadow, size);
+            }
             copy = {device_addr, size, tick, offset, stream_shadow_used};
             stream_shadow_used += size;
         } else {
+            const AmdGpu::VkCallPerf guest_perf{AmdGpu::cp_perf.sc_guest_ns};
             memory->CopySparseMemory(device_addr, data, size);
         }
         stream_buffer.Commit();
