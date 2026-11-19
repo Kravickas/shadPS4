@@ -1,4 +1,4 @@
-// SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
+// SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #pragma once
@@ -77,6 +77,12 @@ public:
                           bool check_read_access = false);
 
     void FlushBarriers();
+
+    /// Adds the stage of a buffer access that no hazard check needs to track to the source
+    /// scope of the next barrier, like AccessBuffer does for any access.
+    void AccessStage(vk::PipelineStageFlags2 stage) {
+        memory_barrier.srcStageMask |= stage;
+    }
 
 private:
     void MakeCurrent(const VideoCore::Buffer* handle);

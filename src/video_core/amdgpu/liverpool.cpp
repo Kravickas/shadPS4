@@ -740,21 +740,15 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb) {
             }
             case PM4ItOpcode::EventWriteEop: {
                 const auto* event_eop = reinterpret_cast<const PM4CmdEventWriteEop*>(header);
-                auto signal = [eop = *event_eop] {
-                    eop.SignalFence(
-                        [](void* address, u64 data, u32 num_bytes) {
-                            auto* memory = Core::Memory::Instance();
-                            ASSERT(memory->TryWriteBacking(address, &data, num_bytes));
-                        },
-                        [] { Platform::IrqC::Instance()->Signal(Platform::InterruptId::GfxEop); });
-                };
                 if (rasterizer) {
                     rasterizer->OnFence();
-                    // End of pipe: the fence and interrupt land once the GPU has done the work.
-                    rasterizer->EnqueueEopFence(std::move(signal));
-                } else {
-                    signal();
                 }
+                event_eop->SignalFence(
+                    [](void* address, u64 data, u32 num_bytes) {
+                        auto* memory = Core::Memory::Instance();
+                        ASSERT(memory->TryWriteBacking(address, &data, num_bytes));
+                    },
+                    [] { Platform::IrqC::Instance()->Signal(Platform::InterruptId::GfxEop); });
                 break;
             }
             case PM4ItOpcode::DmaData: {
@@ -803,7 +797,22 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb) {
                     if (rasterizer) {
                         rasterizer->OnFence();
                     }
-                    std::memcpy(address, write_data->data, data_size);
+                    // The driver's patched flip: the label write directly followed by the flip
+                    // NOP. The flip is finished on the GPU right here.
+                    const size_t this_size = header->type3.NumWords() + 1;
+                    const auto* next_nop =
+                        dcb.size() > this_size + 1
+                            ? reinterpret_cast<const PM4CmdNop*>(dcb.data() + this_size)
+                            : nullptr;
+                    const bool flip_label =
+                        next_nop && vo_port && vo_port->IsVoLabel(address) &&
+                        next_nop->header.type == 3 && next_nop->header.opcode == PM4ItOpcode::Nop &&
+                        next_nop->data_block[0] == PM4CmdNop::PayloadType::PatchedFlip;
+                    if (flip_label) {
+                        vo_port->WriteFlipLabel(address, write_data->data, data_size);
+                    } else {
+                        std::memcpy(address, write_data->data, data_size);
+                    }
                 } else {
                     UNREACHABLE();
                 }

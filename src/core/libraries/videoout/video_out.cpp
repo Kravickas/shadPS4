@@ -6,7 +6,6 @@
 #include "common/elf_info.h"
 #include "common/logging/log.h"
 #include "core/emulator_settings.h"
-#include "core/libraries/kernel/time.h"
 #include "core/libraries/libs.h"
 #include "core/libraries/system/userservice.h"
 #include "core/libraries/videoout/driver.h"
@@ -350,26 +349,15 @@ s32 sceVideoOutSubmitEopFlip(s32 handle, u32 buf_id, u32 mode, s64 flip_arg, voi
         return ORBIS_VIDEO_OUT_ERROR_INVALID_HANDLE;
     }
 
-    const s32 index = static_cast<s32>(buf_id);
-    if (index < -1 || index > 15) {
-        LOG_ERROR(Lib_VideoOut, "Invalid buf_id = {}", index);
-        return ORBIS_VIDEO_OUT_ERROR_INVALID_INDEX;
-    }
-    if (index != -1 && port->buffer_slots[index].group_index == -1) {
-        LOG_ERROR(Lib_VideoOut, "Buffer {} is not registered", index);
-        return ORBIS_VIDEO_OUT_ERROR_INVALID_INDEX;
-    }
-    if (mode - 1u > 5u) {
-        LOG_ERROR(Lib_VideoOut, "Invalid flip mode = {}", mode);
-        return ORBIS_VIDEO_OUT_ERROR_INVALID_FLIP_MODE;
-    }
-
+    // The flip is pending, and pending on the GPU, from submission.
     {
         std::unique_lock lock{port->port_mutex};
-        if (index != -1 && port->flip_status.flip_pending_num >= 16) {
+        if (static_cast<s32>(buf_id) != -1 && port->flip_status.flip_pending_num > 16) {
             LOG_ERROR(Lib_VideoOut, "Flip queue is full");
             return ORBIS_VIDEO_OUT_ERROR_FLIP_QUEUE_FULL;
         }
+        ++port->flip_status.flip_pending_num;
+        ++port->flip_status.gc_queue_num;
     }
 
     Platform::IrqC::Instance()->RegisterOnce(

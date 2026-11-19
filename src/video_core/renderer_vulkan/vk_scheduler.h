@@ -1,4 +1,4 @@
-// SPDX-FileCopyrightText: Copyright 2025 shadPS4 Emulator Project
+// SPDX-FileCopyrightText: Copyright 2025-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #pragma once
@@ -446,6 +446,12 @@ public:
         }
         priority_pending_ops_cv.notify_one();
     }
+
+    /// Submits a buffer readback command buffer that was recorded outside of the scheduler. It
+    /// runs once the GPU reached wait_tick and must not depend on anything recorded later. With
+    /// a readback queue it waits for wait_tick only; otherwise it is queued after all work
+    /// submitted to the graphics queue so far. Can be called from any thread.
+    void SubmitOutOfBand(vk::CommandBuffer cmdbuf, vk::Fence fence, u64 wait_tick) const;
 
     static std::mutex submit_mutex;
 

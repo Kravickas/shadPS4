@@ -20,9 +20,18 @@
 #include "video_core/texture_cache/image_view.h"
 #include "video_core/texture_cache/texture_cache.h"
 
+#include <cstring>
+#include <type_traits>
 #include <vulkan/vulkan_format_traits.hpp>
+#include <xxhash.h>
 
 namespace Vulkan {
+
+template <typename T>
+static bool SameBits(const T& a, const T& b) {
+    static_assert(std::is_trivially_copyable_v<T>);
+    return std::memcmp(&a, &b, sizeof(T)) == 0;
+}
 
 static Shader::PushData MakeUserData(const AmdGpu::Regs& regs) {
     // TODO(roamic): Add support for multiple viewports and geometry shaders when ViewportIndex
@@ -126,8 +135,24 @@ void Rasterizer::PrepareRenderState(const GraphicsPipeline* pipeline) {
             continue;
         }
         const auto& hint = liverpool->last_cb_extent[cb];
-        std::construct_at(&desc, col_buf, hint);
-        image_id = bound_images.emplace_back(texture_cache.FindImage(desc));
+        auto& lookup = cb_lookups[cb];
+        const u64 generation = texture_cache.RegistryGeneration();
+        if (lookup.generation == generation && SameBits(lookup.col_buf, col_buf) &&
+            lookup.hint.raw == hint.raw) {
+            desc = lookup.binding.desc;
+            image_id = lookup.binding.image_id;
+            texture_cache.TouchFoundImage(image_id);
+        } else {
+            std::construct_at(&desc, col_buf, hint);
+            image_id = texture_cache.FindImage(desc);
+            const bool reusable = texture_cache.RegistryGeneration() == generation &&
+                                  texture_cache.IsPerfectMatch(image_id, desc);
+            lookup.generation = reusable ? generation : 0;
+            lookup.col_buf = col_buf;
+            lookup.hint = hint;
+            lookup.binding = {image_id, desc};
+        }
+        bound_images.emplace_back(image_id);
         auto& image = texture_cache.GetImage(image_id);
         image.binding.is_target = 1u;
     }
@@ -137,9 +162,30 @@ void Rasterizer::PrepareRenderState(const GraphicsPipeline* pipeline) {
         const auto htile_address = regs.depth_htile_data_base.GetAddress();
         const auto& hint = liverpool->last_db_extent;
         auto& [image_id, desc] = db_desc;
-        std::construct_at(&desc, regs.depth_buffer, regs.depth_view, regs.depth_control,
-                          htile_address, hint);
-        image_id = bound_images.emplace_back(texture_cache.FindImage(desc));
+        auto& lookup = db_lookup;
+        const u64 generation = texture_cache.RegistryGeneration();
+        if (lookup.generation == generation && SameBits(lookup.depth_buffer, regs.depth_buffer) &&
+            SameBits(lookup.depth_view, regs.depth_view) &&
+            SameBits(lookup.depth_control, regs.depth_control) &&
+            lookup.htile_address == htile_address && lookup.hint.raw == hint.raw) {
+            desc = lookup.binding.desc;
+            image_id = lookup.binding.image_id;
+            texture_cache.TouchFoundImage(image_id);
+        } else {
+            std::construct_at(&desc, regs.depth_buffer, regs.depth_view, regs.depth_control,
+                              htile_address, hint);
+            image_id = texture_cache.FindImage(desc);
+            const bool reusable = texture_cache.RegistryGeneration() == generation &&
+                                  texture_cache.IsPerfectMatch(image_id, desc);
+            lookup.generation = reusable ? generation : 0;
+            lookup.depth_buffer = regs.depth_buffer;
+            lookup.depth_view = regs.depth_view;
+            lookup.depth_control = regs.depth_control;
+            lookup.htile_address = htile_address;
+            lookup.hint = hint;
+            lookup.binding = {image_id, desc};
+        }
+        bound_images.emplace_back(image_id);
         auto& image = texture_cache.GetImage(image_id);
         image.binding.is_target = 1u;
     } else {
@@ -428,11 +474,6 @@ void Rasterizer::OnFence() {
     texture_cache.ProcessDownloadImages();
 }
 
-void Rasterizer::EnqueueEopFence(Common::UniqueFunction<void>&& signal) {
-    scheduler.DeferPriorityOperation(std::move(signal));
-    Flush();
-}
-
 bool Rasterizer::BindResources(const Pipeline* pipeline) {
     if (IsComputeImageCopy(pipeline) || IsComputeMetaClear(pipeline) ||
         IsComputeImageClear(pipeline)) {
@@ -617,9 +658,16 @@ void Rasterizer::ResetBindings(bool is_compute) {
         }
         image.binding = {};
     }
+    // Only the host writes the stream buffer, so no hazard check ever looks at its read
+    // ranges; reads of it only add their stage to the next barrier.
+    const VideoCore::Buffer* const stream_buffer = &buffer_cache.GetStreamBuffer();
     for (const auto [buffer, offset, size, src_access] : bound_buffers) {
         const auto dst_stage = is_compute ? vk::PipelineStageFlagBits2::eComputeShader
                                           : vk::PipelineStageFlagBits2::eAllGraphics;
+        if (buffer == stream_buffer && !(src_access & vk::AccessFlagBits2::eShaderWrite)) {
+            runtime.AccessStage(dst_stage);
+            continue;
+        }
         runtime.AccessBuffer(buffer, offset, size, dst_stage, src_access);
     }
     bound_images.clear();
@@ -920,18 +968,41 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
 
         for (auto i = 0; i < num_bindings; i++) {
             auto& [image_id, desc] = image_bindings[num_images++];
-            std::construct_at(&desc, tsharp, image_desc);
+            TextureKey key{};
+            key.tsharp = tsharp;
+            key.is_depth = image_desc.is_depth;
+            key.is_array = image_desc.is_array;
+            key.is_written = image_desc.is_written;
+            key.mip_level = mip_fallback_mode == Shader::MipStorageFallbackMode::ConstantIndex
+                                ? image_desc.constant_mip_index
+                            : mip_fallback_mode == Shader::MipStorageFallbackMode::DynamicIndex
+                                ? static_cast<u32>(i)
+                                : ~0U;
+            auto& lookup = texture_lookups[XXH3_64bits(&key, sizeof(key)) % texture_lookups.size()];
+            const u64 generation = texture_cache.RegistryGeneration();
+            if (lookup.generation == generation && SameBits(lookup.key, key)) {
+                desc = lookup.binding.desc;
+                image_id = lookup.binding.image_id;
+                texture_cache.TouchFoundImage(image_id);
+            } else {
+                std::construct_at(&desc, tsharp, image_desc);
 
-            if (mip_fallback_mode == Shader::MipStorageFallbackMode::ConstantIndex) {
-                ASSERT(num_bindings == 1);
-                desc.view_info.range.base.level += image_desc.constant_mip_index;
-                desc.view_info.range.extent.levels = 1;
-            } else if (mip_fallback_mode == Shader::MipStorageFallbackMode::DynamicIndex) {
-                desc.view_info.range.base.level += i;
-                desc.view_info.range.extent.levels = 1;
+                if (mip_fallback_mode == Shader::MipStorageFallbackMode::ConstantIndex) {
+                    ASSERT(num_bindings == 1);
+                    desc.view_info.range.base.level += image_desc.constant_mip_index;
+                    desc.view_info.range.extent.levels = 1;
+                } else if (mip_fallback_mode == Shader::MipStorageFallbackMode::DynamicIndex) {
+                    desc.view_info.range.base.level += i;
+                    desc.view_info.range.extent.levels = 1;
+                }
+
+                image_id = texture_cache.FindImage(desc);
+                const bool reusable = texture_cache.RegistryGeneration() == generation &&
+                                      texture_cache.IsPerfectMatch(image_id, desc);
+                lookup.generation = reusable ? generation : 0;
+                lookup.key = key;
+                lookup.binding = {image_id, desc};
             }
-
-            image_id = texture_cache.FindImage(desc);
             auto* image = &texture_cache.GetImage(image_id);
             if (auto depth_image_id = texture_cache.GetAssociatedDepth(*image)) {
                 // If this image has an associated depth image, it's a stencil attachment.
@@ -1325,6 +1396,17 @@ bool Rasterizer::InvalidateMemory(VAddr addr, u64 size, bool assume_locks) {
     }
     buffer_cache.InvalidateMemory(addr, size, assume_locks);
     texture_cache.InvalidateMemory(addr, size);
+    return true;
+}
+
+bool Rasterizer::AccessBesideGpuData(VAddr addr, u32 size, bool is_write, u8* data) {
+    if (!IsMapped(addr, size) || !buffer_cache.AccessBesideGpuData(addr, size, is_write, data)) {
+        return false;
+    }
+    if (is_write) {
+        // Like InvalidateMemory does for a write that faults.
+        texture_cache.InvalidateMemory(addr, size);
+    }
     return true;
 }
 

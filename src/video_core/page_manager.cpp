@@ -1,11 +1,14 @@
-// SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
+// SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
+#include <bit>
+#include <cstring>
 #include <utility>
 #include "common/adaptive_mutex.h"
 #include "common/assert.h"
 #include "common/debug.h"
+#include "common/decoder.h"
 #include "common/div_ceil.h"
 #include "common/error.h"
 #include "common/multi_level_page_table.h"
@@ -436,12 +439,214 @@ struct SignalImpl : public PageManager::Impl {
         const auto size = std::min<u64>(8, PageManager::GetNextPageAddr(addr) - addr);
         const auto is_gpu_thread =
             std::this_thread::get_id() == rasterizer->GetGpuCommandProcessorThread();
+        if (!is_gpu_thread && TryEmulateAccess(context, addr)) {
+            return true;
+        }
         if (Common::IsWriteError(context)) {
             return rasterizer->InvalidateMemory(addr, size, is_gpu_thread);
         } else {
             return rasterizer->ReadMemory(addr, size, is_gpu_thread);
         }
         return false;
+    }
+
+    /// Value of a general purpose register operand, false if it is not a plain one.
+    static bool ReadGpr(void* context, ZydisRegister reg, u64& value) {
+        const auto reg_class = ZydisRegisterGetClass(reg);
+        if (reg_class != ZYDIS_REGCLASS_GPR8 && reg_class != ZYDIS_REGCLASS_GPR16 &&
+            reg_class != ZYDIS_REGCLASS_GPR32 && reg_class != ZYDIS_REGCLASS_GPR64) {
+            return false;
+        }
+        if (reg >= ZYDIS_REGISTER_AH && reg <= ZYDIS_REGISTER_BH) {
+            return false;
+        }
+        const u64* const pointer = GprPointer(context, reg);
+        if (!pointer) {
+            return false;
+        }
+        value = *pointer;
+        return true;
+    }
+
+    /// The 64-bit register of the context that holds a general purpose register operand.
+    static u64* GprPointer(void* context, ZydisRegister reg) {
+        // The register number is the one of the enclosing 64-bit register: the 8-bit class
+        // numbers its registers differently.
+        const auto full = ZydisRegisterGetLargestEnclosing(ZYDIS_MACHINE_MODE_LONG_64, reg);
+        if (ZydisRegisterGetClass(full) != ZYDIS_REGCLASS_GPR64) {
+            return nullptr;
+        }
+        return Common::GetGprPointer(context, u8(ZydisRegisterGetId(full)));
+    }
+
+    /// Performs the faulting instruction's memory access on guest memory and skips the
+    /// instruction, when the access touches no GPU data. Handles the plain forms of mov, cmp
+    /// and 128-bit vector stores; anything else is left to the readback.
+    static bool TryEmulateAccess(void* context, VAddr fault_addr) {
+        ZydisDecodedInstruction inst;
+        ZydisDecodedOperand operands[ZYDIS_MAX_OPERAND_COUNT];
+        const VAddr rip = reinterpret_cast<VAddr>(Common::GetRip(context));
+        if (!ZYAN_SUCCESS(Common::Decoder::Instance()->decodeInstruction(
+                inst, operands, reinterpret_cast<void*>(rip)))) {
+            return false;
+        }
+        constexpr ZydisInstructionAttributes Unsupported =
+            ZYDIS_ATTRIB_HAS_LOCK | ZYDIS_ATTRIB_HAS_REP | ZYDIS_ATTRIB_HAS_REPE |
+            ZYDIS_ATTRIB_HAS_REPNE | ZYDIS_ATTRIB_HAS_ADDRESSSIZE;
+        if ((inst.attributes & Unsupported) != 0 || inst.operand_count_visible != 2) {
+            return false;
+        }
+        const bool mem_first = operands[0].type == ZYDIS_OPERAND_TYPE_MEMORY;
+        const bool mem_second = operands[1].type == ZYDIS_OPERAND_TYPE_MEMORY;
+        if (mem_first == mem_second) {
+            return false;
+        }
+        const auto& mem_op = operands[mem_first ? 0 : 1];
+        const auto& other_op = operands[mem_first ? 1 : 0];
+        const auto& mem = mem_op.mem;
+        if (mem.type != ZYDIS_MEMOP_TYPE_MEM || mem.segment == ZYDIS_REGISTER_FS ||
+            mem.segment == ZYDIS_REGISTER_GS) {
+            return false;
+        }
+        const u32 size = mem_op.size / 8;
+        if (size == 0 || size > 16) {
+            return false;
+        }
+
+        // The effective address has to be the faulting one, within a single page.
+        u64 address = static_cast<u64>(mem.disp.value);
+        if (mem.base == ZYDIS_REGISTER_RIP) {
+            address += rip + inst.length;
+        } else if (mem.base != ZYDIS_REGISTER_NONE) {
+            u64 base;
+            if (ZydisRegisterGetClass(mem.base) != ZYDIS_REGCLASS_GPR64 ||
+                !ReadGpr(context, mem.base, base)) {
+                return false;
+            }
+            address += base;
+        }
+        if (mem.index != ZYDIS_REGISTER_NONE) {
+            u64 index;
+            if (ZydisRegisterGetClass(mem.index) != ZYDIS_REGCLASS_GPR64 ||
+                !ReadGpr(context, mem.index, index)) {
+                return false;
+            }
+            address += index * mem.scale;
+        }
+        if (address != fault_addr || PageManager::GetNextPageAddr(address) < address + size) {
+            return false;
+        }
+
+        // The other operand: a register or an immediate.
+        u64 other = 0;
+        const bool other_is_reg = other_op.type == ZYDIS_OPERAND_TYPE_REGISTER;
+        if (other_op.type == ZYDIS_OPERAND_TYPE_IMMEDIATE) {
+            other = other_op.imm.is_signed ? static_cast<u64>(other_op.imm.value.s)
+                                           : other_op.imm.value.u;
+        } else if (!other_is_reg) {
+            return false;
+        }
+        const u64 mask = size >= 8 ? ~0ULL : (1ULL << (size * 8)) - 1;
+        const bool is_write_fault = Common::IsWriteError(context);
+        u8 data[16];
+
+        switch (inst.mnemonic) {
+        case ZYDIS_MNEMONIC_MOV: {
+            if (size > 8) {
+                return false;
+            }
+            if (mem_first) {
+                // Store of a register or an immediate.
+                if (!is_write_fault ||
+                    (other_is_reg && !ReadGpr(context, other_op.reg.value, other))) {
+                    return false;
+                }
+                std::memcpy(data, &other, size);
+                if (!rasterizer->AccessBesideGpuData(address, size, true, data)) {
+                    return false;
+                }
+            } else {
+                // Load into a 32 or 64-bit register; a 32-bit load clears the upper half.
+                const auto reg_class = ZydisRegisterGetClass(other_op.reg.value);
+                if (is_write_fault || !other_is_reg ||
+                    (reg_class != ZYDIS_REGCLASS_GPR32 && reg_class != ZYDIS_REGCLASS_GPR64) ||
+                    size != (reg_class == ZYDIS_REGCLASS_GPR32 ? 4U : 8U)) {
+                    return false;
+                }
+                u64* const dest = GprPointer(context, other_op.reg.value);
+                if (!dest || !rasterizer->AccessBesideGpuData(address, size, false, data)) {
+                    return false;
+                }
+                u64 value = 0;
+                std::memcpy(&value, data, size);
+                *dest = value;
+            }
+            break;
+        }
+        case ZYDIS_MNEMONIC_CMP: {
+            if (size > 8 || is_write_fault ||
+                (other_is_reg && !ReadGpr(context, other_op.reg.value, other)) ||
+                !rasterizer->AccessBesideGpuData(address, size, false, data)) {
+                return false;
+            }
+            u64 value = 0;
+            std::memcpy(&value, data, size);
+            // cmp subtracts the second operand from the first and only sets the flags.
+            const u64 lhs = (mem_first ? value : other) & mask;
+            const u64 rhs = (mem_first ? other : value) & mask;
+            const u64 result = (lhs - rhs) & mask;
+            const u64 sign = 1ULL << (size * 8 - 1);
+            constexpr u64 CF = 1ULL << 0, PF = 1ULL << 2, AF = 1ULL << 4, ZF = 1ULL << 6,
+                          SF = 1ULL << 7, OF = 1ULL << 11;
+            u64 flags = Common::GetFlags(context) & ~(CF | PF | AF | ZF | SF | OF);
+            flags |= lhs < rhs ? CF : 0;
+            flags |= (std::popcount(static_cast<u8>(result)) & 1) == 0 ? PF : 0;
+            flags |= ((lhs ^ rhs ^ result) & 0x10) != 0 ? AF : 0;
+            flags |= result == 0 ? ZF : 0;
+            flags |= (result & sign) != 0 ? SF : 0;
+            flags |= ((lhs ^ rhs) & (lhs ^ result) & sign) != 0 ? OF : 0;
+            Common::SetFlags(context, flags);
+            break;
+        }
+        case ZYDIS_MNEMONIC_MOVAPS:
+        case ZYDIS_MNEMONIC_MOVAPD:
+        case ZYDIS_MNEMONIC_MOVDQA:
+        case ZYDIS_MNEMONIC_VMOVAPS:
+        case ZYDIS_MNEMONIC_VMOVAPD:
+        case ZYDIS_MNEMONIC_VMOVDQA:
+            if ((address & 0xf) != 0) {
+                // An unaligned access of these raises a general protection fault.
+                return false;
+            }
+            [[fallthrough]];
+        case ZYDIS_MNEMONIC_MOVUPS:
+        case ZYDIS_MNEMONIC_MOVUPD:
+        case ZYDIS_MNEMONIC_MOVDQU:
+        case ZYDIS_MNEMONIC_VMOVUPS:
+        case ZYDIS_MNEMONIC_VMOVUPD:
+        case ZYDIS_MNEMONIC_VMOVDQU: {
+            // Store of an XMM register. Loads are left alone: the VEX forms also clear the
+            // upper bits of the YMM register, which the context here does not hold.
+            if (!mem_first || !is_write_fault || size != 16 || !other_is_reg ||
+                ZydisRegisterGetClass(other_op.reg.value) != ZYDIS_REGCLASS_XMM) {
+                return false;
+            }
+            const void* const xmm =
+                Common::GetXmmRegisterPointer(context, u8(ZydisRegisterGetId(other_op.reg.value)));
+            if (!xmm) {
+                return false;
+            }
+            std::memcpy(data, xmm, 16);
+            if (!rasterizer->AccessBesideGpuData(address, size, true, data)) {
+                return false;
+            }
+            break;
+        }
+        default:
+            return false;
+        }
+        Common::SkipInstruction(context, inst.length);
+        return true;
     }
 };
 

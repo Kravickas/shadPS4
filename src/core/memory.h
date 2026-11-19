@@ -1,4 +1,4 @@
-// SPDX-FileCopyrightText: Copyright 2025 shadPS4 Emulator Project
+// SPDX-FileCopyrightText: Copyright 2025-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #pragma once
@@ -255,6 +255,9 @@ public:
     void SetPrtArea(u32 id, VAddr address, u64 size);
 
     void CopySparseMemory(VAddr source, u8* dest, u64 size);
+
+    /// Whether guest memory holds the given bytes, reading it like CopySparseMemory does.
+    bool CompareSparseMemory(VAddr source, const u8* data, u64 size);
 
     bool TryWriteBacking(void* address, const void* data, u64 size);
 

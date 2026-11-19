@@ -155,10 +155,11 @@ void TextureCache::DownloadImageMemory(ImageId image_id, DownloadMemoryFlags fla
 
     const auto write_data = [this, image_addr, copy_size, download, discard_buffer_cache, is_sync] {
         download.Invalidate();
-        Core::Memory::Instance()->TryWriteBacking(std::bit_cast<u8*>(image_addr), download.mapped,
-                                                  copy_size);
         if (discard_buffer_cache) {
-            buffer_cache.UnmarkRegionAsGpuModified(image_addr, copy_size, true);
+            buffer_cache.WriteAndUnmarkGpuModified(image_addr, download.mapped, copy_size);
+        } else {
+            Core::Memory::Instance()->TryWriteBacking(std::bit_cast<u8*>(image_addr),
+                                                      download.mapped, copy_size);
         }
         if (!is_sync) {
             runtime.GetStagingPool().FreeDeferred(download);
@@ -348,10 +349,7 @@ std::tuple<ImageId, int, int> TextureCache::ResolveOverlap(const ImageInfo& imag
     if (image_info.guest_address == cache_image.info.guest_address) {
         const u32 lhs_block_size = image_info.num_bits * image_info.num_samples;
         const u32 rhs_block_size = cache_image.info.num_bits * cache_image.info.num_samples;
-        // A pow2 padded texture and its target disagree on logical height but not on padded.
-        const bool same_dim = image_info.BlockDim() == cache_image.info.BlockDim() ||
-                              image_info.PaddedDim() == cache_image.info.PaddedDim();
-        if (!same_dim || lhs_block_size != rhs_block_size) {
+        if (!image_info.HasSameBlockLayout(cache_image.info) || lhs_block_size != rhs_block_size) {
             // Very likely this kind of overlap is caused by allocation from a pool.
             if (safe_to_delete) {
                 FreeImage(cache_image_id);
@@ -960,6 +958,7 @@ void TextureCache::RegisterImage(ImageId image_id) {
     ASSERT_MSG(False(image.flags & ImageFlagBits::Registered),
                "Trying to register an already registered image");
     image.flags |= ImageFlagBits::Registered;
+    ++registry_generation;
     image.memory_usage_counter = &total_used_memory;
     total_used_memory += Common::AlignUp(image.SizeBytes(), 1024);
     image_lru_cache.Insert(image, gc_tick);
@@ -979,6 +978,7 @@ void TextureCache::UnregisterImage(ImageId image_id) {
     ASSERT_MSG(True(image.flags & ImageFlagBits::Registered),
                "Trying to unregister an already unregistered image");
     image.flags &= ~ImageFlagBits::Registered;
+    ++registry_generation;
     image.memory_usage_counter = nullptr;
     image_lru_cache.Free(image);
     total_used_memory -= Common::AlignUp(image.SizeBytes(), 1024);
@@ -1249,6 +1249,22 @@ void TextureCache::RunGarbageCollector() {
 
 void TextureCache::TouchImage(Image& image) {
     image_lru_cache.Touch(image, gc_tick);
+}
+
+bool TextureCache::IsPerfectMatch(ImageId image_id, const ImageDesc& desc) {
+    // The same tests as the perfect match in FindImage.
+    const auto& info = desc.info;
+    const auto& cache_info = slot_images[image_id].info;
+    return cache_info.guest_address == info.guest_address &&
+           cache_info.guest_size == info.guest_size && cache_info.size == info.size &&
+           IsVulkanFormatCompatible(cache_info.pixel_format, info.pixel_format) &&
+           (cache_info.type == info.type || info.size == Extent3D{1, 1, 1});
+}
+
+void TextureCache::TouchFoundImage(ImageId image_id) {
+    Image& image = slot_images[image_id];
+    image.tick_accessed_last = scheduler.CurrentTick();
+    TouchImage(image);
 }
 
 void TextureCache::DeleteImage(ImageId image_id) {

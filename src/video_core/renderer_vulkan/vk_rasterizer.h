@@ -74,6 +74,9 @@ public:
     u32 ReadDataFromGds(u32 gsd_offset);
     bool InvalidateMemory(VAddr addr, u64 size, bool assume_locks = false);
     bool ReadMemory(VAddr addr, u64 size, bool assume_locks = false);
+    /// Performs a faulting CPU access that touches no GPU data directly on guest memory.
+    /// Returns false if the fault has to be handled by InvalidateMemory or ReadMemory.
+    bool AccessBesideGpuData(VAddr addr, u32 size, bool is_write, u8* data);
     bool IsMapped(VAddr addr, u64 size);
     void MapMemory(VAddr addr, u64 size);
     void RegisterMemory(VAddr addr, u64 size);
@@ -83,7 +86,6 @@ public:
     void Finish();
     void OnSubmit();
     void OnFence();
-    void EnqueueEopFence(Common::UniqueFunction<void>&& signal);
 
     PipelineCache& GetPipelineCache() {
         return pipeline_cache;
@@ -162,6 +164,43 @@ private:
     std::array<ImageBinding, Shader::NUM_IMAGES> image_bindings;
     std::array<ImageBinding, AmdGpu::NUM_COLOR_BUFFERS> cb_descs;
     ImageBinding db_desc;
+
+    /// Registers and result of the last render target lookup that found a perfect match. The
+    /// same registers give the same image while the texture cache registry generation is equal.
+    struct ColorTargetLookup {
+        u64 generation{};
+        AmdGpu::ColorBuffer col_buf;
+        AmdGpu::CbDbExtent hint;
+        ImageBinding binding;
+    };
+    struct DepthTargetLookup {
+        u64 generation{};
+        AmdGpu::DepthBuffer depth_buffer;
+        AmdGpu::DepthView depth_view;
+        AmdGpu::DepthControl depth_control;
+        VAddr htile_address;
+        AmdGpu::CbDbExtent hint;
+        ImageBinding binding;
+    };
+    std::array<ColorTargetLookup, AmdGpu::NUM_COLOR_BUFFERS> cb_lookups{};
+    DepthTargetLookup db_lookup{};
+
+    /// Inputs of a texture lookup: the T# and the shader resource fields ImageDesc reads.
+    struct TextureKey {
+        AmdGpu::Image tsharp;
+        u32 is_depth;
+        u32 is_array;
+        u32 is_written;
+        u32 mip_level; ///< Mip the binding is limited to by the storage fallback, or ~0U
+    };
+    /// Last texture lookup that found a perfect match, per hash slot of its key. The same key
+    /// gives the same image while the texture cache registry generation is equal.
+    struct TextureLookup {
+        u64 generation{};
+        TextureKey key;
+        ImageBinding binding;
+    };
+    std::array<TextureLookup, 512> texture_lookups{};
 
     boost::container::static_vector<vk::DescriptorImageInfo, Shader::NUM_IMAGES> image_infos;
     boost::container::static_vector<vk::DescriptorBufferInfo, Shader::NUM_BUFFERS> buffer_infos;
