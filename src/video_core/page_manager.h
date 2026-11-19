@@ -1,4 +1,4 @@
-// SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
+// SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #pragma once
@@ -59,6 +59,11 @@ public:
     static constexpr size_t GetPageSize() {
         return PM_PAGE_SIZE;
     }
+
+    // PADDIAG: test build only.
+    static void PadDiagArmPool(VAddr address, size_t size);
+    static void PadDiagRecordGpuWrite(VAddr address, size_t size);
+    static void PadDiagReport(VAddr image, VAddr address, size_t size, const char* label);
 
 private:
     friend struct UffdImpl;

@@ -691,6 +691,10 @@ s32 MemoryManager::MapMemory(void** out_addr, VAddr virtual_addr, u64 size, Memo
         if (type != VMAType::Flexible) {
             impl.Map(mapped_addr, size, phys_addr, is_exec);
             rasterizer->RegisterMemory(mapped_addr, size);
+            // PADDIAG: test build only.
+            if (True(prot & MemoryProt::GpuReadWrite) && size >= 0x40000000) {
+                VideoCore::PageManager::PadDiagArmPool(mapped_addr, size);
+            }
             // Tracy memory tracking breaks from merging memory areas. Disabled for now.
             // TRACK_ALLOC(mapped_addr, size, "VMEM");
         }

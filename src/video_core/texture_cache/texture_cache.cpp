@@ -313,6 +313,7 @@ void TextureCache::InvalidateMemory(VAddr addr, size_t size) {
 }
 
 void TextureCache::InvalidateMemoryFromGPU(VAddr address, size_t max_size) {
+    PageManager::PadDiagRecordGpuWrite(address, max_size);
     // Mark the image at the written address, then follow images stored right after it
     // (e.g. the chroma planes after a luma plane).
     const VAddr end = address + max_size;
@@ -1107,6 +1108,10 @@ void TextureCache::RegisterImage(ImageId image_id) {
                     info.guest_address,
                     CountNonZeroBacking(info.guest_address, info.mips_layout[0].size));
         FindPadDescriptorOwners(info.guest_address);
+        const u64 mip0_size = info.mips_layout[0].size;
+        PageManager::PadDiagReport(info.guest_address, info.guest_address, mip0_size, "mip0");
+        PageManager::PadDiagReport(info.guest_address, info.guest_address + mip0_size,
+                                   info.guest_size - mip0_size, "mips1+");
     }
     ASSERT_MSG((info.guest_address & 0xff) == 0, "Trying to register an unaligned image");
     ForEachPage(info.guest_address, info.guest_size, [this, image_id, info](u64 page) {

@@ -1,7 +1,9 @@
-// SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
+// SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
+#include <atomic>
+#include <map>
 #include <utility>
 #include "common/adaptive_mutex.h"
 #include "common/assert.h"
@@ -24,6 +26,10 @@
 #include <windows.h>
 #endif
 
+#if defined(__linux__) && !defined(_WIN32)
+#include <sys/ucontext.h>
+#endif
+
 #ifdef __linux__
 #include <thread>
 #include <fcntl.h>
@@ -36,6 +42,48 @@
 #endif
 
 namespace VideoCore {
+
+// PADDIAG: test build only. Records the first CPU writer of every page of the GPU pool.
+namespace {
+constexpr VAddr PAD_DIAG_EBOOT_BASE = 0x5340000;
+constexpr VAddr PAD_DIAG_EBOOT_END = 0x5340000 + 0x6320000;
+constexpr u64 PAD_DIAG_GPU_WRITER = 1;
+
+struct PadDiagPool {
+    VAddr base{};
+    u64 num_pages{};
+    std::unique_ptr<std::atomic<u8>[]> armed;
+    std::unique_ptr<std::atomic<u64>[]> writer;
+    std::unique_ptr<std::atomic<u64>[]> caller;
+};
+PadDiagPool pad_pool;
+std::atomic<bool> pad_pool_ready{false};
+
+u64 PadDiagGetRsp(void* ctx) {
+#if defined(_WIN32)
+    return ((EXCEPTION_POINTERS*)ctx)->ContextRecord->Rsp;
+#elif defined(__linux__) && defined(ARCH_X86_64)
+    return ((ucontext_t*)ctx)->uc_mcontext.gregs[REG_RSP];
+#else
+    return 0;
+#endif
+}
+
+u64 PadDiagFindCaller(void* ctx) {
+    const u64 rsp = PadDiagGetRsp(ctx);
+    if (rsp == 0) {
+        return 0;
+    }
+    const u64* stack = reinterpret_cast<const u64*>(rsp);
+    for (u32 i = 0; i < 256; ++i) {
+        const u64 value = stack[i];
+        if (value >= PAD_DIAG_EBOOT_BASE && value < PAD_DIAG_EBOOT_END) {
+            return value;
+        }
+    }
+    return 0;
+}
+} // namespace
 
 struct PageManager::Impl {
     struct PageState {
@@ -415,6 +463,7 @@ public:
 struct SignalImpl : public PageManager::Impl {
     SignalImpl(Vulkan::Rasterizer* rasterizer_) : Impl() {
         rasterizer = rasterizer_;
+        instance = this;
 
         // Should be called first.
         constexpr auto priority = std::numeric_limits<u32>::min();
@@ -431,8 +480,39 @@ struct SignalImpl : public PageManager::Impl {
         impl.Protect(address, size, perms);
     }
 
+    static bool PadDiagFault(void* context, VAddr addr) {
+        if (!pad_pool_ready.load(std::memory_order_acquire) || !Common::IsWriteError(context) ||
+            addr < pad_pool.base ||
+            addr >= pad_pool.base + (pad_pool.num_pages << PageManager::PM_PAGE_BITS)) {
+            return false;
+        }
+        const u64 index = (addr - pad_pool.base) >> PageManager::PM_PAGE_BITS;
+        if (pad_pool.armed[index].exchange(0) == 0) {
+            return false;
+        }
+        pad_pool.writer[index].store(reinterpret_cast<u64>(Common::GetRip(context)));
+        pad_pool.caller[index].store(PadDiagFindCaller(context));
+        const u64 page = addr >> PageManager::PM_PAGE_BITS;
+        auto& lock = instance->locks[page];
+        std::scoped_lock lk{lock};
+        const PageState* state = instance->cached_pages.find(page);
+        if (state && (state->num_write_watchers != 0 || state->num_read_watchers != 0)) {
+            // Page is watched by the page manager, let it handle the fault as usual.
+            return false;
+        }
+        Core::Memory::Instance()->GetAddressSpace().Protect(page << PageManager::PM_PAGE_BITS,
+                                                            PageManager::PM_PAGE_SIZE,
+                                                            Core::MemoryPermission::ReadWrite);
+        return true;
+    }
+
+    inline static SignalImpl* instance;
+
     static bool GuestFaultSignalHandler(void* context, void* fault_address) {
         const auto addr = reinterpret_cast<VAddr>(fault_address);
+        if (PadDiagFault(context, addr)) {
+            return true;
+        }
         const auto size = std::min<u64>(8, PageManager::GetNextPageAddr(addr) - addr);
         const auto is_gpu_thread =
             std::this_thread::get_id() == rasterizer->GetGpuCommandProcessorThread();
@@ -462,6 +542,68 @@ PageManager::PageManager(Vulkan::Rasterizer* rasterizer_) {
 }
 
 PageManager::~PageManager() = default;
+
+void PageManager::PadDiagArmPool(VAddr address, size_t size) {
+    if (pad_pool_ready.load()) {
+        return;
+    }
+    const VAddr base = Common::AlignDown(address, PM_PAGE_SIZE);
+    const u64 num_pages = Common::AlignUp(address + size, PM_PAGE_SIZE) - base >> PM_PAGE_BITS;
+    pad_pool.base = base;
+    pad_pool.num_pages = num_pages;
+    pad_pool.armed = std::make_unique<std::atomic<u8>[]>(num_pages);
+    pad_pool.writer = std::make_unique<std::atomic<u64>[]>(num_pages);
+    pad_pool.caller = std::make_unique<std::atomic<u64>[]>(num_pages);
+    for (u64 i = 0; i < num_pages; ++i) {
+        pad_pool.armed[i].store(1, std::memory_order_relaxed);
+    }
+    pad_pool_ready.store(true, std::memory_order_release);
+    Core::Memory::Instance()->GetAddressSpace().Protect(base, num_pages << PM_PAGE_BITS,
+                                                        Core::MemoryPermission::Read);
+    LOG_WARNING(Render, "PADDIAG armed pool {:#x} size {:#x} eboot {:#x}-{:#x}", base,
+                num_pages << PM_PAGE_BITS, PAD_DIAG_EBOOT_BASE, PAD_DIAG_EBOOT_END);
+}
+
+void PageManager::PadDiagRecordGpuWrite(VAddr address, size_t size) {
+    if (!pad_pool_ready.load(std::memory_order_acquire)) {
+        return;
+    }
+    const VAddr end =
+        std::min<VAddr>(address + size, pad_pool.base + (pad_pool.num_pages << PM_PAGE_BITS));
+    for (VAddr page = std::max(GetPageAddr(address), pad_pool.base); page < end;
+         page += PM_PAGE_SIZE) {
+        const u64 index = (page - pad_pool.base) >> PM_PAGE_BITS;
+        u64 expected = 0;
+        pad_pool.writer[index].compare_exchange_strong(expected, PAD_DIAG_GPU_WRITER);
+    }
+}
+
+void PageManager::PadDiagReport(VAddr image, VAddr address, size_t size, const char* label) {
+    if (!pad_pool_ready.load(std::memory_order_acquire) || address < pad_pool.base ||
+        address + size > pad_pool.base + (pad_pool.num_pages << PM_PAGE_BITS)) {
+        LOG_WARNING(Render, "PADDIAG writers image={:#x} {}: outside armed pool", image, label);
+        return;
+    }
+    std::map<std::pair<u64, u64>, u32> writers;
+    for (VAddr page = GetPageAddr(address); page < address + size; page += PM_PAGE_SIZE) {
+        const u64 index = (page - pad_pool.base) >> PM_PAGE_BITS;
+        ++writers[{pad_pool.writer[index].load(), pad_pool.caller[index].load()}];
+    }
+    for (const auto& [key, pages] : writers) {
+        const auto [rip, caller] = key;
+        const bool in_eboot = rip >= PAD_DIAG_EBOOT_BASE && rip < PAD_DIAG_EBOOT_END;
+        LOG_WARNING(Render,
+                    "PADDIAG writers image={:#x} {}: rip={:#x} ({}) eboot_off={:#x} "
+                    "caller={:#x} caller_off={:#x} pages={}",
+                    image, label, rip,
+                    rip == 0                     ? "never written"
+                    : rip == PAD_DIAG_GPU_WRITER ? "gpu"
+                    : in_eboot                   ? "eboot"
+                                                 : "other module/host",
+                    in_eboot ? rip - PAD_DIAG_EBOOT_BASE : 0, caller,
+                    caller ? caller - PAD_DIAG_EBOOT_BASE : 0, pages);
+    }
+}
 
 void PageManager::OnGpuMap(VAddr address, size_t size) {
     impl->OnMap(address, size);
