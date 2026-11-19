@@ -168,6 +168,14 @@ jobs:
     - name: Print CPU Info
       run: bash -c "cat /proc/cpuinfo"
 
+    # The pinned openal-soft takes the address of standard library member functions, which the
+    # STL of MSVC 14.52 does not accept. The next commit of its repository stops doing that.
+    - name: Update openal-soft
+      run: |
+        git -C externals/openal-soft fetch --depth=1 origin 7f9c6de1162b1d4604b9a2f8bcd6c53021566221
+        if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+        git -C externals/openal-soft checkout --detach 7f9c6de1162b1d4604b9a2f8bcd6c53021566221
+
     # The STL of the image's MSVC 14.52 needs Clang 22, the image comes with LLVM 20.
     - name: Install LLVM 22
       run: |
