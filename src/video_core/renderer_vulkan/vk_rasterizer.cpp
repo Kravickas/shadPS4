@@ -20,9 +20,47 @@
 #include "video_core/texture_cache/image_view.h"
 #include "video_core/texture_cache/texture_cache.h"
 
+#include <array>
+#include <cstring>
+#include <unordered_map>
 #include <vulkan/vulkan_format_traits.hpp>
 
 namespace Vulkan {
+
+// PADDIAG: test build only.
+static void LogPadDiagSharps(const Shader::Info& stage, u32 image_index,
+                             const AmdGpu::Image& tsharp, const VideoCore::ImageInfo& info) {
+    if (info.size.width != 2048 || info.size.height != 1024 || info.resources.levels != 9 ||
+        info.guest_size != 0x155a00) {
+        return;
+    }
+    std::array<u32, 8> words;
+    std::memcpy(words.data(), &tsharp, sizeof(words));
+    static std::unordered_map<VAddr, std::array<u32, 8>> last_words;
+    auto [it, inserted] = last_words.try_emplace(info.guest_address, words);
+    if (!inserted && it->second == words) {
+        return;
+    }
+    it->second = words;
+    LOG_WARNING(Render_Vulkan,
+                "PADDIAG T# image={:#x} idx={} words={:08x} {:08x} {:08x} {:08x} {:08x} {:08x} "
+                "{:08x} {:08x} base_level={} last_level={} min_lod={:#x} min_lod_warn={:#x} "
+                "counter_bank_id={} lod_hw_cnt_en={} perf_mod={}",
+                info.guest_address, image_index, words[0], words[1], words[2], words[3], words[4],
+                words[5], words[6], words[7], u32(tsharp.base_level), u32(tsharp.last_level),
+                u32(tsharp.min_lod), u32(tsharp.min_lod_warn), u32(tsharp.counter_bank_id),
+                u32(tsharp.lod_hw_cnt_en), u32(tsharp.perf_modulation));
+    for (u32 i = 0; i < stage.samplers.size(); ++i) {
+        const auto ssharp = stage.samplers[i].GetSharp(stage);
+        LOG_WARNING(Render_Vulkan,
+                    "PADDIAG S# image={:#x} idx={} words={:016x} {:016x} min_lod={:#x} "
+                    "max_lod={:#x} lod_bias={:#x} lod_bias_sec={:#x} perf_mip={} mip_filter={}",
+                    info.guest_address, i, ssharp.raw0, ssharp.raw1, u32(ssharp.min_lod.Value()),
+                    u32(ssharp.max_lod.Value()), u32(ssharp.lod_bias.Value()),
+                    u32(ssharp.lod_bias_sec.Value()), u32(ssharp.perf_mip.Value()),
+                    u32(ssharp.mip_filter.Value()));
+    }
+}
 
 static Shader::PushData MakeUserData(const AmdGpu::Regs& regs) {
     // TODO(roamic): Add support for multiple viewports and geometry shaders when ViewportIndex
@@ -928,6 +966,7 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
 
             image_id = texture_cache.FindImage(desc);
             auto* image = &texture_cache.GetImage(image_id);
+            LogPadDiagSharps(stage, u32(&image_desc - stage.images.data()), tsharp, image->info);
             if (auto depth_image_id = texture_cache.GetAssociatedDepth(*image)) {
                 // If this image has an associated depth image, it's a stencil attachment.
                 // Redirect the access to the actual depth-stencil buffer.
