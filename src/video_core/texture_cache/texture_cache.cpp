@@ -11,6 +11,7 @@
 #include "common/hash.h"
 #include "core/emulator_settings.h"
 #include "core/memory.h"
+#include "video_core/amdgpu/liverpool.h"
 #include "video_core/buffer_cache/buffer_cache.h"
 #include "video_core/page_manager.h"
 #include "video_core/renderer_vulkan/liverpool_to_vk.h"
@@ -101,8 +102,12 @@ void TextureCache::ProcessDownloadImages() {
     for (const ImageId image_id : download_images) {
         DownloadImageMemory(image_id);
     }
+    AmdGpu::cp_perf.img_downloads += static_cast<u32>(download_images.size());
     download_images.clear();
-    scheduler.Finish();
+    {
+        const AmdGpu::CpPerfScope perf_finish{AmdGpu::cp_perf.img_finish_ns};
+        scheduler.Finish();
+    }
     scheduler.PopPendingOperations();
 }
 
@@ -155,10 +160,11 @@ void TextureCache::DownloadImageMemory(ImageId image_id, DownloadMemoryFlags fla
 
     const auto write_data = [this, image_addr, copy_size, download, discard_buffer_cache, is_sync] {
         download.Invalidate();
-        Core::Memory::Instance()->TryWriteBacking(std::bit_cast<u8*>(image_addr), download.mapped,
-                                                  copy_size);
         if (discard_buffer_cache) {
-            buffer_cache.UnmarkRegionAsGpuModified(image_addr, copy_size, true);
+            buffer_cache.WriteAndUnmarkGpuModified(image_addr, download.mapped, copy_size);
+        } else {
+            Core::Memory::Instance()->TryWriteBacking(std::bit_cast<u8*>(image_addr),
+                                                      download.mapped, copy_size);
         }
         if (!is_sync) {
             runtime.GetStagingPool().FreeDeferred(download);
@@ -168,7 +174,10 @@ void TextureCache::DownloadImageMemory(ImageId image_id, DownloadMemoryFlags fla
     if (is_priority) {
         scheduler.DeferPriorityOperation(std::move(write_data));
     } else if (is_sync) {
-        scheduler.Finish();
+        {
+            const AmdGpu::CpPerfScope perf_finish{AmdGpu::cp_perf.img_finish_ns};
+            scheduler.Finish();
+        }
         write_data();
     } else {
         scheduler.DeferOperation(std::move(write_data));
@@ -348,8 +357,7 @@ std::tuple<ImageId, int, int> TextureCache::ResolveOverlap(const ImageInfo& imag
     if (image_info.guest_address == cache_image.info.guest_address) {
         const u32 lhs_block_size = image_info.num_bits * image_info.num_samples;
         const u32 rhs_block_size = cache_image.info.num_bits * cache_image.info.num_samples;
-        if (image_info.BlockDim() != cache_image.info.BlockDim() ||
-            lhs_block_size != rhs_block_size) {
+        if (!image_info.HasSameBlockLayout(cache_image.info) || lhs_block_size != rhs_block_size) {
             // Very likely this kind of overlap is caused by allocation from a pool.
             if (safe_to_delete) {
                 FreeImage(cache_image_id);
@@ -925,6 +933,12 @@ void TextureCache::RefreshImage(Image& image) {
 
     scheduler.EndRendering();
 
+    {
+        // Cleared before guest memory is read, so a CPU write during the copy keeps it dirty.
+        std::scoped_lock lk{image.mutex};
+        image.flags &= ~ImageFlagBits::Dirty;
+    }
+
     const auto [in_buffer, in_offset] =
         buffer_cache.ObtainBufferForImage(image.info.guest_address, image.info.guest_size);
     const auto [buffer, offset] = tile_manager.DetileImage(in_buffer, in_offset, image.info);
@@ -933,6 +947,12 @@ void TextureCache::RefreshImage(Image& image) {
     }
 
     runtime.UploadImage(&image, buffer, image_copies);
+
+    std::scoped_lock lk{image.mutex};
+    if (True(image.flags & ImageFlagBits::CpuDirty)) {
+        LOG_WARNING(Render_Vulkan, "CPU write during image upload: addr={:#x} size={:#x}",
+                    image.info.guest_address, image.info.guest_size);
+    }
 }
 
 vk::Sampler TextureCache::GetSampler(const AmdGpu::Sampler& sharp,
@@ -958,6 +978,7 @@ void TextureCache::RegisterImage(ImageId image_id) {
     ASSERT_MSG(False(image.flags & ImageFlagBits::Registered),
                "Trying to register an already registered image");
     image.flags |= ImageFlagBits::Registered;
+    ++registry_generation;
     image.memory_usage_counter = &total_used_memory;
     total_used_memory += Common::AlignUp(image.SizeBytes(), 1024);
     image_lru_cache.Insert(image, gc_tick);
@@ -977,6 +998,7 @@ void TextureCache::UnregisterImage(ImageId image_id) {
     ASSERT_MSG(True(image.flags & ImageFlagBits::Registered),
                "Trying to unregister an already unregistered image");
     image.flags &= ~ImageFlagBits::Registered;
+    ++registry_generation;
     image.memory_usage_counter = nullptr;
     image_lru_cache.Free(image);
     total_used_memory -= Common::AlignUp(image.SizeBytes(), 1024);
@@ -1247,6 +1269,22 @@ void TextureCache::RunGarbageCollector() {
 
 void TextureCache::TouchImage(Image& image) {
     image_lru_cache.Touch(image, gc_tick);
+}
+
+bool TextureCache::IsPerfectMatch(ImageId image_id, const ImageDesc& desc) {
+    // The same tests as the perfect match in FindImage.
+    const auto& info = desc.info;
+    const auto& cache_info = slot_images[image_id].info;
+    return cache_info.guest_address == info.guest_address &&
+           cache_info.guest_size == info.guest_size && cache_info.size == info.size &&
+           IsVulkanFormatCompatible(cache_info.pixel_format, info.pixel_format) &&
+           (cache_info.type == info.type || info.size == Extent3D{1, 1, 1});
+}
+
+void TextureCache::TouchFoundImage(ImageId image_id) {
+    Image& image = slot_images[image_id];
+    image.tick_accessed_last = scheduler.CurrentTick();
+    TouchImage(image);
 }
 
 void TextureCache::DeleteImage(ImageId image_id) {
