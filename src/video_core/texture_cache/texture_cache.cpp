@@ -2,6 +2,8 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
+#include <array>
+#include <cstring>
 #include <limits>
 #include <mutex>
 #include <unordered_map>
@@ -74,6 +76,59 @@ static u64 CountNonZeroBacking(VAddr virtual_addr, u64 size) {
         virtual_addr += chunk;
     }
     return count;
+}
+
+static const u8* BackingPtr(VAddr addr) {
+    const auto& backing_pages = Core::Memory::Instance()->GetAddressSpace().BackingPages();
+    if (auto* entry = backing_pages.find(addr >> Core::GUEST_PAGE_BITS); entry && *entry) {
+        return *entry + (addr & (Core::GUEST_PAGE_SIZE - 1));
+    }
+    return nullptr;
+}
+
+// Finds copies of the T# first two dwords in the game's CPU heaps and dumps the memory around
+// each one, to locate the game's texture object.
+static void FindPadDescriptorOwners(VAddr image_addr) {
+    const u64 pattern = (u64{0xe6300040} << 32) | u32(image_addr >> 8);
+    static constexpr std::array<std::pair<VAddr, u64>, 2> regions{{
+        {0x7000000000ULL, 0x90c00000ULL},
+        {0x200000000ULL, 0x800000ULL},
+    }};
+    u32 matches = 0;
+    for (const auto& [region_base, region_size] : regions) {
+        for (VAddr page = region_base; page < region_base + region_size;
+             page += Core::GUEST_PAGE_SIZE) {
+            const u8* data = BackingPtr(page);
+            if (!data) {
+                continue;
+            }
+            for (u64 off = 0; off < Core::GUEST_PAGE_SIZE; off += sizeof(u64)) {
+                u64 value;
+                std::memcpy(&value, data + off, sizeof(value));
+                if (value != pattern) {
+                    continue;
+                }
+                const VAddr match = page + off;
+                LOG_WARNING(Render_Vulkan, "PADDIAG owner image={:#x} T# copy at {:#x}", image_addr,
+                            match);
+                for (VAddr row = match - 0x100; row < match + 0x100; row += 0x20) {
+                    std::array<u64, 4> q{};
+                    for (u32 i = 0; i < 4; ++i) {
+                        if (const u8* src = BackingPtr(row + i * 8)) {
+                            std::memcpy(&q[i], src, sizeof(u64));
+                        }
+                    }
+                    LOG_WARNING(Render_Vulkan,
+                                "PADDIAG owner image={:#x} {:#x}: {:016x} {:016x} {:016x} {:016x}",
+                                image_addr, row, q[0], q[1], q[2], q[3]);
+                }
+                if (++matches == 8) {
+                    return;
+                }
+            }
+        }
+    }
+    LOG_WARNING(Render_Vulkan, "PADDIAG owner image={:#x} matches={}", image_addr, matches);
 }
 
 static std::mutex pad_diag_mutex;
@@ -1051,6 +1106,7 @@ void TextureCache::RegisterImage(ImageId image_id) {
         LOG_WARNING(Render_Vulkan, "PADDIAG register image={:#x} mip0_nonzero={}",
                     info.guest_address,
                     CountNonZeroBacking(info.guest_address, info.mips_layout[0].size));
+        FindPadDescriptorOwners(info.guest_address);
     }
     ASSERT_MSG((info.guest_address & 0xff) == 0, "Trying to register an unaligned image");
     ForEachPage(info.guest_address, info.guest_size, [this, image_id, info](u64 page) {
