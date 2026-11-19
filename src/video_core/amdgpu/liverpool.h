@@ -8,6 +8,7 @@
 #include <condition_variable>
 #include <coroutine>
 #include <exception>
+#include <memory>
 #include <mutex>
 #include <semaphore>
 #include <span>
@@ -139,6 +140,16 @@ struct CpPerf {
     std::array<u32, 6> run_draws; ///< Draws in runs of 1, 2-3, 4-7, 8-15, 16-31 and 32+ draws
     u32 state_packets;            ///< Packets that only set state
     u32 state_words;
+    u32 la_runs;    ///< Runs handed to the lookahead thread
+    u32 la_results; ///< Draws whose lookahead result was taken
+    u32 la_waits;   ///< Draws that had to wait for their result
+    u64 la_wait_ns;
+    u32 la_sync_waits; ///< Run ends that had to wait for the lookahead thread to stop
+    u64 la_sync_ns;
+    u32 la_copies;     ///< Full copies of the state into the lookahead thread's
+    u32 la_compares;   ///< Comparisons of the lookahead thread's state with the real one
+    u32 la_mismatches; ///< Comparisons or positions that differed
+    u32 la_early;      ///< Runs the lookahead thread stopped before their end
 };
 inline CpPerf cp_perf;
 
@@ -149,6 +160,13 @@ struct RecorderPerf {
     std::atomic<u64> stream_write_ns; ///< Sampled draws: stream buffer writes
 };
 inline RecorderPerf recorder_perf;
+
+/// Work of the lookahead thread.
+struct LookaheadPerf {
+    std::atomic<u64> scan_ns; ///< Time scanning runs
+    std::atomic<u64> sleeps;  ///< Times the thread went to sleep with nothing to scan
+};
+inline LookaheadPerf lookahead_perf;
 
 /// Packets that ended a run of draws, by opcode. The last entry counts commands of other threads.
 inline std::array<u64, 257> perf_run_enders{};
@@ -222,6 +240,16 @@ struct Liverpool {
     u32 index_buffer_num_indices{};
     std::array<CbDbExtent, NUM_COLOR_BUFFERS> last_cb_extent{};
     CbDbExtent last_db_extent{};
+
+    /// What the state packets of the graphics queue set and its draws read.
+    struct GfxState {
+        Regs& regs;
+        ComputeProgram& cs_state;
+        std::array<CbDbExtent, NUM_COLOR_BUFFERS>& last_cb_extent;
+        CbDbExtent& last_db_extent;
+        u32& index_buffer_num_indices;
+        VAddr& indirect_args_addr;
+    };
 
 public:
     explicit Liverpool();
@@ -384,6 +412,87 @@ private:
         static std::array<u8, 48_KB> constants_heap;
     } cblock{};
 
+    /// The lookahead thread's own copy of the graphics queue state.
+    struct GfxStateCopy {
+        Regs regs{};
+        ComputeProgram cs_state{};
+        std::array<CbDbExtent, NUM_COLOR_BUFFERS> last_cb_extent{};
+        CbDbExtent last_db_extent{};
+        u32 index_buffer_num_indices{};
+        VAddr indirect_args_addr{};
+
+        GfxState Ref() {
+            return {regs,
+                    cs_state,
+                    last_cb_extent,
+                    last_db_extent,
+                    index_buffer_num_indices,
+                    indirect_args_addr};
+        }
+    };
+
+    struct LookaheadResult {
+        const u32* packet;
+    };
+
+    static constexpr u32 LookaheadCompareInterval = 64;
+    static constexpr u32 LookaheadIdleSpins = 4096;
+
+    GfxState LiveGfxState() {
+        return {regs,           mapped_queues[GfxQueueId].cs_state, last_cb_extent,
+                last_db_extent, index_buffer_num_indices,           indirect_args_addr};
+    }
+
+    enum class PacketClass { State, Draw, Other };
+
+    /// Whether a packet only sets state, is a draw or dispatch, or does anything else.
+    static PacketClass ClassifyPacket(const PM4Header* header, bool guest_markers_enabled);
+
+    /// Applies what a state packet or a draw sets in the graphics queue state.
+    static void ApplyPacketState(const GfxState& state, const PM4Header* header);
+
+    /// Whether ClassifyPacket and ApplyPacketState can run on a packet that words_available
+    /// words are readable from, without reading or writing out of bounds or asserting.
+    static bool IsSafePacket(const PM4Header* header, std::size_t words_available);
+
+    /// Lets the lookahead thread scan the packets from the start of dcb up to the first one that
+    /// is neither a state packet nor a draw.
+    void StartLookaheadRun(std::span<const u32> dcb);
+
+    /// Waits until the lookahead thread has stopped. packet is where the run ends.
+    void EndLookaheadRun(const u32* packet);
+
+    /// Takes the lookahead result of the draw at the start of dcb, restarting the run there if
+    /// the lookahead thread did not get to it.
+    void TakeLookaheadResult(std::span<const u32> dcb);
+
+    void WaitLookaheadStopped();
+
+    bool CompareLookaheadState();
+
+    void LookaheadThread(std::stop_token stoken);
+
+    std::unique_ptr<GfxStateCopy> lookahead_state;
+    std::array<LookaheadResult, 4096> lookahead_results;
+    /// Run the lookahead thread scans. Only changes while it is stopped.
+    const u32* lookahead_run_begin{};
+    const u32* lookahead_run_end{};
+    /// Where the lookahead thread stopped. Valid once lookahead_stopped_run names the run.
+    const u32* lookahead_stop{};
+    bool is_lookahead_running{};
+    bool lookahead_needs_copy{true};
+    u32 lookahead_compare_countdown{};
+    u32 lookahead_logged_mismatches{};
+    u64 lookahead_run{};
+    u64 lookahead_taken{};
+    alignas(64) std::atomic<u64> lookahead_started_run{};
+    alignas(64) std::atomic<u64> lookahead_stopped_run{};
+    alignas(64) std::atomic<u64> lookahead_produced{};
+    alignas(64) std::atomic<u64> lookahead_consumed{};
+    alignas(64) std::atomic<bool> lookahead_sleeping{};
+    std::mutex lookahead_mutex;
+    std::condition_variable_any lookahead_cv;
+
     Vulkan::Rasterizer* rasterizer{};
     Libraries::VideoOut::VideoOutPort* vo_port{};
     const bool guest_markers_enabled;
@@ -399,6 +508,9 @@ private:
     u32 gpu_tid;
 #endif
     s32 curr_qid{-1};
+
+private:
+    std::jthread lookahead_thread;
 };
 
 } // namespace AmdGpu
