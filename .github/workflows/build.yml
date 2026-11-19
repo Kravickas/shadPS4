@@ -168,6 +168,15 @@ jobs:
     - name: Print CPU Info
       run: bash -c "cat /proc/cpuinfo"
 
+    # The STL of the image's MSVC 14.52 needs Clang 22, the image comes with LLVM 20.
+    - name: Install LLVM 22
+      run: |
+        choco upgrade llvm --version=22.1.8 --allow-downgrade -y --no-progress
+        if ($LASTEXITCODE -notin 0, 1641, 3010) { exit $LASTEXITCODE }
+        $version = clang-cl --version | Select-Object -First 1
+        Write-Host $version
+        if ($version -notmatch 'clang version 22\.') { exit 1 }
+
     - name: Configure CMake
       run: cmake --fresh -G Ninja -B ${{github.workspace}}/build -DCMAKE_BUILD_TYPE=${{env.BUILD_TYPE}} -DCMAKE_INTERPROCEDURAL_OPTIMIZATION_RELEASE=ON -DCMAKE_C_COMPILER=clang-cl -DCMAKE_CXX_COMPILER=clang-cl -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
 
