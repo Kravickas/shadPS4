@@ -254,8 +254,10 @@ s32 PS4_SYSV_ABI sceKernelReserveVirtualRange(void** addr, u64 len, s32 flags, u
     return ReserveVirtualRangeImpl(addr, len, flags, alignment, "anon");
 }
 
-s32 PS4_SYSV_ABI sceKernelMapNamedDirectMemory(void** addr, u64 len, s32 prot, s32 flags,
-                                               s64 phys_addr, u64 alignment, const char* name) {
+// app_caller: called by application code, not by code in the system library area or by the
+// emulator itself (which stands for system library code), see VirtualQueryImpl.
+static s32 MapNamedDirectMemoryImpl(void** addr, u64 len, s32 prot, s32 flags, s64 phys_addr,
+                                    u64 alignment, const char* name, bool app_caller) {
     // Measured on hardware: a null name is EFAULT.
     if (name == nullptr) {
         LOG_ERROR(Kernel_Vmm, "name is invalid!");
@@ -361,9 +363,10 @@ s32 PS4_SYSV_ABI sceKernelMapNamedDirectMemory(void** addr, u64 len, s32 prot, s
         // page ending exactly at 0x7F0000000 included, is searched from 0xFF0000000 instead (one
         // ending a page earlier is mapped at its address; flexible mappings are not moved). Not
         // measured: a search that starts below the area and reaches it because the address is
-        // taken.
-        if (False(map_flags & Core::MemoryMapFlags::Fixed) && in_addr < SystemAreaEnd &&
-            in_addr + len >= SystemAreaStart) {
+        // taken, and a call by a system module; the GnmDriver area is mapped inside the area
+        // (DmemTest VQ14), so calls that are not the application's keep their address.
+        if (app_caller && False(map_flags & Core::MemoryMapFlags::Fixed) &&
+            in_addr < SystemAreaEnd && in_addr + len >= SystemAreaStart) {
             in_addr = SystemAreaEnd;
         }
     }
@@ -381,6 +384,12 @@ s32 PS4_SYSV_ABI sceKernelMapNamedDirectMemory(void** addr, u64 len, s32 prot, s
 
     LOG_INFO(Kernel_Vmm, "out_addr = {}", fmt::ptr(*addr));
     return ret;
+}
+
+// For the emulator's own HLE libraries (system modules on the PS4).
+s32 PS4_SYSV_ABI sceKernelMapNamedDirectMemory(void** addr, u64 len, s32 prot, s32 flags,
+                                               s64 phys_addr, u64 alignment, const char* name) {
+    return MapNamedDirectMemoryImpl(addr, len, prot, flags, phys_addr, alignment, name, false);
 }
 
 s32 PS4_SYSV_ABI sceKernelMapDirectMemory(void** addr, u64 len, s32 prot, s32 flags, s64 phys_addr,
@@ -1436,8 +1445,9 @@ static s32 PS4_SYSV_ABI MapFlexibleMemoryFromGuest(VAddr caller, void** addr_in_
 }
 static s32 PS4_SYSV_ABI MapDirectMemoryFromGuest(VAddr caller, void** addr, u64 len, s32 prot,
                                                  s32 flags, s64 phys_addr, u64 alignment) {
-    return sceKernelMapNamedDirectMemory(addr, len, prot, flags, phys_addr, alignment,
-                                         CallerName(caller).c_str());
+    return MapNamedDirectMemoryImpl(addr, len, prot, flags, phys_addr, alignment,
+                                    CallerName(caller).c_str(),
+                                    caller - 0x7F0000000ULL >= 0x800000000ULL);
 }
 static s32 PS4_SYSV_ABI VirtualQueryFromGuest(VAddr caller, const void* addr, s32 flags,
                                               OrbisVirtualQueryInfo* info, u64 /*infoSize*/) {
@@ -1455,11 +1465,12 @@ static s32 PS4_SYSV_ABI MapNamedSystemFlexibleMemoryFromGuest(VAddr caller, void
 static s32 PS4_SYSV_ABI MapNamedDirectMemoryFromGuest(VAddr caller, void** addr, u64 len, s32 prot,
                                                       s32 flags, s64 phys_addr, u64 alignment,
                                                       const char* name) {
+    const bool app_caller = caller - 0x7F0000000ULL >= 0x800000000ULL;
     if (name != nullptr && name[0] == '\0') {
-        return sceKernelMapNamedDirectMemory(addr, len, prot, flags, phys_addr, alignment,
-                                             CallerName(caller).c_str());
+        return MapNamedDirectMemoryImpl(addr, len, prot, flags, phys_addr, alignment,
+                                        CallerName(caller).c_str(), app_caller);
     }
-    return sceKernelMapNamedDirectMemory(addr, len, prot, flags, phys_addr, alignment, name);
+    return MapNamedDirectMemoryImpl(addr, len, prot, flags, phys_addr, alignment, name, app_caller);
 }
 static s32 PS4_SYSV_ABI MapNamedFlexibleMemoryFromGuest(VAddr caller, void** addr_in_out, u64 len,
                                                         s32 prot, s32 flags, const char* name) {
