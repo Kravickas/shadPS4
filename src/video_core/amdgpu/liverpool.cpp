@@ -209,7 +209,8 @@ void Liverpool::Process(std::stop_token stoken) {
             "vi_obtain_us={} vi_bind_us={} index_us={} cmd_record_us={} reset_images_us={} "
             "reset_buffers_us={} bound_buffers={} bound_images={} tex_lookups={} tex_hits={} "
             "emulated={} stg_same_inputs={} vk_vi_us={} vk_index_us={} vk_desc_us={} "
-            "vk_dyn_us={} vk_draw_us={}",
+            "vk_dyn_us={} vk_draw_us={} rec_cmds={} rec_kb={} rec_publishes={} rec_wakes={} "
+            "rec_syncs={} rec_sync_us={} rec_space_waits={} rec_run_us={} rec_sleeps={}",
             cycle_t0, cycle_t1, cp_perf.tasks, was_submit_done, (cycle_t1 - flush_t0) / 1000,
             cp_perf.vo_block_ns / 1000, cp_perf.vo_blocks, cp_perf.vo_spin_ns / 1000,
             cp_perf.mem_spin_ns / 1000, cp_perf.mem_spins, cp_perf.asc_spin_ns / 1000,
@@ -242,7 +243,11 @@ void Liverpool::Process(std::stop_token stoken) {
             cp_perf.tex_lookups, cp_perf.tex_hits,
             readback_wait.emulated.exchange(0, std::memory_order_relaxed), cp_perf.stg_same_inputs,
             cp_perf.vk_vi_ns / 1000, cp_perf.vk_index_ns / 1000, cp_perf.vk_desc_ns / 1000,
-            cp_perf.vk_dyn_ns / 1000, cp_perf.vk_draw_ns / 1000);
+            cp_perf.vk_dyn_ns / 1000, cp_perf.vk_draw_ns / 1000, cp_perf.rec_cmds,
+            cp_perf.rec_bytes / 1024, cp_perf.rec_publishes, cp_perf.rec_wakes, cp_perf.rec_syncs,
+            cp_perf.rec_sync_ns / 1000, cp_perf.rec_space_waits,
+            recorder_perf.run_ns.exchange(0, std::memory_order_relaxed) / 1000,
+            recorder_perf.sleeps.exchange(0, std::memory_order_relaxed));
 
         Platform::IrqC::Instance()->Signal(Platform::InterruptId::GpuIdle);
     }

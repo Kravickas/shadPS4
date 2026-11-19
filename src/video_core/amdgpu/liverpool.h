@@ -124,8 +124,22 @@ struct CpPerf {
     u64 rb_finish_ns; ///< Host GPU drains for buffer readbacks
     u32 img_downloads;
     u64 img_finish_ns; ///< Host GPU drains for linear image readbacks
+    u32 rec_cmds;      ///< Commands handed to the recorder thread
+    u64 rec_bytes;
+    u32 rec_publishes;
+    u32 rec_wakes;       ///< Publishes that found the recorder thread asleep
+    u32 rec_syncs;       ///< Waits for the recorder thread to run everything recorded
+    u64 rec_sync_ns;     ///< Time in those waits
+    u32 rec_space_waits; ///< Waits for space in the record ring
 };
 inline CpPerf cp_perf;
+
+/// Work of the command recorder thread.
+struct RecorderPerf {
+    std::atomic<u64> run_ns; ///< Time running recorded commands
+    std::atomic<u64> sleeps; ///< Times the thread went to sleep with nothing to run
+};
+inline RecorderPerf recorder_perf;
 
 /// Time guest threads spend waiting for a buffer readback done by the GPU thread.
 struct ReadbackWaitPerf {

@@ -273,6 +273,7 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset) {
     AmdGpu::cp_perf.draw_begin_ns += bind_t3 - bind_t2;
     AmdGpu::cp_perf.draw_bind_ns += bind_t3 - bind_t0;
 
+    scheduler.DeferRecording();
     BindVertexBuffers(pipeline);
     if (is_indexed) {
         const u64 index_t0 = AmdGpu::PerfNs();
@@ -303,18 +304,22 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset) {
     const auto& fetch_shader = pipeline->GetFetchShader();
     const auto [vertex_offset, instance_offset] = GetDrawOffsets(regs, vs_info, fetch_shader);
 
-    const auto cmdbuf = scheduler.CommandBuffer();
     {
         const AmdGpu::VkCallPerf vk_perf{AmdGpu::cp_perf.vk_draw_ns};
-        cmdbuf.bindPipeline(vk::PipelineBindPoint::eGraphics, pipeline->Handle());
+        scheduler.Record([handle = pipeline->Handle(), is_indexed, num_indices = regs.num_indices,
+                          num_instances = regs.num_instances.NumInstances(),
+                          vertex_offset = vertex_offset,
+                          instance_offset = instance_offset](vk::CommandBuffer cmdbuf) {
+            cmdbuf.bindPipeline(vk::PipelineBindPoint::eGraphics, handle);
 
-        if (is_indexed) {
-            cmdbuf.drawIndexed(regs.num_indices, regs.num_instances.NumInstances(), 0,
-                               s32(vertex_offset), instance_offset);
-        } else {
-            cmdbuf.draw(regs.num_indices, regs.num_instances.NumInstances(), vertex_offset,
-                        instance_offset);
-        }
+            if (is_indexed) {
+                cmdbuf.drawIndexed(num_indices, num_instances, 0, s32(vertex_offset),
+                                   instance_offset);
+            } else {
+                cmdbuf.draw(num_indices, num_instances, vertex_offset, instance_offset);
+            }
+        });
+        scheduler.PublishRecording();
     }
     DebugState.IncDrawCall();
     AmdGpu::cp_perf.cmd_record_ns += AmdGpu::PerfNs() - rp_t1;
@@ -365,6 +370,7 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
     AmdGpu::cp_perf.draw_begin_ns += bind_t3 - bind_t2;
     AmdGpu::cp_perf.draw_bind_ns += bind_t3 - bind_t0;
 
+    scheduler.DeferRecording();
     BindVertexBuffers(pipeline);
     if (is_indexed) {
         BindIndexBuffer(0, true);
@@ -392,30 +398,33 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
     UpdateDynamicState(pipeline, is_indexed);
     scheduler.BeginRendering(state);
 
-    const auto cmdbuf = scheduler.CommandBuffer();
-    cmdbuf.bindPipeline(vk::PipelineBindPoint::eGraphics, pipeline->Handle());
+    ASSERT((is_indexed ? sizeof(VkDrawIndexedIndirectCommand) : sizeof(VkDrawIndirectCommand)) ==
+           stride);
+    scheduler.Record([handle = pipeline->Handle(), is_indexed, buffer = buffer->Handle(),
+                      base = base, has_count = count_address != 0,
+                      count_buffer = count_address != 0 ? count_buffer->Handle() : vk::Buffer{},
+                      count_offset = count_address != 0 ? count_offset : 0, max_count,
+                      stride](vk::CommandBuffer cmdbuf) {
+        cmdbuf.bindPipeline(vk::PipelineBindPoint::eGraphics, handle);
 
-    if (is_indexed) {
-        ASSERT(sizeof(VkDrawIndexedIndirectCommand) == stride);
-
-        if (count_address != 0) {
-            cmdbuf.drawIndexedIndirectCount(buffer->Handle(), base, count_buffer->Handle(),
-                                            count_offset, max_count, stride);
+        if (is_indexed) {
+            if (has_count) {
+                cmdbuf.drawIndexedIndirectCount(buffer, base, count_buffer, count_offset, max_count,
+                                                stride);
+            } else {
+                cmdbuf.drawIndexedIndirect(buffer, base, max_count, stride);
+            }
         } else {
-            cmdbuf.drawIndexedIndirect(buffer->Handle(), base, max_count, stride);
+            if (has_count) {
+                cmdbuf.drawIndirectCount(buffer, base, count_buffer, count_offset, max_count,
+                                         stride);
+            } else {
+                cmdbuf.drawIndirect(buffer, base, max_count, stride);
+            }
         }
-        DebugState.IncDrawCall();
-    } else {
-        ASSERT(sizeof(VkDrawIndirectCommand) == stride);
-
-        if (count_address != 0) {
-            cmdbuf.drawIndirectCount(buffer->Handle(), base, count_buffer->Handle(), count_offset,
-                                     max_count, stride);
-        } else {
-            cmdbuf.drawIndirect(buffer->Handle(), base, max_count, stride);
-        }
-        DebugState.IncDrawCall();
-    }
+    });
+    scheduler.PublishRecording();
+    DebugState.IncDrawCall();
 
     ResetBindings(false);
 }
@@ -447,6 +456,7 @@ void Rasterizer::DispatchDirect() {
         return;
     }
 
+    scheduler.DeferRecording();
     if (needs_barrier) {
         runtime.FlushBarriers();
     }
@@ -454,9 +464,13 @@ void Rasterizer::DispatchDirect() {
     scheduler.EndRendering();
     pipeline->BindResources(set_writes, push_data);
 
-    const auto cmdbuf = scheduler.CommandBuffer();
-    cmdbuf.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline->Handle());
-    cmdbuf.dispatch(cs_program.dim_x, cs_program.dim_y, cs_program.dim_z);
+    scheduler.Record([handle = pipeline->Handle(), dim_x = cs_program.dim_x,
+                      dim_y = cs_program.dim_y,
+                      dim_z = cs_program.dim_z](vk::CommandBuffer cmdbuf) {
+        cmdbuf.bindPipeline(vk::PipelineBindPoint::eCompute, handle);
+        cmdbuf.dispatch(dim_x, dim_y, dim_z);
+    });
+    scheduler.PublishRecording();
     DebugState.IncDispatch();
 
     ResetBindings(true);
@@ -488,6 +502,7 @@ void Rasterizer::DispatchIndirect(VAddr address, u32 offset, u32 size) {
     needs_barrier |= runtime.IsBufferAccessed(buffer, base, size);
     bound_buffers.emplace_back(buffer, base, size, vk::AccessFlagBits2::eIndirectCommandRead);
 
+    scheduler.DeferRecording();
     if (needs_barrier) {
         runtime.FlushBarriers();
     }
@@ -495,9 +510,12 @@ void Rasterizer::DispatchIndirect(VAddr address, u32 offset, u32 size) {
     scheduler.EndRendering();
     pipeline->BindResources(set_writes, push_data);
 
-    const auto cmdbuf = scheduler.CommandBuffer();
-    cmdbuf.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline->Handle());
-    cmdbuf.dispatchIndirect(buffer->Handle(), base);
+    scheduler.Record([handle = pipeline->Handle(), buffer = buffer->Handle(),
+                      base = base](vk::CommandBuffer cmdbuf) {
+        cmdbuf.bindPipeline(vk::PipelineBindPoint::eCompute, handle);
+        cmdbuf.dispatchIndirect(buffer, base);
+    });
+    scheduler.PublishRecording();
     DebugState.IncDispatch();
 
     ResetBindings(true);
@@ -596,9 +614,28 @@ void Rasterizer::BindVertexBuffers(const GraphicsPipeline* pipeline) {
 
     if (instance.IsVertexInputDynamicState()) {
         // Update current vertex inputs.
-        const auto cmdbuf = scheduler.CommandBuffer();
         const AmdGpu::VkCallPerf vk_perf{AmdGpu::cp_perf.vk_vi_ns};
-        cmdbuf.setVertexInputEXT(bindings, attributes);
+        const std::size_t bindings_size =
+            bindings.size() * sizeof(vk::VertexInputBindingDescription2EXT);
+        const std::size_t attributes_size =
+            attributes.size() * sizeof(vk::VertexInputAttributeDescription2EXT);
+        scheduler.Record(
+            bindings_size + attributes_size,
+            [&](u8* data) {
+                std::memcpy(data, bindings.data(), bindings_size);
+                std::memcpy(data + bindings_size, attributes.data(), attributes_size);
+            },
+            [num_bindings = static_cast<u32>(bindings.size()),
+             num_attributes = static_cast<u32>(attributes.size())](vk::CommandBuffer cmdbuf,
+                                                                   const u8* data) {
+                const auto* const binding_descs =
+                    reinterpret_cast<const vk::VertexInputBindingDescription2EXT*>(data);
+                const auto* const attribute_descs =
+                    reinterpret_cast<const vk::VertexInputAttributeDescription2EXT*>(binding_descs +
+                                                                                     num_bindings);
+                cmdbuf.setVertexInputEXT(num_bindings, binding_descs, num_attributes,
+                                         attribute_descs);
+            });
     }
     const u64 vi_t1 = AmdGpu::PerfNs();
     AmdGpu::cp_perf.vi_inputs_ns += vi_t1 - vi_t0;
@@ -680,14 +717,29 @@ void Rasterizer::BindVertexBuffers(const GraphicsPipeline* pipeline) {
         host_strides.push_back(buffer.GetStride());
     }
 
-    const auto cmdbuf = scheduler.CommandBuffer();
-    const auto num_buffers = guest_buffers.size();
-    if (instance.IsVertexInputDynamicState()) {
-        cmdbuf.bindVertexBuffers(0, num_buffers, host_buffers.data(), host_offsets.data());
-    } else {
-        cmdbuf.bindVertexBuffers2(0, num_buffers, host_buffers.data(), host_offsets.data(),
-                                  host_sizes.data(), host_strides.data());
-    }
+    // The handles, offsets, sizes and strides follow each other in the recorded data.
+    static_assert(sizeof(vk::Buffer) == sizeof(vk::DeviceSize));
+    const auto num_buffers = static_cast<u32>(guest_buffers.size());
+    const std::size_t array_size = num_buffers * sizeof(vk::DeviceSize);
+    scheduler.Record(
+        array_size * 4,
+        [&](u8* data) {
+            std::memcpy(data, host_buffers.data(), array_size);
+            std::memcpy(data + array_size, host_offsets.data(), array_size);
+            std::memcpy(data + array_size * 2, host_sizes.data(), array_size);
+            std::memcpy(data + array_size * 3, host_strides.data(), array_size);
+        },
+        [num_buffers, is_dynamic = instance.IsVertexInputDynamicState()](vk::CommandBuffer cmdbuf,
+                                                                         const u8* data) {
+            const auto* const buffers = reinterpret_cast<const vk::Buffer*>(data);
+            const auto* const offsets = reinterpret_cast<const vk::DeviceSize*>(data) + num_buffers;
+            if (is_dynamic) {
+                cmdbuf.bindVertexBuffers(0, num_buffers, buffers, offsets);
+            } else {
+                cmdbuf.bindVertexBuffers2(0, num_buffers, buffers, offsets, offsets + num_buffers,
+                                          offsets + num_buffers * 2);
+            }
+        });
     AmdGpu::cp_perf.vi_bind_ns += AmdGpu::PerfNs() - vi_t2;
 }
 
@@ -726,13 +778,15 @@ void Rasterizer::BindIndexBuffer(u32 index_offset, bool is_indirect) {
         index_buffer = null_buffer->Handle();
     }
 
-    const auto cmdbuf = scheduler.CommandBuffer();
     const AmdGpu::VkCallPerf vk_perf{AmdGpu::cp_perf.vk_index_ns};
-    if (instance.IsMaintenance5Supported()) {
-        cmdbuf.bindIndexBuffer2KHR(index_buffer, buffer_offset, index_buffer_size, index_type);
-    } else {
-        cmdbuf.bindIndexBuffer(index_buffer, buffer_offset, index_type);
-    }
+    scheduler.Record([index_buffer, buffer_offset, index_buffer_size, index_type,
+                      has_size = instance.IsMaintenance5Supported()](vk::CommandBuffer cmdbuf) {
+        if (has_size) {
+            cmdbuf.bindIndexBuffer2KHR(index_buffer, buffer_offset, index_buffer_size, index_type);
+        } else {
+            cmdbuf.bindIndexBuffer(index_buffer, buffer_offset, index_type);
+        }
+    });
 }
 
 void Rasterizer::ResetBindings(bool is_compute) {
@@ -1558,7 +1612,7 @@ void Rasterizer::UpdateDynamicState(const GraphicsPipeline* pipeline, const bool
 
     auto& dynamic_state = scheduler.GetDynamicState();
     const AmdGpu::VkCallPerf vk_perf{AmdGpu::cp_perf.vk_dyn_ns};
-    dynamic_state.Commit(instance, scheduler.CommandBuffer());
+    dynamic_state.Commit(instance, scheduler);
 }
 
 void Rasterizer::UpdateViewportScissorState() const {
