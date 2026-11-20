@@ -175,28 +175,32 @@ struct CpPerf {
     u64 dispatch_bindtex_ns; ///< DispatchDirect and DispatchIndirect: BindTextures
     u64 ow_obtain_ns;        ///< ObtainBuffer of written bindings
     u64 ow_inval_ns;         ///< Invalidating images under written bindings
-    u64 ow_bytes;            ///< ObtainBuffer of written ranges: their sizes
-    u64 ow_dirty_ns;         ///< ...marking images under them
-    u64 ow_sync_ns;          ///< ...uploads and tracking
-    u32 oa_repeats;          ///< Bindings that took what the slot's last binding resolved to
-    u32 oa_checks;           ///< Repeats that obtained the buffer anyway to compare
-    u32 oa_diffs;            ///< Compared repeats that resolved to something else
-    u32 oa_diffs_stream;     ///< Compared repeats with another copy in the stream buffer
-    u32 oa_uploads;          ///< Compared repeats that had guest memory to upload
-    u32 oa_new_tick;         ///< Same range as the slot's last binding, but in another tick
-    u32 oa_new_epoch;        ///< ...but the tracking of some range changed
-    u32 oa_gpu_writes;       ///< ...but the GPU wrote to guest memory
-    u32 oa_emulated;         ///< ...but with a CPU write beside GPU data to upload
-    // Checked cycles only. Image bindings of graphics stages:
+    // ObtainBuffer of written ranges in the arenas:
+    u64 ow_bytes;        ///< Their sizes
+    u64 ow_dirty_ns;     ///< Marking images under them
+    u64 ow_sync_ns;      ///< SynchronizeMemory, made of:
+    u64 ow_lock_ns;      ///< waiting for the lock shared with readbacks
+    u64 ow_walk_ns;      ///< the memory tracker walk with its page watcher updates
+    u64 ow_mark_ns;      ///< emulated writes, GPU-modified ranges and write ticks
+    u64 ow_upload_ns;    ///< copying CPU-modified pages
+    u64 ow_upload_bytes; ///< Their size
+    u64 ow_watch_pages;  ///< Pages the watcher updates of the walks went over
+    u32 ow_uploads;      ///< Written ranges with CPU-modified pages
+    u32 ow_protects;     ///< Page protection calls of the walks
+    // Timed cycles only:
+    u64 st_state_ns; ///< State packets, from the first behind a draw to the next draw
+    // Checked cycles only. Words of register-setting packets and those set to another value:
+    u32 bc_reg_words;
+    u32 bc_reg_words_changed;
+    u32 bc_sh_words;
+    u32 bc_sh_words_changed;
+    // Image bindings of graphics stages:
     u32 bc_images;
     u32 bc_images_same;  ///< Same T# and use as the same slot of the draw before, same run
     u32 bc_images_equal; ///< ...and resolved to the same view and layout
     u32 bc_image_stages;
     u32 bc_image_stages_same;  ///< Stages with all image bindings as in the draw before
     u32 bc_image_stages_quiet; ///< ...equal results, nothing recorded, same registry
-    u32 bc_flats;              ///< Flattened user data bindings of graphics stages
-    u32 bc_flats_same;         ///< ...with the words of the stage's last one, same run and tick
-    u64 bc_flat_bytes;
     u32 bc_draws;
     u32 bc_draws_state_same; ///< Draws with no context or uconfig register changed since the last
     u32 dispatch_skips;      ///< DispatchDirect: dispatches BindResources handled itself
@@ -235,7 +239,11 @@ inline ReadbackWaitPerf readback_wait;
 inline bool perf_vk_sample = false;
 /// Probe, on for one command processor cycle in PerfBindCheckRate: whether the bindings of a
 /// draw resolve to what the same bindings of the draw before it resolved to.
+/// Cycles with at least this many draws turn the sampling profiler on for the next cycle.
+inline constexpr u32 PerfProfiledDraws = 3000;
 inline bool perf_bind_check = false;
+/// One cycle in PerfBindCheckRate, another one than the checked: state packets are timed.
+inline bool perf_state_timed = false;
 inline constexpr u32 PerfBindCheckRate = 8;
 inline constexpr u64 PerfVkSampleRate = 8;
 
@@ -392,9 +400,9 @@ public:
         return gpu_id;
     }
 
-    /// Names the run of state packets and draws the GPU thread is in, 0 outside of one.
+    /// Names the current run of state packets and draws. For the GPU thread.
     u64 LookaheadRun() const noexcept {
-        return is_lookahead_running ? lookahead_run : 0;
+        return lookahead_run;
     }
 
 #ifdef __linux__
@@ -520,6 +528,9 @@ private:
     /// Applies what a state packet or a draw sets in the graphics queue state.
     static void ApplyPacketState(const GfxState& state, const PM4Header* header);
 
+    /// Probe: counts the words a register-setting packet sets and how many get another value.
+    static void CountSetWords(const GfxState& state, const PM4Header* header);
+
     /// Whether ClassifyPacket and ApplyPacketState can run on a packet that words_available
     /// words are readable from, without reading or writing out of bounds or asserting.
     static bool IsSafePacket(const PM4Header* header, std::size_t words_available);
@@ -565,6 +576,7 @@ private:
     u32 perf_cycles{};
     /// Probe: a context, uconfig or config register changed since the last draw.
     bool perf_state_changed{};
+    u64 perf_state_t0{};
     u64 lookahead_taken{};
     alignas(64) std::atomic<u64> lookahead_started_run{};
     alignas(64) std::atomic<u64> lookahead_stopped_run{};

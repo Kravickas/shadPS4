@@ -7,6 +7,7 @@
 #include "common/assert.h"
 #include "common/debug.h"
 #include "common/polyfill_thread.h"
+#include "common/sampling_profiler.h"
 #include "common/scope_exit.h"
 #include "common/thread.h"
 #include "core/debug_state.h"
@@ -124,14 +125,22 @@ void Liverpool::ProcessCommands() {
             command_queue.pop();
             --num_commands;
         }
-        const CpPerfScope perf_command{cp_perf.commands_ns};
-        ++cp_perf.commands;
-        callback();
+        const u64 commands_ns = cp_perf.commands_ns;
+        {
+            const CpPerfScope perf_command{cp_perf.commands_ns};
+            ++cp_perf.commands;
+            callback();
+        }
+        if (perf_state_t0 != 0) {
+            // Commands of other threads are not part of the timed state packets.
+            perf_state_t0 += cp_perf.commands_ns - commands_ns;
+        }
     }
 }
 
 void Liverpool::Process(std::stop_token stoken) {
     Common::SetCurrentThreadName("shadPS4:GpuCommandProcessor");
+    Common::SamplingProfiler::RegisterCurrentThread("GpuCommandProcessor");
     gpu_id = std::this_thread::get_id();
 #ifdef __linux__
     gpu_tid = gettid();
@@ -151,6 +160,8 @@ void Liverpool::Process(std::stop_token stoken) {
 
         const u64 cycle_t0 = PerfNs();
         cp_perf = {};
+        perf_state_timed = (perf_cycles & (PerfBindCheckRate - 1)) == PerfBindCheckRate / 2;
+        perf_state_t0 = 0;
         perf_bind_check = (perf_cycles++ & (PerfBindCheckRate - 1)) == 0;
         curr_qid = -1;
 
@@ -196,6 +207,8 @@ void Liverpool::Process(std::stop_token stoken) {
             submit_done = false;
         }
         const u64 cycle_t1 = PerfNs();
+        // The profile is of gameplay: samples are taken while the last cycle had its draw count.
+        Common::SamplingProfiler::SetEnabled(cp_perf.draws >= PerfProfiledDraws);
         LOG_INFO(
             Render,
             "PERF cp t0={} t1={} tasks={} submit_done={} flush_us={} vo_block_us={} "
@@ -230,11 +243,12 @@ void Liverpool::Process(std::stop_token stoken) {
             "sa_checks={} sa_diffs={} tx_first_us={} tx_second_us={} tx_samplers_us={} "
             "dispatch_hle_us={} dispatch_bind_us={} dispatch_hles={} dispatch_skips={} "
             "dispatch_bindbuf_us={} dispatch_bindtex_us={} ow_obtain_us={} ow_inval_us={} "
-            "ow_kb={} ow_dirty_us={} ow_sync_us={} oa_repeats={} oa_checks={} oa_diffs={} "
-            "oa_diffs_stream={} oa_uploads={} oa_new_tick={} oa_new_epoch={} oa_gpu_writes={} "
-            "oa_emulated={} bc_on={} bc_images={} bc_images_same={} bc_images_equal={} "
-            "bc_image_stages={} bc_image_stages_same={} bc_image_stages_quiet={} bc_draws={} "
-            "bc_draws_state_same={} bc_flats={} bc_flats_same={} bc_flat_kb={}",
+            "ow_kb={} ow_dirty_us={} ow_sync_us={} ow_lock_us={} ow_walk_us={} ow_mark_us={} "
+            "ow_upload_us={} ow_uploads={} ow_upload_kb={} ow_watch_pages={} ow_protects={} "
+            "st_on={} st_state_us={} bc_on={} bc_reg_words={} bc_reg_words_changed={} "
+            "bc_sh_words={} bc_sh_words_changed={} bc_images={} bc_images_same={} "
+            "bc_images_equal={} bc_image_stages={} bc_image_stages_same={} "
+            "bc_image_stages_quiet={} bc_draws={} bc_draws_state_same={}",
             cycle_t0, cycle_t1, cp_perf.tasks, was_submit_done, (cycle_t1 - flush_t0) / 1000,
             cp_perf.vo_block_ns / 1000, cp_perf.vo_blocks, cp_perf.vo_spin_ns / 1000,
             cp_perf.mem_spin_ns / 1000, cp_perf.mem_spins, cp_perf.asc_spin_ns / 1000,
@@ -290,13 +304,14 @@ void Liverpool::Process(std::stop_token stoken) {
             cp_perf.dispatch_skips, cp_perf.dispatch_bindbuf_ns / 1000,
             cp_perf.dispatch_bindtex_ns / 1000, cp_perf.ow_obtain_ns / 1000,
             cp_perf.ow_inval_ns / 1000, cp_perf.ow_bytes / 1024, cp_perf.ow_dirty_ns / 1000,
-            cp_perf.ow_sync_ns / 1000, cp_perf.oa_repeats, cp_perf.oa_checks, cp_perf.oa_diffs,
-            cp_perf.oa_diffs_stream, cp_perf.oa_uploads, cp_perf.oa_new_tick, cp_perf.oa_new_epoch,
-            cp_perf.oa_gpu_writes, cp_perf.oa_emulated, perf_bind_check ? 1 : 0, cp_perf.bc_images,
-            cp_perf.bc_images_same, cp_perf.bc_images_equal, cp_perf.bc_image_stages,
-            cp_perf.bc_image_stages_same, cp_perf.bc_image_stages_quiet, cp_perf.bc_draws,
-            cp_perf.bc_draws_state_same, cp_perf.bc_flats, cp_perf.bc_flats_same,
-            cp_perf.bc_flat_bytes / 1024);
+            cp_perf.ow_sync_ns / 1000, cp_perf.ow_lock_ns / 1000, cp_perf.ow_walk_ns / 1000,
+            cp_perf.ow_mark_ns / 1000, cp_perf.ow_upload_ns / 1000, cp_perf.ow_uploads,
+            cp_perf.ow_upload_bytes / 1024, cp_perf.ow_watch_pages, cp_perf.ow_protects,
+            perf_state_timed ? 1 : 0, cp_perf.st_state_ns / 1000, perf_bind_check ? 1 : 0,
+            cp_perf.bc_reg_words, cp_perf.bc_reg_words_changed, cp_perf.bc_sh_words,
+            cp_perf.bc_sh_words_changed, cp_perf.bc_images, cp_perf.bc_images_same,
+            cp_perf.bc_images_equal, cp_perf.bc_image_stages, cp_perf.bc_image_stages_same,
+            cp_perf.bc_image_stages_quiet, cp_perf.bc_draws, cp_perf.bc_draws_state_same);
         if (++perf_run_log_cycles == 2048) {
             perf_run_log_cycles = 0;
             std::string enders;
@@ -510,6 +525,42 @@ bool Liverpool::ChangesStateRegs(const PM4Header* header) const {
     const auto* set_data = reinterpret_cast<const PM4CmdSetData*>(header);
     return std::memcmp(&regs.reg_array[base + set_data->reg_offset], header + 2,
                        (header->type3.NumWords() - 1) * sizeof(u32)) != 0;
+}
+
+void Liverpool::CountSetWords(const GfxState& state, const PM4Header* header) {
+    const auto* set_data = reinterpret_cast<const PM4CmdSetData*>(header);
+    const u32 reg_offset = set_data->reg_offset;
+    const u32* current;
+    bool is_sh = false;
+    switch (header->type3.opcode) {
+    case PM4ItOpcode::SetConfigReg:
+        current = &state.regs.reg_array[Regs::ConfigRegWordOffset + reg_offset];
+        break;
+    case PM4ItOpcode::SetContextReg:
+        current = &state.regs.reg_array[Regs::ContextRegWordOffset + reg_offset];
+        break;
+    case PM4ItOpcode::SetUconfigReg:
+        current = &state.regs.reg_array[Regs::UconfigRegWordOffset + reg_offset];
+        break;
+    case PM4ItOpcode::SetShReg:
+        is_sh = true;
+        if (reg_offset >= 0x200 && reg_offset <= (0x200 + sizeof(ComputeProgram) / 4)) {
+            current = reinterpret_cast<const u32*>(&state.cs_state) + (reg_offset - 0x200);
+        } else {
+            current = &state.regs.reg_array[Regs::ShRegWordOffset + reg_offset];
+        }
+        break;
+    default:
+        return;
+    }
+    const auto* payload = reinterpret_cast<const u32*>(header + 2);
+    const u32 words = header->type3.NumWords() - 1;
+    u32 changed = 0;
+    for (u32 i = 0; i < words; ++i) {
+        changed += current[i] != payload[i];
+    }
+    (is_sh ? cp_perf.bc_sh_words : cp_perf.bc_reg_words) += words;
+    (is_sh ? cp_perf.bc_sh_words_changed : cp_perf.bc_reg_words_changed) += changed;
 }
 
 void Liverpool::ApplyPacketState(const GfxState& state, const PM4Header* header) {
@@ -970,6 +1021,7 @@ bool Liverpool::CompareLookaheadState() {
 
 void Liverpool::LookaheadThread(std::stop_token stoken) {
     Common::SetCurrentThreadName("shadPS4:GpuLookahead");
+    Common::SamplingProfiler::RegisterCurrentThread("GpuLookahead");
 
     const GfxState state = lookahead_state->Ref();
     u64 run = 0;
@@ -1086,6 +1138,10 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb) {
             const u32 count = header->type3.NumWords();
             const PM4ItOpcode opcode = header->type3.opcode;
             const PacketClass packet_class = ClassifyPacket(header, guest_markers_enabled);
+            if (packet_class != PacketClass::State && perf_state_t0 != 0) {
+                cp_perf.st_state_ns += PerfNs() - perf_state_t0;
+                perf_state_t0 = 0;
+            }
             if (packet_class == PacketClass::Other) {
                 end_run(static_cast<u32>(opcode) & 0xff);
                 EndLookaheadRun(dcb.data());
@@ -1109,8 +1165,14 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb) {
                 } else {
                     ++cp_perf.state_packets;
                     cp_perf.state_words += count;
-                    if (perf_bind_check && !perf_state_changed) {
-                        perf_state_changed = ChangesStateRegs(header);
+                    if (perf_state_timed && perf_state_t0 == 0) {
+                        perf_state_t0 = PerfNs();
+                    }
+                    if (perf_bind_check) {
+                        CountSetWords(gfx_state, header);
+                        if (!perf_state_changed) {
+                            perf_state_changed = ChangesStateRegs(header);
+                        }
                     }
                 }
             }
@@ -1665,6 +1727,10 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb) {
             dcb = NextPacket(dcb, count + 1);
             break;
         }
+    }
+    if (perf_state_t0 != 0) {
+        cp_perf.st_state_ns += PerfNs() - perf_state_t0;
+        perf_state_t0 = 0;
     }
     end_run(0);
     EndLookaheadRun(dcb.data());

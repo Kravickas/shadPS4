@@ -4,6 +4,7 @@
 #include "common/arch.h"
 #include "common/assert.h"
 #include "common/debug.h"
+#include "common/sampling_profiler.h"
 #include "common/thread.h"
 #include "imgui/renderer/texture_manager.h"
 #include "video_core/amdgpu/liverpool.h"
@@ -229,6 +230,7 @@ void Scheduler::WaitRecordSpace(u64 size) {
 
 void Scheduler::RecorderThread(std::stop_token stoken) {
     Common::SetCurrentThreadName("shadPS4:GpuCommandRecorder");
+    Common::SamplingProfiler::RegisterCurrentThread("GpuCommandRecorder");
 
     u64 tail = 0;
     u32 idle_spins = 0;

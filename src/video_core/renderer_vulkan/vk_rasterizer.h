@@ -258,23 +258,6 @@ private:
     };
     std::array<TextureLookup, 512> texture_lookups{};
 
-    /// What the read-only buffer slots of the graphics stages, the vertex buffer ranges and
-    /// the index buffer resolved to in the last draw, for BufferCache::ObtainBufferAgain.
-    static constexpr u32 MaxRepeatSlots = 32;
-    using ObtainedBuffers = std::array<VideoCore::BufferCache::ObtainedBuffer, MaxRepeatSlots>;
-    std::array<ObtainedBuffers, MaxShaderStages> obtained_buffers{};
-    std::array<VideoCore::BufferCache::ObtainedBuffer, MaxVertexBufferCount>
-        obtained_vertex_buffers{};
-    VideoCore::BufferCache::ObtainedBuffer obtained_index_buffer{};
-
-    /// Probe: the flattened user data each graphics stage bound in the last draw.
-    struct CheckedFlats {
-        u64 run;
-        u64 tick;
-        std::vector<u32> words;
-    };
-    std::array<CheckedFlats, MaxShaderStages> checked_flats{};
-
     /// Probe: what the image slots of each graphics stage resolved to in the last draw.
     struct CheckedImage {
         const Shader::Info* info;

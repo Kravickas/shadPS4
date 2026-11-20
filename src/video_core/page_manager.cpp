@@ -40,6 +40,8 @@
 
 namespace VideoCore {
 
+static thread_local PageManager::WatchCounts watch_counts{};
+
 struct PageManager::Impl {
     struct PageState {
         u8 num_write_watchers;
@@ -121,6 +123,7 @@ struct PageManager::Impl {
     void UpdatePageWatchers(VAddr addr, u64 size, PageOp write_op) {
         const u64 page_start = addr >> PM_PAGE_BITS;
         const u64 page_end = Common::DivCeil(addr + size, PM_PAGE_SIZE);
+        watch_counts.pages += page_end - page_start;
 
         Core::MemoryPermission perms{};
         u64 range_begin = page_start;
@@ -129,6 +132,7 @@ struct PageManager::Impl {
 
         const auto release_pending = [&] {
             if (range_pages > 0) {
+                ++watch_counts.protects;
                 Protect(range_begin << PM_PAGE_BITS, range_pages << PM_PAGE_BITS, perms);
                 range_pages = 0;
                 potential_pages = 0;
@@ -196,6 +200,7 @@ struct PageManager::Impl {
         const u64 base_page = base_addr >> PM_PAGE_BITS;
         const u64 page_start = bounds.start_word * PAGES_PER_WORD + bounds.start_page;
         const u64 page_end = bounds.end_word * PAGES_PER_WORD + bounds.end_page + 1;
+        watch_counts.pages += page_end - page_start;
 
         Core::MemoryPermission perms{};
         u64 range_begin = base_page + page_start;
@@ -204,6 +209,7 @@ struct PageManager::Impl {
 
         const auto release_pending = [&] {
             if (range_pages > 0) {
+                ++watch_counts.protects;
                 Protect(range_begin << PM_PAGE_BITS, range_pages << PM_PAGE_BITS, perms);
                 range_pages = 0;
                 potential_pages = 0;
@@ -708,6 +714,10 @@ void PageManager::OnGpuUnmap(VAddr address, size_t size) {
 
 void PageManager::UpdatePageWatchers(VAddr addr, u64 size, PageOp write_op) const {
     impl->UpdatePageWatchers(addr, size, write_op);
+}
+
+PageManager::WatchCounts PageManager::WatchCountsOfThread() noexcept {
+    return watch_counts;
 }
 
 void PageManager::UpdatePageWatchersForRegion(VAddr base_addr, const Bounds& bounds,

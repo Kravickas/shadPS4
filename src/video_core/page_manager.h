@@ -58,6 +58,13 @@ public:
                                      const RegionBits& write_mask, const RegionBits& read_mask,
                                      PageOp write_op, PageOp read_op) const;
 
+    /// Probe: pages the calling thread's watcher updates went over, and their protection calls.
+    struct WatchCounts {
+        u64 pages;
+        u64 protects;
+    };
+    static WatchCounts WatchCountsOfThread() noexcept;
+
     /// Returns page aligned address.
     static constexpr VAddr GetPageAddr(VAddr addr) {
         return Common::AlignDown(addr, PM_PAGE_SIZE);

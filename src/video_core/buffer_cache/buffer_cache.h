@@ -167,26 +167,6 @@ public:
         stream_hints = {};
     }
 
-    /// What a read-only binding resolved to. Kept by the caller per binding slot.
-    struct ObtainedBuffer {
-        VAddr device_addr{};
-        u32 size{};
-        u64 run{};
-        u64 tick{};
-        u64 binding_epoch{};
-        u64 gpu_write_epoch{};
-        const Buffer* buffer{};
-        u64 offset{};
-    };
-
-    /// ObtainBuffer without flags for a binding slot that the draws of a run bind in turn. run
-    /// names the run and is 0 outside of one. Returns what the slot's last binding returned
-    /// when that was the same range in the same run and scheduler tick, and nothing has
-    /// happened since that changes what ObtainBuffer returns or uploads for the range.
-    [[nodiscard]] std::pair<const Buffer*, u64> ObtainBufferAgain(ObtainedBuffer& last,
-                                                                  VAddr device_addr, u32 size,
-                                                                  u64 run);
-
     /// Attempts to obtain a buffer without modifying the cache contents.
     [[nodiscard]] std::pair<const Buffer*, u64> ObtainBufferForImage(VAddr device_addr, u32 size);
 
@@ -357,13 +337,6 @@ private:
     static constexpr u32 StreamHintCheckInterval = 64;
     static constexpr u32 MaxStreamHintDiffsLogged = 64;
     u32 stream_hint_diffs_logged{};
-    /// One repeat in this many obtains the buffer anyway and compares.
-    static constexpr u32 ObtainAgainCheckInterval = 64;
-    u32 obtain_again_uses{};
-    /// Counts what ObtainBufferAgain must not repeat across: a range becoming or ceasing to be
-    /// GPU-modified, a page becoming CPU-modified, a new arena. Counted behind the change, by
-    /// guest threads too, so a binding that saw the change keeps an older count.
-    std::atomic<u64> binding_epoch{};
 
     /// Bytes the lookahead thread read, in a ring it fills in order. A position is a count of
     /// bytes since the start; the bytes at a position are at position % StreamAheadSize.

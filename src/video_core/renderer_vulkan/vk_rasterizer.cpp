@@ -956,9 +956,7 @@ void Rasterizer::BindVertexBuffers(const GraphicsPipeline* pipeline) {
     // Map buffers for merged ranges
     for (auto& range : ranges_merged) {
         const u64 size = memory->ClampRangeSize(range.base_address, range.GetSize());
-        const u32 slot = static_cast<u32>(&range - ranges_merged.data());
-        std::tie(range.buffer, range.offset) = buffer_cache.ObtainBufferAgain(
-            obtained_vertex_buffers[slot], range.base_address, size, liverpool->LookaheadRun());
+        std::tie(range.buffer, range.offset) = buffer_cache.ObtainBuffer(range.base_address, size);
         needs_barrier |= runtime.IsBufferAccessed(range.buffer, range.offset, size);
         bound_buffers.emplace_back(range.buffer, range.offset, size,
                                    vk::AccessFlagBits2::eVertexAttributeRead);
@@ -1037,8 +1035,7 @@ void Rasterizer::BindIndexBuffer(u32 index_offset, bool is_indirect) {
     vk::Buffer index_buffer{};
     u64 buffer_offset{};
     if (index_buffer_size != 0) {
-        const auto [buffer, offset] = buffer_cache.ObtainBufferAgain(
-            obtained_index_buffer, index_address, index_buffer_size, liverpool->LookaheadRun());
+        const auto [buffer, offset] = buffer_cache.ObtainBuffer(index_address, index_buffer_size);
         needs_barrier |= runtime.IsBufferAccessed(buffer, offset, index_buffer_size);
         bound_buffers.emplace_back(buffer, offset, index_buffer_size,
                                    vk::AccessFlagBits2::eIndexRead);
@@ -1276,21 +1273,6 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
                 const u64 offset =
                     vk_buffer.Copy(user_data.flattened_ud_buf.data(), ubo_size, alignment);
                 buffer_infos.emplace_back(vk_buffer.Handle(), offset, ubo_size);
-                if (AmdGpu::perf_bind_check && stage.sw_stage != Shader::SwStage::Compute) {
-                    auto& perf = AmdGpu::cp_perf;
-                    auto& last = checked_flats[u32(stage.sw_stage)];
-                    const u64 run = liverpool->LookaheadRun();
-                    const u64 tick = scheduler.CurrentTick();
-                    ++perf.bc_flats;
-                    perf.bc_flat_bytes += ubo_size;
-                    perf.bc_flats_same +=
-                        run != 0 && last.run == run && last.tick == tick &&
-                        std::ranges::equal(last.words, user_data.flattened_ud_buf);
-                    last.run = run;
-                    last.tick = tick;
-                    last.words.assign(user_data.flattened_ud_buf.begin(),
-                                      user_data.flattened_ud_buf.end());
-                }
             } else if (desc.buffer_type == Shader::BufferType::ClipPlanes) {
                 // Permutations compiled without enabled planes never read the buffer, so the
                 // declared binding is satisfied with a null descriptor instead of a copy.
@@ -1345,15 +1327,8 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
                     flags |= VideoCore::ObtainBufferFlags::IsTexelBuffer;
                 }
                 const u64 obtain_t0 = desc.is_written ? AmdGpu::PerfNs() : 0;
-                const u32 slot = static_cast<u32>(&desc - stage.buffers.data());
-                const bool is_repeatable = flags == VideoCore::ObtainBufferFlags::None &&
-                                           stage.sw_stage != Shader::SwStage::Compute &&
-                                           slot < MaxRepeatSlots;
                 const auto [buffer, offset] =
-                    is_repeatable ? buffer_cache.ObtainBufferAgain(
-                                        obtained_buffers[u32(stage.sw_stage)][slot],
-                                        vsharp.base_address, size, liverpool->LookaheadRun())
-                                  : buffer_cache.ObtainBuffer(vsharp.base_address, size, flags);
+                    buffer_cache.ObtainBuffer(vsharp.base_address, size, flags);
                 if (desc.is_written) {
                     AmdGpu::cp_perf.ow_obtain_ns += AmdGpu::PerfNs() - obtain_t0;
                 }
@@ -1564,7 +1539,7 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
                 const vk::ImageView view = info.imageView;
                 const u64 run = liverpool->LookaheadRun();
                 ++check_images;
-                if (run != 0 && last.info == &stage && last.run == run &&
+                if (last.info == &stage && last.run == run &&
                     SameBits(last.key, checked_image_keys[i])) {
                     ++check_same;
                     check_equal += last.view == view && last.layout == info.imageLayout;
