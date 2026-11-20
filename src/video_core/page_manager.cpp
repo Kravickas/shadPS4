@@ -3,7 +3,10 @@
 
 #include <algorithm>
 #include <atomic>
+#include <bit>
+#include <chrono>
 #include <map>
+#include <thread>
 #include <tuple>
 #include <utility>
 #include "common/adaptive_mutex.h"
@@ -46,21 +49,30 @@
 
 namespace VideoCore {
 
-// PADDIAG: test build only. Records the first CPU writer of every page of the GPU pool.
+// PADDIAG: test build only. Records the last CPU writers of every page of the GPU pool.
 namespace {
 VAddr pad_eboot_base{};
 VAddr pad_eboot_end{};
+
+struct PadDiagWriter {
+    u64 rip{};
+    u64 caller{};
+    u64 caller2{};
+    u64 seq{};
+};
 
 struct PadDiagPool {
     VAddr base{};
     u64 num_pages{};
     std::unique_ptr<std::atomic<u8>[]> armed;
-    std::unique_ptr<std::atomic<u64>[]> writer;
-    std::unique_ptr<std::atomic<u64>[]> caller;
     std::unique_ptr<std::atomic<u8>[]> sources;
+    std::unique_ptr<std::atomic<u16>[]> faults;
+    std::unique_ptr<PadDiagWriter[]> last;
+    std::unique_ptr<PadDiagWriter[]> prev;
 };
 PadDiagPool pad_pool;
 std::atomic<bool> pad_pool_ready{false};
+std::atomic<u64> pad_seq{0};
 
 u64 PadDiagGetRsp(void* ctx) {
 #if defined(_WIN32)
@@ -72,19 +84,32 @@ u64 PadDiagGetRsp(void* ctx) {
 #endif
 }
 
-u64 PadDiagFindCaller(void* ctx) {
+void PadDiagFindCallers(void* ctx, u64& caller, u64& caller2) {
+    caller = 0;
+    caller2 = 0;
     const u64 rsp = PadDiagGetRsp(ctx);
     if (rsp == 0) {
-        return 0;
+        return;
     }
     const u64* stack = reinterpret_cast<const u64*>(rsp);
     for (u32 i = 0; i < 256; ++i) {
         const u64 value = stack[i];
-        if (value >= pad_eboot_base && value < pad_eboot_end) {
-            return value;
+        if (value < pad_eboot_base || value >= pad_eboot_end) {
+            continue;
+        }
+        if (caller == 0) {
+            caller = value;
+        } else if (value != caller) {
+            caller2 = value;
+            return;
         }
     }
-    return 0;
+}
+
+constexpr u64 PadPageBits = std::countr_zero(PageManager::GetPageSize());
+
+bool PadDiagInPool(VAddr addr) {
+    return addr >= pad_pool.base && addr < pad_pool.base + (pad_pool.num_pages << PadPageBits);
 }
 } // namespace
 
@@ -480,34 +505,90 @@ struct SignalImpl : public PageManager::Impl {
         auto& impl = memory->GetAddressSpace();
         ASSERT_MSG(perms != Core::MemoryPermission::Write,
                    "Attempted to protect region as write-only which is not a valid permission");
+        if (True(perms & Core::MemoryPermission::Write) &&
+            pad_pool_ready.load(std::memory_order_acquire)) {
+            // Armed pool pages stay read-only so the next guest write is recorded.
+            const auto read_perms = perms & ~Core::MemoryPermission::Write;
+            VAddr run_begin = address;
+            Core::MemoryPermission run_perms = perms;
+            for (VAddr page = address; page < address + size; page += PageManager::PM_PAGE_SIZE) {
+                const bool armed =
+                    PadDiagInPool(page) &&
+                    pad_pool.armed[(page - pad_pool.base) >> PageManager::PM_PAGE_BITS].load() != 0;
+                const auto page_perms = armed ? read_perms : perms;
+                if (page != address && page_perms != run_perms) {
+                    impl.Protect(run_begin, page - run_begin, run_perms);
+                    run_begin = page;
+                }
+                run_perms = page_perms;
+            }
+            impl.Protect(run_begin, address + size - run_begin, run_perms);
+            return;
+        }
         impl.Protect(address, size, perms);
     }
 
     static bool PadDiagFault(void* context, VAddr addr) {
         if (!pad_pool_ready.load(std::memory_order_acquire) || !Common::IsWriteError(context) ||
-            addr < pad_pool.base ||
-            addr >= pad_pool.base + (pad_pool.num_pages << PageManager::PM_PAGE_BITS)) {
+            !PadDiagInPool(addr)) {
             return false;
         }
         const u64 index = (addr - pad_pool.base) >> PageManager::PM_PAGE_BITS;
         if (pad_pool.armed[index].exchange(0) == 0) {
             return false;
         }
-        pad_pool.writer[index].store(reinterpret_cast<u64>(Common::GetRip(context)));
-        pad_pool.caller[index].store(PadDiagFindCaller(context));
-        pad_pool.sources[index].fetch_or(1);
+        PadDiagWriter writer{
+            .rip = reinterpret_cast<u64>(Common::GetRip(context)),
+            .seq = pad_seq.fetch_add(1) + 1,
+        };
+        PadDiagFindCallers(context, writer.caller, writer.caller2);
         const u64 page = addr >> PageManager::PM_PAGE_BITS;
         auto& lock = instance->locks[page];
         std::scoped_lock lk{lock};
+        pad_pool.prev[index] = pad_pool.last[index];
+        pad_pool.last[index] = writer;
+        pad_pool.sources[index].fetch_or(1);
+        if (const u16 faults = pad_pool.faults[index].load(); faults != 0xffff) {
+            pad_pool.faults[index].store(faults + 1);
+        }
         const PageState* state = instance->cached_pages.find(page);
         if (state && (state->num_write_watchers != 0 || state->num_read_watchers != 0)) {
             // Page is watched by the page manager, let it handle the fault as usual.
             return false;
         }
+        pad_pool.armed[index].store(0);
         Core::Memory::Instance()->GetAddressSpace().Protect(page << PageManager::PM_PAGE_BITS,
                                                             PageManager::PM_PAGE_SIZE,
                                                             Core::MemoryPermission::ReadWrite);
         return true;
+    }
+
+    // Re-arms written pool pages. Pages written in many windows are re-armed less often.
+    static void PadDiagRearm(u64 pass) {
+        if (!instance) {
+            return;
+        }
+        auto& address_space = Core::Memory::Instance()->GetAddressSpace();
+        const u64 base_page = pad_pool.base >> PageManager::PM_PAGE_BITS;
+        for (u64 index = 0; index < pad_pool.num_pages; ++index) {
+            if (pad_pool.armed[index].load(std::memory_order_relaxed) != 0) {
+                continue;
+            }
+            if (pad_pool.faults[index].load(std::memory_order_relaxed) >= 8 && pass % 25 != 0) {
+                continue;
+            }
+            const u64 page = base_page + index;
+            auto& lock = instance->locks[page];
+            std::scoped_lock lk{lock};
+            pad_pool.armed[index].store(1);
+            const PageState* state = instance->cached_pages.find(page);
+            if (state && (state->num_write_watchers != 0 || state->num_read_watchers != 0)) {
+                // Already protected by the page manager.
+                continue;
+            }
+            address_space.Protect(page << PageManager::PM_PAGE_BITS, PageManager::PM_PAGE_SIZE,
+                                  Core::MemoryPermission::Read);
+        }
     }
 
     inline static SignalImpl* instance;
@@ -558,19 +639,27 @@ void PageManager::PadDiagArmPool(VAddr address, size_t size) {
                     pad_eboot_end);
     }
     const VAddr base = Common::AlignDown(address, PM_PAGE_SIZE);
-    const u64 num_pages = Common::AlignUp(address + size, PM_PAGE_SIZE) - base >> PM_PAGE_BITS;
+    const u64 num_pages = (Common::AlignUp(address + size, PM_PAGE_SIZE) - base) >> PM_PAGE_BITS;
     pad_pool.base = base;
     pad_pool.num_pages = num_pages;
     pad_pool.armed = std::make_unique<std::atomic<u8>[]>(num_pages);
-    pad_pool.writer = std::make_unique<std::atomic<u64>[]>(num_pages);
-    pad_pool.caller = std::make_unique<std::atomic<u64>[]>(num_pages);
     pad_pool.sources = std::make_unique<std::atomic<u8>[]>(num_pages);
+    pad_pool.faults = std::make_unique<std::atomic<u16>[]>(num_pages);
+    pad_pool.last = std::make_unique<PadDiagWriter[]>(num_pages);
+    pad_pool.prev = std::make_unique<PadDiagWriter[]>(num_pages);
     for (u64 i = 0; i < num_pages; ++i) {
         pad_pool.armed[i].store(1, std::memory_order_relaxed);
     }
     pad_pool_ready.store(true, std::memory_order_release);
     Core::Memory::Instance()->GetAddressSpace().Protect(base, num_pages << PM_PAGE_BITS,
                                                         Core::MemoryPermission::Read);
+    std::thread([] {
+        Common::SetCurrentThreadName("shadPS4:PadDiag");
+        for (u64 pass = 1;; ++pass) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(200));
+            SignalImpl::PadDiagRearm(pass);
+        }
+    }).detach();
     LOG_WARNING(Render, "PADDIAG armed pool {:#x} size {:#x}", base, num_pages << PM_PAGE_BITS);
 }
 
@@ -589,25 +678,42 @@ void PageManager::PadDiagRecord(VAddr address, size_t size, u8 source) {
 }
 
 void PageManager::PadDiagReport(VAddr image, VAddr address, size_t size, const char* label) {
-    if (!pad_pool_ready.load(std::memory_order_acquire) || address < pad_pool.base ||
-        address + size > pad_pool.base + (pad_pool.num_pages << PM_PAGE_BITS)) {
+    if (!pad_pool_ready.load(std::memory_order_acquire) || !PadDiagInPool(address) ||
+        !PadDiagInPool(address + size - 1)) {
         LOG_WARNING(Render, "PADDIAG writers image={:#x} {}: outside armed pool", image, label);
         return;
     }
-    std::map<std::tuple<u8, u64, u64>, u32> writers;
-    for (VAddr page = GetPageAddr(address); page < address + size; page += PM_PAGE_SIZE) {
-        const u64 index = (page - pad_pool.base) >> PM_PAGE_BITS;
-        ++writers[{pad_pool.sources[index].load(), pad_pool.writer[index].load(),
-                   pad_pool.caller[index].load()}];
-    }
-    for (const auto& [key, pages] : writers) {
-        const auto [sources, rip, caller] = key;
-        LOG_WARNING(Render,
-                    "PADDIAG writers image={:#x} {}: sources={:#x} rip={:#x} caller={:#x} "
-                    "caller_off={:#x} pages={}",
-                    image, label, sources, rip, caller, caller ? caller - pad_eboot_base : 0,
-                    pages);
-    }
+    const auto offset = [](u64 addr) { return addr ? addr - pad_eboot_base : 0; };
+    const auto report = [&](const char* which, auto get) {
+        struct Group {
+            u32 pages{};
+            u64 min_seq{~0ULL};
+            u64 max_seq{};
+            u32 max_faults{};
+        };
+        std::map<std::tuple<u8, u64, u64, u64>, Group> groups;
+        for (VAddr page = GetPageAddr(address); page < address + size; page += PM_PAGE_SIZE) {
+            const u64 index = (page - pad_pool.base) >> PM_PAGE_BITS;
+            const PadDiagWriter& writer = get(index);
+            auto& group =
+                groups[{pad_pool.sources[index].load(), writer.rip, writer.caller, writer.caller2}];
+            ++group.pages;
+            group.min_seq = std::min(group.min_seq, writer.seq);
+            group.max_seq = std::max(group.max_seq, writer.seq);
+            group.max_faults = std::max<u32>(group.max_faults, pad_pool.faults[index].load());
+        }
+        for (const auto& [key, group] : groups) {
+            const auto [sources, rip, caller, caller2] = key;
+            LOG_WARNING(Render,
+                        "PADDIAG writers image={:#x} {} {}: sources={:#x} rip={:#x} "
+                        "caller_off={:#x} caller2_off={:#x} seq={}-{} faults<={} pages={} now={}",
+                        image, label, which, sources, rip, offset(caller), offset(caller2),
+                        group.min_seq, group.max_seq, group.max_faults, group.pages,
+                        pad_seq.load());
+        }
+    };
+    report("last", [](u64 index) -> const PadDiagWriter& { return pad_pool.last[index]; });
+    report("prev", [](u64 index) -> const PadDiagWriter& { return pad_pool.prev[index]; });
 }
 
 void PageManager::OnGpuMap(VAddr address, size_t size) {

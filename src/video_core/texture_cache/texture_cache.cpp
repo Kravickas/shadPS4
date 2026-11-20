@@ -6,6 +6,7 @@
 #include <cstring>
 #include <limits>
 #include <mutex>
+#include <string>
 #include <unordered_map>
 #include <xxhash.h>
 
@@ -1105,9 +1106,15 @@ void TextureCache::RegisterImage(ImageId image_id) {
     image_lru_cache.Insert(image, gc_tick);
     const auto& info = image.info;
     if (IsPadDiagImage(info)) {
-        LOG_WARNING(Render_Vulkan, "PADDIAG register image={:#x} mip0_nonzero={}",
+        std::string mips;
+        for (u32 level = 0; level < info.resources.levels; ++level) {
+            const auto& mip = info.mips_layout[level];
+            mips += fmt::format(" {}:{:#x}+{:#x}={}", level, mip.offset, mip.size,
+                                CountNonZeroBacking(info.guest_address + mip.offset, mip.size));
+        }
+        LOG_WARNING(Render_Vulkan, "PADDIAG register image={:#x} mip0_nonzero={} mips{}",
                     info.guest_address,
-                    CountNonZeroBacking(info.guest_address, info.mips_layout[0].size));
+                    CountNonZeroBacking(info.guest_address, info.mips_layout[0].size), mips);
         FindPadDescriptorOwners(info.guest_address);
         const u64 mip0_size = info.mips_layout[0].size;
         PageManager::PadDiagReport(info.guest_address, info.guest_address, mip0_size, "mip0");
