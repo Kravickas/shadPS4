@@ -113,6 +113,7 @@ constexpr u64 PadPageBits = std::countr_zero(PageManager::GetPageSize());
 constexpr u64 PadBpStreamRead = 0x2905322;    // call [rax+0x68]: stream->Read(dst, size)
 constexpr u64 PadBpStreamReadRet = 0x2905325; // mov rax, [r14]
 constexpr u64 PadBpGnfMemcpy = 0x2905daa;     // call memcpy(dst, src, size)
+constexpr u64 PadBpCreateTexture = 0x28efa72; // mov ecx, [r14+0x20] after the object ctor
 constexpr u64 PadMemcpyTarget = 0x4a2d3d0;
 constexpr u64 PadBpMinSize = 0x10000;
 
@@ -150,10 +151,11 @@ u64 PadDiagNonZero(u64 addr, u64 size) {
 
 void PadDiagInstallBreakpoints() {
 #ifdef _WIN32
-    static constexpr std::array<std::pair<u64, u8>, 3> breakpoints{{
+    static constexpr std::array<std::pair<u64, u8>, 4> breakpoints{{
         {PadBpStreamRead, 0xff},
         {PadBpStreamReadRet, 0x49},
         {PadBpGnfMemcpy, 0xe8},
+        {PadBpCreateTexture, 0x41},
     }};
     for (const auto [offset, expected] : breakpoints) {
         u8* code = reinterpret_cast<u8*>(pad_eboot_base + offset);
@@ -795,7 +797,7 @@ bool PageManager::PadDiagBreakpoint(void* context) {
     const auto is_bp = [](u64 rip) {
         const u64 offset = rip - pad_eboot_base;
         return offset == PadBpStreamRead || offset == PadBpStreamReadRet ||
-               offset == PadBpGnfMemcpy;
+               offset == PadBpGnfMemcpy || offset == PadBpCreateTexture;
     };
     u64 bp = ctx->Rip;
     if (!is_bp(bp)) {
@@ -812,6 +814,16 @@ bool PageManager::PadDiagBreakpoint(void* context) {
         return addr >= pad_eboot_base && addr < pad_eboot_end ? addr - pad_eboot_base : addr;
     };
     const u64 caller = *reinterpret_cast<const u64*>(ctx->Rbp + 8);
+    // Return addresses of the two frames above the loader, following the rbp chain.
+    std::array<u64, 2> callers{};
+    u64 frame = *reinterpret_cast<const u64*>(ctx->Rbp);
+    for (u64& ret : callers) {
+        if (frame <= ctx->Rsp || frame - ctx->Rsp > 0x100000) {
+            break;
+        }
+        ret = *reinterpret_cast<const u64*>(frame + 8);
+        frame = *reinterpret_cast<const u64*>(frame);
+    }
     switch (bp - pad_eboot_base) {
     case PadBpStreamRead: {
         const u64 vtable = *reinterpret_cast<const u64*>(ctx->Rdi);
@@ -849,12 +861,27 @@ bool PageManager::PadDiagBreakpoint(void* context) {
         if (ctx->Rdx >= PadBpMinSize) {
             LOG_WARNING(Render,
                         "PADDIAG bp gnf memcpy dst={:#x} src={:#x} size={:#x} src_nonzero={} "
-                        "caller_off={:#x} seq={}",
+                        "caller_off={:#x} {:#x} {:#x} seq={}",
                         ctx->Rdi, ctx->Rsi, ctx->Rdx, PadDiagNonZero(ctx->Rsi, ctx->Rdx),
-                        offset(caller), pad_seq.load());
+                        offset(caller), offset(callers[0]), offset(callers[1]), pad_seq.load());
         }
         push(bp + 5);
         ctx->Rip = pad_eboot_base + PadMemcpyTarget;
+        return true;
+    }
+    case PadBpCreateTexture: {
+        const u32* desc = reinterpret_cast<const u32*>(ctx->R14);
+        if (desc[0] == 2048 && desc[1] == 1024) {
+            LOG_WARNING(Render,
+                        "PADDIAG bp create texture object={:#x} desc={:08x} {:08x} {:08x} "
+                        "{:08x} {:08x} {:08x} {:08x} {:08x} {:08x} caller_off={:#x} "
+                        "{:#x} {:#x} seq={}",
+                        ctx->Rbx, desc[0], desc[1], desc[2], desc[3], desc[4], desc[5], desc[6],
+                        desc[7], desc[8], offset(caller), offset(callers[0]), offset(callers[1]),
+                        pad_seq.load());
+        }
+        ctx->Rcx = desc[8];
+        ctx->Rip = bp + 4;
         return true;
     }
     default:
