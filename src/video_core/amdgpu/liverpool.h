@@ -121,7 +121,11 @@ struct CpPerf {
     u32 bound_images;
     u32 tex_lookups;
     u32 tex_hits;
-    u32 rb_downloads; ///< Buffer readbacks downloaded
+    u32 tex_miss_key;         ///< The slot of the lookup table held another key
+    u32 tex_miss_generation;  ///< Same key, but an image was registered or unregistered since
+    u32 tex_miss_unreusable;  ///< Same key, and its image was not a perfect match last time
+    u32 tex_registry_changes; ///< Images registered or unregistered
+    u32 rb_downloads;         ///< Buffer readbacks downloaded
     u64 rb_bytes;
     u64 rb_finish_ns; ///< Host GPU drains for buffer readbacks
     u32 img_downloads;
@@ -237,6 +241,8 @@ inline constexpr u32 PerfProfiledDraws = 3000;
 inline bool perf_bind_check = false;
 inline constexpr u32 PerfBindCheckRate = 8;
 inline constexpr u64 PerfVkSampleRate = 16;
+/// The timings inside draws are off: the sampling profiler measures the same without the cost.
+inline constexpr bool PerfDrawTimings = false;
 /// Scale of the timings taken with PerfDrawNs: PerfVkSampleRate inside a sampled draw, 0 inside
 /// the other draws, 1 everywhere else. Reading the clock for every draw costs too much.
 inline u64 perf_draw_scale = 1;

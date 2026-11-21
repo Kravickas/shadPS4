@@ -256,7 +256,7 @@ private:
         TextureKey key;
         ImageBinding binding;
     };
-    std::array<TextureLookup, 512> texture_lookups{};
+    std::array<TextureLookup, 4096> texture_lookups{};
 
     /// Probe: what the image slots of each graphics stage resolved to in the last draw.
     struct CheckedImage {

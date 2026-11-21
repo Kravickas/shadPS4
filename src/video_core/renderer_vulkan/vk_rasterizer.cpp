@@ -481,7 +481,8 @@ void Rasterizer::EliminateFastClear() {
 
 void Rasterizer::Draw(bool is_indexed, u32 index_offset) {
     RENDERER_TRACE;
-    const bool is_sampled = (perf_vk_counter++ & (AmdGpu::PerfVkSampleRate - 1)) == 0;
+    const bool is_sampled =
+        AmdGpu::PerfDrawTimings && (perf_vk_counter++ & (AmdGpu::PerfVkSampleRate - 1)) == 0;
     AmdGpu::perf_draw_scale = is_sampled ? AmdGpu::PerfVkSampleRate : 0;
     SCOPE_EXIT {
         AmdGpu::perf_vk_sample = false;
@@ -588,8 +589,9 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
                               u32 max_count, VAddr count_address, u16 vertex_sgpr_offset,
                               u16 instance_sgpr_offset) {
     RENDERER_TRACE;
-    AmdGpu::perf_draw_scale =
-        (perf_vk_counter++ & (AmdGpu::PerfVkSampleRate - 1)) == 0 ? AmdGpu::PerfVkSampleRate : 0;
+    const bool is_sampled =
+        AmdGpu::PerfDrawTimings && (perf_vk_counter++ & (AmdGpu::PerfVkSampleRate - 1)) == 0;
+    AmdGpu::perf_draw_scale = is_sampled ? AmdGpu::PerfVkSampleRate : 0;
     SCOPE_EXIT {
         AmdGpu::perf_draw_scale = 1;
     };
@@ -1442,6 +1444,13 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
                 image_id = lookup.binding.image_id;
                 texture_cache.TouchFoundImage(image_id);
             } else {
+                if (!SameBits(lookup.key, key)) {
+                    ++AmdGpu::cp_perf.tex_miss_key;
+                } else if (lookup.generation != 0) {
+                    ++AmdGpu::cp_perf.tex_miss_generation;
+                } else {
+                    ++AmdGpu::cp_perf.tex_miss_unreusable;
+                }
                 std::construct_at(&desc, tsharp, image_desc);
 
                 if (mip_fallback_mode == Shader::MipStorageFallbackMode::ConstantIndex) {

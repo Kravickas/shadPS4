@@ -967,6 +967,7 @@ void TextureCache::RegisterImage(ImageId image_id) {
                "Trying to register an already registered image");
     image.flags |= ImageFlagBits::Registered;
     ++registry_generation;
+    ++AmdGpu::cp_perf.tex_registry_changes;
     image.memory_usage_counter = &total_used_memory;
     total_used_memory += Common::AlignUp(image.SizeBytes(), 1024);
     image_lru_cache.Insert(image, gc_tick);
@@ -987,6 +988,7 @@ void TextureCache::UnregisterImage(ImageId image_id) {
                "Trying to unregister an already unregistered image");
     image.flags &= ~ImageFlagBits::Registered;
     ++registry_generation;
+    ++AmdGpu::cp_perf.tex_registry_changes;
     image.memory_usage_counter = nullptr;
     image_lru_cache.Free(image);
     total_used_memory -= Common::AlignUp(image.SizeBytes(), 1024);

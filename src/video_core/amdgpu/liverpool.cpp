@@ -220,6 +220,8 @@ void Liverpool::Process(std::stop_token stoken) {
             "vi_inputs_us={} "
             "vi_obtain_us={} vi_bind_us={} index_us={} cmd_record_us={} reset_images_us={} "
             "reset_buffers_us={} bound_buffers={} bound_images={} tex_lookups={} tex_hits={} "
+            "tex_miss_key={} tex_miss_generation={} tex_miss_unreusable={} "
+            "tex_registry_changes={} "
             "emulated={} stg_same_inputs={} vk_vi_us={} vk_index_us={} vk_desc_us={} "
             "vk_dyn_us={} vk_draw_us={} rec_cmds={} rec_kb={} rec_publishes={} rec_wakes={} "
             "rec_syncs={} rec_sync_us={} rec_space_waits={} rec_run_us={} rec_sleeps={} "
@@ -268,7 +270,8 @@ void Liverpool::Process(std::stop_token stoken) {
             cp_perf.vi_inputs_ns / 1000, cp_perf.vi_obtain_ns / 1000, cp_perf.vi_bind_ns / 1000,
             cp_perf.index_ns / 1000, cp_perf.cmd_record_ns / 1000, cp_perf.reset_images_ns / 1000,
             cp_perf.reset_buffers_ns / 1000, cp_perf.bound_buffers, cp_perf.bound_images,
-            cp_perf.tex_lookups, cp_perf.tex_hits,
+            cp_perf.tex_lookups, cp_perf.tex_hits, cp_perf.tex_miss_key,
+            cp_perf.tex_miss_generation, cp_perf.tex_miss_unreusable, cp_perf.tex_registry_changes,
             readback_wait.emulated.exchange(0, std::memory_order_relaxed), cp_perf.stg_same_inputs,
             cp_perf.vk_vi_ns / 1000, cp_perf.vk_index_ns / 1000, cp_perf.vk_desc_ns / 1000,
             cp_perf.vk_dyn_ns / 1000, cp_perf.vk_draw_ns / 1000, cp_perf.rec_cmds,

@@ -31,6 +31,12 @@ void ThreadPause() {
 #endif
 }
 
+/// The thread's id without a call into the runtime library for every command recorded.
+std::thread::id ThisThreadId() {
+    static thread_local const std::thread::id id = std::this_thread::get_id();
+    return id;
+}
+
 } // Anonymous namespace
 
 std::mutex Scheduler::submit_mutex;
@@ -152,7 +158,7 @@ void Scheduler::DeferRecording() {
         recorder_thread = std::jthread(std::bind_front(&Scheduler::RecorderThread, this));
     }
     record_cmdbuf = sessions.back().primary;
-    recording_thread = std::this_thread::get_id();
+    recording_thread = ThisThreadId();
     is_deferred = true;
 }
 
@@ -178,7 +184,7 @@ void Scheduler::SyncRecording() {
     if (!is_deferred) {
         return;
     }
-    ASSERT_MSG(std::this_thread::get_id() == recording_thread,
+    ASSERT_MSG(ThisThreadId() == recording_thread,
                "Command buffer taken by another thread while its recording is deferred");
     const u64 sync_t0 = AmdGpu::PerfNs();
     PublishRecording();
@@ -192,7 +198,7 @@ void Scheduler::SyncRecording() {
 }
 
 Scheduler::RecordEntry* Scheduler::AllocateRecord(std::size_t payload_size) {
-    ASSERT_MSG(std::this_thread::get_id() == recording_thread,
+    ASSERT_MSG(ThisThreadId() == recording_thread,
                "Command recorded by another thread while recording is deferred");
     const u64 size = Common::AlignUp(sizeof(RecordEntry) + payload_size, RecordAlignment);
     u64 offset = record_head % RecordCapacity;
