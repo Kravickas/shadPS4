@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <bit>
 #include <chrono>
@@ -107,6 +108,72 @@ void PadDiagFindCallers(void* ctx, u64& caller, u64& caller2) {
 }
 
 constexpr u64 PadPageBits = std::countr_zero(PageManager::GetPageSize());
+
+// Guest breakpoints on the eboot texture loaders (offsets from the eboot base).
+constexpr u64 PadBpStreamRead = 0x2905322;    // call [rax+0x68]: stream->Read(dst, size)
+constexpr u64 PadBpStreamReadRet = 0x2905325; // mov rax, [r14]
+constexpr u64 PadBpGnfMemcpy = 0x2905daa;     // call memcpy(dst, src, size)
+constexpr u64 PadMemcpyTarget = 0x4a2d3d0;
+constexpr u64 PadBpMinSize = 0x10000;
+
+struct PadDiagPendingRead {
+    u64 dst{};
+    u64 size{};
+    u64 stream{};
+};
+thread_local PadDiagPendingRead pad_pending_read;
+
+// Reads through the backing view so protected pages do not fault inside the handler.
+u64 PadDiagNonZero(u64 addr, u64 size) {
+    const auto& backing_pages = Core::Memory::Instance()->GetAddressSpace().BackingPages();
+    u64 count = 0;
+    while (size) {
+        const u64 offset_in_page = addr & (Core::GUEST_PAGE_SIZE - 1);
+        const u64 chunk = std::min<u64>(Core::GUEST_PAGE_SIZE - offset_in_page, size);
+        if (const auto* entry = backing_pages.find(addr >> Core::GUEST_PAGE_BITS);
+            entry && *entry) {
+            const u8* data = *entry + offset_in_page;
+            for (u64 i = 0; i < chunk; ++i) {
+                count += data[i] != 0;
+            }
+        } else {
+            const u8* data = reinterpret_cast<const u8*>(addr);
+            for (u64 i = 0; i < chunk; ++i) {
+                count += data[i] != 0;
+            }
+        }
+        addr += chunk;
+        size -= chunk;
+    }
+    return count;
+}
+
+void PadDiagInstallBreakpoints() {
+#ifdef _WIN32
+    static constexpr std::array<std::pair<u64, u8>, 3> breakpoints{{
+        {PadBpStreamRead, 0xff},
+        {PadBpStreamReadRet, 0x49},
+        {PadBpGnfMemcpy, 0xe8},
+    }};
+    for (const auto [offset, expected] : breakpoints) {
+        u8* code = reinterpret_cast<u8*>(pad_eboot_base + offset);
+        if (*code != expected) {
+            LOG_ERROR(Render, "PADDIAG breakpoint {:#x} unexpected byte {:#04x}", offset, *code);
+            continue;
+        }
+        DWORD old_protect{};
+        if (!VirtualProtect(code, 1, PAGE_EXECUTE_READWRITE, &old_protect)) {
+            LOG_ERROR(Render, "PADDIAG breakpoint {:#x} protect failed", offset);
+            continue;
+        }
+        *code = 0xCC;
+        DWORD unused{};
+        VirtualProtect(code, 1, old_protect, &unused);
+        FlushInstructionCache(GetCurrentProcess(), code, 1);
+        LOG_WARNING(Render, "PADDIAG breakpoint {:#x} installed", offset);
+    }
+#endif
+}
 
 bool PadDiagInPool(VAddr addr) {
     return addr >= pad_pool.base && addr < pad_pool.base + (pad_pool.num_pages << PadPageBits);
@@ -638,6 +705,9 @@ void PageManager::PadDiagArmPool(VAddr address, size_t size) {
         LOG_WARNING(Render, "PADDIAG module 0 {} {:#x}-{:#x}", eboot->name, pad_eboot_base,
                     pad_eboot_end);
     }
+    if (pad_eboot_base != 0) {
+        PadDiagInstallBreakpoints();
+    }
     const VAddr base = Common::AlignDown(address, PM_PAGE_SIZE);
     const u64 num_pages = (Common::AlignUp(address + size, PM_PAGE_SIZE) - base) >> PM_PAGE_BITS;
     pad_pool.base = base;
@@ -714,6 +784,85 @@ void PageManager::PadDiagReport(VAddr image, VAddr address, size_t size, const c
     };
     report("last", [](u64 index) -> const PadDiagWriter& { return pad_pool.last[index]; });
     report("prev", [](u64 index) -> const PadDiagWriter& { return pad_pool.prev[index]; });
+}
+
+bool PageManager::PadDiagBreakpoint(void* context) {
+#ifdef _WIN32
+    if (pad_eboot_base == 0) {
+        return false;
+    }
+    CONTEXT* ctx = reinterpret_cast<EXCEPTION_POINTERS*>(context)->ContextRecord;
+    const auto is_bp = [](u64 rip) {
+        const u64 offset = rip - pad_eboot_base;
+        return offset == PadBpStreamRead || offset == PadBpStreamReadRet ||
+               offset == PadBpGnfMemcpy;
+    };
+    u64 bp = ctx->Rip;
+    if (!is_bp(bp)) {
+        if (!is_bp(bp - 1)) {
+            return false;
+        }
+        bp -= 1;
+    }
+    const auto push = [ctx](u64 value) {
+        ctx->Rsp -= 8;
+        *reinterpret_cast<u64*>(ctx->Rsp) = value;
+    };
+    const auto offset = [](u64 addr) {
+        return addr >= pad_eboot_base && addr < pad_eboot_end ? addr - pad_eboot_base : addr;
+    };
+    const u64 caller = *reinterpret_cast<const u64*>(ctx->Rbp + 8);
+    switch (bp - pad_eboot_base) {
+    case PadBpStreamRead: {
+        const u64 vtable = *reinterpret_cast<const u64*>(ctx->Rdi);
+        const u64 target = *reinterpret_cast<const u64*>(ctx->Rax + 0x68);
+        pad_pending_read = {.dst = ctx->Rsi, .size = ctx->Rdx, .stream = ctx->Rdi};
+        if (ctx->Rdx >= PadBpMinSize) {
+            const u64* stream = reinterpret_cast<const u64*>(ctx->Rdi);
+            LOG_WARNING(Render,
+                        "PADDIAG bp stream read stream={:#x} vtable_off={:#x} read_off={:#x} "
+                        "dst={:#x} size={:#x} caller_off={:#x} seq={} stream_words={:016x} "
+                        "{:016x} {:016x} {:016x} {:016x} {:016x}",
+                        ctx->Rdi, offset(vtable), offset(target), ctx->Rsi, ctx->Rdx,
+                        offset(caller), pad_seq.load(), stream[1], stream[2], stream[3], stream[4],
+                        stream[5], stream[6]);
+        }
+        push(bp + 3);
+        ctx->Rip = target;
+        return true;
+    }
+    case PadBpStreamReadRet: {
+        const PadDiagPendingRead read = pad_pending_read;
+        if (read.size >= PadBpMinSize) {
+            LOG_WARNING(Render,
+                        "PADDIAG bp stream read done stream={:#x} dst={:#x} size={:#x} got={:#x} "
+                        "nonzero={} seq={}",
+                        read.stream, read.dst, read.size, ctx->Rax,
+                        PadDiagNonZero(read.dst, read.size), pad_seq.load());
+        }
+        pad_pending_read = {};
+        ctx->Rax = *reinterpret_cast<const u64*>(ctx->R14);
+        ctx->Rip = bp + 3;
+        return true;
+    }
+    case PadBpGnfMemcpy: {
+        if (ctx->Rdx >= PadBpMinSize) {
+            LOG_WARNING(Render,
+                        "PADDIAG bp gnf memcpy dst={:#x} src={:#x} size={:#x} src_nonzero={} "
+                        "caller_off={:#x} seq={}",
+                        ctx->Rdi, ctx->Rsi, ctx->Rdx, PadDiagNonZero(ctx->Rsi, ctx->Rdx),
+                        offset(caller), pad_seq.load());
+        }
+        push(bp + 5);
+        ctx->Rip = pad_eboot_base + PadMemcpyTarget;
+        return true;
+    }
+    default:
+        return false;
+    }
+#else
+    return false;
+#endif
 }
 
 void PageManager::OnGpuMap(VAddr address, size_t size) {

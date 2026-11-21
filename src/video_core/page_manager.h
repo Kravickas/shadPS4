@@ -64,6 +64,7 @@ public:
     static void PadDiagArmPool(VAddr address, size_t size);
     static void PadDiagRecord(VAddr address, size_t size, u8 source);
     static void PadDiagReport(VAddr image, VAddr address, size_t size, const char* label);
+    static bool PadDiagBreakpoint(void* context);
 
 private:
     friend struct UffdImpl;

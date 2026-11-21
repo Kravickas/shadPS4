@@ -12,6 +12,7 @@
 #include "core/libraries/kernel/threads/pthread.h"
 #include "core/signals.h"
 #include "emulator.h"
+#include "video_core/page_manager.h"
 
 #ifdef _WIN32
 #include <windows.h>
@@ -113,6 +114,10 @@ static LONG WINAPI SignalHandler(EXCEPTION_POINTERS* pExp) noexcept {
         guest_info._si_code = POSIX_ILL_BADSTK; // i am not sure about this one either
         break;
     case EXCEPTION_BREAKPOINT:
+        if (VideoCore::PageManager::PadDiagBreakpoint(pExp)) {
+            return EXCEPTION_CONTINUE_EXECUTION;
+        }
+        [[fallthrough]];
     case EXCEPTION_SINGLE_STEP:
         guest_info._si_signo = POSIX_SIGTRAP;
         guest_info._si_code = POSIX_TRAP_BRKPT;
