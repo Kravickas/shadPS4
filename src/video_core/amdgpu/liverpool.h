@@ -187,14 +187,7 @@ struct CpPerf {
     u64 ow_watch_pages;  ///< Pages the watcher updates of the walks went over
     u32 ow_uploads;      ///< Written ranges with CPU-modified pages
     u32 ow_protects;     ///< Page protection calls of the walks
-    // Timed cycles only:
-    u64 st_state_ns; ///< State packets, from the first behind a draw to the next draw
-    // Checked cycles only. Words of register-setting packets and those set to another value:
-    u32 bc_reg_words;
-    u32 bc_reg_words_changed;
-    u32 bc_sh_words;
-    u32 bc_sh_words_changed;
-    // Image bindings of graphics stages:
+    // Checked cycles only. Image bindings of graphics stages:
     u32 bc_images;
     u32 bc_images_same;  ///< Same T# and use as the same slot of the draw before, same run
     u32 bc_images_equal; ///< ...and resolved to the same view and layout
@@ -242,10 +235,16 @@ inline bool perf_vk_sample = false;
 /// Cycles with at least this many draws turn the sampling profiler on for the next cycle.
 inline constexpr u32 PerfProfiledDraws = 3000;
 inline bool perf_bind_check = false;
-/// One cycle in PerfBindCheckRate, another one than the checked: state packets are timed.
-inline bool perf_state_timed = false;
 inline constexpr u32 PerfBindCheckRate = 8;
-inline constexpr u64 PerfVkSampleRate = 8;
+inline constexpr u64 PerfVkSampleRate = 16;
+/// Scale of the timings taken with PerfDrawNs: PerfVkSampleRate inside a sampled draw, 0 inside
+/// the other draws, 1 everywhere else. Reading the clock for every draw costs too much.
+inline u64 perf_draw_scale = 1;
+
+/// Clock for timings inside draws. Differences come out scaled, and as 0 on draws not sampled.
+inline u64 PerfDrawNs() {
+    return perf_draw_scale != 0 ? PerfNs() * perf_draw_scale : 0;
+}
 
 /// Adds the lifetime of the object to a CpPerf field on sampled draws, scaled by the rate.
 struct VkCallPerf {
@@ -254,6 +253,16 @@ struct VkCallPerf {
         if (perf_vk_sample) {
             field += (PerfNs() - t0) * PerfVkSampleRate;
         }
+    }
+    u64& field;
+    u64 t0;
+};
+
+/// Adds the lifetime of the object to a CpPerf field, on the clock for timings inside draws.
+struct CpDrawPerfScope {
+    explicit CpDrawPerfScope(u64& field_) : field{field_}, t0{PerfDrawNs()} {}
+    ~CpDrawPerfScope() {
+        field += PerfDrawNs() - t0;
     }
     u64& field;
     u64 t0;
@@ -528,9 +537,6 @@ private:
     /// Applies what a state packet or a draw sets in the graphics queue state.
     static void ApplyPacketState(const GfxState& state, const PM4Header* header);
 
-    /// Probe: counts the words a register-setting packet sets and how many get another value.
-    static void CountSetWords(const GfxState& state, const PM4Header* header);
-
     /// Whether ClassifyPacket and ApplyPacketState can run on a packet that words_available
     /// words are readable from, without reading or writing out of bounds or asserting.
     static bool IsSafePacket(const PM4Header* header, std::size_t words_available);
@@ -576,7 +582,6 @@ private:
     u32 perf_cycles{};
     /// Probe: a context, uconfig or config register changed since the last draw.
     bool perf_state_changed{};
-    u64 perf_state_t0{};
     u64 lookahead_taken{};
     alignas(64) std::atomic<u64> lookahead_started_run{};
     alignas(64) std::atomic<u64> lookahead_stopped_run{};

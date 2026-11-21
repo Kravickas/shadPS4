@@ -396,11 +396,10 @@ private:
     };
     std::unordered_map<u64, EmulatedAccesses> emulated_accesses;
     static constexpr u32 MaxEmulatedAccesses = 512;
-    /// Scheduler tick of the last writable binding per WriteTickChunk bytes of guest memory.
-    std::unordered_map<u64, u64> write_ticks;
+    /// Scheduler tick of the last writable binding of each page of guest memory, as ranges of
+    /// pages with the same tick.
+    RangeMap<u64> write_ticks;
     static constexpr u64 WriteTickChunkBits = 16;
-    /// The same per page, to tell for a few pages whether their own GPU writes were submitted.
-    std::unordered_map<u64, u64> page_write_ticks;
     static constexpr u64 MaxPageTickRange = 1ULL << WriteTickChunkBits;
     /// Readback windows that held GPU-modified data recently: start -> {size, scheduler tick}.
     /// A readback downloads all of them that are ready, so the CPU does not fault on each one.

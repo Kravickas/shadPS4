@@ -375,22 +375,12 @@ bool BufferCache::IsGpuWriteSubmitted(VAddr device_addr, u64 size) const {
 }
 
 u64 BufferCache::LastWriteTick(VAddr device_addr, u64 size) const {
+    const u64 granule = size <= MaxPageTickRange ? BYTES_PER_PAGE : 1ULL << WriteTickChunkBits;
+    const VAddr begin = Common::AlignDown(device_addr, granule);
+    const VAddr end = Common::AlignUp(device_addr + size, granule);
     u64 last_tick = 0;
-    if (size <= MaxPageTickRange) {
-        for (u64 page = device_addr / BYTES_PER_PAGE;
-             page <= (device_addr + size - 1) / BYTES_PER_PAGE; ++page) {
-            if (const auto it = page_write_ticks.find(page); it != page_write_ticks.end()) {
-                last_tick = std::max(last_tick, it->second);
-            }
-        }
-        return last_tick;
-    }
-    for (u64 chunk = device_addr >> WriteTickChunkBits;
-         chunk <= (device_addr + size - 1) >> WriteTickChunkBits; ++chunk) {
-        if (const auto it = write_ticks.find(chunk); it != write_ticks.end()) {
-            last_tick = std::max(last_tick, it->second);
-        }
-    }
+    write_ticks.ForEachInRange(
+        begin, end - begin, [&](VAddr, VAddr, u64 tick) { last_tick = std::max(last_tick, tick); });
     return last_tick;
 }
 
@@ -1191,14 +1181,11 @@ bool BufferCache::SynchronizeMemory(const Buffer* arena, VAddr device_addr, u32 
         }
         if (is_written) {
             gpu_modified_ranges.Add(device_addr, size);
-            const u64 tick = scheduler.CurrentTick();
-            for (u64 chunk = device_addr >> WriteTickChunkBits;
-                 chunk <= (device_addr + size - 1) >> WriteTickChunkBits; ++chunk) {
-                write_ticks[chunk] = tick;
-            }
-            for (u64 page = device_addr / BYTES_PER_PAGE;
-                 page <= (device_addr + size - 1) / BYTES_PER_PAGE; ++page) {
-                page_write_ticks[page] = tick;
+            const VAddr tick_begin = Common::AlignDown(device_addr, BYTES_PER_PAGE);
+            const u64 tick_size = Common::AlignUp(device_addr + size, BYTES_PER_PAGE) - tick_begin;
+            if (tick_size != 0) {
+                write_ticks.Subtract(tick_begin, tick_size);
+                write_ticks.Add(tick_begin, tick_size, scheduler.CurrentTick());
             }
             perf.ow_mark_ns += AmdGpu::PerfNs() - mark_t0;
         }

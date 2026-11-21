@@ -32,7 +32,7 @@ constexpr u32 MaxModules = 64;
 constexpr u32 TableBits = 17;
 constexpr u32 TableSize = 1u << TableBits;
 constexpr u32 MaxProbes = 64;
-constexpr u32 StackWords = 64;
+constexpr u32 StackWords = 192;
 constexpr u64 FirstReportSamples = 15'000;
 constexpr u64 ReportSamples = 30'000;
 constexpr u32 EntriesPerLine = 40;
@@ -85,26 +85,43 @@ Module DescribeModule(HMODULE handle) {
     return {reinterpret_cast<u64>(base), nt->OptionalHeader.SizeOfImage, std::move(name)};
 }
 
+void SamplerThread();
+
 void DescribeExe() {
     const HMODULE handle = GetModuleHandleW(nullptr);
     modules.reserve(MaxModules);
     modules.push_back(DescribeModule(handle));
     modules.push_back({0, 0, "(none)"});
 
+    // The code of the executable is the section this file's code is in. Data lies between it
+    // and the other executable sections.
     const auto* base = reinterpret_cast<const u8*>(handle);
     const auto* dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(base);
     const auto* nt = reinterpret_cast<const IMAGE_NT_HEADERS64*>(base + dos->e_lfanew);
     const IMAGE_SECTION_HEADER* section = IMAGE_FIRST_SECTION(nt);
-    exe_text_begin = ~0ULL;
-    exe_text_end = 0;
+    const u64 own_code = reinterpret_cast<u64>(&SamplerThread);
     for (u32 i = 0; i < nt->FileHeader.NumberOfSections; ++i, ++section) {
-        if ((section->Characteristics & IMAGE_SCN_MEM_EXECUTE) == 0) {
-            continue;
-        }
         const u64 begin = modules[ExeModule].base + section->VirtualAddress;
-        exe_text_begin = std::min(exe_text_begin, begin);
-        exe_text_end = std::max(exe_text_end, begin + section->Misc.VirtualSize);
+        if (own_code - begin < section->Misc.VirtualSize) {
+            exe_text_begin = begin;
+            exe_text_end = begin + section->Misc.VirtualSize;
+        }
     }
+}
+
+/// Whether the address in the code of the executable follows a call instruction.
+bool IsReturnAddress(u64 address) {
+    if (address < exe_text_begin + 8 || address >= exe_text_end) {
+        return false;
+    }
+    const auto* code = reinterpret_cast<const u8*>(address);
+    const auto is_indirect_call = [code](u32 length) {
+        return code[-static_cast<s32>(length)] == 0xFF &&
+               (code[1 - static_cast<s32>(length)] & 0x38) == 0x10;
+    };
+    // call rel32, and call r/m64 with its two to seven bytes.
+    return code[-5] == 0xE8 || is_indirect_call(2) || is_indirect_call(3) || is_indirect_call(4) ||
+           is_indirect_call(6) || is_indirect_call(7);
 }
 
 u32 FindModule(u64 address) {
@@ -166,11 +183,12 @@ void Sample(Thread& thread) {
         Count(thread, (u64{ExeModule + 1} << 32) | (context.Rip - exe_base));
         return;
     }
-    // Outside of the executable the sample is counted for the first address on the stack that
-    // lies in the code of the executable, which is where it was probably called from.
+    // Outside of the executable the sample is counted for the first word on the stack that
+    // is a return address into the code of the executable, which is where it was probably
+    // called from.
     u64 caller = 0;
     for (u32 i = 0; i < num_words; ++i) {
-        if (stack[i] >= exe_text_begin && stack[i] < exe_text_end) {
+        if (IsReturnAddress(stack[i])) {
             caller = stack[i] - exe_base;
             break;
         }
