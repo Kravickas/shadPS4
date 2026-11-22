@@ -79,9 +79,9 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [windows-2022, ubuntu-latest, macos-26]
+        os: [windows-latest, ubuntu-latest, macos-26]
         include:
-          - os: windows-2022
+          - os: windows-latest
             compiler_cxx: clang-cl
             compiler_c: clang-cl
           - os: ubuntu-latest
@@ -164,7 +164,7 @@ jobs:
         shell: bash
 
   windows-sdl:
-    runs-on: windows-2022
+    runs-on: windows-2025-vs2026
     needs: get-info
     steps:
     - uses: actions/checkout@v6
