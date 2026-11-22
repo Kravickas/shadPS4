@@ -607,6 +607,16 @@ std::tuple<ImageId, int, int> TextureCache::ResolveOverlap(const ImageInfo& imag
             cache_image.info.resources.levels == 1 && image_info.resources.layers == 1 &&
             cache_image.info.resources.layers == 1;
 
+        // Different format and the cached image lacks the requested levels or layers: expand
+        // it so its GPU data is kept, instead of freeing it after the view lookup fails.
+        if (!merged_image_id && image_info.pixel_format != cache_image.info.pixel_format &&
+            image_info.type == cache_image.info.type &&
+            image_info.tile_mode == cache_image.info.tile_mode &&
+            !cache_image.info.resources.Contains(image_info.resources) &&
+            IsVulkanFormatCompatible(cache_image.info.pixel_format, image_info.pixel_format)) {
+            return {ExpandImage(image_info, cache_image_id), -1, -1};
+        }
+
         // Size and resources are less than or equal, use image view.
         if (image_info.pixel_format != cache_image.info.pixel_format ||
             image_info.guest_size <= cache_image.info.guest_size || pow2_padding_only) {
@@ -800,6 +810,28 @@ std::tuple<ImageId, int, int> TextureCache::ResolveOverlap(const ImageInfo& imag
     return {merged_image_id, -1, -1};
 }
 
+// Number of leading levels of dst that CopyImage from src overwrites completely.
+static u32 FullyCopiedLevels(const ImageInfo& src, const ImageInfo& dst) {
+    if (src.type != dst.type || src.props.is_volume || dst.props.is_volume ||
+        dst.props.has_stencil || src.resources.layers < dst.resources.layers) {
+        return 0;
+    }
+    const auto blocks = [](u32 texels, bool is_block) {
+        return is_block ? Common::DivCeil(texels, 4u) : texels;
+    };
+    const u32 num_levels = std::min(src.resources.levels, dst.resources.levels);
+    for (u32 m = 0; m < num_levels; ++m) {
+        const u32 copy_w = blocks(std::max(src.size.width >> m, 1u), src.props.is_block);
+        const u32 copy_h = blocks(std::max(src.size.height >> m, 1u), src.props.is_block);
+        const u32 dst_w = blocks(std::max(dst.size.width >> m, 1u), dst.props.is_block);
+        const u32 dst_h = blocks(std::max(dst.size.height >> m, 1u), dst.props.is_block);
+        if (copy_w < dst_w || copy_h < dst_h) {
+            return m;
+        }
+    }
+    return num_levels;
+}
+
 ImageId TextureCache::ExpandImage(const ImageInfo& info, ImageId image_id) {
     const auto new_image_id = slot_images.Insert(instance, runtime, slot_image_views, info);
     RegisterImage(new_image_id);
@@ -821,7 +853,8 @@ ImageId TextureCache::ExpandImage(const ImageInfo& info, ImageId image_id) {
                     src_has_gpu_data);
     }
 
-    RefreshImage(new_image);
+    // Levels the copy below overwrites need no upload from guest memory.
+    RefreshImage(new_image, src_has_gpu_data ? FullyCopiedLevels(src_image.info, info) : 0);
 
     if (src_image.binding.is_bound || src_image.binding.is_target) {
         src_image.binding.needs_rebind = 1u;
@@ -1119,7 +1152,7 @@ void TextureCache::AssociateStencil(ImageId depth_id, const ImageInfo& depth_inf
     stencil_image.AssociateDepth(depth_id, slot_images[depth_id].image_uid);
 }
 
-void TextureCache::RefreshImage(Image& image) {
+void TextureCache::RefreshImage(Image& image, u32 first_level) {
     if (False(image.flags & ImageFlagBits::Dirty) || image.info.num_samples > 1) {
         return;
     }
@@ -1153,7 +1186,7 @@ void TextureCache::RefreshImage(Image& image) {
     const u32 num_mips = image.info.resources.levels;
 
     SmallVector<vk::BufferImageCopy, 14> image_copies;
-    for (u32 m = 0; m < num_mips; m++) {
+    for (u32 m = first_level; m < num_mips; m++) {
         const u32 width = std::max(image.info.size.width >> m, 1u);
         const u32 height = std::max(image.info.size.height >> m, 1u);
         const u32 depth =
