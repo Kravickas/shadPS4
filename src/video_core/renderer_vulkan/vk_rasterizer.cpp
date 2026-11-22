@@ -121,6 +121,9 @@ static void LogPadDiagEncoder(const Shader::Info& stage, const auto& bindings, u
             PadDiagNonZeroBacking(info.guest_address, info.guest_size));
         if (desc.type != VideoCore::TextureCache::BindingType::Storage) {
             texture_cache.PadDiagProbe(image_id, "encoder src");
+            if (desc.view_info.range.base.level == 0) {
+                texture_cache.PadDiagDumpImageEvents(info.guest_address, info.guest_size, 120);
+            }
         }
     }
 }

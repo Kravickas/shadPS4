@@ -8,6 +8,7 @@
 #include <mutex>
 #include <string>
 #include <unordered_map>
+#include <vector>
 #include <xxhash.h>
 
 #include "common/assert.h"
@@ -170,16 +171,19 @@ static void PadDiagLogEvent(char kind, u64 tick, const ImageInfo& info, u32 imag
     };
 }
 
-static void PadDiagDumpEvents(VAddr addr, u64 size) {
+static void PadDiagDumpEvents(VAddr addr, u64 size, u32 max_matches = 0xffffffff) {
     std::scoped_lock lk{pad_diag_mutex};
     const u64 count = std::min<u64>(pad_diag_ring_next, PadDiagRingSize);
-    u32 matches = 0;
+    std::vector<u64> matches;
     for (u64 i = pad_diag_ring_next - count; i < pad_diag_ring_next; ++i) {
         const PadDiagEvent& event = pad_diag_ring[i % PadDiagRingSize];
-        if (event.addr >= addr + size || event.addr + event.size <= addr) {
-            continue;
+        if (event.addr < addr + size && event.addr + event.size > addr) {
+            matches.push_back(i);
         }
-        ++matches;
+    }
+    const size_t first = matches.size() > max_matches ? matches.size() - max_matches : 0;
+    for (size_t m = first; m < matches.size(); ++m) {
+        const PadDiagEvent& event = pad_diag_ring[matches[m] % PadDiagRingSize];
         LOG_WARNING(Render_Vulkan,
                     "PADDIAG event image={:#x} {} id={} tick={} addr={:#x} size={:#x} {} {}x{} "
                     "levels={} tile={} flags={:#x}",
@@ -187,8 +191,8 @@ static void PadDiagDumpEvents(VAddr addr, u64 size) {
                     vk::to_string(static_cast<vk::Format>(event.format)), event.width, event.height,
                     event.levels, event.tile, event.flags);
     }
-    LOG_WARNING(Render_Vulkan, "PADDIAG events image={:#x} matches={} total={}", addr, matches,
-                pad_diag_ring_next);
+    LOG_WARNING(Render_Vulkan, "PADDIAG events image={:#x} matches={} shown={} total={}", addr,
+                matches.size(), matches.size() - first, pad_diag_ring_next);
 }
 
 TextureCache::TextureCache(const Vulkan::Instance& instance_, Vulkan::Scheduler& scheduler_,
@@ -315,6 +319,10 @@ void TextureCache::DownloadImageMemory(ImageId image_id, DownloadMemoryFlags fla
     } else {
         scheduler.DeferOperation(std::move(write_data));
     }
+}
+
+void TextureCache::PadDiagDumpImageEvents(VAddr addr, u64 size, u32 max_matches) {
+    PadDiagDumpEvents(addr, size, max_matches);
 }
 
 void TextureCache::PadDiagProbe(ImageId image_id, const char* label) {
