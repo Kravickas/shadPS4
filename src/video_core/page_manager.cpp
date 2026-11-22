@@ -1,14 +1,7 @@
-// SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
+// SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
-#include <array>
-#include <atomic>
-#include <bit>
-#include <chrono>
-#include <map>
-#include <thread>
-#include <tuple>
 #include <utility>
 #include "common/adaptive_mutex.h"
 #include "common/assert.h"
@@ -17,10 +10,8 @@
 #include "common/error.h"
 #include "common/multi_level_page_table.h"
 #include "common/signal_context.h"
-#include "common/singleton.h"
 #include "common/thread.h"
 #include "core/emulator_settings.h"
-#include "core/linker.h"
 #include "core/memory.h"
 #include "core/signals.h"
 #include "video_core/page_manager.h"
@@ -31,10 +22,6 @@
 #include "common/adaptive_mutex.h"
 #else
 #include <windows.h>
-#endif
-
-#if defined(__linux__) && !defined(_WIN32)
-#include <sys/ucontext.h>
 #endif
 
 #ifdef __linux__
@@ -49,138 +36,6 @@
 #endif
 
 namespace VideoCore {
-
-// PADDIAG: test build only. Records the last CPU writers of every page of the GPU pool.
-namespace {
-VAddr pad_eboot_base{};
-VAddr pad_eboot_end{};
-
-struct PadDiagWriter {
-    u64 rip{};
-    u64 caller{};
-    u64 caller2{};
-    u64 seq{};
-};
-
-struct PadDiagPool {
-    VAddr base{};
-    u64 num_pages{};
-    std::unique_ptr<std::atomic<u8>[]> armed;
-    std::unique_ptr<std::atomic<u8>[]> sources;
-    std::unique_ptr<std::atomic<u16>[]> faults;
-    std::unique_ptr<PadDiagWriter[]> last;
-    std::unique_ptr<PadDiagWriter[]> prev;
-};
-PadDiagPool pad_pool;
-std::atomic<bool> pad_pool_ready{false};
-std::atomic<u64> pad_seq{0};
-
-u64 PadDiagGetRsp(void* ctx) {
-#if defined(_WIN32)
-    return ((EXCEPTION_POINTERS*)ctx)->ContextRecord->Rsp;
-#elif defined(__linux__) && defined(ARCH_X86_64)
-    return ((ucontext_t*)ctx)->uc_mcontext.gregs[REG_RSP];
-#else
-    return 0;
-#endif
-}
-
-void PadDiagFindCallers(void* ctx, u64& caller, u64& caller2) {
-    caller = 0;
-    caller2 = 0;
-    const u64 rsp = PadDiagGetRsp(ctx);
-    if (rsp == 0) {
-        return;
-    }
-    const u64* stack = reinterpret_cast<const u64*>(rsp);
-    for (u32 i = 0; i < 256; ++i) {
-        const u64 value = stack[i];
-        if (value < pad_eboot_base || value >= pad_eboot_end) {
-            continue;
-        }
-        if (caller == 0) {
-            caller = value;
-        } else if (value != caller) {
-            caller2 = value;
-            return;
-        }
-    }
-}
-
-constexpr u64 PadPageBits = std::countr_zero(PageManager::GetPageSize());
-
-// Guest breakpoints on the eboot texture loaders (offsets from the eboot base).
-constexpr u64 PadBpStreamRead = 0x2905322;    // call [rax+0x68]: stream->Read(dst, size)
-constexpr u64 PadBpStreamReadRet = 0x2905325; // mov rax, [r14]
-constexpr u64 PadBpGnfMemcpy = 0x2905daa;     // call memcpy(dst, src, size)
-constexpr u64 PadBpCreateTexture = 0x28efa72; // mov ecx, [r14+0x20] after the object ctor
-constexpr u64 PadMemcpyTarget = 0x4a2d3d0;
-constexpr u64 PadBpMinSize = 0x10000;
-
-struct PadDiagPendingRead {
-    u64 dst{};
-    u64 size{};
-    u64 stream{};
-};
-thread_local PadDiagPendingRead pad_pending_read;
-
-// Reads through the backing view so protected pages do not fault inside the handler.
-u64 PadDiagNonZero(u64 addr, u64 size) {
-    const auto& backing_pages = Core::Memory::Instance()->GetAddressSpace().BackingPages();
-    u64 count = 0;
-    while (size) {
-        const u64 offset_in_page = addr & (Core::GUEST_PAGE_SIZE - 1);
-        const u64 chunk = std::min<u64>(Core::GUEST_PAGE_SIZE - offset_in_page, size);
-        if (const auto* entry = backing_pages.find(addr >> Core::GUEST_PAGE_BITS);
-            entry && *entry) {
-            const u8* data = *entry + offset_in_page;
-            for (u64 i = 0; i < chunk; ++i) {
-                count += data[i] != 0;
-            }
-        } else {
-            const u8* data = reinterpret_cast<const u8*>(addr);
-            for (u64 i = 0; i < chunk; ++i) {
-                count += data[i] != 0;
-            }
-        }
-        addr += chunk;
-        size -= chunk;
-    }
-    return count;
-}
-
-void PadDiagInstallBreakpoints() {
-#ifdef _WIN32
-    static constexpr std::array<std::pair<u64, u8>, 4> breakpoints{{
-        {PadBpStreamRead, 0xff},
-        {PadBpStreamReadRet, 0x49},
-        {PadBpGnfMemcpy, 0xe8},
-        {PadBpCreateTexture, 0x41},
-    }};
-    for (const auto [offset, expected] : breakpoints) {
-        u8* code = reinterpret_cast<u8*>(pad_eboot_base + offset);
-        if (*code != expected) {
-            LOG_ERROR(Render, "PADDIAG breakpoint {:#x} unexpected byte {:#04x}", offset, *code);
-            continue;
-        }
-        DWORD old_protect{};
-        if (!VirtualProtect(code, 1, PAGE_EXECUTE_READWRITE, &old_protect)) {
-            LOG_ERROR(Render, "PADDIAG breakpoint {:#x} protect failed", offset);
-            continue;
-        }
-        *code = 0xCC;
-        DWORD unused{};
-        VirtualProtect(code, 1, old_protect, &unused);
-        FlushInstructionCache(GetCurrentProcess(), code, 1);
-        LOG_WARNING(Render, "PADDIAG breakpoint {:#x} installed", offset);
-    }
-#endif
-}
-
-bool PadDiagInPool(VAddr addr) {
-    return addr >= pad_pool.base && addr < pad_pool.base + (pad_pool.num_pages << PadPageBits);
-}
-} // namespace
 
 struct PageManager::Impl {
     struct PageState {
@@ -560,7 +415,6 @@ public:
 struct SignalImpl : public PageManager::Impl {
     SignalImpl(Vulkan::Rasterizer* rasterizer_) : Impl() {
         rasterizer = rasterizer_;
-        instance = this;
 
         // Should be called first.
         constexpr auto priority = std::numeric_limits<u32>::min();
@@ -574,99 +428,11 @@ struct SignalImpl : public PageManager::Impl {
         auto& impl = memory->GetAddressSpace();
         ASSERT_MSG(perms != Core::MemoryPermission::Write,
                    "Attempted to protect region as write-only which is not a valid permission");
-        if (True(perms & Core::MemoryPermission::Write) &&
-            pad_pool_ready.load(std::memory_order_acquire)) {
-            // Armed pool pages stay read-only so the next guest write is recorded.
-            const auto read_perms = perms & ~Core::MemoryPermission::Write;
-            VAddr run_begin = address;
-            Core::MemoryPermission run_perms = perms;
-            for (VAddr page = address; page < address + size; page += PageManager::PM_PAGE_SIZE) {
-                const bool armed =
-                    PadDiagInPool(page) &&
-                    pad_pool.armed[(page - pad_pool.base) >> PageManager::PM_PAGE_BITS].load() != 0;
-                const auto page_perms = armed ? read_perms : perms;
-                if (page != address && page_perms != run_perms) {
-                    impl.Protect(run_begin, page - run_begin, run_perms);
-                    run_begin = page;
-                }
-                run_perms = page_perms;
-            }
-            impl.Protect(run_begin, address + size - run_begin, run_perms);
-            return;
-        }
         impl.Protect(address, size, perms);
     }
 
-    static bool PadDiagFault(void* context, VAddr addr) {
-        if (!pad_pool_ready.load(std::memory_order_acquire) || !Common::IsWriteError(context) ||
-            !PadDiagInPool(addr)) {
-            return false;
-        }
-        const u64 index = (addr - pad_pool.base) >> PageManager::PM_PAGE_BITS;
-        if (pad_pool.armed[index].exchange(0) == 0) {
-            return false;
-        }
-        PadDiagWriter writer{
-            .rip = reinterpret_cast<u64>(Common::GetRip(context)),
-            .seq = pad_seq.fetch_add(1) + 1,
-        };
-        PadDiagFindCallers(context, writer.caller, writer.caller2);
-        const u64 page = addr >> PageManager::PM_PAGE_BITS;
-        auto& lock = instance->locks[page];
-        std::scoped_lock lk{lock};
-        pad_pool.prev[index] = pad_pool.last[index];
-        pad_pool.last[index] = writer;
-        pad_pool.sources[index].fetch_or(1);
-        if (const u16 faults = pad_pool.faults[index].load(); faults != 0xffff) {
-            pad_pool.faults[index].store(faults + 1);
-        }
-        const PageState* state = instance->cached_pages.find(page);
-        if (state && (state->num_write_watchers != 0 || state->num_read_watchers != 0)) {
-            // Page is watched by the page manager, let it handle the fault as usual.
-            return false;
-        }
-        pad_pool.armed[index].store(0);
-        Core::Memory::Instance()->GetAddressSpace().Protect(page << PageManager::PM_PAGE_BITS,
-                                                            PageManager::PM_PAGE_SIZE,
-                                                            Core::MemoryPermission::ReadWrite);
-        return true;
-    }
-
-    // Re-arms written pool pages. Pages written in many windows are re-armed less often.
-    static void PadDiagRearm(u64 pass) {
-        if (!instance) {
-            return;
-        }
-        auto& address_space = Core::Memory::Instance()->GetAddressSpace();
-        const u64 base_page = pad_pool.base >> PageManager::PM_PAGE_BITS;
-        for (u64 index = 0; index < pad_pool.num_pages; ++index) {
-            if (pad_pool.armed[index].load(std::memory_order_relaxed) != 0) {
-                continue;
-            }
-            if (pad_pool.faults[index].load(std::memory_order_relaxed) >= 8 && pass % 25 != 0) {
-                continue;
-            }
-            const u64 page = base_page + index;
-            auto& lock = instance->locks[page];
-            std::scoped_lock lk{lock};
-            pad_pool.armed[index].store(1);
-            const PageState* state = instance->cached_pages.find(page);
-            if (state && (state->num_write_watchers != 0 || state->num_read_watchers != 0)) {
-                // Already protected by the page manager.
-                continue;
-            }
-            address_space.Protect(page << PageManager::PM_PAGE_BITS, PageManager::PM_PAGE_SIZE,
-                                  Core::MemoryPermission::Read);
-        }
-    }
-
-    inline static SignalImpl* instance;
-
     static bool GuestFaultSignalHandler(void* context, void* fault_address) {
         const auto addr = reinterpret_cast<VAddr>(fault_address);
-        if (PadDiagFault(context, addr)) {
-            return true;
-        }
         const auto size = std::min<u64>(8, PageManager::GetNextPageAddr(addr) - addr);
         const auto is_gpu_thread =
             std::this_thread::get_id() == rasterizer->GetGpuCommandProcessorThread();
@@ -696,201 +462,6 @@ PageManager::PageManager(Vulkan::Rasterizer* rasterizer_) {
 }
 
 PageManager::~PageManager() = default;
-
-void PageManager::PadDiagArmPool(VAddr address, size_t size) {
-    if (pad_pool_ready.load()) {
-        return;
-    }
-    if (const auto* eboot = Common::Singleton<Core::Linker>::Instance()->GetModule(0)) {
-        pad_eboot_base = eboot->GetBaseAddress();
-        pad_eboot_end = pad_eboot_base + eboot->aligned_base_size;
-        LOG_WARNING(Render, "PADDIAG module 0 {} {:#x}-{:#x}", eboot->name, pad_eboot_base,
-                    pad_eboot_end);
-    }
-    if (pad_eboot_base != 0) {
-        PadDiagInstallBreakpoints();
-    }
-    const VAddr base = Common::AlignDown(address, PM_PAGE_SIZE);
-    const u64 num_pages = (Common::AlignUp(address + size, PM_PAGE_SIZE) - base) >> PM_PAGE_BITS;
-    pad_pool.base = base;
-    pad_pool.num_pages = num_pages;
-    pad_pool.armed = std::make_unique<std::atomic<u8>[]>(num_pages);
-    pad_pool.sources = std::make_unique<std::atomic<u8>[]>(num_pages);
-    pad_pool.faults = std::make_unique<std::atomic<u16>[]>(num_pages);
-    pad_pool.last = std::make_unique<PadDiagWriter[]>(num_pages);
-    pad_pool.prev = std::make_unique<PadDiagWriter[]>(num_pages);
-    for (u64 i = 0; i < num_pages; ++i) {
-        pad_pool.armed[i].store(1, std::memory_order_relaxed);
-    }
-    pad_pool_ready.store(true, std::memory_order_release);
-    Core::Memory::Instance()->GetAddressSpace().Protect(base, num_pages << PM_PAGE_BITS,
-                                                        Core::MemoryPermission::Read);
-    std::thread([] {
-        Common::SetCurrentThreadName("shadPS4:PadDiag");
-        for (u64 pass = 1;; ++pass) {
-            std::this_thread::sleep_for(std::chrono::milliseconds(200));
-            SignalImpl::PadDiagRearm(pass);
-        }
-    }).detach();
-    LOG_WARNING(Render, "PADDIAG armed pool {:#x} size {:#x}", base, num_pages << PM_PAGE_BITS);
-}
-
-// Sources: 1 CPU write fault, 2 GPU DMA/copy, 4 shader storage write, 8 readback to guest,
-// 16 marked GPU modified.
-void PageManager::PadDiagRecord(VAddr address, size_t size, u8 source) {
-    if (!pad_pool_ready.load(std::memory_order_acquire) || size == 0) {
-        return;
-    }
-    const VAddr pool_end = pad_pool.base + (pad_pool.num_pages << PM_PAGE_BITS);
-    const VAddr end = std::min<VAddr>(address + size, pool_end);
-    for (VAddr page = std::max(GetPageAddr(address), pad_pool.base); page < end;
-         page += PM_PAGE_SIZE) {
-        pad_pool.sources[(page - pad_pool.base) >> PM_PAGE_BITS].fetch_or(source);
-    }
-}
-
-void PageManager::PadDiagReport(VAddr image, VAddr address, size_t size, const char* label) {
-    if (!pad_pool_ready.load(std::memory_order_acquire) || !PadDiagInPool(address) ||
-        !PadDiagInPool(address + size - 1)) {
-        LOG_WARNING(Render, "PADDIAG writers image={:#x} {}: outside armed pool", image, label);
-        return;
-    }
-    const auto offset = [](u64 addr) { return addr ? addr - pad_eboot_base : 0; };
-    const auto report = [&](const char* which, auto get) {
-        struct Group {
-            u32 pages{};
-            u64 min_seq{~0ULL};
-            u64 max_seq{};
-            u32 max_faults{};
-        };
-        std::map<std::tuple<u8, u64, u64, u64>, Group> groups;
-        for (VAddr page = GetPageAddr(address); page < address + size; page += PM_PAGE_SIZE) {
-            const u64 index = (page - pad_pool.base) >> PM_PAGE_BITS;
-            const PadDiagWriter& writer = get(index);
-            auto& group =
-                groups[{pad_pool.sources[index].load(), writer.rip, writer.caller, writer.caller2}];
-            ++group.pages;
-            group.min_seq = std::min(group.min_seq, writer.seq);
-            group.max_seq = std::max(group.max_seq, writer.seq);
-            group.max_faults = std::max<u32>(group.max_faults, pad_pool.faults[index].load());
-        }
-        for (const auto& [key, group] : groups) {
-            const auto [sources, rip, caller, caller2] = key;
-            LOG_WARNING(Render,
-                        "PADDIAG writers image={:#x} {} {}: sources={:#x} rip={:#x} "
-                        "caller_off={:#x} caller2_off={:#x} seq={}-{} faults<={} pages={} now={}",
-                        image, label, which, sources, rip, offset(caller), offset(caller2),
-                        group.min_seq, group.max_seq, group.max_faults, group.pages,
-                        pad_seq.load());
-        }
-    };
-    report("last", [](u64 index) -> const PadDiagWriter& { return pad_pool.last[index]; });
-    report("prev", [](u64 index) -> const PadDiagWriter& { return pad_pool.prev[index]; });
-}
-
-bool PageManager::PadDiagBreakpoint(void* context) {
-#ifdef _WIN32
-    if (pad_eboot_base == 0) {
-        return false;
-    }
-    CONTEXT* ctx = reinterpret_cast<EXCEPTION_POINTERS*>(context)->ContextRecord;
-    const auto is_bp = [](u64 rip) {
-        const u64 offset = rip - pad_eboot_base;
-        return offset == PadBpStreamRead || offset == PadBpStreamReadRet ||
-               offset == PadBpGnfMemcpy || offset == PadBpCreateTexture;
-    };
-    u64 bp = ctx->Rip;
-    if (!is_bp(bp)) {
-        if (!is_bp(bp - 1)) {
-            return false;
-        }
-        bp -= 1;
-    }
-    const auto push = [ctx](u64 value) {
-        ctx->Rsp -= 8;
-        *reinterpret_cast<u64*>(ctx->Rsp) = value;
-    };
-    const auto offset = [](u64 addr) {
-        return addr >= pad_eboot_base && addr < pad_eboot_end ? addr - pad_eboot_base : addr;
-    };
-    const u64 caller = *reinterpret_cast<const u64*>(ctx->Rbp + 8);
-    // Return addresses of the two frames above the loader, following the rbp chain.
-    std::array<u64, 2> callers{};
-    u64 frame = *reinterpret_cast<const u64*>(ctx->Rbp);
-    for (u64& ret : callers) {
-        if (frame <= ctx->Rsp || frame - ctx->Rsp > 0x100000) {
-            break;
-        }
-        ret = *reinterpret_cast<const u64*>(frame + 8);
-        frame = *reinterpret_cast<const u64*>(frame);
-    }
-    switch (bp - pad_eboot_base) {
-    case PadBpStreamRead: {
-        const u64 vtable = *reinterpret_cast<const u64*>(ctx->Rdi);
-        const u64 target = *reinterpret_cast<const u64*>(ctx->Rax + 0x68);
-        pad_pending_read = {.dst = ctx->Rsi, .size = ctx->Rdx, .stream = ctx->Rdi};
-        if (ctx->Rdx >= PadBpMinSize) {
-            const u64* stream = reinterpret_cast<const u64*>(ctx->Rdi);
-            LOG_WARNING(Render,
-                        "PADDIAG bp stream read stream={:#x} vtable_off={:#x} read_off={:#x} "
-                        "dst={:#x} size={:#x} caller_off={:#x} seq={} stream_words={:016x} "
-                        "{:016x} {:016x} {:016x} {:016x} {:016x}",
-                        ctx->Rdi, offset(vtable), offset(target), ctx->Rsi, ctx->Rdx,
-                        offset(caller), pad_seq.load(), stream[1], stream[2], stream[3], stream[4],
-                        stream[5], stream[6]);
-        }
-        push(bp + 3);
-        ctx->Rip = target;
-        return true;
-    }
-    case PadBpStreamReadRet: {
-        const PadDiagPendingRead read = pad_pending_read;
-        if (read.size >= PadBpMinSize) {
-            LOG_WARNING(Render,
-                        "PADDIAG bp stream read done stream={:#x} dst={:#x} size={:#x} got={:#x} "
-                        "nonzero={} seq={}",
-                        read.stream, read.dst, read.size, ctx->Rax,
-                        PadDiagNonZero(read.dst, read.size), pad_seq.load());
-        }
-        pad_pending_read = {};
-        ctx->Rax = *reinterpret_cast<const u64*>(ctx->R14);
-        ctx->Rip = bp + 3;
-        return true;
-    }
-    case PadBpGnfMemcpy: {
-        if (ctx->Rdx >= PadBpMinSize) {
-            LOG_WARNING(Render,
-                        "PADDIAG bp gnf memcpy dst={:#x} src={:#x} size={:#x} src_nonzero={} "
-                        "caller_off={:#x} {:#x} {:#x} seq={}",
-                        ctx->Rdi, ctx->Rsi, ctx->Rdx, PadDiagNonZero(ctx->Rsi, ctx->Rdx),
-                        offset(caller), offset(callers[0]), offset(callers[1]), pad_seq.load());
-        }
-        push(bp + 5);
-        ctx->Rip = pad_eboot_base + PadMemcpyTarget;
-        return true;
-    }
-    case PadBpCreateTexture: {
-        const u32* desc = reinterpret_cast<const u32*>(ctx->R14);
-        if (desc[0] == 2048 && desc[1] == 1024) {
-            LOG_WARNING(Render,
-                        "PADDIAG bp create texture object={:#x} desc={:08x} {:08x} {:08x} "
-                        "{:08x} {:08x} {:08x} {:08x} {:08x} {:08x} caller_off={:#x} "
-                        "{:#x} {:#x} seq={}",
-                        ctx->Rbx, desc[0], desc[1], desc[2], desc[3], desc[4], desc[5], desc[6],
-                        desc[7], desc[8], offset(caller), offset(callers[0]), offset(callers[1]),
-                        pad_seq.load());
-        }
-        ctx->Rcx = desc[8];
-        ctx->Rip = bp + 4;
-        return true;
-    }
-    default:
-        return false;
-    }
-#else
-    return false;
-#endif
-}
 
 void PageManager::OnGpuMap(VAddr address, size_t size) {
     impl->OnMap(address, size);

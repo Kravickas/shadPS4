@@ -136,12 +136,6 @@ public:
     /// Schedules a copy of pending images for download back to CPU memory.
     void ProcessDownloadImages();
 
-    /// PADDIAG: logs non-zero bytes per mip of the image contents at this point on the GPU.
-    void PadDiagProbe(ImageId image_id, const char* label);
-
-    /// PADDIAG: logs the last image events overlapping the range.
-    void PadDiagDumpImageEvents(VAddr addr, u64 size, u32 max_matches);
-
     /// Retrieves the image handle of the image with the provided attributes.
     [[nodiscard]] ImageId FindImage(ImageDesc& desc, bool exact_fmt = false);
 

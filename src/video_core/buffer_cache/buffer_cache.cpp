@@ -1,4 +1,4 @@
-// SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
+// SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
@@ -196,7 +196,6 @@ void BufferCache::DownloadMemory(const Buffer* arena, VAddr device_addr, u64 siz
             auto* dst_addr = std::bit_cast<u8*>(arena_base + copy.srcOffset);
             memory->TryWriteBacking(dst_addr, download.mapped + (copy.dstOffset - download.offset),
                                     copy.size);
-            PageManager::PadDiagRecord(arena_base + copy.srcOffset, copy.size, 8);
         }
         memory_tracker->UnmarkRegionAsGpuModified(device_addr, size, false);
 
@@ -260,7 +259,6 @@ bool BufferCache::IsRegionGpuModified(VAddr addr, size_t size) {
 }
 
 void BufferCache::MarkRegionAsGpuModified(VAddr addr, size_t size) {
-    PageManager::PadDiagRecord(addr, size, 16);
     texture_cache.MarkAsMaybeGpuDirty(addr, size);
     memory_tracker->MarkRegionAsGpuModified(addr, size);
     gpu_modified_ranges.Add(addr, size);

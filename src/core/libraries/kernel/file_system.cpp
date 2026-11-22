@@ -704,17 +704,12 @@ s64 ReadFile(Core::FileSys::File* file, void* buf, u64 nbytes) {
 
     const auto* memory = Core::Memory::Instance();
     // Invalidate up to the actual number of bytes that could be read.
-    const s64 file_pos = file->Tell();
-    const auto remaining = file->GetSize() - file_pos;
+    const auto remaining = file->GetSize() - file->Tell();
     memory->InvalidateMemory(reinterpret_cast<VAddr>(buf), std::min<u64>(nbytes, remaining));
     if (file_buf.capacity() < nbytes) {
         file_buf.reserve(nbytes);
     }
     s64 bytes = file->Read(file_buf.data(), nbytes);
-    if (nbytes >= 0x10000) {
-        LOG_WARNING(Kernel_Fs, "PADDIAG read file={} off={:#x} dst={:#x} req={:#x} got={:#x}",
-                    file->m_guest_name, file_pos, reinterpret_cast<VAddr>(buf), nbytes, bytes);
-    }
     if (bytes < 0) {
         return bytes;
     }

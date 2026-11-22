@@ -2,13 +2,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
-#include <array>
-#include <cstring>
 #include <limits>
-#include <mutex>
-#include <string>
-#include <unordered_map>
-#include <vector>
 #include <xxhash.h>
 
 #include "common/assert.h"
@@ -53,146 +47,6 @@ static u64 HashBackingMemory(VAddr virtual_addr, u64 size) {
     const u64 hash = XXH3_64bits_digest(state);
     XXH3_freeState(state);
     return hash;
-}
-
-// PADDIAG: test build only.
-static bool IsPadDiagImage(const ImageInfo& info) {
-    return info.size.width == 2048 && info.size.height == 1024 && info.resources.levels == 9 &&
-           info.guest_size == 0x155a00;
-}
-
-static u64 CountNonZeroBacking(VAddr virtual_addr, u64 size) {
-    const auto& backing_pages = Core::Memory::Instance()->GetAddressSpace().BackingPages();
-    u64 count = 0;
-    while (size) {
-        const u64 page = virtual_addr >> Core::GUEST_PAGE_BITS;
-        const u64 offset_in_page = virtual_addr & (Core::GUEST_PAGE_SIZE - 1);
-        const u64 chunk = std::min<u64>(Core::GUEST_PAGE_SIZE - offset_in_page, size);
-        if (auto* entry = backing_pages.find(page); entry && *entry) {
-            const u8* data = *entry + offset_in_page;
-            for (u64 i = 0; i < chunk; ++i) {
-                count += data[i] != 0;
-            }
-        }
-        size -= chunk;
-        virtual_addr += chunk;
-    }
-    return count;
-}
-
-static const u8* BackingPtr(VAddr addr) {
-    const auto& backing_pages = Core::Memory::Instance()->GetAddressSpace().BackingPages();
-    if (auto* entry = backing_pages.find(addr >> Core::GUEST_PAGE_BITS); entry && *entry) {
-        return *entry + (addr & (Core::GUEST_PAGE_SIZE - 1));
-    }
-    return nullptr;
-}
-
-// Finds copies of the T# first two dwords in the game's CPU heaps and dumps the memory around
-// each one, to locate the game's texture object.
-static void FindPadDescriptorOwners(VAddr image_addr) {
-    const u64 pattern = (u64{0xe6300040} << 32) | u32(image_addr >> 8);
-    static constexpr std::array<std::pair<VAddr, u64>, 2> regions{{
-        {0x7000000000ULL, 0x90c00000ULL},
-        {0x200000000ULL, 0x800000ULL},
-    }};
-    u32 matches = 0;
-    for (const auto& [region_base, region_size] : regions) {
-        for (VAddr page = region_base; page < region_base + region_size;
-             page += Core::GUEST_PAGE_SIZE) {
-            const u8* data = BackingPtr(page);
-            if (!data) {
-                continue;
-            }
-            for (u64 off = 0; off < Core::GUEST_PAGE_SIZE; off += sizeof(u64)) {
-                u64 value;
-                std::memcpy(&value, data + off, sizeof(value));
-                if (value != pattern) {
-                    continue;
-                }
-                const VAddr match = page + off;
-                LOG_WARNING(Render_Vulkan, "PADDIAG owner image={:#x} T# copy at {:#x}", image_addr,
-                            match);
-                for (VAddr row = match - 0x100; row < match + 0x100; row += 0x20) {
-                    std::array<u64, 4> q{};
-                    for (u32 i = 0; i < 4; ++i) {
-                        if (const u8* src = BackingPtr(row + i * 8)) {
-                            std::memcpy(&q[i], src, sizeof(u64));
-                        }
-                    }
-                    LOG_WARNING(Render_Vulkan,
-                                "PADDIAG owner image={:#x} {:#x}: {:016x} {:016x} {:016x} {:016x}",
-                                image_addr, row, q[0], q[1], q[2], q[3]);
-                }
-                if (++matches == 8) {
-                    return;
-                }
-            }
-        }
-    }
-    LOG_WARNING(Render_Vulkan, "PADDIAG owner image={:#x} matches={}", image_addr, matches);
-}
-
-static std::mutex pad_diag_mutex;
-static std::unordered_map<VAddr, u64> pad_diag_hash;
-
-// Ring of image events, dumped for the range of a pad image when it is registered.
-struct PadDiagEvent {
-    u64 tick;
-    VAddr addr;
-    u64 size;
-    u32 format;
-    u32 width;
-    u32 height;
-    u32 image;
-    u16 levels;
-    u16 flags;
-    u8 tile;
-    char kind;
-};
-static constexpr size_t PadDiagRingSize = 1 << 16;
-static std::array<PadDiagEvent, PadDiagRingSize> pad_diag_ring;
-static u64 pad_diag_ring_next = 0;
-
-static void PadDiagLogEvent(char kind, u64 tick, const ImageInfo& info, u32 image, u32 flags) {
-    std::scoped_lock lk{pad_diag_mutex};
-    pad_diag_ring[pad_diag_ring_next++ % PadDiagRingSize] = {
-        .tick = tick,
-        .addr = info.guest_address,
-        .size = info.guest_size,
-        .format = static_cast<u32>(info.pixel_format),
-        .width = info.size.width,
-        .height = info.size.height,
-        .image = image,
-        .levels = static_cast<u16>(info.resources.levels),
-        .flags = static_cast<u16>(flags),
-        .tile = static_cast<u8>(info.tile_mode),
-        .kind = kind,
-    };
-}
-
-static void PadDiagDumpEvents(VAddr addr, u64 size, u32 max_matches = 0xffffffff) {
-    std::scoped_lock lk{pad_diag_mutex};
-    const u64 count = std::min<u64>(pad_diag_ring_next, PadDiagRingSize);
-    std::vector<u64> matches;
-    for (u64 i = pad_diag_ring_next - count; i < pad_diag_ring_next; ++i) {
-        const PadDiagEvent& event = pad_diag_ring[i % PadDiagRingSize];
-        if (event.addr < addr + size && event.addr + event.size > addr) {
-            matches.push_back(i);
-        }
-    }
-    const size_t first = matches.size() > max_matches ? matches.size() - max_matches : 0;
-    for (size_t m = first; m < matches.size(); ++m) {
-        const PadDiagEvent& event = pad_diag_ring[matches[m] % PadDiagRingSize];
-        LOG_WARNING(Render_Vulkan,
-                    "PADDIAG event image={:#x} {} id={} tick={} addr={:#x} size={:#x} {} {}x{} "
-                    "levels={} tile={} flags={:#x}",
-                    addr, event.kind, event.image, event.tick, event.addr, event.size,
-                    vk::to_string(static_cast<vk::Format>(event.format)), event.width, event.height,
-                    event.levels, event.tile, event.flags);
-    }
-    LOG_WARNING(Render_Vulkan, "PADDIAG events image={:#x} matches={} shown={} total={}", addr,
-                matches.size(), matches.size() - first, pad_diag_ring_next);
 }
 
 TextureCache::TextureCache(const Vulkan::Instance& instance_, Vulkan::Scheduler& scheduler_,
@@ -321,64 +175,6 @@ void TextureCache::DownloadImageMemory(ImageId image_id, DownloadMemoryFlags fla
     }
 }
 
-void TextureCache::PadDiagDumpImageEvents(VAddr addr, u64 size, u32 max_matches) {
-    PadDiagDumpEvents(addr, size, max_matches);
-}
-
-void TextureCache::PadDiagProbe(ImageId image_id, const char* label) {
-    Image& image = slot_images[image_id];
-    const ImageInfo info = image.info;
-    u32 copy_size = 0;
-    boost::container::small_vector<vk::BufferImageCopy, 16> buffer_copies;
-    for (u32 mip = 0; mip < info.resources.levels; ++mip) {
-        const u32 width = std::max(info.size.width >> mip, 1u);
-        const u32 height = std::max(info.size.height >> mip, 1u);
-        const u32 depth = info.props.is_volume ? std::max(info.size.depth >> mip, 1u) : 1u;
-        const auto [mip_size, mip_pitch, mip_height, mip_offset] = info.mips_layout[mip];
-        const u32 extent_width = mip_pitch ? std::min<u32>(mip_pitch, width) : width;
-        const u32 extent_height = mip_height ? std::min<u32>(mip_height, height) : height;
-        buffer_copies.push_back(vk::BufferImageCopy{
-            .bufferOffset = mip_offset,
-            .bufferRowLength = mip_pitch,
-            .bufferImageHeight = mip_height,
-            .imageSubresource{
-                .aspectMask = image.aspect_mask & ~vk::ImageAspectFlagBits::eStencil,
-                .mipLevel = mip,
-                .baseArrayLayer = 0,
-                .layerCount = info.resources.layers,
-            },
-            .imageOffset = {0, 0, 0},
-            .imageExtent = {extent_width, extent_height, depth},
-        });
-        copy_size += mip_size;
-    }
-    if (buffer_copies.empty() || copy_size > info.guest_size) {
-        return;
-    }
-    const auto download =
-        runtime.GetStagingPool().Request(copy_size, MemoryType::HostCached, 16, true);
-    tile_manager.TileImage(image, buffer_copies, download.buffer, download.offset);
-    const u64 tick = scheduler.CurrentTick();
-    const u32 id = image_id.index;
-    scheduler.DeferOperation([this, info, download, label, tick, id] {
-        download.Invalidate();
-        std::string mips;
-        for (u32 mip = 0; mip < info.resources.levels; ++mip) {
-            const auto& layout = info.mips_layout[mip];
-            u64 count = 0;
-            for (u64 i = 0; i < layout.size; ++i) {
-                count += download.mapped[layout.offset + i] != 0;
-            }
-            mips += fmt::format(" {}={}", mip, count);
-        }
-        LOG_WARNING(Render_Vulkan,
-                    "PADDIAG probe {} id={} addr={:#x} {} {}x{} tick={} gpu_nonzero{}", label, id,
-                    info.guest_address, vk::to_string(info.pixel_format), info.size.width,
-                    info.size.height, tick, mips);
-        runtime.GetStagingPool().FreeDeferred(download);
-    });
-}
-
 void TextureCache::MarkAsMaybeDirty(ImageId image_id, Image& image) {
     if (image.cpu_hash == 0) {
         // Initialize hash
@@ -406,10 +202,6 @@ void TextureCache::InvalidateMemory(VAddr addr, size_t size) {
         if (image.Overlaps(addr, size)) {
             // Modified region overlaps image, so the image was definitely accessed by this fault.
             // Untrack the image, so that the range is unprotected and the guest can write freely.
-            if (IsPadDiagImage(image.info)) {
-                LOG_WARNING(Render_Vulkan, "PADDIAG cpu write image={:#x} at={:#x}",
-                            image.info.guest_address, addr);
-            }
             image.flags |= ImageFlagBits::CpuDirty;
             UntrackImage(image_id);
         } else if (pages_end < image_end) {
@@ -432,7 +224,6 @@ void TextureCache::InvalidateMemory(VAddr addr, size_t size) {
 }
 
 void TextureCache::InvalidateMemoryFromGPU(VAddr address, size_t max_size) {
-    PageManager::PadDiagRecord(address, max_size, 2);
     // Mark the image at the written address, then follow images stored right after it
     // (e.g. the chroma planes after a luma plane).
     const VAddr end = address + max_size;
@@ -449,26 +240,10 @@ void TextureCache::InvalidateMemoryFromGPU(VAddr address, size_t max_size) {
         });
         next = next_end > next ? next_end : end;
     }
-    if (max_size <= 256_MB) {
-        ForEachImageInRegion(address, max_size, [&](ImageId, Image& image) {
-            if (IsPadDiagImage(image.info)) {
-                LOG_WARNING(Render_Vulkan,
-                            "PADDIAG gpu write dst={:#x} size={:#x} image={:#x} marked={}", address,
-                            max_size, image.info.guest_address,
-                            True(image.flags & ImageFlagBits::GpuDirty));
-            }
-        });
-    }
 }
 
 void TextureCache::MarkAsMaybeGpuDirty(VAddr addr, size_t size) {
-    PageManager::PadDiagRecord(addr, size, 4);
     ForEachImageInRegion(addr, size, [&](ImageId image_id, Image& image) {
-        if (IsPadDiagImage(image.info)) {
-            LOG_WARNING(Render_Vulkan,
-                        "PADDIAG gpu buffer write dst={:#x} size={:#x} image={:#x} dirty={}", addr,
-                        size, image.info.guest_address, True(image.flags & ImageFlagBits::Dirty));
-        }
         if (image.gpu_hash == 0) {
             // Read backing pages directly, without faulting through the guest readback path.
             image.gpu_hash = HashBackingMemory(image.info.guest_address, image.info.guest_size);
@@ -575,8 +350,6 @@ std::tuple<ImageId, int, int> TextureCache::ResolveOverlap(const ImageInfo& imag
         const u32 rhs_block_size = cache_image.info.num_bits * cache_image.info.num_samples;
         if (image_info.BlockDim() != cache_image.info.BlockDim() ||
             lhs_block_size != rhs_block_size) {
-            PadDiagLogEvent(safe_to_delete ? 'X' : 'x', scheduler.CurrentTick(), image_info,
-                            cache_image_id.index, static_cast<u32>(cache_image.flags));
             // Very likely this kind of overlap is caused by allocation from a pool.
             if (safe_to_delete) {
                 FreeImage(cache_image_id);
@@ -843,15 +616,6 @@ ImageId TextureCache::ExpandImage(const ImageInfo& info, ImageId image_id) {
     // A CPU-dirty source is stale (e.g. a streamed texture rewritten in a reused pool slot);
     // copying it would overwrite the fresh upload with old data.
     const bool src_has_gpu_data = src_image.HasGpuValidData();
-    if (IsPadDiagImage(info)) {
-        LOG_WARNING(Render_Vulkan,
-                    "PADDIAG expand image={:#x} from id={} {} {}x{} levels={} flags={:#x} "
-                    "copy={}",
-                    info.guest_address, image_id.index, vk::to_string(src_image.info.pixel_format),
-                    src_image.info.size.width, src_image.info.size.height,
-                    src_image.info.resources.levels, static_cast<u32>(src_image.flags),
-                    src_has_gpu_data);
-    }
 
     // Levels the copy below overwrites need no upload from guest memory.
     RefreshImage(new_image, src_has_gpu_data ? FullyCopiedLevels(src_image.info, info) : 0);
@@ -864,9 +628,6 @@ ImageId TextureCache::ExpandImage(const ImageInfo& info, ImageId image_id) {
     new_image.flags &= ~ImageFlagBits::Dirty;
     if (src_has_gpu_data) {
         runtime.CopyImage(&src_image, &new_image);
-    }
-    if (IsPadDiagImage(info)) {
-        PadDiagProbe(new_image_id, "expanded");
     }
     FreeImage(image_id);
 
@@ -999,8 +760,6 @@ ImageId TextureCache::FindImageFromRange(VAddr address, size_t size, bool ensure
 ImageView& TextureCache::FindTexture(ImageId image_id, const ImageDesc& desc) {
     Image& image = slot_images[image_id];
     if (desc.type == BindingType::Storage) {
-        PadDiagLogEvent('S', scheduler.CurrentTick(), image.info, image_id.index,
-                        static_cast<u32>(image.flags));
         image.flags |= ImageFlagBits::GpuModified;
         if (readback_linear_images && (!image.info.props.is_tiled || image.info.size.width <= 8) &&
             image.info.guest_address != 0) {
@@ -1009,19 +768,6 @@ ImageView& TextureCache::FindTexture(ImageId image_id, const ImageDesc& desc) {
         }
     }
     UpdateImage(image_id);
-    if (IsPadDiagImage(image.info) && False(image.flags & ImageFlagBits::Dirty)) {
-        const u64 hash = HashBackingMemory(image.info.guest_address, image.info.guest_size);
-        std::scoped_lock lk{pad_diag_mutex};
-        auto [it, inserted] = pad_diag_hash.try_emplace(image.info.guest_address, hash);
-        if (!inserted && it->second != hash) {
-            LOG_WARNING(
-                Render_Vulkan,
-                "PADDIAG guest changed without re-upload image={:#x} mip0_nonzero={}",
-                image.info.guest_address,
-                CountNonZeroBacking(image.info.guest_address, image.info.mips_layout[0].size));
-            it->second = hash;
-        }
-    }
     return image.FindView(desc.view_info);
 }
 
@@ -1052,8 +798,6 @@ void TextureCache::UnregisterMeta(VAddr address, u64 owner_uid) {
 
 ImageView& TextureCache::FindRenderTarget(ImageId image_id, const ImageDesc& desc) {
     Image& image = slot_images[image_id];
-    PadDiagLogEvent('T', scheduler.CurrentTick(), image.info, image_id.index,
-                    static_cast<u32>(image.flags));
     image.flags |= ImageFlagBits::GpuModified;
     if (readback_linear_images && (!image.info.props.is_tiled || image.info.size.width <= 8)) {
         std::unique_lock lk{download_images_mutex};
@@ -1096,8 +840,6 @@ ImageView& TextureCache::FindRenderTarget(ImageId image_id, const ImageDesc& des
 
 ImageView& TextureCache::FindDepthTarget(ImageId image_id, const ImageDesc& desc) {
     Image& image = slot_images[image_id];
-    PadDiagLogEvent('D', scheduler.CurrentTick(), image.info, image_id.index,
-                    static_cast<u32>(image.flags));
     image.flags |= ImageFlagBits::GpuModified;
     image.usage.depth_target = 1u;
     UpdateImage(image_id);
@@ -1230,23 +972,6 @@ void TextureCache::RefreshImage(Image& image, u32 first_level) {
     }
 
     runtime.UploadImage(&image, buffer, image_copies);
-
-    if (IsPadDiagImage(image.info)) {
-        const u64 hash = HashBackingMemory(image.info.guest_address, image.info.guest_size);
-        LOG_WARNING(
-            Render_Vulkan, "PADDIAG upload image={:#x} mip0_nonzero={} gpu_src={}",
-            image.info.guest_address,
-            CountNonZeroBacking(image.info.guest_address, image.info.mips_layout[0].size),
-            buffer_cache.IsRegionGpuModified(image.info.guest_address, image.info.guest_size));
-        std::scoped_lock lk{pad_diag_mutex};
-        pad_diag_hash[image.info.guest_address] = hash;
-    }
-
-    std::scoped_lock lk{image.mutex};
-    if (True(image.flags & ImageFlagBits::CpuDirty)) {
-        LOG_WARNING(Render_Vulkan, "CPU write during image upload: addr={:#x} size={:#x}",
-                    image.info.guest_address, image.info.guest_size);
-    }
 }
 
 vk::Sampler TextureCache::GetSampler(const AmdGpu::Sampler& sharp,
@@ -1276,25 +1001,6 @@ void TextureCache::RegisterImage(ImageId image_id) {
     total_used_memory += Common::AlignUp(image.SizeBytes(), 1024);
     image_lru_cache.Insert(image, gc_tick);
     const auto& info = image.info;
-    PadDiagLogEvent('R', scheduler.CurrentTick(), info, image_id.index,
-                    static_cast<u32>(image.flags));
-    if (IsPadDiagImage(info)) {
-        PadDiagDumpEvents(info.guest_address, info.guest_size);
-        std::string mips;
-        for (u32 level = 0; level < info.resources.levels; ++level) {
-            const auto& mip = info.mips_layout[level];
-            mips += fmt::format(" {}:{:#x}+{:#x}={}", level, mip.offset, mip.size,
-                                CountNonZeroBacking(info.guest_address + mip.offset, mip.size));
-        }
-        LOG_WARNING(Render_Vulkan, "PADDIAG register image={:#x} mip0_nonzero={} mips{}",
-                    info.guest_address,
-                    CountNonZeroBacking(info.guest_address, info.mips_layout[0].size), mips);
-        FindPadDescriptorOwners(info.guest_address);
-        const u64 mip0_size = info.mips_layout[0].size;
-        PageManager::PadDiagReport(info.guest_address, info.guest_address, mip0_size, "mip0");
-        PageManager::PadDiagReport(info.guest_address, info.guest_address + mip0_size,
-                                   info.guest_size - mip0_size, "mips1+");
-    }
     ASSERT_MSG((info.guest_address & 0xff) == 0, "Trying to register an unaligned image");
     ForEachPage(info.guest_address, info.guest_size, [this, image_id, info](u64 page) {
         page_table[page].entries.emplace_back(BucketEntry{
@@ -1311,13 +1017,6 @@ void TextureCache::UnregisterImage(ImageId image_id) {
                "Trying to unregister an already unregistered image");
     image.flags &= ~ImageFlagBits::Registered;
     image.memory_usage_counter = nullptr;
-    PadDiagLogEvent('U', scheduler.CurrentTick(), image.info, image_id.index,
-                    static_cast<u32>(image.flags));
-    if (IsPadDiagImage(image.info)) {
-        LOG_WARNING(Render_Vulkan, "PADDIAG unregister image={:#x}", image.info.guest_address);
-        std::scoped_lock lk{pad_diag_mutex};
-        pad_diag_hash.erase(image.info.guest_address);
-    }
     image_lru_cache.Free(image);
     total_used_memory -= Common::AlignUp(image.SizeBytes(), 1024);
     ForEachPage(image.info.guest_address, image.info.guest_size, [this, image_id](u64 page) {

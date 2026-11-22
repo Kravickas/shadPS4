@@ -20,113 +20,9 @@
 #include "video_core/texture_cache/image_view.h"
 #include "video_core/texture_cache/texture_cache.h"
 
-#include <array>
-#include <cstring>
-#include <unordered_map>
 #include <vulkan/vulkan_format_traits.hpp>
 
 namespace Vulkan {
-
-// PADDIAG: test build only.
-static void LogPadDiagSharps(const Shader::Info& stage, u32 image_index,
-                             const AmdGpu::Image& tsharp, const VideoCore::ImageInfo& info) {
-    if (info.size.width != 2048 || info.size.height != 1024 || info.resources.levels != 9 ||
-        info.guest_size != 0x155a00) {
-        return;
-    }
-    std::array<u32, 8> words;
-    std::memcpy(words.data(), &tsharp, sizeof(words));
-    static std::unordered_map<VAddr, std::array<u32, 8>> last_words;
-    auto [it, inserted] = last_words.try_emplace(info.guest_address, words);
-    if (!inserted && it->second == words) {
-        return;
-    }
-    it->second = words;
-    LOG_WARNING(Render_Vulkan,
-                "PADDIAG T# image={:#x} idx={} words={:08x} {:08x} {:08x} {:08x} {:08x} {:08x} "
-                "{:08x} {:08x} base_level={} last_level={} min_lod={:#x} min_lod_warn={:#x} "
-                "counter_bank_id={} lod_hw_cnt_en={} perf_mod={}",
-                info.guest_address, image_index, words[0], words[1], words[2], words[3], words[4],
-                words[5], words[6], words[7], u32(tsharp.base_level), u32(tsharp.last_level),
-                u32(tsharp.min_lod), u32(tsharp.min_lod_warn), u32(tsharp.counter_bank_id),
-                u32(tsharp.lod_hw_cnt_en), u32(tsharp.perf_modulation));
-    for (u32 i = 0; i < stage.samplers.size(); ++i) {
-        const auto ssharp = stage.samplers[i].GetSharp(stage);
-        LOG_WARNING(Render_Vulkan,
-                    "PADDIAG S# image={:#x} idx={} words={:016x} {:016x} min_lod={:#x} "
-                    "max_lod={:#x} lod_bias={:#x} lod_bias_sec={:#x} perf_mip={} mip_filter={}",
-                    info.guest_address, i, ssharp.raw0, ssharp.raw1, u32(ssharp.min_lod.Value()),
-                    u32(ssharp.max_lod.Value()), u32(ssharp.lod_bias.Value()),
-                    u32(ssharp.lod_bias_sec.Value()), u32(ssharp.perf_mip.Value()),
-                    u32(ssharp.mip_filter.Value()));
-    }
-}
-
-static u64 PadDiagNonZeroBacking(VAddr addr, u64 size) {
-    const auto& backing_pages = Core::Memory::Instance()->GetAddressSpace().BackingPages();
-    u64 count = 0;
-    while (size) {
-        const u64 offset_in_page = addr & (Core::GUEST_PAGE_SIZE - 1);
-        const u64 chunk = std::min<u64>(Core::GUEST_PAGE_SIZE - offset_in_page, size);
-        const auto* entry = backing_pages.find(addr >> Core::GUEST_PAGE_BITS);
-        const u8* data =
-            entry && *entry ? *entry + offset_in_page : reinterpret_cast<const u8*>(addr);
-        for (u64 i = 0; i < chunk; ++i) {
-            count += data[i] != 0;
-        }
-        addr += chunk;
-        size -= chunk;
-    }
-    return count;
-}
-
-// Logs every image of a dispatch that writes a 512x256 R16G16B16A16Uint storage image,
-// the block view the pad textures are encoded through.
-static void LogPadDiagEncoder(const Shader::Info& stage, const auto& bindings, u32 count,
-                              VideoCore::TextureCache& texture_cache) {
-    bool is_encoder = false;
-    for (u32 i = 0; i < count; ++i) {
-        const auto& [image_id, desc] = bindings[i];
-        if (!image_id || desc.type != VideoCore::TextureCache::BindingType::Storage) {
-            continue;
-        }
-        const auto& info = texture_cache.GetImage(image_id).info;
-        is_encoder |= info.pixel_format == vk::Format::eR16G16B16A16Uint &&
-                      info.size.width == 512 && info.size.height == 256;
-    }
-    static u32 logged = 0;
-    if (!is_encoder || logged >= 400) {
-        return;
-    }
-    ++logged;
-    LOG_WARNING(Render_Vulkan, "PADDIAG encoder dispatch pgm_hash={:#x} images={}", stage.pgm_hash,
-                count);
-    for (u32 i = 0; i < count; ++i) {
-        const auto& [image_id, desc] = bindings[i];
-        if (!image_id) {
-            LOG_WARNING(Render_Vulkan, "PADDIAG encoder   [{}] none", i);
-            continue;
-        }
-        const auto& image = texture_cache.GetImage(image_id);
-        const auto& info = image.info;
-        LOG_WARNING(
-            Render_Vulkan,
-            "PADDIAG encoder   [{}] {} id={} addr={:#x} size={:#x} {} {}x{} levels={} "
-            "view_level={}+{} flags={:#x} guest_nonzero={}",
-            i, desc.type == VideoCore::TextureCache::BindingType::Storage ? "storage" : "sampled",
-            image_id.index, info.guest_address, info.guest_size, vk::to_string(info.pixel_format),
-            info.size.width, info.size.height, info.resources.levels,
-            desc.view_info.range.base.level, desc.view_info.range.extent.levels,
-            static_cast<u32>(image.flags),
-            PadDiagNonZeroBacking(info.guest_address, info.guest_size));
-        if (desc.type != VideoCore::TextureCache::BindingType::Storage) {
-            texture_cache.PadDiagProbe(image_id, "encoder src");
-            if (desc.view_info.range.base.level == 0) {
-                texture_cache.PadDiagDumpImageEvents(info.guest_address, info.guest_size, 120);
-            }
-        }
-    }
-}
 
 static Shader::PushData MakeUserData(const AmdGpu::Regs& regs) {
     // TODO(roamic): Add support for multiple viewports and geometry shaders when ViewportIndex
@@ -1032,7 +928,6 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
 
             image_id = texture_cache.FindImage(desc);
             auto* image = &texture_cache.GetImage(image_id);
-            LogPadDiagSharps(stage, u32(&image_desc - stage.images.data()), tsharp, image->info);
             if (auto depth_image_id = texture_cache.GetAssociatedDepth(*image)) {
                 // If this image has an associated depth image, it's a stencil attachment.
                 // Redirect the access to the actual depth-stencil buffer.
@@ -1052,7 +947,6 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
 
         image_descriptor_array_sizes.push_back(num_bindings);
     }
-    LogPadDiagEncoder(stage, image_bindings, num_images, texture_cache);
 
     // Second pass to re-bind images that were updated after binding
     for (u32 i = 0; i < num_images; ++i) {
