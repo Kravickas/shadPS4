@@ -317,6 +317,60 @@ void TextureCache::DownloadImageMemory(ImageId image_id, DownloadMemoryFlags fla
     }
 }
 
+void TextureCache::PadDiagProbe(ImageId image_id, const char* label) {
+    Image& image = slot_images[image_id];
+    const ImageInfo info = image.info;
+    u32 copy_size = 0;
+    boost::container::small_vector<vk::BufferImageCopy, 16> buffer_copies;
+    for (u32 mip = 0; mip < info.resources.levels; ++mip) {
+        const u32 width = std::max(info.size.width >> mip, 1u);
+        const u32 height = std::max(info.size.height >> mip, 1u);
+        const u32 depth = info.props.is_volume ? std::max(info.size.depth >> mip, 1u) : 1u;
+        const auto [mip_size, mip_pitch, mip_height, mip_offset] = info.mips_layout[mip];
+        const u32 extent_width = mip_pitch ? std::min<u32>(mip_pitch, width) : width;
+        const u32 extent_height = mip_height ? std::min<u32>(mip_height, height) : height;
+        buffer_copies.push_back(vk::BufferImageCopy{
+            .bufferOffset = mip_offset,
+            .bufferRowLength = mip_pitch,
+            .bufferImageHeight = mip_height,
+            .imageSubresource{
+                .aspectMask = image.aspect_mask & ~vk::ImageAspectFlagBits::eStencil,
+                .mipLevel = mip,
+                .baseArrayLayer = 0,
+                .layerCount = info.resources.layers,
+            },
+            .imageOffset = {0, 0, 0},
+            .imageExtent = {extent_width, extent_height, depth},
+        });
+        copy_size += mip_size;
+    }
+    if (buffer_copies.empty() || copy_size > info.guest_size) {
+        return;
+    }
+    const auto download =
+        runtime.GetStagingPool().Request(copy_size, MemoryType::HostCached, 16, true);
+    tile_manager.TileImage(image, buffer_copies, download.buffer, download.offset);
+    const u64 tick = scheduler.CurrentTick();
+    const u32 id = image_id.index;
+    scheduler.DeferOperation([this, info, download, label, tick, id] {
+        download.Invalidate();
+        std::string mips;
+        for (u32 mip = 0; mip < info.resources.levels; ++mip) {
+            const auto& layout = info.mips_layout[mip];
+            u64 count = 0;
+            for (u64 i = 0; i < layout.size; ++i) {
+                count += download.mapped[layout.offset + i] != 0;
+            }
+            mips += fmt::format(" {}={}", mip, count);
+        }
+        LOG_WARNING(Render_Vulkan,
+                    "PADDIAG probe {} id={} addr={:#x} {} {}x{} tick={} gpu_nonzero{}", label, id,
+                    info.guest_address, vk::to_string(info.pixel_format), info.size.width,
+                    info.size.height, tick, mips);
+        runtime.GetStagingPool().FreeDeferred(download);
+    });
+}
+
 void TextureCache::MarkAsMaybeDirty(ImageId image_id, Image& image) {
     if (image.cpu_hash == 0) {
         // Initialize hash
@@ -769,6 +823,9 @@ ImageId TextureCache::ExpandImage(const ImageInfo& info, ImageId image_id) {
     new_image.flags &= ~ImageFlagBits::Dirty;
     if (src_has_gpu_data) {
         runtime.CopyImage(&src_image, &new_image);
+    }
+    if (IsPadDiagImage(info)) {
+        PadDiagProbe(new_image_id, "expanded");
     }
     FreeImage(image_id);
 

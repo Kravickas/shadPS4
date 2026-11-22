@@ -119,6 +119,9 @@ static void LogPadDiagEncoder(const Shader::Info& stage, const auto& bindings, u
             desc.view_info.range.base.level, desc.view_info.range.extent.levels,
             static_cast<u32>(image.flags),
             PadDiagNonZeroBacking(info.guest_address, info.guest_size));
+        if (desc.type != VideoCore::TextureCache::BindingType::Storage) {
+            texture_cache.PadDiagProbe(image_id, "encoder src");
+        }
     }
 }
 
