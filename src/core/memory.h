@@ -3,10 +3,13 @@
 
 #pragma once
 
+#include <array>
+#include <atomic>
 #include <map>
 #include <mutex>
 #include <string>
 #include <string_view>
+#include <vector>
 #include "common/enum.h"
 #include "common/shared_first_mutex.h"
 #include "common/singleton.h"
@@ -256,7 +259,31 @@ public:
 
     void CopySparseMemory(VAddr source, u8* dest, u64 size);
 
+    /// Whether guest memory holds the given bytes, reading it like CopySparseMemory does.
+    bool CompareSparseMemory(VAddr source, const u8* data, u64 size);
+
     bool TryWriteBacking(void* address, const void* data, u64 size);
+
+    /// TryWriteBacking for data the GPU produced. These writes are counted, so that bytes read
+    /// from guest memory ahead of their use can be told from bytes the GPU has since replaced.
+    bool WriteBackingFromGpu(void* address, const void* data, u64 size);
+
+    /// Count of the WriteBackingFromGpu writes that have ended. To be read before the bytes.
+    u64 GpuWriteEpoch() const noexcept {
+        return gpu_write_epoch.load();
+    }
+
+    /// Whether no WriteBackingFromGpu write has ended since the epoch was read and none is in
+    /// progress.
+    bool IsFreeOfGpuWrites(u64 epoch) const noexcept {
+        // A write that ends between the two reads has changed the epoch before it stops
+        // counting as in progress.
+        return num_gpu_writes_active.load() == 0 && gpu_write_epoch.load() == epoch;
+    }
+
+    /// Whether a WriteBackingFromGpu write to the range has ended since the epoch was read or
+    /// is in progress.
+    bool IsGpuWrittenSince(u64 epoch, VAddr address, u64 size);
 
     void SetupMemoryRegions(u64 flexible_size, bool use_extended_mem1, bool use_extended_mem2);
 
@@ -370,6 +397,22 @@ private:
         }
     };
     std::array<PrtArea, 3> prt_areas{};
+
+    struct GpuWrite {
+        VAddr address;
+        u64 size;
+
+        bool Overlaps(VAddr test_address, u64 test_size) const {
+            return address < test_address + test_size && test_address < address + size;
+        }
+    };
+    static constexpr u64 NumGpuWrites = 256;
+    /// Range of the write that ended at each of the last epochs.
+    std::array<GpuWrite, NumGpuWrites> gpu_writes{};
+    std::vector<GpuWrite> gpu_writes_active;
+    std::mutex gpu_writes_mutex;
+    std::atomic<u32> num_gpu_writes_active{};
+    std::atomic<u64> gpu_write_epoch{};
 
     friend class ::Core::Devtools::Widget::MemoryMapViewer;
 };

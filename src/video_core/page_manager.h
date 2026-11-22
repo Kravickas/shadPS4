@@ -18,6 +18,18 @@ namespace VideoCore {
 struct UffdImpl;
 struct SignalImpl;
 
+/// The CPU access that faulted on a tracked page, decoded from the faulting instruction. Set by
+/// the signal handler for the duration of its readback on the faulting thread.
+struct FaultAccess {
+    VAddr rip;
+    u32 mnemonic; ///< ZydisMnemonic, 0 if the instruction was not decoded
+    u32 bytes;    ///< Size of the memory operand, 0 if unknown
+    bool lock;
+    bool rep;
+    bool valid;
+};
+inline thread_local FaultAccess current_fault_access{};
+
 enum class PageOp : s8 {
     None = 0,
     Track = 1,
@@ -45,6 +57,16 @@ public:
     void UpdatePageWatchersForRegion(VAddr base_addr, const Bounds& bounds,
                                      const RegionBits& write_mask, const RegionBits& read_mask,
                                      PageOp write_op, PageOp read_op) const;
+
+    /// Probe: pages the calling thread's watcher updates went over, and their protection calls.
+    /// The image counts are the part of UpdatePageWatchers, which only images use.
+    struct WatchCounts {
+        u64 pages;
+        u64 protects;
+        u64 image_pages;
+        u64 image_protects;
+    };
+    static WatchCounts WatchCountsOfThread() noexcept;
 
     /// Returns page aligned address.
     static constexpr VAddr GetPageAddr(VAddr addr) {

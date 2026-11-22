@@ -243,12 +243,13 @@ s32 ImageInfo::MipOf(const ImageInfo& info) const {
         return -1;
     }
 
-    // 2D block dimensions of both images should be the same.
+    // 2D block dimensions of both images should be the same, or this image covers the level's
+    // padded layout.
     const auto mip_w = std::max(info.size.width >> (mip + info_dim), 1u);
     const auto mip_h = std::max(info.size.height >> (mip + info_dim), 1u);
     const auto this_w = std::max(size.width >> this_dim, 1u);
     const auto this_h = std::max(size.height >> this_dim, 1u);
-    if ((this_w != mip_w) || (this_h != mip_h)) {
+    if (((this_w != mip_w) || (this_h != mip_h)) && !HasSameLevelLayout(info, mip)) {
         return -1;
     }
 
@@ -287,7 +288,8 @@ s32 ImageInfo::SliceOf(const ImageInfo& info, s32 mip) const {
     const auto this_w = std::max(size.width >> this_dim, 1u);
     const auto this_h = std::max(size.height >> this_dim, 1u);
     const auto this_p = std::max(pitch >> this_dim, 1u);
-    if ((this_w != mip_w) || (this_h != mip_h) || (this_p != mip_p)) {
+    if (((this_w != mip_w) || (this_h != mip_h) || (this_p != mip_p)) &&
+        !HasSameLevelLayout(info, mip)) {
         return -1;
     }
 

@@ -18,6 +18,8 @@ extern std::unique_ptr<AmdGpu::Liverpool> liverpool;
 
 namespace Libraries::VideoOut {
 
+using AmdGpu::PerfNs;
+
 constexpr static bool Is32BppPixelFormat(PixelFormat format) {
     switch (format) {
     case PixelFormat::A8R8G8B8Srgb:
@@ -69,6 +71,7 @@ void VideoOutDriver::Close(s32 handle) {
 
     // Clear port information
     std::memset(main_port.buffer_labels.data(), 0, sizeof(main_port.buffer_labels));
+    main_port.buffer_executed.fill(0);
     std::memset(main_port.groups.data(), 0, sizeof(main_port.groups));
     std::memset(&main_port.vblank_status, 0, sizeof(main_port.vblank_status));
     main_port.flip_status = FlipStatus{};
@@ -238,10 +241,14 @@ void VideoOutDriver::Flip(const Request& req) {
     presenter->SetHDR(req.port->is_hdr);
 
     // Present the frame.
+    const u64 present_t0 = PerfNs();
     presenter->Present(req.frame);
+    const u64 present_t1 = PerfNs();
 
     // Update flip status.
     auto* port = req.port;
+    const s32 prev_index = port->prev_index;
+    u64 label_ns = 0;
     {
         std::unique_lock lock{port->port_mutex};
         auto& flip_status = port->flip_status;
@@ -250,9 +257,6 @@ void VideoOutDriver::Flip(const Request& req) {
         flip_status.tsc = Libraries::Kernel::sceKernelReadTsc();
         flip_status.flip_arg = req.flip_arg;
         flip_status.current_buffer = req.index;
-        if (req.eop) {
-            --flip_status.gc_queue_num;
-        }
         --flip_status.flip_pending_num;
     }
 
@@ -268,11 +272,27 @@ void VideoOutDriver::Flip(const Request& req) {
         }
     }
 
-    // Reset prev flip label
+    // The previous buffer leaves the screen. Its label is cleared once no flip of it finished by
+    // the GPU is still waiting to be shown.
     if (port->prev_index != -1) {
-        port->buffer_labels[port->prev_index] = 0;
-        port->SignalVoLabel();
+        bool released;
+        {
+            std::unique_lock lock{port->port_mutex};
+            released = --port->buffer_executed[port->prev_index] == 0;
+            if (released) {
+                port->buffer_labels[port->prev_index] = 0;
+                label_ns = PerfNs();
+            }
+        }
+        if (released) {
+            port->SignalVoLabel();
+        }
     }
+    LOG_INFO(Lib_VideoOut,
+             "PERF flip idx={} prev={} arg={} eop={} t_submit={} t_queued={} t_tick={} "
+             "t_present0={} t_present1={} t_label={}",
+             req.index, prev_index, req.flip_arg, req.eop, req.submit_ns, req.queued_ns,
+             vblank_tick_ns, present_t0, present_t1, label_ns);
     // save to prev buf index
     port->prev_index = req.index;
 }
@@ -293,29 +313,36 @@ bool VideoOutDriver::SubmitFlip(VideoOutPort* port, s32 index, s64 flip_arg,
                                 bool is_eop /*= false*/) {
     {
         std::unique_lock lock{port->port_mutex};
-        if (index != -1 && port->flip_status.flip_pending_num > 16) {
-            LOG_ERROR(Lib_VideoOut, "Flip queue is full");
-            return false;
+        // An EOP flip was admitted and counted when it was submitted.
+        if (!is_eop) {
+            if (index != -1 && port->flip_status.flip_pending_num > 16) {
+                LOG_ERROR(Lib_VideoOut, "Flip queue is full");
+                return false;
+            }
+            ++port->flip_status.flip_pending_num;
+            // An immediate flip marks its buffer in use and finished at submission.
+            if (index != -1) {
+                port->buffer_labels[index] = 1;
+                ++port->buffer_executed[index];
+            }
         }
-
-        if (is_eop) {
-            ++port->flip_status.gc_queue_num;
-        }
-        ++port->flip_status.flip_pending_num; // integral GPU and CPU pending flips counter
         port->flip_status.submit_tsc = Libraries::Kernel::sceKernelReadTsc();
     }
 
     if (!is_eop) {
         // Non EOP flips can arrive from any thread so ask GPU thread to perform them
-        liverpool->SendCommand([=, this]() { SubmitFlipInternal(port, index, flip_arg, is_eop); });
+        const u64 submit_ns = PerfNs();
+        liverpool->SendCommand(
+            [=, this]() { SubmitFlipInternal(port, index, flip_arg, is_eop, submit_ns); });
     } else {
-        SubmitFlipInternal(port, index, flip_arg, is_eop);
+        SubmitFlipInternal(port, index, flip_arg, is_eop, PerfNs());
     }
 
     return true;
 }
 
-void VideoOutDriver::SubmitFlipInternal(VideoOutPort* port, s32 index, s64 flip_arg, bool is_eop) {
+void VideoOutDriver::SubmitFlipInternal(VideoOutPort* port, s32 index, s64 flip_arg, bool is_eop,
+                                        u64 submit_ns) {
     Vulkan::Frame* frame;
     if (index == -1) {
         frame = presenter->PrepareBlankFrame(false);
@@ -333,6 +360,8 @@ void VideoOutDriver::SubmitFlipInternal(VideoOutPort* port, s32 index, s64 flip_
         .flip_arg = flip_arg,
         .index = index,
         .eop = is_eop,
+        .submit_ns = submit_ns,
+        .queued_ns = PerfNs(),
     });
 }
 
@@ -357,6 +386,7 @@ void VideoOutDriver::PresentThread(std::stop_token token) {
 
     while (!token.stop_requested()) {
         timer.Start();
+        vblank_tick_ns = PerfNs();
 
         if (DebugState.IsGuestThreadsPaused()) {
             DrawLastFrame();

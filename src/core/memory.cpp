@@ -1,6 +1,8 @@
 // SPDX-FileCopyrightText: Copyright 2025-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <algorithm>
+#include <cstring>
 #include <boost/container/small_vector.hpp>
 #include "common/alignment.h"
 #include "common/assert.h"
@@ -162,6 +164,27 @@ void MemoryManager::CopySparseMemory(VAddr virtual_addr, u8* dest, u64 size) {
     }
 }
 
+bool MemoryManager::CompareSparseMemory(VAddr virtual_addr, const u8* data, u64 size) {
+    const auto& backing_pages = impl.BackingPages();
+    while (size) {
+        const u64 page = virtual_addr >> GUEST_PAGE_BITS;
+        const u64 offset_in_page = virtual_addr % GUEST_PAGE_SIZE;
+        const u64 compare_size = std::min<u64>(GUEST_PAGE_SIZE - offset_in_page, size);
+        if (auto* entry = backing_pages.find(page); entry && *entry) {
+            if (std::memcmp(data, *entry + offset_in_page, compare_size) != 0) {
+                return false;
+            }
+        } else if (std::any_of(data, data + compare_size, [](u8 byte) { return byte != 0; })) {
+            // CopySparseMemory reads memory without backing as zeroes.
+            return false;
+        }
+        size -= compare_size;
+        virtual_addr += compare_size;
+        data += compare_size;
+    }
+    return true;
+}
+
 bool MemoryManager::TryWriteBacking(void* address, const void* data, u64 size) {
     const VAddr virtual_addr = std::bit_cast<VAddr>(address);
     std::shared_lock lk{mutex};
@@ -202,6 +225,44 @@ bool MemoryManager::TryWriteBacking(void* address, const void* data, u64 size) {
     }
 
     return true;
+}
+
+bool MemoryManager::WriteBackingFromGpu(void* address, const void* data, u64 size) {
+    const GpuWrite write{std::bit_cast<VAddr>(address), size};
+    {
+        std::scoped_lock lk{gpu_writes_mutex};
+        gpu_writes_active.push_back(write);
+        ++num_gpu_writes_active;
+    }
+    const bool is_written = TryWriteBacking(address, data, size);
+    {
+        std::scoped_lock lk{gpu_writes_mutex};
+        const auto it = std::ranges::find_if(gpu_writes_active, [&](const GpuWrite& active) {
+            return active.address == write.address && active.size == write.size;
+        });
+        gpu_writes_active.erase(it);
+        const u64 epoch = gpu_write_epoch.load(std::memory_order_relaxed) + 1;
+        gpu_writes[epoch % NumGpuWrites] = write;
+        // In this order for IsFreeOfGpuWrites.
+        gpu_write_epoch.store(epoch);
+        --num_gpu_writes_active;
+    }
+    return is_written;
+}
+
+bool MemoryManager::IsGpuWrittenSince(u64 epoch, VAddr address, u64 size) {
+    std::scoped_lock lk{gpu_writes_mutex};
+    const u64 current = gpu_write_epoch.load(std::memory_order_relaxed);
+    if (current - epoch > NumGpuWrites) {
+        return true;
+    }
+    for (u64 later = epoch + 1; later <= current; ++later) {
+        if (gpu_writes[later % NumGpuWrites].Overlaps(address, size)) {
+            return true;
+        }
+    }
+    return std::ranges::any_of(
+        gpu_writes_active, [&](const GpuWrite& active) { return active.Overlaps(address, size); });
 }
 
 PAddr MemoryManager::PoolExpand(PAddr search_start, PAddr search_end, u64 size, u64 alignment) {

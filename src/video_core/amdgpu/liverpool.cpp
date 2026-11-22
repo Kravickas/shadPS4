@@ -3,9 +3,11 @@
 
 #include <boost/preprocessor/stringize.hpp>
 
+#include "common/arch.h"
 #include "common/assert.h"
 #include "common/debug.h"
 #include "common/polyfill_thread.h"
+#include "common/sampling_profiler.h"
 #include "common/scope_exit.h"
 #include "common/thread.h"
 #include "core/debug_state.h"
@@ -16,8 +18,15 @@
 #include "core/platform.h"
 #include "video_core/amdgpu/liverpool.h"
 #include "video_core/amdgpu/pm4_cmds.h"
+#include "video_core/page_manager.h"
 #include "video_core/renderdoc.h"
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
+
+#if _MSC_VER
+#include <intrin.h>
+#elif defined(ARCH_X86_64)
+#include <xmmintrin.h>
+#endif
 
 namespace AmdGpu {
 
@@ -117,12 +126,15 @@ void Liverpool::ProcessCommands() {
             command_queue.pop();
             --num_commands;
         }
+        const CpPerfScope perf_command{cp_perf.commands_ns};
+        ++cp_perf.commands;
         callback();
     }
 }
 
 void Liverpool::Process(std::stop_token stoken) {
     Common::SetCurrentThreadName("shadPS4:GpuCommandProcessor");
+    Common::SamplingProfiler::RegisterCurrentThread("GpuCommandProcessor");
     gpu_id = std::this_thread::get_id();
 #ifdef __linux__
     gpu_tid = gettid();
@@ -140,6 +152,10 @@ void Liverpool::Process(std::stop_token stoken) {
 
         VideoCore::StartCapture();
 
+        const u64 cycle_t0 = PerfNs();
+        cp_perf = {};
+        const auto watch_t0 = VideoCore::PageManager::WatchCountsOfThread();
+        perf_bind_check = (perf_cycles++ & (PerfBindCheckRate - 1)) == 0;
         curr_qid = -1;
 
         while ((num_submits || num_commands) && !stoken.stop_requested()) {
@@ -162,6 +178,7 @@ void Liverpool::Process(std::stop_token stoken) {
 
             if (task.done()) {
                 task.destroy();
+                ++cp_perf.tasks;
 
                 std::scoped_lock lock{queue.m_access};
                 queue.submits.pop();
@@ -172,6 +189,8 @@ void Liverpool::Process(std::stop_token stoken) {
             }
         }
 
+        const u64 flush_t0 = PerfNs();
+        const bool was_submit_done = submit_done;
         if (submit_done) {
             VideoCore::EndCapture();
             if (rasterizer) {
@@ -179,6 +198,165 @@ void Liverpool::Process(std::stop_token stoken) {
                 rasterizer->Flush();
             }
             submit_done = false;
+        }
+        const u64 cycle_t1 = PerfNs();
+        // The profile is of gameplay: samples are taken while the last cycle had its draw count.
+        const bool is_gameplay = cp_perf.draws >= PerfProfiledDraws;
+        Common::SamplingProfiler::SetEnabled(is_gameplay);
+        const auto watch_t1 = VideoCore::PageManager::WatchCountsOfThread();
+        cp_perf.pm_pages = watch_t1.pages - watch_t0.pages;
+        cp_perf.pm_protects = watch_t1.protects - watch_t0.protects;
+        cp_perf.pm_image_pages = watch_t1.image_pages - watch_t0.image_pages;
+        cp_perf.pm_image_protects = watch_t1.image_protects - watch_t0.image_protects;
+        LOG_INFO(
+            Render,
+            "PERF cp t0={} t1={} tasks={} submit_done={} flush_us={} vo_block_us={} "
+            "vo_blocks={} vo_spin_us={} mem_spin_us={} mem_spins={} asc_spin_us={} "
+            "draws={} draw_us={} draw_pipeline_us={} draw_bind_us={} dispatches={} "
+            "dispatch_us={} dispatch_pipeline_us={} copy_us={} fence_us={} eop_us={} "
+            "flushes={} host_flush_us={} rb_downloads={} rb_kb={} rb_finish_us={} "
+            "img_downloads={} img_finish_us={} rbw_n={} rbw_us={} rbw_max_us={} "
+            "draw_prep_us={} draw_begin_us={} bind_buffers_us={} bind_textures_us={} "
+            "dma_sync_us={} eos={} eos_us={} commands={} commands_us={} draw_pre_us={} "
+            "draw_vb_us={} draw_barrier_us={} draw_desc_us={} draw_dyn_us={} draw_rp_us={} "
+            "draw_cmd_us={} draw_barriers={} render_passes={} zpass_dumps={} obtains={} "
+            "obtain_stream={} obtain_stream_kb={} obtain_written={} obtain_uploads={} "
+            "obtain_upload_kb={} obtain_texel={} obtain_texel_image={} obtain_stream_reused={} "
+            "obtain_stream_reused_kb={} pipe_key_us={} pipe_stages_us={} pipe_changes={} "
+            "stg_params_us={} stg_runtime_us={} stg_lookup_us={} stg_flatbuf_us={} "
+            "stg_spec_us={} stg_find_us={} stg_calls={} stg_perms_scanned={} "
+            "vi_inputs_us={} "
+            "vi_obtain_us={} vi_bind_us={} index_us={} cmd_record_us={} reset_images_us={} "
+            "reset_buffers_us={} bound_buffers={} bound_images={} tex_lookups={} tex_hits={} "
+            "tex_miss_key={} tex_miss_generation={} tex_miss_unreusable={} "
+            "tex_registry_changes={} tex_find_images={} tex_reg_new={} tex_reg_depth={} "
+            "tex_reg_expand={} tex_reg_merge={} tex_reg_stencil={} tex_free_unmap={} "
+            "tex_free_pool={} tex_free_tile={} tex_free_chance={} tex_free_target={} "
+            "tex_free_mip={} tex_free_wrong={} tex_free_gc={} pm_pages={} pm_protects={} "
+            "pm_image_pages={} pm_image_protects={} tex_alias_swaps={} tex_find_texture={} "
+            "tex_find_storage={} tex_find_target={} tex_find_depth={} tex_find_vo={} up_16k={} "
+            "up_64k={} up_256k={} up_big={} up_16k_kb={} up_64k_kb={} up_256k_kb={} up_big_kb={} "
+            "ob_16k={} ob_64k={} ob_256k={} ob_big={} db_miss_unreusable={} db_miss_generation={} "
+            "db_miss_buffer={} db_miss_view={} db_miss_htile_hint={} db_miss_swap={} "
+            "db_un_registry={} db_un_swap={} db_un_imperfect={} resident_hits={} gf_writes={} "
+            "gf_write_us={} gf_write_next_page={} gf_reads={} gf_read_us={} la_solo_runs={} "
+            "emulated={} stg_same_inputs={} vk_vi_us={} vk_index_us={} vk_desc_us={} "
+            "vk_dyn_us={} vk_draw_us={} rec_cmds={} rec_kb={} rec_publishes={} rec_wakes={} "
+            "rec_syncs={} rec_sync_us={} rec_space_waits={} rec_run_us={} rec_sleeps={} "
+            "sc_total_us={} sc_compare_us={} sc_guest_us={} sc_write_us={} rec_stream_write_us={} "
+            "run_n={} run_d1={} run_d2={} run_d4={} run_d8={} run_d16={} run_d32={} "
+            "state_packets={} state_words={} la_runs={} la_results={} la_waits={} la_wait_us={} "
+            "la_sync_waits={} la_sync_us={} la_copies={} la_compares={} la_mismatches={} "
+            "la_early={} la_scan_us={} la_sleeps={} la_lookups_used={} la_lookups_rejected={} "
+            "la_lookup_us={} la_lookups_checked={} la_stream_us={} sa_ahead_known={} "
+            "sa_ahead_same={} "
+            "sa_ahead_copied={} sa_ahead_kb={} sa_ahead_full={} sa_used={} sa_stale={} "
+            "sa_checks={} sa_diffs={} tx_first_us={} tx_second_us={} tx_samplers_us={} "
+            "dispatch_hle_us={} dispatch_bind_us={} dispatch_hles={} dispatch_skips={} "
+            "dispatch_bindbuf_us={} dispatch_bindtex_us={} ow_obtain_us={} ow_inval_us={} "
+            "ow_kb={} ow_dirty_us={} ow_sync_us={} ow_lock_us={} ow_walk_us={} ow_mark_us={} "
+            "ow_upload_us={} ow_uploads={} ow_upload_kb={} ow_watch_pages={} ow_protects={} "
+            "bc_on={} bc_images={} bc_images_same={} "
+            "bc_images_equal={} bc_image_stages={} bc_image_stages_same={} "
+            "bc_image_stages_quiet={} bc_draws={} bc_draws_state_same={}",
+            cycle_t0, cycle_t1, cp_perf.tasks, was_submit_done, (cycle_t1 - flush_t0) / 1000,
+            cp_perf.vo_block_ns / 1000, cp_perf.vo_blocks, cp_perf.vo_spin_ns / 1000,
+            cp_perf.mem_spin_ns / 1000, cp_perf.mem_spins, cp_perf.asc_spin_ns / 1000,
+            cp_perf.draws, cp_perf.draw_ns / 1000, cp_perf.draw_pipeline_ns / 1000,
+            cp_perf.draw_bind_ns / 1000, cp_perf.dispatches, cp_perf.dispatch_ns / 1000,
+            cp_perf.dispatch_pipeline_ns / 1000, cp_perf.copy_ns / 1000, cp_perf.fence_ns / 1000,
+            cp_perf.eop_ns / 1000, cp_perf.flushes, cp_perf.flush_ns / 1000, cp_perf.rb_downloads,
+            cp_perf.rb_bytes / 1024, cp_perf.rb_finish_ns / 1000, cp_perf.img_downloads,
+            cp_perf.img_finish_ns / 1000,
+            readback_wait.count.exchange(0, std::memory_order_relaxed),
+            readback_wait.wait_ns.exchange(0, std::memory_order_relaxed) / 1000,
+            readback_wait.max_ns.exchange(0, std::memory_order_relaxed) / 1000,
+            cp_perf.draw_prep_ns / 1000, cp_perf.draw_begin_ns / 1000,
+            cp_perf.bind_buffers_ns / 1000, cp_perf.bind_textures_ns / 1000,
+            cp_perf.dma_sync_ns / 1000, cp_perf.eos, cp_perf.eos_ns / 1000, cp_perf.commands,
+            cp_perf.commands_ns / 1000, cp_perf.draw_pre_ns / 1000, cp_perf.draw_vb_ns / 1000,
+            cp_perf.draw_barrier_ns / 1000, cp_perf.draw_desc_ns / 1000, cp_perf.draw_dyn_ns / 1000,
+            cp_perf.draw_rp_ns / 1000, cp_perf.draw_cmd_ns / 1000, cp_perf.draw_barriers,
+            cp_perf.render_passes, cp_perf.zpass_dumps, cp_perf.obtains, cp_perf.obtain_stream,
+            cp_perf.obtain_stream_bytes / 1024, cp_perf.obtain_written, cp_perf.obtain_uploads,
+            cp_perf.obtain_upload_bytes / 1024, cp_perf.obtain_texel, cp_perf.obtain_texel_image,
+            cp_perf.obtain_stream_reused, cp_perf.obtain_stream_reused_bytes / 1024,
+            cp_perf.pipe_key_ns / 1000, cp_perf.pipe_stages_ns / 1000, cp_perf.pipe_changes,
+            cp_perf.stg_params_ns / 1000, cp_perf.stg_runtime_ns / 1000,
+            cp_perf.stg_lookup_ns / 1000, cp_perf.stg_flatbuf_ns / 1000, cp_perf.stg_spec_ns / 1000,
+            cp_perf.stg_find_ns / 1000, cp_perf.stg_calls, cp_perf.stg_perms_scanned,
+            cp_perf.vi_inputs_ns / 1000, cp_perf.vi_obtain_ns / 1000, cp_perf.vi_bind_ns / 1000,
+            cp_perf.index_ns / 1000, cp_perf.cmd_record_ns / 1000, cp_perf.reset_images_ns / 1000,
+            cp_perf.reset_buffers_ns / 1000, cp_perf.bound_buffers, cp_perf.bound_images,
+            cp_perf.tex_lookups, cp_perf.tex_hits, cp_perf.tex_miss_key,
+            cp_perf.tex_miss_generation, cp_perf.tex_miss_unreusable, cp_perf.tex_registry_changes,
+            cp_perf.tex_find_images, cp_perf.tex_sites[0], cp_perf.tex_sites[1],
+            cp_perf.tex_sites[2], cp_perf.tex_sites[3], cp_perf.tex_sites[4], cp_perf.tex_sites[5],
+            cp_perf.tex_sites[6], cp_perf.tex_sites[7], cp_perf.tex_sites[8], cp_perf.tex_sites[9],
+            cp_perf.tex_sites[10], cp_perf.tex_sites[11], cp_perf.tex_sites[12], cp_perf.pm_pages,
+            cp_perf.pm_protects, cp_perf.pm_image_pages, cp_perf.pm_image_protects,
+            cp_perf.tex_alias_swaps, cp_perf.tex_find_types[0], cp_perf.tex_find_types[1],
+            cp_perf.tex_find_types[2], cp_perf.tex_find_types[3], cp_perf.tex_find_types[4],
+            cp_perf.upload_sizes[0], cp_perf.upload_sizes[1], cp_perf.upload_sizes[2],
+            cp_perf.upload_sizes[3], cp_perf.upload_size_bytes[0] / 1024,
+            cp_perf.upload_size_bytes[1] / 1024, cp_perf.upload_size_bytes[2] / 1024,
+            cp_perf.upload_size_bytes[3] / 1024, cp_perf.cached_obtain_sizes[0],
+            cp_perf.cached_obtain_sizes[1], cp_perf.cached_obtain_sizes[2],
+            cp_perf.cached_obtain_sizes[3], cp_perf.db_misses[0], cp_perf.db_misses[1],
+            cp_perf.db_misses[2], cp_perf.db_misses[3], cp_perf.db_misses[4], cp_perf.db_misses[5],
+            cp_perf.db_unreusable[0], cp_perf.db_unreusable[1], cp_perf.db_unreusable[2],
+            cp_perf.resident_hits, guest_faults.writes.exchange(0, std::memory_order_relaxed),
+            guest_faults.write_ns.exchange(0, std::memory_order_relaxed) / 1000,
+            guest_faults.next_page_writes.exchange(0, std::memory_order_relaxed),
+            guest_faults.reads.exchange(0, std::memory_order_relaxed),
+            guest_faults.read_ns.exchange(0, std::memory_order_relaxed) / 1000,
+            cp_perf.la_solo_runs, readback_wait.emulated.exchange(0, std::memory_order_relaxed),
+            cp_perf.stg_same_inputs, cp_perf.vk_vi_ns / 1000, cp_perf.vk_index_ns / 1000,
+            cp_perf.vk_desc_ns / 1000, cp_perf.vk_dyn_ns / 1000, cp_perf.vk_draw_ns / 1000,
+            cp_perf.rec_cmds, cp_perf.rec_bytes / 1024, cp_perf.rec_publishes, cp_perf.rec_wakes,
+            cp_perf.rec_syncs, cp_perf.rec_sync_ns / 1000, cp_perf.rec_space_waits,
+            recorder_perf.run_ns.exchange(0, std::memory_order_relaxed) / 1000,
+            recorder_perf.sleeps.exchange(0, std::memory_order_relaxed), cp_perf.sc_total_ns / 1000,
+            cp_perf.sc_compare_ns / 1000, cp_perf.sc_guest_ns / 1000, cp_perf.sc_write_ns / 1000,
+            recorder_perf.stream_write_ns.exchange(0, std::memory_order_relaxed) / 1000,
+            cp_perf.run_n, cp_perf.run_draws[0], cp_perf.run_draws[1], cp_perf.run_draws[2],
+            cp_perf.run_draws[3], cp_perf.run_draws[4], cp_perf.run_draws[5], cp_perf.state_packets,
+            cp_perf.state_words, cp_perf.la_runs, cp_perf.la_results, cp_perf.la_waits,
+            cp_perf.la_wait_ns / 1000, cp_perf.la_sync_waits, cp_perf.la_sync_ns / 1000,
+            cp_perf.la_copies, cp_perf.la_compares, cp_perf.la_mismatches, cp_perf.la_early,
+            lookahead_perf.scan_ns.exchange(0, std::memory_order_relaxed) / 1000,
+            lookahead_perf.sleeps.exchange(0, std::memory_order_relaxed), cp_perf.la_lookups_used,
+            cp_perf.la_lookups_rejected, cp_perf.la_lookup_ns / 1000, cp_perf.la_lookups_checked,
+            cp_perf.la_stream_ns / 1000, cp_perf.sa_ahead_known, cp_perf.sa_ahead_same,
+            cp_perf.sa_ahead_copied, cp_perf.sa_ahead_bytes / 1024, cp_perf.sa_ahead_full,
+            cp_perf.sa_used, cp_perf.sa_stale, cp_perf.sa_checks, cp_perf.sa_diffs,
+            cp_perf.tx_first_ns / 1000, cp_perf.tx_second_ns / 1000, cp_perf.tx_samplers_ns / 1000,
+            cp_perf.dispatch_hle_ns / 1000, cp_perf.dispatch_bind_ns / 1000, cp_perf.dispatch_hles,
+            cp_perf.dispatch_skips, cp_perf.dispatch_bindbuf_ns / 1000,
+            cp_perf.dispatch_bindtex_ns / 1000, cp_perf.ow_obtain_ns / 1000,
+            cp_perf.ow_inval_ns / 1000, cp_perf.ow_bytes / 1024, cp_perf.ow_dirty_ns / 1000,
+            cp_perf.ow_sync_ns / 1000, cp_perf.ow_lock_ns / 1000, cp_perf.ow_walk_ns / 1000,
+            cp_perf.ow_mark_ns / 1000, cp_perf.ow_upload_ns / 1000, cp_perf.ow_uploads,
+            cp_perf.ow_upload_bytes / 1024, cp_perf.ow_watch_pages, cp_perf.ow_protects,
+            perf_bind_check ? 1 : 0, cp_perf.bc_images, cp_perf.bc_images_same,
+            cp_perf.bc_images_equal, cp_perf.bc_image_stages, cp_perf.bc_image_stages_same,
+            cp_perf.bc_image_stages_quiet, cp_perf.bc_draws, cp_perf.bc_draws_state_same);
+        if (++perf_run_log_cycles == 2048) {
+            perf_run_log_cycles = 0;
+            if (is_gameplay && perf_tex_site_refills < PerfTexSiteRefills) {
+                ++perf_tex_site_refills;
+                perf_tex_site_budget.store(PerfTexSiteLines, std::memory_order_relaxed);
+                perf_db_site_budget.store(PerfDbSiteLines, std::memory_order_relaxed);
+                perf_upload_site_budget.store(PerfUploadSiteLines, std::memory_order_relaxed);
+            }
+            std::string enders;
+            for (u32 op = 0; op < perf_run_enders.size(); ++op) {
+                if (perf_run_enders[op] != 0) {
+                    enders += fmt::format(" {:#x}={}", op, perf_run_enders[op]);
+                }
+            }
+            perf_run_enders.fill(0);
+            LOG_INFO(Render, "PERF run_enders{}", enders);
         }
 
         Platform::IrqC::Instance()->Signal(Platform::InterruptId::GpuIdle);
@@ -272,8 +450,714 @@ Liverpool::Task Liverpool::ProcessCeUpdate(std::span<const u32> ccb) {
     FIBER_EXIT;
 }
 
+namespace {
+
+void ThreadPause() {
+#if defined(ARCH_X86_64)
+    _mm_pause();
+#elif _MSC_VER
+    __yield();
+#else
+    asm("yield");
+#endif
+}
+
+template <typename Packet>
+constexpr std::size_t PacketWords = sizeof(Packet) / sizeof(u32);
+
+} // Anonymous namespace
+
+namespace {
+
+// Values of Liverpool::PacketClass.
+constexpr u8 PacketState = 0;
+constexpr u8 PacketDraw = 1;
+constexpr u8 PacketOther = 2;
+constexpr u8 PacketDependsOnPayload = 0xff;
+
+/// Class of the packets of each opcode, unless it depends on their payload.
+constexpr std::array<u8, 256> PacketClasses = [] {
+    using enum PM4ItOpcode;
+    std::array<u8, 256> classes{};
+    classes.fill(PacketOther);
+    for (const PM4ItOpcode opcode : {Nop, EventWrite, DmaData}) {
+        classes[static_cast<u32>(opcode)] = PacketDependsOnPayload;
+    }
+    for (const PM4ItOpcode opcode :
+         {ContextControl, ClearState, SetConfigReg, SetContextReg, SetShReg, SetUconfigReg,
+          IndexType, NumInstances, IndexBase, IndexBufferSize, SetBase, AcquireMem, PfpSyncMe}) {
+        classes[static_cast<u32>(opcode)] = PacketState;
+    }
+    for (const PM4ItOpcode opcode :
+         {DrawIndex2, DrawIndexOffset2, DrawIndexAuto, DrawIndirect, DrawIndirectCountMulti,
+          DrawIndirectMulti, DrawIndexIndirect, DrawIndexIndirectMulti, DrawIndexIndirectCountMulti,
+          DispatchDirect, DispatchIndirect}) {
+        classes[static_cast<u32>(opcode)] = PacketDraw;
+    }
+    return classes;
+}();
+
+} // Anonymous namespace
+
+Liverpool::PacketClass Liverpool::ClassifyPacket(const PM4Header* header,
+                                                 bool guest_markers_enabled) {
+    static_assert(static_cast<u8>(PacketClass::State) == PacketState &&
+                  static_cast<u8>(PacketClass::Draw) == PacketDraw &&
+                  static_cast<u8>(PacketClass::Other) == PacketOther);
+    const u8 fixed_class = PacketClasses[static_cast<u32>(header->type3.opcode.Value()) & 0xff];
+    if (fixed_class != PacketDependsOnPayload) [[likely]] {
+        return static_cast<PacketClass>(fixed_class);
+    }
+    switch (header->type3.opcode) {
+    case PM4ItOpcode::Nop: {
+        const auto* nop = reinterpret_cast<const PM4CmdNop*>(header);
+        if (nop->header.count.Value() == 0) {
+            return PacketClass::State;
+        }
+        switch (nop->data_block[0]) {
+        case PM4CmdNop::PayloadType::PatchedFlip:
+            return PacketClass::Other;
+        case PM4CmdNop::PayloadType::DebugMarkerPush:
+        case PM4CmdNop::PayloadType::DebugColorMarkerPush:
+        case PM4CmdNop::PayloadType::DebugMarkerPop:
+            return guest_markers_enabled ? PacketClass::Other : PacketClass::State;
+        default:
+            return PacketClass::State;
+        }
+    }
+    case PM4ItOpcode::EventWrite: {
+        const auto* event = reinterpret_cast<const PM4CmdEventWrite*>(header);
+        const bool dumps_counters = event->event_index.Value() == EventIndex::ZpassDone &&
+                                    event->event_type.Value() == EventType::PixelPipeStatDump;
+        return dumps_counters ? PacketClass::Other : PacketClass::State;
+    }
+    case PM4ItOpcode::DmaData: {
+        const auto* dma_data = reinterpret_cast<const PM4DmaData*>(header);
+        return dma_data->dst_addr_lo == 0x3022C ? PacketClass::State : PacketClass::Other;
+    }
+    default:
+        return PacketClass::Other;
+    }
+}
+
+bool Liverpool::ChangesStateRegs(const PM4Header* header) const {
+    u32 base;
+    switch (header->type3.opcode) {
+    case PM4ItOpcode::ClearState:
+        return true;
+    case PM4ItOpcode::SetConfigReg:
+        base = Regs::ConfigRegWordOffset;
+        break;
+    case PM4ItOpcode::SetContextReg:
+        base = Regs::ContextRegWordOffset;
+        break;
+    case PM4ItOpcode::SetUconfigReg:
+        base = Regs::UconfigRegWordOffset;
+        break;
+    default:
+        return false;
+    }
+    const auto* set_data = reinterpret_cast<const PM4CmdSetData*>(header);
+    return std::memcmp(&regs.reg_array[base + set_data->reg_offset], header + 2,
+                       (header->type3.NumWords() - 1) * sizeof(u32)) != 0;
+}
+
+void Liverpool::ApplyPacketState(const GfxState& state, const PM4Header* header) {
+    Regs& regs = state.regs;
+    const u32 count = header->type3.NumWords();
+    switch (header->type3.opcode) {
+    case PM4ItOpcode::ClearState: {
+        regs.SetDefaults();
+        break;
+    }
+    case PM4ItOpcode::SetConfigReg: {
+        const auto* set_data = reinterpret_cast<const PM4CmdSetData*>(header);
+        const auto reg_addr = Regs::ConfigRegWordOffset + set_data->reg_offset;
+        const auto* payload = reinterpret_cast<const u32*>(header + 2);
+        std::memcpy(&regs.reg_array[reg_addr], payload, (count - 1) * sizeof(u32));
+        break;
+    }
+    case PM4ItOpcode::SetContextReg: {
+        const auto* set_data = reinterpret_cast<const PM4CmdSetData*>(header);
+        const auto reg_addr = Regs::ContextRegWordOffset + set_data->reg_offset;
+        const auto* payload = reinterpret_cast<const u32*>(header + 2);
+
+        std::memcpy(&regs.reg_array[reg_addr], payload, (count - 1) * sizeof(u32));
+
+        // In the case of HW, render target memory has alignment as color block operates on
+        // tiles. There is no information of actual resource extents stored in CB context
+        // regs, so any deduction of it from slices/pitch will lead to a larger surface created.
+        // The same applies to the depth targets. Fortunately, the guest always sends
+        // a trailing NOP packet right after the context regs setup, so we can use the heuristic
+        // below and extract the hint to determine actual resource dims.
+
+        switch (reg_addr) {
+        case ContextRegs::CbColor0Base:
+        case ContextRegs::CbColor1Base:
+        case ContextRegs::CbColor2Base:
+        case ContextRegs::CbColor3Base:
+        case ContextRegs::CbColor4Base:
+        case ContextRegs::CbColor5Base:
+        case ContextRegs::CbColor6Base:
+        case ContextRegs::CbColor7Base: {
+            const auto col_buf_id = (reg_addr - ContextRegs::CbColor0Base) /
+                                    (ContextRegs::CbColor1Base - ContextRegs::CbColor0Base);
+            ASSERT(col_buf_id < NUM_COLOR_BUFFERS);
+
+            const auto nop_offset = header->type3.count;
+            if (nop_offset == 0x0e || nop_offset == 0x0d || nop_offset == 0x0b) {
+                ASSERT_MSG(payload[nop_offset] == 0xc0001000,
+                           "NOP hint is missing in CB setup sequence");
+                state.last_cb_extent[col_buf_id].raw = payload[nop_offset + 1];
+            } else {
+                state.last_cb_extent[col_buf_id].raw = 0;
+            }
+            break;
+        }
+        case ContextRegs::CbColor0Cmask:
+        case ContextRegs::CbColor1Cmask:
+        case ContextRegs::CbColor2Cmask:
+        case ContextRegs::CbColor3Cmask:
+        case ContextRegs::CbColor4Cmask:
+        case ContextRegs::CbColor5Cmask:
+        case ContextRegs::CbColor6Cmask:
+        case ContextRegs::CbColor7Cmask: {
+            const auto col_buf_id = (reg_addr - ContextRegs::CbColor0Cmask) /
+                                    (ContextRegs::CbColor1Cmask - ContextRegs::CbColor0Cmask);
+            ASSERT(col_buf_id < NUM_COLOR_BUFFERS);
+
+            const auto nop_offset = header->type3.count;
+            if (nop_offset == 0x04) {
+                ASSERT_MSG(payload[nop_offset] == 0xc0001000,
+                           "NOP hint is missing in CB setup sequence");
+                state.last_cb_extent[col_buf_id].raw = payload[nop_offset + 1];
+            }
+            break;
+        }
+        case ContextRegs::DbZInfo: {
+            if (header->type3.count == 8) {
+                ASSERT_MSG(payload[20] == 0xc0001000, "NOP hint is missing in DB setup sequence");
+                state.last_db_extent.raw = payload[21];
+            } else {
+                state.last_db_extent.raw = 0;
+            }
+            break;
+        }
+        default:
+            break;
+        }
+        break;
+    }
+    case PM4ItOpcode::SetShReg: {
+        const auto* set_data = reinterpret_cast<const PM4CmdSetData*>(header);
+        const auto set_size = (count - 1) * sizeof(u32);
+
+        if (set_data->reg_offset >= 0x200 &&
+            set_data->reg_offset <= (0x200 + sizeof(ComputeProgram) / 4)) {
+            ASSERT(set_size <= sizeof(ComputeProgram));
+            auto* addr = reinterpret_cast<u32*>(&state.cs_state) + (set_data->reg_offset - 0x200);
+            std::memcpy(addr, header + 2, set_size);
+        } else {
+            std::memcpy(&regs.reg_array[Regs::ShRegWordOffset + set_data->reg_offset], header + 2,
+                        set_size);
+        }
+        break;
+    }
+    case PM4ItOpcode::SetUconfigReg: {
+        const auto* set_data = reinterpret_cast<const PM4CmdSetData*>(header);
+        std::memcpy(&regs.reg_array[Regs::UconfigRegWordOffset + set_data->reg_offset], header + 2,
+                    (count - 1) * sizeof(u32));
+        break;
+    }
+    case PM4ItOpcode::IndexType: {
+        const auto* index_type = reinterpret_cast<const PM4CmdDrawIndexType*>(header);
+        regs.index_buffer_type.raw = index_type->raw;
+        break;
+    }
+    case PM4ItOpcode::NumInstances: {
+        const auto* num_instances = reinterpret_cast<const PM4CmdDrawNumInstances*>(header);
+        regs.num_instances.num_instances = num_instances->num_instances;
+        break;
+    }
+    case PM4ItOpcode::IndexBase: {
+        const auto* index_base = reinterpret_cast<const PM4CmdDrawIndexBase*>(header);
+        regs.index_base_address.base_addr_lo = index_base->addr_lo;
+        regs.index_base_address.base_addr_hi = index_base->addr_hi;
+        break;
+    }
+    case PM4ItOpcode::IndexBufferSize: {
+        const auto* index_size = reinterpret_cast<const PM4CmdDrawIndexBufferSize*>(header);
+        state.index_buffer_num_indices = index_size->num_indices;
+        break;
+    }
+    case PM4ItOpcode::SetBase: {
+        const auto* set_base = reinterpret_cast<const PM4CmdSetBase*>(header);
+        ASSERT(set_base->base_index == PM4CmdSetBase::BaseIndex::DrawIndexIndirPatchTable);
+        state.indirect_args_addr = set_base->Address<u64>();
+        break;
+    }
+    case PM4ItOpcode::DrawIndex2: {
+        const auto* draw_index = reinterpret_cast<const PM4CmdDrawIndex2*>(header);
+        regs.max_index_size = draw_index->max_size;
+        regs.index_base_address.base_addr_lo = draw_index->index_base_lo;
+        regs.index_base_address.base_addr_hi = draw_index->index_base_hi;
+        regs.num_indices = draw_index->index_count;
+        regs.draw_initiator = draw_index->draw_initiator;
+        break;
+    }
+    case PM4ItOpcode::DrawIndexOffset2: {
+        const auto* draw_index_off = reinterpret_cast<const PM4CmdDrawIndexOffset2*>(header);
+        regs.max_index_size = draw_index_off->max_size;
+        regs.num_indices = draw_index_off->index_count;
+        regs.draw_initiator = draw_index_off->draw_initiator;
+        break;
+    }
+    case PM4ItOpcode::DrawIndexAuto: {
+        const auto* draw_index = reinterpret_cast<const PM4CmdDrawIndexAuto*>(header);
+        regs.num_indices = draw_index->index_count;
+        regs.draw_initiator = draw_index->draw_initiator;
+        break;
+    }
+    case PM4ItOpcode::DrawIndexIndirect:
+    case PM4ItOpcode::DrawIndexIndirectMulti:
+    case PM4ItOpcode::DrawIndexIndirectCountMulti: {
+        regs.max_index_size = state.index_buffer_num_indices;
+        break;
+    }
+    case PM4ItOpcode::DispatchDirect: {
+        const auto* dispatch_direct = reinterpret_cast<const PM4CmdDispatchDirect*>(header);
+        state.cs_state.dim_x = dispatch_direct->dim_x;
+        state.cs_state.dim_y = dispatch_direct->dim_y;
+        state.cs_state.dim_z = dispatch_direct->dim_z;
+        state.cs_state.dispatch_initiator = dispatch_direct->dispatch_initiator;
+        break;
+    }
+    case PM4ItOpcode::EventWrite: {
+        const auto* event = reinterpret_cast<const PM4CmdEventWrite*>(header);
+        if (event->event_type.Value() == EventType::SoVgtStreamoutFlush) {
+            // TODO: handle proper synchronization, for now signal that update is done
+            // immediately
+            regs.cp_strmout_cntl.offset_update_done = 1;
+        }
+        break;
+    }
+    default:
+        break;
+    }
+}
+
+bool Liverpool::IsSafePacket(const PM4Header* header, std::size_t words_available) {
+    if (words_available == 0 || header->type != 3) {
+        return false;
+    }
+    const std::size_t count = header->type3.NumWords();
+    const std::size_t packet_words = count + 1;
+    if (packet_words > words_available) {
+        return false;
+    }
+    const auto fits_regs = [&](std::size_t reg_addr) {
+        return packet_words >= PacketWords<PM4CmdSetData> && reg_addr + count - 1 <= Regs::NumRegs;
+    };
+    const auto* set_data = reinterpret_cast<const PM4CmdSetData*>(header);
+    switch (header->type3.opcode) {
+    case PM4ItOpcode::SetConfigReg:
+        return fits_regs(Regs::ConfigRegWordOffset + set_data->reg_offset);
+    case PM4ItOpcode::SetUconfigReg:
+        return fits_regs(Regs::UconfigRegWordOffset + set_data->reg_offset);
+    case PM4ItOpcode::SetShReg: {
+        if (packet_words < PacketWords<PM4CmdSetData>) {
+            return false;
+        }
+        const std::size_t reg_offset = set_data->reg_offset;
+        if (reg_offset >= 0x200 && reg_offset <= (0x200 + sizeof(ComputeProgram) / 4)) {
+            return (reg_offset - 0x200 + count - 1) * sizeof(u32) <= sizeof(ComputeProgram);
+        }
+        return fits_regs(Regs::ShRegWordOffset + reg_offset);
+    }
+    case PM4ItOpcode::SetContextReg: {
+        const std::size_t reg_addr = Regs::ContextRegWordOffset + set_data->reg_offset;
+        if (!fits_regs(reg_addr)) {
+            return false;
+        }
+        // The extent hint is read from the NOP packet that follows.
+        const auto* payload = reinterpret_cast<const u32*>(header + 2);
+        const std::size_t nop_offset = header->type3.count;
+        const auto has_hint = [&](std::size_t hint_offset) {
+            return words_available >= hint_offset + 4 && payload[hint_offset] == 0xc0001000;
+        };
+        switch (reg_addr) {
+        case ContextRegs::CbColor0Base:
+        case ContextRegs::CbColor1Base:
+        case ContextRegs::CbColor2Base:
+        case ContextRegs::CbColor3Base:
+        case ContextRegs::CbColor4Base:
+        case ContextRegs::CbColor5Base:
+        case ContextRegs::CbColor6Base:
+        case ContextRegs::CbColor7Base:
+            return (nop_offset != 0x0e && nop_offset != 0x0d && nop_offset != 0x0b) ||
+                   has_hint(nop_offset);
+        case ContextRegs::CbColor0Cmask:
+        case ContextRegs::CbColor1Cmask:
+        case ContextRegs::CbColor2Cmask:
+        case ContextRegs::CbColor3Cmask:
+        case ContextRegs::CbColor4Cmask:
+        case ContextRegs::CbColor5Cmask:
+        case ContextRegs::CbColor6Cmask:
+        case ContextRegs::CbColor7Cmask:
+            return nop_offset != 0x04 || has_hint(nop_offset);
+        case ContextRegs::DbZInfo:
+            return nop_offset != 8 || has_hint(20);
+        default:
+            return true;
+        }
+    }
+    case PM4ItOpcode::Nop:
+        return packet_words >= 2;
+    case PM4ItOpcode::EventWrite:
+        return packet_words >= PacketWords<PM4CmdEventWrite>;
+    case PM4ItOpcode::DmaData:
+        return packet_words >= PacketWords<PM4DmaData>;
+    case PM4ItOpcode::IndexType:
+        return packet_words >= PacketWords<PM4CmdDrawIndexType>;
+    case PM4ItOpcode::NumInstances:
+        return packet_words >= PacketWords<PM4CmdDrawNumInstances>;
+    case PM4ItOpcode::IndexBase:
+        return packet_words >= PacketWords<PM4CmdDrawIndexBase>;
+    case PM4ItOpcode::IndexBufferSize:
+        return packet_words >= PacketWords<PM4CmdDrawIndexBufferSize>;
+    case PM4ItOpcode::SetBase:
+        return packet_words >= PacketWords<PM4CmdSetBase> &&
+               reinterpret_cast<const PM4CmdSetBase*>(header)->base_index ==
+                   PM4CmdSetBase::BaseIndex::DrawIndexIndirPatchTable;
+    case PM4ItOpcode::DrawIndex2:
+        return packet_words >= PacketWords<PM4CmdDrawIndex2>;
+    case PM4ItOpcode::DrawIndexOffset2:
+        return packet_words >= PacketWords<PM4CmdDrawIndexOffset2>;
+    case PM4ItOpcode::DrawIndexAuto:
+        return packet_words >= PacketWords<PM4CmdDrawIndexAuto>;
+    case PM4ItOpcode::DispatchDirect:
+        return packet_words >= PacketWords<PM4CmdDispatchDirect>;
+    default:
+        return true;
+    }
+}
+
+bool Liverpool::HasLookaheadDraw(std::span<const u32> dcb) const {
+    // The walk of the lookahead thread.
+    const u32* packet = dcb.data();
+    const u32* const end = packet + dcb.size();
+    while (packet < end) {
+        const auto* header = reinterpret_cast<const PM4Header*>(packet);
+        if (header->type == 2) {
+            ++packet;
+            continue;
+        }
+        if (!IsSafePacket(header, end - packet)) {
+            break;
+        }
+        const PacketClass packet_class = ClassifyPacket(header, guest_markers_enabled);
+        if (packet_class == PacketClass::Other) {
+            break;
+        }
+        if (packet_class == PacketClass::Draw) {
+            switch (header->type3.opcode) {
+            case PM4ItOpcode::DrawIndex2:
+            case PM4ItOpcode::DrawIndexOffset2:
+            case PM4ItOpcode::DrawIndexAuto:
+                return true;
+            default:
+                break;
+            }
+        }
+        packet += header->type3.NumWords() + 1;
+    }
+    return false;
+}
+
+void Liverpool::ApplySoloPacketState(const PM4Header* header, std::size_t words_available) {
+    if (lookahead_needs_copy) {
+        // The lookahead state is copied before its next run.
+        return;
+    }
+    if (!IsSafePacket(header, words_available)) {
+        lookahead_needs_copy = true;
+        return;
+    }
+    ApplyPacketState(lookahead_state->Ref(), header);
+}
+
+void Liverpool::StartLookaheadRun(std::span<const u32> dcb) {
+    if (!lookahead_thread.joinable()) {
+        lookahead_state = std::make_unique<GfxStateCopy>();
+        lookahead_draws = std::make_unique<Vulkan::DrawAhead[]>(NumLookaheadResults);
+        lookahead_cp_perf = std::make_unique<CpPerf>();
+        lookahead_thread = std::jthread{std::bind_front(&Liverpool::LookaheadThread, this)};
+    }
+    // The lookahead thread is stopped here, so its state has to be the real one.
+    if (!lookahead_needs_copy && lookahead_compare_countdown-- == 0) {
+        lookahead_compare_countdown = LookaheadCompareInterval - 1;
+        ++cp_perf.la_compares;
+        if (!CompareLookaheadState()) {
+            ++cp_perf.la_mismatches;
+            lookahead_needs_copy = true;
+        }
+    }
+    if (lookahead_needs_copy) {
+        GfxStateCopy& copy = *lookahead_state;
+        std::memcpy(&copy.regs, &regs, sizeof(regs));
+        std::memcpy(&copy.cs_state, &mapped_queues[GfxQueueId].cs_state, sizeof(copy.cs_state));
+        copy.last_cb_extent = last_cb_extent;
+        copy.last_db_extent = last_db_extent;
+        copy.index_buffer_num_indices = index_buffer_num_indices;
+        copy.indirect_args_addr = indirect_args_addr;
+        lookahead_needs_copy = false;
+        ++cp_perf.la_copies;
+    }
+    lookahead_run_begin = dcb.data();
+    lookahead_run_end = dcb.data() + dcb.size();
+    is_lookahead_running = true;
+    ++cp_perf.la_runs;
+    // Sequentially consistent with the lookahead thread, which sets lookahead_sleeping and then
+    // reads lookahead_started_run: one of the two sees the other's store.
+    lookahead_started_run.store(++lookahead_run);
+    if (lookahead_sleeping.load()) {
+        {
+            std::scoped_lock lk{lookahead_mutex};
+        }
+        lookahead_cv.notify_one();
+    }
+}
+
+void Liverpool::WaitLookaheadStopped() {
+    const auto drop_results = [this] {
+        // Results nobody takes must not keep the thread from stopping.
+        const u64 produced = lookahead_produced.load(std::memory_order_acquire);
+        if (produced != lookahead_taken) {
+            lookahead_taken = produced;
+            lookahead_consumed.store(produced, std::memory_order_release);
+        }
+    };
+    if (lookahead_stopped_run.load(std::memory_order_acquire) != lookahead_run) {
+        const u64 sync_t0 = PerfNs();
+        ++cp_perf.la_sync_waits;
+        do {
+            drop_results();
+            PauseForLookahead();
+        } while (lookahead_stopped_run.load(std::memory_order_acquire) != lookahead_run);
+        cp_perf.la_sync_ns += PerfNs() - sync_t0;
+    }
+    drop_results();
+
+    // The thread is stopped, so the probes of its work can be taken.
+    CpPerf& ahead = *lookahead_cp_perf;
+    cp_perf.la_lookup_ns += ahead.pipe_key_ns;
+    cp_perf.la_stream_ns += ahead.la_stream_ns;
+    cp_perf.sa_ahead_known += ahead.sa_ahead_known;
+    cp_perf.sa_ahead_same += ahead.sa_ahead_same;
+    cp_perf.sa_ahead_copied += ahead.sa_ahead_copied;
+    cp_perf.sa_ahead_bytes += ahead.sa_ahead_bytes;
+    cp_perf.sa_ahead_full += ahead.sa_ahead_full;
+    ahead = {};
+}
+
+void Liverpool::PauseForLookahead() {
+    if (num_commands) {
+        ProcessCommands();
+    }
+    ThreadPause();
+}
+
+void Liverpool::EndLookaheadRun(const u32* packet) {
+    is_lookahead_solo = false;
+    if (!is_lookahead_running) {
+        return;
+    }
+    is_lookahead_running = false;
+    const u64 taken = lookahead_taken;
+    WaitLookaheadStopped();
+    if (lookahead_stop == packet && lookahead_taken == taken) {
+        return;
+    }
+    // The lookahead thread did not stop at this packet, so its state is not the real one.
+    if (lookahead_taken == taken && lookahead_stop < packet) {
+        ++cp_perf.la_early;
+    } else {
+        ++cp_perf.la_mismatches;
+        if (lookahead_logged_mismatches < 32) {
+            ++lookahead_logged_mismatches;
+            LOG_ERROR(Render, "PERF lookahead stopped at {} with {} results left, run ends at {}",
+                      fmt::ptr(lookahead_stop), lookahead_taken - taken, fmt::ptr(packet));
+        }
+    }
+    lookahead_needs_copy = true;
+}
+
+void Liverpool::TakeLookaheadResult(std::span<const u32> dcb) {
+    for (u32 attempt = 0; attempt < 2; ++attempt) {
+        u64 produced = lookahead_produced.load(std::memory_order_acquire);
+        if (produced == lookahead_taken) {
+            const u64 wait_t0 = PerfNs();
+            ++cp_perf.la_waits;
+            while (lookahead_stopped_run.load(std::memory_order_acquire) != lookahead_run &&
+                   lookahead_produced.load(std::memory_order_acquire) == lookahead_taken) {
+                PauseForLookahead();
+            }
+            produced = lookahead_produced.load(std::memory_order_acquire);
+            cp_perf.la_wait_ns += PerfNs() - wait_t0;
+        }
+        if (produced != lookahead_taken) {
+            const LookaheadResult& result =
+                lookahead_results[lookahead_taken % NumLookaheadResults];
+            if (result.packet == dcb.data()) {
+                rasterizer->SetDrawAhead(&lookahead_draws[lookahead_taken % NumLookaheadResults]);
+                lookahead_consumed.store(++lookahead_taken, std::memory_order_release);
+                ++cp_perf.la_results;
+                return;
+            }
+            ++cp_perf.la_mismatches;
+            if (lookahead_logged_mismatches < 32) {
+                ++lookahead_logged_mismatches;
+                LOG_ERROR(Render, "PERF lookahead result is for {}, the draw is at {}",
+                          fmt::ptr(result.packet), fmt::ptr(dcb.data()));
+            }
+        } else {
+            ++cp_perf.la_early;
+        }
+        // The lookahead thread is not at this draw: restart it here with the real state.
+        rasterizer->SetDrawAhead(nullptr);
+        is_lookahead_running = false;
+        WaitLookaheadStopped();
+        lookahead_needs_copy = true;
+        if (attempt == 0) {
+            StartLookaheadRun(dcb);
+        }
+    }
+}
+
+bool Liverpool::CompareLookaheadState() {
+    const GfxStateCopy& copy = *lookahead_state;
+    const bool is_regs_equal = std::memcmp(&copy.regs, &regs, sizeof(regs)) == 0;
+    const bool is_cs_equal = std::memcmp(&copy.cs_state, &mapped_queues[GfxQueueId].cs_state,
+                                         sizeof(copy.cs_state)) == 0;
+    const bool is_rest_equal = std::memcmp(copy.last_cb_extent.data(), last_cb_extent.data(),
+                                           sizeof(last_cb_extent)) == 0 &&
+                               copy.last_db_extent.raw == last_db_extent.raw &&
+                               copy.index_buffer_num_indices == index_buffer_num_indices &&
+                               copy.indirect_args_addr == indirect_args_addr;
+    if (is_regs_equal && is_cs_equal && is_rest_equal) {
+        return true;
+    }
+    if (lookahead_logged_mismatches < 32) {
+        ++lookahead_logged_mismatches;
+        u32 reg = 0;
+        while (reg < Regs::NumRegs && copy.regs.reg_array[reg] == regs.reg_array[reg]) {
+            ++reg;
+        }
+        const bool has_reg = reg < Regs::NumRegs;
+        LOG_ERROR(Render,
+                  "PERF lookahead state differs: reg {:#x} real {:#x} lookahead {:#x}, compute "
+                  "state equal {}, rest equal {}",
+                  has_reg ? reg : 0, has_reg ? regs.reg_array[reg] : 0,
+                  has_reg ? copy.regs.reg_array[reg] : 0, is_cs_equal, is_rest_equal);
+    }
+    return false;
+}
+
+void Liverpool::LookaheadThread(std::stop_token stoken) {
+    Common::SetCurrentThreadName("shadPS4:GpuLookahead");
+    Common::SamplingProfiler::RegisterCurrentThread("GpuLookahead");
+
+    const GfxState state = lookahead_state->Ref();
+    u64 run = 0;
+    u32 idle_spins = 0;
+    while (!stoken.stop_requested()) {
+        const u64 started = lookahead_started_run.load(std::memory_order_acquire);
+        if (started == run) {
+            if (++idle_spins < LookaheadIdleSpins) {
+                ThreadPause();
+                continue;
+            }
+            idle_spins = 0;
+            std::unique_lock lk{lookahead_mutex};
+            lookahead_sleeping.store(true);
+            lookahead_cv.wait(lk, stoken, [&] { return lookahead_started_run.load() != run; });
+            lookahead_sleeping.store(false);
+            lookahead_perf.sleeps.fetch_add(1, std::memory_order_relaxed);
+            continue;
+        }
+        idle_spins = 0;
+        run = started;
+
+        const u64 scan_t0 = PerfNs();
+        const u32* packet = lookahead_run_begin;
+        const u32* const end = lookahead_run_end;
+        u64 produced = lookahead_produced.load(std::memory_order_relaxed);
+        while (packet < end) {
+            const auto* header = reinterpret_cast<const PM4Header*>(packet);
+            if (header->type == 2) {
+                ++packet;
+                continue;
+            }
+            if (!IsSafePacket(header, end - packet)) {
+                break;
+            }
+            const PacketClass packet_class = ClassifyPacket(header, guest_markers_enabled);
+            if (packet_class == PacketClass::Other) {
+                break;
+            }
+            ApplyPacketState(state, header);
+            if (packet_class == PacketClass::Draw) {
+                // The entry of the last result taken stays as it is: its draw may be using it.
+                while (produced - lookahead_consumed.load(std::memory_order_acquire) >=
+                       NumLookaheadResults - 1) {
+                    if (stoken.stop_requested()) {
+                        return;
+                    }
+                    ThreadPause();
+                }
+                Vulkan::DrawAhead& ahead = lookahead_draws[produced % NumLookaheadResults];
+                switch (header->type3.opcode) {
+                case PM4ItOpcode::DrawIndex2:
+                    rasterizer->LookAhead(ahead, state.regs, true, 0, run, *lookahead_cp_perf);
+                    break;
+                case PM4ItOpcode::DrawIndexOffset2:
+                    rasterizer->LookAhead(
+                        ahead, state.regs, true,
+                        reinterpret_cast<const PM4CmdDrawIndexOffset2*>(header)->index_offset, run,
+                        *lookahead_cp_perf);
+                    break;
+                case PM4ItOpcode::DrawIndexAuto:
+                    rasterizer->LookAhead(ahead, state.regs, false, 0, run, *lookahead_cp_perf);
+                    break;
+                default:
+                    ahead.lookup.pipeline = nullptr;
+                    break;
+                }
+                lookahead_results[produced % NumLookaheadResults] = {packet};
+                lookahead_produced.store(++produced, std::memory_order_release);
+            }
+            packet += header->type3.NumWords() + 1;
+        }
+        lookahead_stop = packet;
+        lookahead_stopped_run.store(run, std::memory_order_release);
+        lookahead_perf.scan_ns.fetch_add(PerfNs() - scan_t0, std::memory_order_relaxed);
+    }
+}
+
 Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb) {
     FIBER_ENTER(dcb_task_name);
+
+    const GfxState gfx_state = LiveGfxState();
+    u32 run_length = 0;
+    const auto end_run = [&run_length](u32 ender) {
+        if (run_length == 0) {
+            return;
+        }
+        ++cp_perf.run_n;
+        cp_perf.run_draws[std::min(std::bit_width(run_length) - 1, 5)] += run_length;
+        ++perf_run_enders[ender];
+        run_length = 0;
+    };
 
     auto base_addr = reinterpret_cast<uintptr_t>(dcb.data());
     while (!dcb.empty()) {
@@ -297,6 +1181,46 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb) {
         case 3:
             const u32 count = header->type3.NumWords();
             const PM4ItOpcode opcode = header->type3.opcode;
+            const PacketClass packet_class = ClassifyPacket(header, guest_markers_enabled);
+            if (packet_class == PacketClass::Other) {
+                end_run(static_cast<u32>(opcode) & 0xff);
+                EndLookaheadRun(dcb.data());
+                perf_state_changed = true;
+            } else {
+                if (rasterizer) {
+                    if (!is_lookahead_running && !is_lookahead_solo) {
+                        if (HasLookaheadDraw(dcb)) {
+                            StartLookaheadRun(dcb);
+                        } else {
+                            is_lookahead_solo = true;
+                            ++cp_perf.la_solo_runs;
+                        }
+                    }
+                    if (is_lookahead_solo) {
+                        ApplySoloPacketState(header, dcb.size());
+                        if (packet_class == PacketClass::Draw) {
+                            rasterizer->SetDrawAhead(nullptr);
+                        }
+                    } else if (packet_class == PacketClass::Draw) {
+                        TakeLookaheadResult(dcb);
+                    }
+                }
+                if (packet_class == PacketClass::Draw) {
+                    ++run_length;
+                    if (perf_bind_check) {
+                        ++cp_perf.bc_draws;
+                        cp_perf.bc_draws_state_same += !perf_state_changed;
+                        perf_state_changed = false;
+                    }
+                } else {
+                    ++cp_perf.state_packets;
+                    cp_perf.state_words += count;
+                    if (perf_bind_check && !perf_state_changed) {
+                        perf_state_changed = ChangesStateRegs(header);
+                    }
+                }
+            }
+            ApplyPacketState(gfx_state, header);
             switch (opcode) {
             case PM4ItOpcode::Nop: {
                 const auto* nop = reinterpret_cast<const PM4CmdNop*>(header);
@@ -342,131 +1266,25 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb) {
                 }
                 break;
             }
-            case PM4ItOpcode::ContextControl: {
-                break;
-            }
-            case PM4ItOpcode::ClearState: {
-                regs.SetDefaults();
-                break;
-            }
-            case PM4ItOpcode::SetConfigReg: {
-                const auto* set_data = reinterpret_cast<const PM4CmdSetData*>(header);
-                const auto reg_addr = Regs::ConfigRegWordOffset + set_data->reg_offset;
-                const auto* payload = reinterpret_cast<const u32*>(header + 2);
-                std::memcpy(&regs.reg_array[reg_addr], payload, (count - 1) * sizeof(u32));
-                break;
-            }
-            case PM4ItOpcode::SetContextReg: {
-                const auto* set_data = reinterpret_cast<const PM4CmdSetData*>(header);
-                const auto reg_addr = Regs::ContextRegWordOffset + set_data->reg_offset;
-                const auto* payload = reinterpret_cast<const u32*>(header + 2);
-
-                std::memcpy(&regs.reg_array[reg_addr], payload, (count - 1) * sizeof(u32));
-
-                // In the case of HW, render target memory has alignment as color block operates on
-                // tiles. There is no information of actual resource extents stored in CB context
-                // regs, so any deduction of it from slices/pitch will lead to a larger surface
-                // created. The same applies to the depth targets. Fortunately, the guest always
-                // sends a trailing NOP packet right after the context regs setup, so we can use the
-                // heuristic below and extract the hint to determine actual resource dims.
-
-                switch (reg_addr) {
-                case ContextRegs::CbColor0Base:
-                case ContextRegs::CbColor1Base:
-                case ContextRegs::CbColor2Base:
-                case ContextRegs::CbColor3Base:
-                case ContextRegs::CbColor4Base:
-                case ContextRegs::CbColor5Base:
-                case ContextRegs::CbColor6Base:
-                case ContextRegs::CbColor7Base: {
-                    const auto col_buf_id = (reg_addr - ContextRegs::CbColor0Base) /
-                                            (ContextRegs::CbColor1Base - ContextRegs::CbColor0Base);
-                    ASSERT(col_buf_id < NUM_COLOR_BUFFERS);
-
-                    const auto nop_offset = header->type3.count;
-                    if (nop_offset == 0x0e || nop_offset == 0x0d || nop_offset == 0x0b) {
-                        ASSERT_MSG(payload[nop_offset] == 0xc0001000,
-                                   "NOP hint is missing in CB setup sequence");
-                        last_cb_extent[col_buf_id].raw = payload[nop_offset + 1];
-                    } else {
-                        last_cb_extent[col_buf_id].raw = 0;
-                    }
-                    break;
-                }
-                case ContextRegs::CbColor0Cmask:
-                case ContextRegs::CbColor1Cmask:
-                case ContextRegs::CbColor2Cmask:
-                case ContextRegs::CbColor3Cmask:
-                case ContextRegs::CbColor4Cmask:
-                case ContextRegs::CbColor5Cmask:
-                case ContextRegs::CbColor6Cmask:
-                case ContextRegs::CbColor7Cmask: {
-                    const auto col_buf_id =
-                        (reg_addr - ContextRegs::CbColor0Cmask) /
-                        (ContextRegs::CbColor1Cmask - ContextRegs::CbColor0Cmask);
-                    ASSERT(col_buf_id < NUM_COLOR_BUFFERS);
-
-                    const auto nop_offset = header->type3.count;
-                    if (nop_offset == 0x04) {
-                        ASSERT_MSG(payload[nop_offset] == 0xc0001000,
-                                   "NOP hint is missing in CB setup sequence");
-                        last_cb_extent[col_buf_id].raw = payload[nop_offset + 1];
-                    }
-                    break;
-                }
-                case ContextRegs::DbZInfo: {
-                    if (header->type3.count == 8) {
-                        ASSERT_MSG(payload[20] == 0xc0001000,
-                                   "NOP hint is missing in DB setup sequence");
-                        last_db_extent.raw = payload[21];
-                    } else {
-                        last_db_extent.raw = 0;
-                    }
-                    break;
-                }
-                default:
-                    break;
-                }
-                break;
-            }
-            case PM4ItOpcode::SetShReg: {
-                const auto* set_data = reinterpret_cast<const PM4CmdSetData*>(header);
-                const auto set_size = (count - 1) * sizeof(u32);
-
-                if (set_data->reg_offset >= 0x200 &&
-                    set_data->reg_offset <= (0x200 + sizeof(ComputeProgram) / 4)) {
-                    ASSERT(set_size <= sizeof(ComputeProgram));
-                    auto* addr = reinterpret_cast<u32*>(&mapped_queues[GfxQueueId].cs_state) +
-                                 (set_data->reg_offset - 0x200);
-                    std::memcpy(addr, header + 2, set_size);
-                } else {
-                    std::memcpy(&regs.reg_array[Regs::ShRegWordOffset + set_data->reg_offset],
-                                header + 2, set_size);
-                }
-                break;
-            }
-            case PM4ItOpcode::SetUconfigReg: {
-                const auto* set_data = reinterpret_cast<const PM4CmdSetData*>(header);
-                std::memcpy(&regs.reg_array[Regs::UconfigRegWordOffset + set_data->reg_offset],
-                            header + 2, (count - 1) * sizeof(u32));
+            case PM4ItOpcode::ContextControl:
+            case PM4ItOpcode::ClearState:
+            case PM4ItOpcode::SetConfigReg:
+            case PM4ItOpcode::SetContextReg:
+            case PM4ItOpcode::SetShReg:
+            case PM4ItOpcode::SetUconfigReg:
+            case PM4ItOpcode::IndexType:
+            case PM4ItOpcode::NumInstances:
+            case PM4ItOpcode::IndexBase:
+            case PM4ItOpcode::IndexBufferSize:
+            case PM4ItOpcode::SetBase: {
+                // ApplyPacketState has done all of it.
                 break;
             }
             case PM4ItOpcode::SetPredication: {
                 LOG_WARNING(Render, "Unimplemented IT_SET_PREDICATION");
                 break;
             }
-            case PM4ItOpcode::IndexType: {
-                const auto* index_type = reinterpret_cast<const PM4CmdDrawIndexType*>(header);
-                regs.index_buffer_type.raw = index_type->raw;
-                break;
-            }
             case PM4ItOpcode::DrawIndex2: {
-                const auto* draw_index = reinterpret_cast<const PM4CmdDrawIndex2*>(header);
-                regs.max_index_size = draw_index->max_size;
-                regs.index_base_address.base_addr_lo = draw_index->index_base_lo;
-                regs.index_base_address.base_addr_hi = draw_index->index_base_hi;
-                regs.num_indices = draw_index->index_count;
-                regs.draw_initiator = draw_index->draw_initiator;
                 if (DebugState.DumpingCurrentReg()) {
                     DebugState.PushRegsDump(base_addr, reinterpret_cast<uintptr_t>(header), regs);
                 }
@@ -481,9 +1299,6 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb) {
             case PM4ItOpcode::DrawIndexOffset2: {
                 const auto* draw_index_off =
                     reinterpret_cast<const PM4CmdDrawIndexOffset2*>(header);
-                regs.max_index_size = draw_index_off->max_size;
-                regs.num_indices = draw_index_off->index_count;
-                regs.draw_initiator = draw_index_off->draw_initiator;
                 if (DebugState.DumpingCurrentReg()) {
                     DebugState.PushRegsDump(base_addr, reinterpret_cast<uintptr_t>(header), regs);
                 }
@@ -497,9 +1312,6 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb) {
                 break;
             }
             case PM4ItOpcode::DrawIndexAuto: {
-                const auto* draw_index = reinterpret_cast<const PM4CmdDrawIndexAuto*>(header);
-                regs.num_indices = draw_index->index_count;
-                regs.draw_initiator = draw_index->draw_initiator;
                 if (DebugState.DumpingCurrentReg()) {
                     DebugState.PushRegsDump(base_addr, reinterpret_cast<uintptr_t>(header), regs);
                 }
@@ -576,7 +1388,6 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb) {
                     reinterpret_cast<const PM4CmdDrawIndexIndirect*>(header);
                 const auto offset = draw_index_indirect->data_offset;
                 const auto stride = sizeof(DrawIndexedIndirectArgs);
-                regs.max_index_size = index_buffer_num_indices;
                 if (DebugState.DumpingCurrentReg()) {
                     DebugState.PushRegsDump(base_addr, reinterpret_cast<uintptr_t>(header), regs);
                 }
@@ -596,7 +1407,6 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb) {
                 const auto* draw_index_indirect =
                     reinterpret_cast<const PM4CmdDrawIndexIndirectMulti*>(header);
                 const auto offset = draw_index_indirect->data_offset;
-                regs.max_index_size = index_buffer_num_indices;
                 if (DebugState.DumpingCurrentReg()) {
                     DebugState.PushRegsDump(base_addr, reinterpret_cast<uintptr_t>(header), regs);
                 }
@@ -617,7 +1427,6 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb) {
                 const auto* draw_index_indirect =
                     reinterpret_cast<const PM4CmdDrawIndexIndirectCountMulti*>(header);
                 const auto offset = draw_index_indirect->data_offset;
-                regs.max_index_size = index_buffer_num_indices;
                 if (DebugState.DumpingCurrentReg()) {
                     DebugState.PushRegsDump(base_addr, reinterpret_cast<uintptr_t>(header), regs);
                 }
@@ -638,12 +1447,7 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb) {
                 break;
             }
             case PM4ItOpcode::DispatchDirect: {
-                const auto* dispatch_direct = reinterpret_cast<const PM4CmdDispatchDirect*>(header);
                 auto& cs_program = GetCsRegs();
-                cs_program.dim_x = dispatch_direct->dim_x;
-                cs_program.dim_y = dispatch_direct->dim_y;
-                cs_program.dim_z = dispatch_direct->dim_z;
-                cs_program.dispatch_initiator = dispatch_direct->dispatch_initiator;
                 if (DebugState.DumpingCurrentReg()) {
                     DebugState.PushRegsDumpCompute(base_addr, reinterpret_cast<uintptr_t>(header),
                                                    cs_program);
@@ -675,39 +1479,15 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb) {
                     [&] { rasterizer->DispatchIndirect(indirect_args_addr, offset, size); });
                 break;
             }
-            case PM4ItOpcode::NumInstances: {
-                const auto* num_instances = reinterpret_cast<const PM4CmdDrawNumInstances*>(header);
-                regs.num_instances.num_instances = num_instances->num_instances;
-                break;
-            }
-            case PM4ItOpcode::IndexBase: {
-                const auto* index_base = reinterpret_cast<const PM4CmdDrawIndexBase*>(header);
-                regs.index_base_address.base_addr_lo = index_base->addr_lo;
-                regs.index_base_address.base_addr_hi = index_base->addr_hi;
-                break;
-            }
-            case PM4ItOpcode::IndexBufferSize: {
-                const auto* index_size = reinterpret_cast<const PM4CmdDrawIndexBufferSize*>(header);
-                index_buffer_num_indices = index_size->num_indices;
-                break;
-            }
-            case PM4ItOpcode::SetBase: {
-                const auto* set_base = reinterpret_cast<const PM4CmdSetBase*>(header);
-                ASSERT(set_base->base_index == PM4CmdSetBase::BaseIndex::DrawIndexIndirPatchTable);
-                indirect_args_addr = set_base->Address<u64>();
-                break;
-            }
             case PM4ItOpcode::EventWrite: {
                 const auto* event = reinterpret_cast<const PM4CmdEventWrite*>(header);
                 LOG_DEBUG(Render, "Encountered EventWrite: event_type = {}, event_index = {}",
                           magic_enum::enum_name(event->event_type.Value()),
                           magic_enum::enum_name(event->event_index.Value()));
-                if (event->event_type.Value() == EventType::SoVgtStreamoutFlush) {
-                    // TODO: handle proper synchronization, for now signal that update is done
-                    // immediately
-                    regs.cp_strmout_cntl.offset_update_done = 1;
-                } else if (event->event_index.Value() == EventIndex::ZpassDone) {
+                if (event->event_type.Value() != EventType::SoVgtStreamoutFlush &&
+                    event->event_index.Value() == EventIndex::ZpassDone) {
                     if (event->event_type.Value() == EventType::PixelPipeStatDump) {
+                        ++cp_perf.zpass_dumps;
                         static constexpr u64 OcclusionCounterValidMask = 0x8000000000000000ULL;
                         static constexpr u64 OcclusionCounterStep = 0x2FFFFFFULL;
                         u64* results = event->Address<u64*>();
@@ -720,6 +1500,8 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb) {
                 break;
             }
             case PM4ItOpcode::EventWriteEos: {
+                const CpPerfScope perf_eos{cp_perf.eos_ns};
+                ++cp_perf.eos;
                 const auto* event_eos = reinterpret_cast<const PM4CmdEventWriteEos*>(header);
                 if (rasterizer) {
                     rasterizer->OnFence();
@@ -739,6 +1521,7 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb) {
                 break;
             }
             case PM4ItOpcode::EventWriteEop: {
+                const CpPerfScope perf_eop{cp_perf.eop_ns};
                 const auto* event_eop = reinterpret_cast<const PM4CmdEventWriteEop*>(header);
                 if (rasterizer) {
                     rasterizer->OnFence();
@@ -797,7 +1580,22 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb) {
                     if (rasterizer) {
                         rasterizer->OnFence();
                     }
-                    std::memcpy(address, write_data->data, data_size);
+                    // The driver's patched flip: the label write directly followed by the flip
+                    // NOP. The flip is finished on the GPU right here.
+                    const size_t this_size = header->type3.NumWords() + 1;
+                    const auto* next_nop =
+                        dcb.size() > this_size + 1
+                            ? reinterpret_cast<const PM4CmdNop*>(dcb.data() + this_size)
+                            : nullptr;
+                    const bool flip_label =
+                        next_nop && vo_port && vo_port->IsVoLabel(address) &&
+                        next_nop->header.type == 3 && next_nop->header.opcode == PM4ItOpcode::Nop &&
+                        next_nop->data_block[0] == PM4CmdNop::PayloadType::PatchedFlip;
+                    if (flip_label) {
+                        vo_port->WriteFlipLabel(address, write_data->data, data_size);
+                    } else {
+                        std::memcpy(address, write_data->data, data_size);
+                    }
                 } else {
                     UNREACHABLE();
                 }
@@ -847,13 +1645,24 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb) {
                 // there are no other submits to yield to we can sleep the thread
                 // instead and allow other tasks to run.
                 const u64* wait_addr = wait_reg_mem->Address<u64*>();
-                if (vo_port->IsVoLabel(wait_addr) &&
-                    num_submits == mapped_queues[GfxQueueId].submits.size()) {
+                const bool vo_label = vo_port->IsVoLabel(wait_addr);
+                if (vo_label && num_submits == mapped_queues[GfxQueueId].submits.size()) {
+                    const CpPerfScope perf_vo{cp_perf.vo_block_ns};
+                    ++cp_perf.vo_blocks;
                     vo_port->WaitVoLabel([&] { return wait_reg_mem->Test(regs.reg_array); });
                     break;
                 }
-                while (!wait_reg_mem->Test(regs.reg_array)) {
-                    YIELD_GFX();
+                if (!wait_reg_mem->Test(regs.reg_array)) {
+                    const u64 t0 = PerfNs();
+                    while (!wait_reg_mem->Test(regs.reg_array)) {
+                        YIELD_GFX();
+                    }
+                    if (vo_label) {
+                        cp_perf.vo_spin_ns += PerfNs() - t0;
+                    } else {
+                        cp_perf.mem_spin_ns += PerfNs() - t0;
+                        ++cp_perf.mem_spins;
+                    }
                 }
                 break;
             }
@@ -932,6 +1741,7 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb) {
                     }
                 }
                 regs.cp_strmout_cntl.offset_update_done = 1;
+                lookahead_needs_copy = true;
                 break;
             }
             case PM4ItOpcode::GetLodStats: {
@@ -962,6 +1772,8 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb) {
             break;
         }
     }
+    end_run(0);
+    EndLookaheadRun(dcb.data());
 
     FIBER_EXIT;
 }
@@ -1125,6 +1937,7 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
             } else {
                 std::memcpy(&regs.reg_array[Regs::ShRegWordOffset + set_data->reg_offset],
                             header + 2, set_size);
+                lookahead_needs_copy = true;
             }
             break;
         }
@@ -1208,8 +2021,12 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
         case PM4ItOpcode::WaitRegMem: {
             const auto* wait_reg_mem = reinterpret_cast<const PM4CmdWaitRegMem*>(header);
             ASSERT(wait_reg_mem->engine.Value() == PM4CmdWaitRegMem::Engine::Me);
-            while (!wait_reg_mem->Test(regs.reg_array)) {
-                YIELD_ASC(vqid);
+            if (!wait_reg_mem->Test(regs.reg_array)) {
+                const u64 t0 = PerfNs();
+                while (!wait_reg_mem->Test(regs.reg_array)) {
+                    YIELD_ASC(vqid);
+                }
+                cp_perf.asc_spin_ns += PerfNs() - t0;
             }
             break;
         }

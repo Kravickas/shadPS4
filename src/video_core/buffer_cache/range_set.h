@@ -57,6 +57,10 @@ struct RangeSet {
         return boost::icl::intersects(m_ranges_set, interval);
     }
 
+    bool Empty() const {
+        return m_ranges_set.empty();
+    }
+
     template <typename Func>
     void ForEach(Func&& func) const {
         if (m_ranges_set.empty()) {

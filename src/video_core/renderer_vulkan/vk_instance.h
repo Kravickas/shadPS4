@@ -75,6 +75,16 @@ public:
         return present_queue;
     }
 
+    /// Returns the queue for buffer readback copies, the graphics queue if there is no other.
+    vk::Queue GetReadbackQueue() const {
+        return readback_queue;
+    }
+
+    /// Returns true if buffer readback copies have a queue of their own.
+    bool HasReadbackQueue() const {
+        return has_readback_queue;
+    }
+
     TracyVkCtx GetProfilerContext() const {
         return profiler_context;
     }
@@ -522,6 +532,8 @@ private:
     VmaAllocator allocator{};
     vk::Queue present_queue;
     vk::Queue graphics_queue;
+    vk::Queue readback_queue;
+    bool has_readback_queue{};
     std::vector<vk::PhysicalDevice> physical_devices;
     std::vector<std::string> available_extensions;
     std::unordered_map<vk::Format, vk::FormatProperties3> format_properties;

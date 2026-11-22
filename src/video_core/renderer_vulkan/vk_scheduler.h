@@ -5,10 +5,15 @@
 
 #include <atomic>
 #include <condition_variable>
+#include <memory>
 #include <mutex>
+#include <new>
 #include <thread>
+#include <type_traits>
+#include <vector>
 #include <queue>
 
+#include "common/alignment.h"
 #include "common/interval_set.h"
 #include "common/unique_function.h"
 #include "video_core/amdgpu/regs_color.h"
@@ -24,6 +29,7 @@ class VkCtxScope;
 namespace Vulkan {
 
 class Instance;
+class Scheduler;
 
 struct RenderAttachment {
     vk::ImageView image_view;
@@ -165,8 +171,8 @@ struct DynamicState {
     float line_width{};
     bool feedback_loop_enabled{};
 
-    /// Commits the dynamic state to the provided command buffer.
-    void Commit(const Instance& instance, const vk::CommandBuffer& cmdbuf);
+    /// Commits the dynamic state to the current command buffer of the scheduler.
+    void Commit(const Instance& instance, Scheduler& scheduler);
 
     /// Invalidates all dynamic state to be flushed into the next command buffer.
     void Invalidate() {
@@ -405,9 +411,62 @@ public:
         return dynamic_state;
     }
 
-    /// Returns the current command buffer.
-    vk::CommandBuffer CommandBuffer() const {
+    /// Returns the current command buffer, with every recorded command in it.
+    vk::CommandBuffer CommandBuffer() {
+        SyncRecording();
         return sessions.back().primary;
+    }
+
+    /// Lets the recorder thread run the commands recorded from now on. They run in recording
+    /// order, and they have all run before the command buffer is taken with CommandBuffer or
+    /// submitted, which ends the deferral.
+    void DeferRecording();
+
+    /// Hands the deferred commands recorded so far to the recorder thread.
+    void PublishRecording();
+
+    /// Records a command for the current command buffer. Whatever func captures must stay valid
+    /// until the command buffer is submitted.
+    template <typename Func>
+    void Record(Func&& func) {
+        using Command = std::decay_t<Func>;
+        if (!is_deferred) {
+            func(sessions.back().primary);
+            return;
+        }
+        static_assert(std::is_trivially_destructible_v<Command> &&
+                      alignof(Command) <= RecordAlignment);
+        RecordEntry* const entry = AllocateRecord(sizeof(Command));
+        ::new (entry + 1) Command(std::forward<Func>(func));
+        entry->invoke = [](void* command, vk::CommandBuffer cmdbuf) {
+            (*static_cast<const Command*>(command))(cmdbuf);
+        };
+    }
+
+    /// Records a command that owns data_size bytes of storage aligned to RecordAlignment. fill
+    /// initializes the storage now, func receives it when the command runs.
+    template <typename Fill, typename Func>
+    void Record(std::size_t data_size, Fill&& fill, Func&& func) {
+        using Command = std::decay_t<Func>;
+        if (!is_deferred || data_size > MaxRecordData) {
+            SyncRecording();
+            record_scratch.resize(data_size);
+            fill(record_scratch.data());
+            func(sessions.back().primary, static_cast<const u8*>(record_scratch.data()));
+            return;
+        }
+        static_assert(std::is_trivially_destructible_v<Command> &&
+                      alignof(Command) <= RecordAlignment);
+        static constexpr std::size_t data_offset =
+            Common::AlignUp(sizeof(Command), RecordAlignment);
+        RecordEntry* const entry = AllocateRecord(data_offset + data_size);
+        u8* const storage = reinterpret_cast<u8*>(entry + 1);
+        fill(storage + data_offset);
+        ::new (storage) Command(std::forward<Func>(func));
+        entry->invoke = [](void* command, vk::CommandBuffer cmdbuf) {
+            (*static_cast<const Command*>(command))(cmdbuf,
+                                                    static_cast<const u8*>(command) + data_offset);
+        };
     }
 
     /// Returns the current command buffer tick.
@@ -447,14 +506,42 @@ public:
         priority_pending_ops_cv.notify_one();
     }
 
+    /// Submits a buffer readback command buffer that was recorded outside of the scheduler. It
+    /// runs once the GPU reached wait_tick and must not depend on anything recorded later. With
+    /// a readback queue it waits for wait_tick only; otherwise it is queued after all work
+    /// submitted to the graphics queue so far. Can be called from any thread.
+    void SubmitOutOfBand(vk::CommandBuffer cmdbuf, vk::Fence fence, u64 wait_tick) const;
+
     static std::mutex submit_mutex;
 
+    static constexpr std::size_t RecordAlignment = 16;
+
 private:
+    struct RecordEntry {
+        void (*invoke)(void* command, vk::CommandBuffer cmdbuf);
+        u64 size;
+    };
+    static_assert(sizeof(RecordEntry) % RecordAlignment == 0);
+
+    static constexpr u64 RecordCapacity = 4_MB;
+    static constexpr std::size_t MaxRecordData = 64_KB;
+    static constexpr u32 RecorderIdleSpins = 4096;
+
     void EndSession();
 
     void SubmitExecution(SubmitInfo& info);
 
     void PriorityPendingOpsThread(std::stop_token stoken);
+
+    /// Waits until the recorder thread has run every deferred command and ends the deferral.
+    void SyncRecording();
+
+    /// Returns a new entry of the record ring with payload_size bytes after its header.
+    RecordEntry* AllocateRecord(std::size_t payload_size);
+
+    void WaitRecordSpace(u64 size);
+
+    void RecorderThread(std::stop_token stoken);
 
 private:
     const Instance& instance;
@@ -483,6 +570,32 @@ private:
     RenderState render_state;
     bool is_rendering = false;
     tracy::VkCtxScope* profiler_scope{};
+
+    /// Whether Record hands the commands to the recorder thread. While false the ring is empty
+    /// and the recorder thread is idle.
+    bool is_deferred = false;
+    /// Storage of Record with data while not deferred.
+    std::vector<u8> record_scratch;
+    /// Deferred commands, laid out back to back. Positions count bytes and never wrap; the
+    /// offset in the ring is the position modulo RecordCapacity.
+    std::unique_ptr<u8[]> record_ring;
+    /// Command buffer of the deferred commands. Only changes while the ring is empty.
+    vk::CommandBuffer record_cmdbuf;
+    /// Thread that deferred the recording, the only one that may record until it ends.
+    const void* recording_thread{};
+    /// End of the recorded commands, known to the recording thread only.
+    u64 record_head{};
+    /// Value of record_write, and the last value of record_tail the recording thread has seen.
+    u64 record_published{};
+    u64 record_tail_seen{};
+    /// End of the commands handed to the recorder thread.
+    alignas(64) std::atomic<u64> record_write{};
+    /// End of the commands the recorder thread has run.
+    alignas(64) std::atomic<u64> record_tail{};
+    alignas(64) std::atomic<bool> recorder_sleeping{};
+    std::mutex recorder_mutex;
+    std::condition_variable_any recorder_cv;
+    std::jthread recorder_thread;
 };
 
 } // namespace Vulkan

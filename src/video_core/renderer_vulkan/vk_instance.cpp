@@ -389,12 +389,19 @@ bool Instance::CreateDevice() {
         return false;
     }
 
-    static constexpr std::array queue_priorities = {1.0f};
+    // A second queue of the family, when there is one, runs buffer readback copies, so they do
+    // not wait behind the work submitted to the main queue. Queue family ownership is per
+    // family, so the resources need no ownership transfer between the two.
+    static constexpr std::array queue_priorities = {1.0f, 1.0f};
+    const u32 queue_count = std::min<u32>(static_cast<u32>(queue_priorities.size()),
+                                          family_properties[queue_family_index].queueCount);
     const vk::DeviceQueueCreateInfo queue_info = {
         .queueFamilyIndex = queue_family_index,
-        .queueCount = static_cast<u32>(queue_priorities.size()),
+        .queueCount = queue_count,
         .pQueuePriorities = queue_priorities.data(),
     };
+    LOG_INFO(Render_Vulkan, "Queue family {} has {} queues, using {}", queue_family_index,
+             family_properties[queue_family_index].queueCount, queue_count);
 
     const auto vk11_features = feature_chain.get<vk::PhysicalDeviceVulkan11Features>();
     vk12_features = feature_chain.get<vk::PhysicalDeviceVulkan12Features>();
@@ -614,6 +621,8 @@ bool Instance::CreateDevice() {
 
     graphics_queue = device->getQueue(queue_family_index, 0);
     present_queue = device->getQueue(queue_family_index, 0);
+    has_readback_queue = queue_count > 1;
+    readback_queue = has_readback_queue ? device->getQueue(queue_family_index, 1) : graphics_queue;
 
     if (calibrated_timestamps) {
         const auto [time_domains_result, time_domains] =

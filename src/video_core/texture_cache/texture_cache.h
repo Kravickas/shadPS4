@@ -1,10 +1,11 @@
-// SPDX-FileCopyrightText: Copyright 2025 shadPS4 Emulator Project
+// SPDX-FileCopyrightText: Copyright 2025-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #pragma once
 
 #include <mutex>
 #include <optional>
+#include <string>
 #include <thread>
 #include <unordered_set>
 #include <absl/container/flat_hash_map.h>
@@ -139,6 +140,46 @@ public:
     /// Retrieves the image handle of the image with the provided attributes.
     [[nodiscard]] ImageId FindImage(ImageDesc& desc, bool exact_fmt = false);
 
+    /// Changes whenever an image is registered or unregistered, except when an image is swapped
+    /// with its parked alias.
+    [[nodiscard]] u64 RegistryGeneration() const noexcept {
+        return registry_generation;
+    }
+
+    /// Probe: the fields of an image description that tell images apart.
+    [[nodiscard]] static std::string DescribeImage(const ImageInfo& info);
+
+    /// Changes whenever an image is swapped with its parked alias.
+    [[nodiscard]] u64 SwapGeneration() const noexcept {
+        return swap_generation;
+    }
+
+    /// Whether a lookup in the range made at swap generation swaps still holds. A swap replaces
+    /// a registered image by one of the same range, so it only changes what is found there.
+    [[nodiscard]] bool IsSwapCurrent(u64& swaps, VAddr address, u64 size) const noexcept {
+        if (swaps == swap_generation) {
+            return true;
+        }
+        if (address < swap_end && swap_begin < address + size) {
+            return false;
+        }
+        swaps = swap_generation;
+        return true;
+    }
+
+    /// Whether FindImage(desc) returned image_id through its perfect match. While the registry
+    /// generation stays the same and no swap is in its range, FindImage(desc) keeps returning
+    /// that image.
+    [[nodiscard]] bool IsPerfectMatch(ImageId image_id, const ImageDesc& desc);
+
+    /// Whether FindImage(desc) returned image_id for a depth target as the only image in the
+    /// range of desc, a depth image at its address that holds the requested layers and levels.
+    /// The same holds for it as for a perfect match.
+    [[nodiscard]] bool IsContainedDepthMatch(ImageId image_id, const ImageDesc& desc);
+
+    /// Accounts the access of a FindImage result that is used again without repeating the lookup.
+    void TouchFoundImage(ImageId image_id);
+
     /// Retrieves image whose address matches provided
     [[nodiscard]] ImageId FindImageFromRange(VAddr address, size_t size, bool ensure_valid = true);
 
@@ -153,6 +194,23 @@ public:
 
     /// Links the stencil plane of a depth surface to its depth image.
     void AssociateStencil(ImageId depth_id, const ImageInfo& depth_info);
+
+    /// Probe: where images are registered and freed.
+    enum class RegistrySite : u32 {
+        New,
+        Depth,
+        Expand,
+        Merge,
+        Stencil,
+        FreeUnmap,
+        FreePool,
+        FreeTile,
+        FreeChance,
+        FreeTarget,
+        FreeMip,
+        FreeWrong,
+        FreeGc,
+    };
 
     /// Updates image contents if it was modified by CPU.
     void UpdateImage(ImageId image_id) {
@@ -176,7 +234,7 @@ public:
     [[nodiscard]] ImageId ExpandImage(const ImageInfo& info, ImageId image_id);
 
     /// Reuploads image contents.
-    void RefreshImage(Image& image);
+    void RefreshImage(Image& image, u32 first_level = 0);
 
     /// Retrieves the sampler that matches the provided S# descriptor.
     [[nodiscard]] vk::Sampler GetSampler(const AmdGpu::Sampler& sampler,
@@ -361,10 +419,10 @@ private:
                              DownloadMemoryFlags flags = DownloadMemoryFlags::None);
 
     /// Register image in the page table
-    void RegisterImage(ImageId image);
+    void RegisterImage(ImageId image, bool is_swap = false);
 
     /// Unregister image from the page table
-    void UnregisterImage(ImageId image);
+    void UnregisterImage(ImageId image, bool is_swap = false);
 
     /// Track CPU reads and writes for image
     void TrackImage(ImageId image_id);
@@ -384,6 +442,19 @@ private:
 
     /// Removes the image and any views/surface metas that reference it.
     void DeleteImage(ImageId image_id);
+
+    /// Removes what refers to an unregistered image by its address: surface metas and downloads.
+    void ReleaseImageRefs(ImageId image_id);
+
+    /// Schedules the image and its views for destruction.
+    void DestroyImage(ImageId image_id);
+
+    /// Brings back the parked alias of the image in place of it, with the contents of the image,
+    /// if it is the image new_info describes. Returns its id, or a null id.
+    [[nodiscard]] ImageId SwapWithParkedAlias(ImageId image_id, const ImageInfo& new_info);
+
+    /// Unregisters the image and keeps it as the parked alias of new_image_id.
+    void ParkImage(ImageId image_id, ImageId new_image_id);
 
     /// Touch the image in the LRU cache.
     void TouchImage(Image& image);
@@ -425,6 +496,27 @@ private:
     u64 pressure_gc_samplers = 0;
     u64 critical_gc_samplers = 0;
     u64 gc_tick = 0;
+    u64 registry_generation = 1;
+    u64 swap_generation = 0;
+    /// Range that holds every image swapped with its parked alias so far.
+    VAddr swap_begin = ~0ULL;
+    VAddr swap_end = 0;
+
+    /// Last stencil association. The same depth image and stencil range give the same stencil
+    /// image while no image is registered or unregistered.
+    struct StencilLookup {
+        u64 generation{};
+        u64 swaps{};
+        ImageId depth_id{};
+        VAddr stencil_addr{};
+        u64 stencil_size{};
+        ImageId stencil_id{};
+    };
+    StencilLookup stencil_lookup{};
+
+    void CountRegistryChange(RegistrySite site, const ImageInfo& info,
+                             const ImageInfo* other = nullptr,
+                             BindingType binding = BindingType::Texture);
     Common::LRUCache<Image> image_lru_cache;
     Common::LRUCache<Sampler> sampler_lru_cache;
     const bool readback_linear_images;
