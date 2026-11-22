@@ -749,6 +749,15 @@ ImageId TextureCache::ExpandImage(const ImageInfo& info, ImageId image_id) {
     // A CPU-dirty source is stale (e.g. a streamed texture rewritten in a reused pool slot);
     // copying it would overwrite the fresh upload with old data.
     const bool src_has_gpu_data = src_image.HasGpuValidData();
+    if (IsPadDiagImage(info)) {
+        LOG_WARNING(Render_Vulkan,
+                    "PADDIAG expand image={:#x} from id={} {} {}x{} levels={} flags={:#x} "
+                    "copy={}",
+                    info.guest_address, image_id.index, vk::to_string(src_image.info.pixel_format),
+                    src_image.info.size.width, src_image.info.size.height,
+                    src_image.info.resources.levels, static_cast<u32>(src_image.flags),
+                    src_has_gpu_data);
+    }
 
     RefreshImage(new_image);
 

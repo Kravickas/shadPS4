@@ -62,6 +62,66 @@ static void LogPadDiagSharps(const Shader::Info& stage, u32 image_index,
     }
 }
 
+static u64 PadDiagNonZeroBacking(VAddr addr, u64 size) {
+    const auto& backing_pages = Core::Memory::Instance()->GetAddressSpace().BackingPages();
+    u64 count = 0;
+    while (size) {
+        const u64 offset_in_page = addr & (Core::GUEST_PAGE_SIZE - 1);
+        const u64 chunk = std::min<u64>(Core::GUEST_PAGE_SIZE - offset_in_page, size);
+        const auto* entry = backing_pages.find(addr >> Core::GUEST_PAGE_BITS);
+        const u8* data =
+            entry && *entry ? *entry + offset_in_page : reinterpret_cast<const u8*>(addr);
+        for (u64 i = 0; i < chunk; ++i) {
+            count += data[i] != 0;
+        }
+        addr += chunk;
+        size -= chunk;
+    }
+    return count;
+}
+
+// Logs every image of a dispatch that writes a 512x256 R16G16B16A16Uint storage image,
+// the block view the pad textures are encoded through.
+static void LogPadDiagEncoder(const Shader::Info& stage, const auto& bindings, u32 count,
+                              VideoCore::TextureCache& texture_cache) {
+    bool is_encoder = false;
+    for (u32 i = 0; i < count; ++i) {
+        const auto& [image_id, desc] = bindings[i];
+        if (!image_id || desc.type != VideoCore::TextureCache::BindingType::Storage) {
+            continue;
+        }
+        const auto& info = texture_cache.GetImage(image_id).info;
+        is_encoder |= info.pixel_format == vk::Format::eR16G16B16A16Uint &&
+                      info.size.width == 512 && info.size.height == 256;
+    }
+    static u32 logged = 0;
+    if (!is_encoder || logged >= 400) {
+        return;
+    }
+    ++logged;
+    LOG_WARNING(Render_Vulkan, "PADDIAG encoder dispatch pgm_hash={:#x} images={}", stage.pgm_hash,
+                count);
+    for (u32 i = 0; i < count; ++i) {
+        const auto& [image_id, desc] = bindings[i];
+        if (!image_id) {
+            LOG_WARNING(Render_Vulkan, "PADDIAG encoder   [{}] none", i);
+            continue;
+        }
+        const auto& image = texture_cache.GetImage(image_id);
+        const auto& info = image.info;
+        LOG_WARNING(
+            Render_Vulkan,
+            "PADDIAG encoder   [{}] {} id={} addr={:#x} size={:#x} {} {}x{} levels={} "
+            "view_level={}+{} flags={:#x} guest_nonzero={}",
+            i, desc.type == VideoCore::TextureCache::BindingType::Storage ? "storage" : "sampled",
+            image_id.index, info.guest_address, info.guest_size, vk::to_string(info.pixel_format),
+            info.size.width, info.size.height, info.resources.levels,
+            desc.view_info.range.base.level, desc.view_info.range.extent.levels,
+            static_cast<u32>(image.flags),
+            PadDiagNonZeroBacking(info.guest_address, info.guest_size));
+    }
+}
+
 static Shader::PushData MakeUserData(const AmdGpu::Regs& regs) {
     // TODO(roamic): Add support for multiple viewports and geometry shaders when ViewportIndex
     // is encountered and implemented in the recompiler.
@@ -986,6 +1046,7 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
 
         image_descriptor_array_sizes.push_back(num_bindings);
     }
+    LogPadDiagEncoder(stage, image_bindings, num_images, texture_cache);
 
     // Second pass to re-bind images that were updated after binding
     for (u32 i = 0; i < num_images; ++i) {
