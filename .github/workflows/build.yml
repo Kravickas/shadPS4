@@ -196,6 +196,11 @@ jobs:
         "CLANG_CL=$((Join-Path $bin 'clang-cl.exe') -replace '\\','/')" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
 
     - name: Configure CMake
+      # Line tables and a PDB for the sampling profiler; the generated code stays the same.
+      env:
+        CFLAGS: -gline-tables-only
+        CXXFLAGS: -gline-tables-only
+        LDFLAGS: /DEBUG /OPT:REF /OPT:ICF
       run: cmake --fresh -G Ninja -B ${{github.workspace}}/build -DCMAKE_BUILD_TYPE=${{env.BUILD_TYPE}} -DCMAKE_INTERPROCEDURAL_OPTIMIZATION_RELEASE=ON -DCMAKE_C_COMPILER="$env:CLANG_CL" -DCMAKE_CXX_COMPILER="$env:CLANG_CL" -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
 
     - name: Build
@@ -205,7 +210,9 @@ jobs:
       uses: actions/upload-artifact@v7
       with:
         name: shadps4-win64-sdl-${{ needs.get-info.outputs.date }}-${{ needs.get-info.outputs.shorthash }}
-        path: ${{github.workspace}}/build/shadPS4.exe
+        path: |
+          ${{github.workspace}}/build/shadPS4.exe
+          ${{github.workspace}}/build/shadPS4.pdb
 
   macos-sdl:
     runs-on: macos-26
