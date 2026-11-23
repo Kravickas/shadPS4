@@ -11,6 +11,7 @@
 #include <span>
 #include <thread>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 #include <boost/container/small_vector.hpp>
 
@@ -98,6 +99,12 @@ public:
     }
 
     void TickFrame();
+
+    /// Whether the open command buffer holds a GPU write to memory the readback thread
+    /// downloads for the game's threads.
+    [[nodiscard]] bool IsEagerWritePending() const {
+        return eager_write_pending.load(std::memory_order_relaxed);
+    }
 
     /// Invalidates any buffer in the logical page range.
     void InvalidateMemory(VAddr device_addr, u64 size, bool assume_locks = false);
@@ -412,6 +419,12 @@ private:
     std::unordered_map<VAddr, u64> eager_pages;
     static constexpr u64 EagerPageTicks = 1024;
     std::atomic<bool> has_eager_pages{};
+    /// The 64 KB chunks that hold eager pages, to find them from a written range.
+    static constexpr u64 EagerChunkBits = 16;
+    std::unordered_set<u64> eager_chunks;
+    /// A GPU write to an eager page was recorded since the last submit.
+    std::atomic<bool> eager_write_pending{};
+    [[nodiscard]] bool WritesEagerPage(VAddr device_addr, u64 size) const;
     std::mutex eager_mutex;
     std::condition_variable_any eager_cv;
     u64 eager_kicks{};

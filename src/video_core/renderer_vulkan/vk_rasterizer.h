@@ -193,7 +193,9 @@ private:
 
     void ResetBindings(bool is_compute);
 
-    void FlushPeriodically();
+    /// Submits when enough was recorded since the last submit. is_dispatch: called for a
+    /// dispatch, not a draw.
+    void FlushPeriodically(bool is_dispatch = false);
 
     bool IsComputeMetaClear(const Pipeline* pipeline);
     bool IsComputeImageCopy(const Pipeline* pipeline);

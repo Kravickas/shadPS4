@@ -140,6 +140,7 @@ void BufferCache::TickFrame() {
     if (std::exchange(fault_process_pending, false)) {
         fault_manager->ProcessFaultBuffer();
     }
+    eager_write_pending.store(false, std::memory_order_relaxed);
     // A tick was submitted: the readback thread waits for the GPU to run it.
     if (has_eager_pages.load(std::memory_order_relaxed)) {
         {
@@ -153,29 +154,80 @@ void BufferCache::TickFrame() {
 void BufferCache::NoteFaultedPages(VAddr device_addr, u64 size) {
     const VAddr page_end = Common::AlignUp(device_addr + size, BYTES_PER_PAGE);
     const u64 tick = scheduler.CurrentTick();
+    auto& perf = AmdGpu::eager_readbacks;
     for (VAddr page = Common::AlignDown(device_addr, BYTES_PER_PAGE); page < page_end;
          page += BYTES_PER_PAGE) {
-        eager_pages[page] = tick;
+        const auto [it, is_new] = eager_pages.try_emplace(page, tick);
+        if (is_new) {
+            eager_chunks.insert(page >> EagerChunkBits);
+            perf.new_faults.fetch_add(1, std::memory_order_relaxed);
+        } else {
+            it->second = tick;
+            perf.known_faults.fetch_add(1, std::memory_order_relaxed);
+        }
     }
     has_eager_pages.store(true, std::memory_order_relaxed);
+}
+
+bool BufferCache::WritesEagerPage(VAddr device_addr, u64 size) const {
+    if (size == 0) {
+        return false;
+    }
+    const VAddr end = device_addr + size;
+    for (u64 chunk = device_addr >> EagerChunkBits; chunk <= (end - 1) >> EagerChunkBits; ++chunk) {
+        if (!eager_chunks.contains(chunk)) {
+            continue;
+        }
+        const VAddr chunk_begin = chunk << EagerChunkBits;
+        const VAddr page_end = std::min<VAddr>(end, chunk_begin + (1ULL << EagerChunkBits));
+        for (VAddr page = Common::AlignDown(std::max(device_addr, chunk_begin), BYTES_PER_PAGE);
+             page < page_end; page += BYTES_PER_PAGE) {
+            if (eager_pages.contains(page)) {
+                return true;
+            }
+        }
+    }
+    return false;
 }
 
 void BufferCache::CollectEagerPages(u64 gpu_tick,
                                     boost::container::small_vector<DownloadWindow, 16>& windows) {
     const u64 current_tick = scheduler.CurrentTick();
+    auto& perf = AmdGpu::eager_readbacks;
+    bool is_erased = false;
     for (auto it = eager_pages.begin(); it != eager_pages.end();) {
         const VAddr page = it->first;
         if (current_tick - it->second > EagerPageTicks) {
             it = eager_pages.erase(it);
+            is_erased = true;
             continue;
         }
         ++it;
+        const VAddr page_end = page + BYTES_PER_PAGE;
         const Buffer* arena = address_space[page >> ARENA_PAGE_BITS];
-        if (arena && !OverlapsDownloadInFlight(page, page + BYTES_PER_PAGE) &&
-            memory_tracker->IsRegionGpuModified(page, BYTES_PER_PAGE) &&
-            gpu_modified_ranges.Intersects(page, BYTES_PER_PAGE) &&
-            LastWriteTick(page, BYTES_PER_PAGE) <= gpu_tick) {
-            windows.push_back({arena, page, BYTES_PER_PAGE});
+        if (!arena || !memory_tracker->IsRegionGpuModified(page, BYTES_PER_PAGE)) {
+            continue;
+        }
+        if (OverlapsDownloadInFlight(page, page_end) || OverlapsDeferredDownload(page, page_end)) {
+            perf.skip_flight.fetch_add(1, std::memory_order_relaxed);
+            continue;
+        }
+        if (!gpu_modified_ranges.Intersects(page, BYTES_PER_PAGE)) {
+            // Marked GPU-modified without GPU data: unmarked as FinishReadback does at a fault.
+            memory_tracker->UnmarkRegionAsGpuModified(page, BYTES_PER_PAGE, false);
+            perf.unmarked.fetch_add(1, std::memory_order_relaxed);
+            continue;
+        }
+        if (LastWriteTick(page, BYTES_PER_PAGE) > gpu_tick) {
+            perf.skip_tick.fetch_add(1, std::memory_order_relaxed);
+            continue;
+        }
+        windows.push_back({arena, page, BYTES_PER_PAGE});
+    }
+    if (is_erased) {
+        eager_chunks.clear();
+        for (const auto& [page, tick] : eager_pages) {
+            eager_chunks.insert(page >> EagerChunkBits);
         }
     }
     if (eager_pages.empty()) {
@@ -1305,6 +1357,10 @@ bool BufferCache::SynchronizeMemory(const Buffer* arena, VAddr device_addr, u32 
         }
         if (is_written) {
             gpu_modified_ranges.Add(device_addr, size);
+            if (!eager_chunks.empty() && !eager_write_pending.load(std::memory_order_relaxed) &&
+                WritesEagerPage(device_addr, size)) {
+                eager_write_pending.store(true, std::memory_order_relaxed);
+            }
             const VAddr tick_begin = Common::AlignDown(device_addr, BYTES_PER_PAGE);
             const u64 tick_size = Common::AlignUp(device_addr + size, BYTES_PER_PAGE) - tick_begin;
             if (tick_size != 0) {

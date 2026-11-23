@@ -152,6 +152,7 @@ struct CpPerf {
     u32 va_checks;     ///< Of those, compared with the vertex inputs made at the draw
     u32 va_diffs;      ///< Compares that differed
     u32 db_expired;    ///< Depth target lookups made again because their time was up
+    u32 early_flushes; ///< Submits made for GPU writes the game's threads wait for
     /// Images registered and freed, by TextureCache::RegistrySite.
     std::array<u32, PerfTexSites> tex_sites;
     /// Page watcher updates of the whole cycle, and the part of them for images.
@@ -274,8 +275,13 @@ struct EagerReadbackPerf {
     std::atomic<u64> downloads;
     std::atomic<u64> windows;
     std::atomic<u64> bytes;
-    std::atomic<u64> gpu_ns;   ///< Download submit to fence signalled
-    std::atomic<u64> total_ns; ///< Working time of the thread, the wait for the GPU included
+    std::atomic<u64> gpu_ns;       ///< Download submit to fence signalled
+    std::atomic<u64> total_ns;     ///< Working time of the thread, the wait for the GPU included
+    std::atomic<u64> unmarked;     ///< Pages unmarked that held no GPU data
+    std::atomic<u64> skip_tick;    ///< Pages left because the GPU has not run their last write
+    std::atomic<u64> skip_flight;  ///< Pages left because a download of them is in flight
+    std::atomic<u64> known_faults; ///< Readbacks on pages the thread knew
+    std::atomic<u64> new_faults;   ///< Readbacks on pages it did not know
 };
 inline EagerReadbackPerf eager_readbacks;
 

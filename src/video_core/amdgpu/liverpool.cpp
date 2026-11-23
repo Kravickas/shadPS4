@@ -242,7 +242,8 @@ void Liverpool::Process(std::stop_token stoken) {
             "gf_write_us={} gf_write_next_page={} gf_reads={} gf_read_us={} la_solo_runs={} "
             "la_bind_us={} la_bind_skips={} va_used={} va_checks={} va_diffs={} "
             "eager_n={} eager_windows={} eager_kb={} eager_gpu_us={} eager_us={} "
-            "emulated_us={} db_expired={} "
+            "emulated_us={} db_expired={} eager_unmarked={} eager_skip_tick={} "
+            "eager_skip_flight={} eager_known={} eager_new={} early_flushes={} "
             "emulated={} stg_same_inputs={} vk_vi_us={} vk_index_us={} vk_desc_us={} "
             "vk_dyn_us={} vk_draw_us={} rec_cmds={} rec_kb={} rec_publishes={} rec_wakes={} "
             "rec_syncs={} rec_sync_us={} rec_space_waits={} rec_run_us={} rec_sleeps={} "
@@ -323,7 +324,12 @@ void Liverpool::Process(std::stop_token stoken) {
             eager_readbacks.gpu_ns.exchange(0, std::memory_order_relaxed) / 1000,
             eager_readbacks.total_ns.exchange(0, std::memory_order_relaxed) / 1000,
             readback_wait.emulated_ns.exchange(0, std::memory_order_relaxed) / 1000,
-            cp_perf.db_expired, readback_wait.emulated.exchange(0, std::memory_order_relaxed),
+            cp_perf.db_expired, eager_readbacks.unmarked.exchange(0, std::memory_order_relaxed),
+            eager_readbacks.skip_tick.exchange(0, std::memory_order_relaxed),
+            eager_readbacks.skip_flight.exchange(0, std::memory_order_relaxed),
+            eager_readbacks.known_faults.exchange(0, std::memory_order_relaxed),
+            eager_readbacks.new_faults.exchange(0, std::memory_order_relaxed),
+            cp_perf.early_flushes, readback_wait.emulated.exchange(0, std::memory_order_relaxed),
             cp_perf.stg_same_inputs, cp_perf.vk_vi_ns / 1000, cp_perf.vk_index_ns / 1000,
             cp_perf.vk_desc_ns / 1000, cp_perf.vk_dyn_ns / 1000, cp_perf.vk_draw_ns / 1000,
             cp_perf.rec_cmds, cp_perf.rec_bytes / 1024, cp_perf.rec_publishes, cp_perf.rec_wakes,

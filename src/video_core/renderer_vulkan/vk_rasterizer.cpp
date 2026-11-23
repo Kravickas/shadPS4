@@ -759,7 +759,7 @@ void Rasterizer::DispatchDirect() {
     const AmdGpu::CpPerfScope perf_scope{AmdGpu::cp_perf.dispatch_ns};
     ++AmdGpu::cp_perf.dispatches;
 
-    FlushPeriodically();
+    FlushPeriodically(true);
     scheduler.PopPendingOperations();
 
     const auto& cs_program = liverpool->GetCsRegs();
@@ -820,7 +820,7 @@ void Rasterizer::DispatchIndirect(VAddr address, u32 offset, u32 size) {
     const AmdGpu::CpPerfScope perf_scope{AmdGpu::cp_perf.dispatch_ns};
     ++AmdGpu::cp_perf.dispatches;
 
-    FlushPeriodically();
+    FlushPeriodically(true);
     scheduler.PopPendingOperations();
 
     const auto& cs_program = liverpool->GetCsRegs();
@@ -865,7 +865,7 @@ void Rasterizer::DispatchIndirect(VAddr address, u32 offset, u32 size) {
     ResetBindings(true);
 }
 
-void Rasterizer::FlushPeriodically() {
+void Rasterizer::FlushPeriodically(bool is_dispatch) {
     if (submit_draw_interval == 0) {
         return;
     }
@@ -873,9 +873,16 @@ void Rasterizer::FlushPeriodically() {
         last_submit_tick = tick;
         draws_since_submit = 0;
     }
-    if (++draws_since_submit >= submit_draw_interval) {
+    // GPU writes to memory the game's threads are known to touch soon wait in the open command
+    // buffer. They are submitted at the first draw behind the dispatches that made them, so
+    // that the GPU runs them and they can be downloaded before those threads get there; at
+    // most four times as often as the interval asks for.
+    const bool is_early = !is_dispatch && draws_since_submit >= submit_draw_interval / 4 &&
+                          buffer_cache.IsEagerWritePending();
+    if (++draws_since_submit >= submit_draw_interval || is_early) {
         const AmdGpu::CpPerfScope perf_flush{AmdGpu::cp_perf.flush_ns};
         ++AmdGpu::cp_perf.flushes;
+        AmdGpu::cp_perf.early_flushes += is_early;
         scheduler.Flush();
     }
 }
