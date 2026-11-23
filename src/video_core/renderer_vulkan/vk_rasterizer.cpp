@@ -161,6 +161,7 @@ bool Rasterizer::FilterDraw() {
 
 const GraphicsPipeline* Rasterizer::LookupPipeline(const DrawIndirectParams& params) {
     const DrawAhead* const ahead = std::exchange(draw_ahead, nullptr);
+    vertex_ahead = nullptr;
     if (ahead && ahead->lookup.pipeline) {
         if (const u64 tick = scheduler.CurrentTick(); tick != stream_ahead_tick) {
             // Everything recorded before the tick changed has run. Since then, only the last
@@ -171,7 +172,8 @@ const GraphicsPipeline* Rasterizer::LookupPipeline(const DrawIndirectParams& par
         stream_ahead_position = ahead->stream_position;
         if (LoadStageUserDataAhead(*ahead)) {
             ++AmdGpu::cp_perf.la_lookups_used;
-            buffer_cache.SetStreamHints(ahead->stream_hints, ahead->gpu_write_epoch);
+            buffer_cache.SetStreamHints(ahead->stream_hints, ahead->binding_write_epoch);
+            vertex_ahead = ahead;
             return ahead->lookup.pipeline;
         }
         ++AmdGpu::cp_perf.la_lookups_rejected;
@@ -188,7 +190,6 @@ const GraphicsPipeline* Rasterizer::LookupPipeline(const DrawIndirectParams& par
 void Rasterizer::LookAhead(DrawAhead& ahead, const AmdGpu::Regs& regs, bool is_indexed,
                            u32 index_offset, u64 run, AmdGpu::CpPerf& perf) {
     ahead.lookup.pipeline = nullptr;
-    ahead.stream_hints.clear();
     if (!NeedsPipeline(regs) || !pipeline_cache.RecordsLookupReads(regs)) {
         return;
     }
@@ -200,15 +201,29 @@ void Rasterizer::LookAhead(DrawAhead& ahead, const AmdGpu::Regs& regs, bool is_i
     if (!ahead.lookup.pipeline) {
         return;
     }
-    const u64 stream_t0 = AmdGpu::PerfNs();
-    ReadStreamAhead(ahead, regs, is_indexed, index_offset, run, perf);
-    perf.la_stream_ns += AmdGpu::PerfNs() - stream_t0;
+    ahead.run = run;
+    ahead.step_rate_0 = regs.vgt_instance_step_rate_0;
+    ahead.step_rate_1 = regs.vgt_instance_step_rate_1;
+    ahead.index_address = 0;
+    ahead.index_size = 0;
+    if (is_indexed) {
+        const bool is_index16 = regs.index_buffer_type.index_type == AmdGpu::IndexType::Index16;
+        const u32 index_size = is_index16 ? sizeof(u16) : sizeof(u32);
+        const VAddr base_address = regs.index_base_address.Address<VAddr>();
+        if (base_address != 0) {
+            const u32 num_indices = std::min(regs.num_indices, regs.max_index_size);
+            ahead.index_address = base_address + u64(index_offset) * index_size;
+            ahead.index_size = u64(num_indices) * index_size;
+        }
+    }
 }
 
-void Rasterizer::ReadStreamAhead(DrawAhead& ahead, const AmdGpu::Regs& regs, bool is_indexed,
-                                 u32 index_offset, u64 run, AmdGpu::CpPerf& perf) {
+void Rasterizer::BindAhead(DrawAhead& ahead, AmdGpu::CpPerf& perf) {
     using Result = VideoCore::BufferCache::StreamAheadResult;
+    const u64 stream_t0 = AmdGpu::PerfNs();
     const PipelineLookup& lookup = ahead.lookup;
+    ahead.stream_hints.clear();
+    ahead.binding_write_epoch = memory->GpuWriteEpoch();
     ahead.stream_position = buffer_cache.StreamAheadPosition();
     // The draw looks its hints up by address and size, so a binding this misses or gets wrong
     // only makes the draw read guest memory itself.
@@ -219,7 +234,8 @@ void Rasterizer::ReadStreamAhead(DrawAhead& ahead, const AmdGpu::Regs& regs, boo
             return;
         }
         VideoCore::BufferCache::StreamHint hint;
-        switch (buffer_cache.ReadStreamAhead(address, size, run, ahead.gpu_write_epoch, hint)) {
+        switch (buffer_cache.ReadStreamAhead(address, size, ahead.run, ahead.binding_write_epoch,
+                                             hint)) {
         case Result::Known:
             ++perf.sa_ahead_known;
             ahead.stream_hints.push_back(hint);
@@ -256,36 +272,47 @@ void Rasterizer::ReadStreamAhead(DrawAhead& ahead, const AmdGpu::Regs& regs, boo
         }
     }
 
+    // The V#s the lookup recorded are those of the fetch shader's attributes, in their order.
+    const auto& sharps = lookup.vs_reads.sharps;
+    ahead.attributes.clear();
+    ahead.bindings.clear();
+    ahead.guest_buffers.clear();
+    ahead.vertex_ranges.clear();
+    ahead.has_vertex_inputs =
+        sharps.size() == lookup.pipeline->GetFetchShader().attributes.size() &&
+        sharps.size() <= MaxVertexBufferCount;
+    if (ahead.has_vertex_inputs && !sharps.empty()) {
+        VertexInputs<vk::VertexInputBindingDivisorDescriptionEXT> divisors;
+        lookup.pipeline->GetVertexInputs(ahead.attributes, ahead.bindings, divisors,
+                                         ahead.guest_buffers, ahead.step_rate_0, ahead.step_rate_1,
+                                         nullptr, sharps);
+    }
     VertexInputs<std::pair<VAddr, VAddr>> ranges;
-    for (const AmdGpu::Buffer& buffer : lookup.vs_reads.sharps) {
+    for (const AmdGpu::Buffer& buffer : sharps) {
         if (buffer.base_address != 0 && buffer.GetSize() > 0 && ranges.size() < ranges.capacity()) {
             ranges.emplace_back(buffer.base_address, buffer.base_address + buffer.GetSize());
         }
     }
     if (!ranges.empty()) {
         std::ranges::sort(ranges);
-        auto [base_address, end_address] = ranges[0];
+        ahead.vertex_ranges.push_back(ranges[0]);
         for (const auto& [range_base, range_end] : ranges) {
+            auto& [base_address, end_address] = ahead.vertex_ranges.back();
             if (end_address < range_base) {
-                read(base_address, end_address - base_address);
-                base_address = range_base;
-                end_address = range_end;
+                ahead.vertex_ranges.emplace_back(range_base, range_end);
             } else {
                 end_address = std::max(end_address, range_end);
             }
         }
-        read(base_address, end_address - base_address);
-    }
-
-    if (is_indexed) {
-        const bool is_index16 = regs.index_buffer_type.index_type == AmdGpu::IndexType::Index16;
-        const u32 index_size = is_index16 ? sizeof(u16) : sizeof(u32);
-        const VAddr base_address = regs.index_base_address.Address<VAddr>();
-        if (base_address != 0) {
-            const u32 num_indices = std::min(regs.num_indices, regs.max_index_size);
-            read(base_address + u64(index_offset) * index_size, u64(num_indices) * index_size);
+        for (const auto& [base_address, end_address] : ahead.vertex_ranges) {
+            read(base_address, end_address - base_address);
         }
     }
+
+    if (ahead.index_address != 0) {
+        read(ahead.index_address, ahead.index_size);
+    }
+    perf.la_stream_ns += AmdGpu::PerfNs() - stream_t0;
 }
 
 std::unique_lock<std::mutex> Rasterizer::LockPipelineLookups() {
@@ -305,9 +332,8 @@ void Rasterizer::LoadStageUserData(const PipelineLookup& lookup) {
         auto& user_data = stage_user_data[u32(stage.info->sw_stage)];
         user_data.pgm_base = stage.pgm_base;
         user_data.user_data = regs.ProgramForStage(stage.hw_stage)->user_data;
-        user_data.flattened_ud_buf.assign(lookup.flats.begin() + stage.flat_begin,
-                                          lookup.flats.begin() + stage.flat_begin +
-                                              stage.flat_size);
+        // The lookup stays as it is while its draw runs.
+        user_data.flattened_ud_buf = {lookup.flats.data() + stage.flat_begin, stage.flat_size};
     }
 }
 
@@ -437,8 +463,7 @@ void Rasterizer::PrepareRenderState(const GraphicsPipeline* pipeline) {
             std::construct_at(&desc, regs.depth_buffer, regs.depth_view, regs.depth_control,
                               htile_address, hint);
             image_id = texture_cache.FindImage(desc);
-            const bool is_perfect = texture_cache.IsPerfectMatch(image_id, desc) ||
-                                    texture_cache.IsContainedDepthMatch(image_id, desc);
+            const bool is_perfect = texture_cache.IsPerfectMatch(image_id, desc);
             const bool reusable = texture_cache.RegistryGeneration() == generation &&
                                   texture_cache.SwapGeneration() == swaps && is_perfect;
             if (!reusable) {
@@ -446,10 +471,13 @@ void Rasterizer::PrepareRenderState(const GraphicsPipeline* pipeline) {
                                      : texture_cache.SwapGeneration() != swaps        ? 1
                                                                                       : 2];
                 if (!is_perfect && AmdGpu::TakePerfLine(AmdGpu::perf_db_site_budget)) {
-                    LOG_INFO(Render, "PERF db_site hint={}x{} {} | cache {}", hint.width,
-                             hint.height, VideoCore::TextureCache::DescribeImage(desc.info),
+                    LOG_INFO(Render,
+                             "PERF db_site hint={}x{} pitch={} {} | cache id={} {} | region{}",
+                             hint.width, hint.height, desc.info.pitch,
+                             VideoCore::TextureCache::DescribeImage(desc.info), image_id.index,
                              VideoCore::TextureCache::DescribeImage(
-                                 texture_cache.GetImage(image_id).info));
+                                 texture_cache.GetImage(image_id).info),
+                             texture_cache.DescribeRegion(desc.info));
                 }
             }
             lookup.generation = reusable ? generation : 0;
@@ -918,13 +946,36 @@ bool Rasterizer::BindResources(const Pipeline* pipeline) {
 void Rasterizer::BindVertexBuffers(const GraphicsPipeline* pipeline) {
     const u64 vi_t0 = AmdGpu::PerfInDrawNs();
     const auto& regs = liverpool->regs;
-    VertexInputs<vk::VertexInputAttributeDescription2EXT> attributes;
-    VertexInputs<vk::VertexInputBindingDescription2EXT> bindings;
+    VertexInputs<vk::VertexInputAttributeDescription2EXT> own_attributes;
+    VertexInputs<vk::VertexInputBindingDescription2EXT> own_bindings;
     VertexInputs<vk::VertexInputBindingDivisorDescriptionEXT> divisors;
-    VertexInputs<AmdGpu::Buffer> guest_buffers;
-    pipeline->GetVertexInputs(attributes, bindings, divisors, guest_buffers,
-                              regs.vgt_instance_step_rate_0, regs.vgt_instance_step_rate_1,
-                              &stage_user_data[u32(Shader::SwStage::Vertex)]);
+    VertexInputs<AmdGpu::Buffer> own_guest_buffers;
+    // The lookup the pipeline came from holds for this draw, and with it the V#s it read.
+    const DrawAhead* ahead = std::exchange(vertex_ahead, nullptr);
+    if (ahead && (!ahead->has_vertex_inputs || !instance.IsVertexInputDynamicState() ||
+                  ahead->step_rate_0 != regs.vgt_instance_step_rate_0 ||
+                  ahead->step_rate_1 != regs.vgt_instance_step_rate_1)) {
+        ahead = nullptr;
+    }
+    const bool is_check = ahead && (++vertex_ahead_uses & (VertexAheadCheckInterval - 1)) == 0;
+    if (!ahead || is_check) {
+        pipeline->GetVertexInputs(own_attributes, own_bindings, divisors, own_guest_buffers,
+                                  regs.vgt_instance_step_rate_0, regs.vgt_instance_step_rate_1,
+                                  &stage_user_data[u32(Shader::SwStage::Vertex)]);
+    }
+    if (is_check) {
+        ++AmdGpu::cp_perf.va_checks;
+        if (!std::ranges::equal(own_attributes, ahead->attributes) ||
+            !std::ranges::equal(own_bindings, ahead->bindings) ||
+            !std::ranges::equal(own_guest_buffers, ahead->guest_buffers)) {
+            ++AmdGpu::cp_perf.va_diffs;
+            ahead = nullptr;
+        }
+    }
+    AmdGpu::cp_perf.va_used += ahead != nullptr;
+    const auto& attributes = ahead ? ahead->attributes : own_attributes;
+    const auto& bindings = ahead ? ahead->bindings : own_bindings;
+    const auto& guest_buffers = ahead ? ahead->guest_buffers : own_guest_buffers;
 
     if (instance.IsVertexInputDynamicState()) {
         // Update current vertex inputs.
@@ -972,14 +1023,20 @@ void Rasterizer::BindVertexBuffers(const GraphicsPipeline* pipeline) {
 
     // Build list of ranges covering the requested buffers
     VertexInputs<BufferRange> ranges{};
-    for (const auto& buffer : guest_buffers) {
-        if (buffer.base_address != 0 && buffer.GetSize() > 0) {
-            ranges.emplace_back(buffer.base_address, buffer.base_address + buffer.GetSize());
+    VertexInputs<BufferRange> ranges_merged{};
+    if (ahead) {
+        for (const auto& [base_address, end_address] : ahead->vertex_ranges) {
+            ranges_merged.emplace_back(base_address, end_address);
+        }
+    } else {
+        for (const auto& buffer : guest_buffers) {
+            if (buffer.base_address != 0 && buffer.GetSize() > 0) {
+                ranges.emplace_back(buffer.base_address, buffer.base_address + buffer.GetSize());
+            }
         }
     }
 
     // Merge connecting ranges together
-    VertexInputs<BufferRange> ranges_merged{};
     if (!ranges.empty()) {
         std::ranges::sort(ranges, [](const BufferRange& lhv, const BufferRange& rhv) {
             return lhv.base_address < rhv.base_address;

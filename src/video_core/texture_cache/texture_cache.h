@@ -172,10 +172,8 @@ public:
     /// that image.
     [[nodiscard]] bool IsPerfectMatch(ImageId image_id, const ImageDesc& desc);
 
-    /// Whether FindImage(desc) returned image_id for a depth target as the only image in the
-    /// range of desc, a depth image at its address that holds the requested layers and levels.
-    /// The same holds for it as for a perfect match.
-    [[nodiscard]] bool IsContainedDepthMatch(ImageId image_id, const ImageDesc& desc);
+    /// Probe: the images registered in the range of info.
+    [[nodiscard]] std::string DescribeRegion(const ImageInfo& info);
 
     /// Accounts the access of a FindImage result that is used again without repeating the lookup.
     void TouchFoundImage(ImageId image_id);

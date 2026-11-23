@@ -1451,27 +1451,14 @@ void TextureCache::TouchImage(Image& image) {
     image_lru_cache.Touch(image, gc_tick);
 }
 
-bool TextureCache::IsContainedDepthMatch(ImageId image_id, const ImageDesc& desc) {
-    const auto& info = desc.info;
-    const auto& cache_info = slot_images[image_id].info;
-    if (desc.type != BindingType::DepthTarget || !info.props.is_depth ||
-        !cache_info.props.is_depth || cache_info.guest_address != info.guest_address) {
-        return false;
-    }
-    // The tests ResolveOverlap and ResolveDepthOverlap make before they give the cached image
-    // as it is, and the one FindImage makes on what they give.
-    if (!info.HasSameBlockLayout(cache_info) ||
-        info.num_bits * info.num_samples != cache_info.num_bits * cache_info.num_samples ||
-        !cache_info.resources.Contains(info.resources) ||
-        info.props.has_stencil != cache_info.props.has_stencil ||
-        info.num_bits != cache_info.num_bits) {
-        return false;
-    }
-    // With no other image in the range nothing else takes part in the lookup.
-    bool is_only = true;
-    ForEachImageInRegion(info.guest_address, info.guest_size,
-                         [&](ImageId other_id, Image&) { is_only &= other_id == image_id; });
-    return is_only;
+std::string TextureCache::DescribeRegion(const ImageInfo& info) {
+    std::string out;
+    ForEachImageInRegion(info.guest_address, info.guest_size, [&](ImageId id, Image& image) {
+        fmt::format_to(std::back_inserter(out), " [id={} pitch={} flags={:#x} accessed={} {}]",
+                       id.index, image.info.pitch, static_cast<u32>(image.flags),
+                       image.tick_accessed_last, DescribeImage(image.info));
+    });
+    return out;
 }
 
 bool TextureCache::IsPerfectMatch(ImageId image_id, const ImageDesc& desc) {

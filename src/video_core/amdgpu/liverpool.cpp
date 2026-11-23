@@ -240,6 +240,7 @@ void Liverpool::Process(std::stop_token stoken) {
             "db_miss_buffer={} db_miss_view={} db_miss_htile_hint={} db_miss_swap={} "
             "db_un_registry={} db_un_swap={} db_un_imperfect={} resident_hits={} gf_writes={} "
             "gf_write_us={} gf_write_next_page={} gf_reads={} gf_read_us={} la_solo_runs={} "
+            "la_bind_us={} la_bind_skips={} va_used={} va_checks={} va_diffs={} "
             "emulated={} stg_same_inputs={} vk_vi_us={} vk_index_us={} vk_desc_us={} "
             "vk_dyn_us={} vk_draw_us={} rec_cmds={} rec_kb={} rec_publishes={} rec_wakes={} "
             "rec_syncs={} rec_sync_us={} rec_space_waits={} rec_run_us={} rec_sleeps={} "
@@ -310,11 +311,15 @@ void Liverpool::Process(std::stop_token stoken) {
             guest_faults.next_page_writes.exchange(0, std::memory_order_relaxed),
             guest_faults.reads.exchange(0, std::memory_order_relaxed),
             guest_faults.read_ns.exchange(0, std::memory_order_relaxed) / 1000,
-            cp_perf.la_solo_runs, readback_wait.emulated.exchange(0, std::memory_order_relaxed),
-            cp_perf.stg_same_inputs, cp_perf.vk_vi_ns / 1000, cp_perf.vk_index_ns / 1000,
-            cp_perf.vk_desc_ns / 1000, cp_perf.vk_dyn_ns / 1000, cp_perf.vk_draw_ns / 1000,
-            cp_perf.rec_cmds, cp_perf.rec_bytes / 1024, cp_perf.rec_publishes, cp_perf.rec_wakes,
-            cp_perf.rec_syncs, cp_perf.rec_sync_ns / 1000, cp_perf.rec_space_waits,
+            cp_perf.la_solo_runs,
+            lookahead_perf.stream_ns.exchange(0, std::memory_order_relaxed) / 1000,
+            lookahead_perf.stream_skips.exchange(0, std::memory_order_relaxed), cp_perf.va_used,
+            cp_perf.va_checks, cp_perf.va_diffs,
+            readback_wait.emulated.exchange(0, std::memory_order_relaxed), cp_perf.stg_same_inputs,
+            cp_perf.vk_vi_ns / 1000, cp_perf.vk_index_ns / 1000, cp_perf.vk_desc_ns / 1000,
+            cp_perf.vk_dyn_ns / 1000, cp_perf.vk_draw_ns / 1000, cp_perf.rec_cmds,
+            cp_perf.rec_bytes / 1024, cp_perf.rec_publishes, cp_perf.rec_wakes, cp_perf.rec_syncs,
+            cp_perf.rec_sync_ns / 1000, cp_perf.rec_space_waits,
             recorder_perf.run_ns.exchange(0, std::memory_order_relaxed) / 1000,
             recorder_perf.sleeps.exchange(0, std::memory_order_relaxed), cp_perf.sc_total_ns / 1000,
             cp_perf.sc_compare_ns / 1000, cp_perf.sc_guest_ns / 1000, cp_perf.sc_write_ns / 1000,
@@ -891,7 +896,10 @@ void Liverpool::StartLookaheadRun(std::span<const u32> dcb) {
         lookahead_state = std::make_unique<GfxStateCopy>();
         lookahead_draws = std::make_unique<Vulkan::DrawAhead[]>(NumLookaheadResults);
         lookahead_cp_perf = std::make_unique<CpPerf>();
+        lookahead_binding_perf = std::make_unique<CpPerf>();
         lookahead_thread = std::jthread{std::bind_front(&Liverpool::LookaheadThread, this)};
+        lookahead_binding_thread =
+            std::jthread{std::bind_front(&Liverpool::LookaheadBindingThread, this)};
     }
     // The lookahead thread is stopped here, so its state has to be the real one.
     if (!lookahead_needs_copy && lookahead_compare_countdown-- == 0) {
@@ -917,14 +925,14 @@ void Liverpool::StartLookaheadRun(std::span<const u32> dcb) {
     lookahead_run_end = dcb.data() + dcb.size();
     is_lookahead_running = true;
     ++cp_perf.la_runs;
-    // Sequentially consistent with the lookahead thread, which sets lookahead_sleeping and then
-    // reads lookahead_started_run: one of the two sees the other's store.
+    // Sequentially consistent with the two threads, which count themselves in
+    // lookahead_sleepers and then read lookahead_started_run: one side sees the other's store.
     lookahead_started_run.store(++lookahead_run);
-    if (lookahead_sleeping.load()) {
+    if (lookahead_sleepers.load() != 0) {
         {
             std::scoped_lock lk{lookahead_mutex};
         }
-        lookahead_cv.notify_one();
+        lookahead_cv.notify_all();
     }
 }
 
@@ -948,9 +956,10 @@ void Liverpool::WaitLookaheadStopped() {
     }
     drop_results();
 
-    // The thread is stopped, so the probes of its work can be taken.
-    CpPerf& ahead = *lookahead_cp_perf;
-    cp_perf.la_lookup_ns += ahead.pipe_key_ns;
+    // The threads are stopped, so the probes of their work can be taken.
+    cp_perf.la_lookup_ns += lookahead_cp_perf->pipe_key_ns;
+    *lookahead_cp_perf = {};
+    CpPerf& ahead = *lookahead_binding_perf;
     cp_perf.la_stream_ns += ahead.la_stream_ns;
     cp_perf.sa_ahead_known += ahead.sa_ahead_known;
     cp_perf.sa_ahead_same += ahead.sa_ahead_same;
@@ -994,18 +1003,18 @@ void Liverpool::EndLookaheadRun(const u32* packet) {
 
 void Liverpool::TakeLookaheadResult(std::span<const u32> dcb) {
     for (u32 attempt = 0; attempt < 2; ++attempt) {
-        u64 produced = lookahead_produced.load(std::memory_order_acquire);
-        if (produced == lookahead_taken) {
+        u64 ready = lookahead_ready.load(std::memory_order_acquire);
+        if (ready == lookahead_taken) {
             const u64 wait_t0 = PerfNs();
             ++cp_perf.la_waits;
             while (lookahead_stopped_run.load(std::memory_order_acquire) != lookahead_run &&
-                   lookahead_produced.load(std::memory_order_acquire) == lookahead_taken) {
+                   lookahead_ready.load(std::memory_order_acquire) == lookahead_taken) {
                 PauseForLookahead();
             }
-            produced = lookahead_produced.load(std::memory_order_acquire);
+            ready = lookahead_ready.load(std::memory_order_acquire);
             cp_perf.la_wait_ns += PerfNs() - wait_t0;
         }
-        if (produced != lookahead_taken) {
+        if (ready != lookahead_taken) {
             const LookaheadResult& result =
                 lookahead_results[lookahead_taken % NumLookaheadResults];
             if (result.packet == dcb.data()) {
@@ -1078,10 +1087,7 @@ void Liverpool::LookaheadThread(std::stop_token stoken) {
                 continue;
             }
             idle_spins = 0;
-            std::unique_lock lk{lookahead_mutex};
-            lookahead_sleeping.store(true);
-            lookahead_cv.wait(lk, stoken, [&] { return lookahead_started_run.load() != run; });
-            lookahead_sleeping.store(false);
+            SleepUntilLookaheadRun(stoken, run);
             lookahead_perf.sleeps.fetch_add(1, std::memory_order_relaxed);
             continue;
         }
@@ -1108,8 +1114,11 @@ void Liverpool::LookaheadThread(std::stop_token stoken) {
             ApplyPacketState(state, header);
             if (packet_class == PacketClass::Draw) {
                 // The entry of the last result taken stays as it is: its draw may be using it.
+                // Entries the binding thread has not finished are its to use.
                 while (produced - lookahead_consumed.load(std::memory_order_acquire) >=
-                       NumLookaheadResults - 1) {
+                           NumLookaheadResults - 1 ||
+                       produced - lookahead_ready.load(std::memory_order_acquire) >=
+                           NumLookaheadResults - 1) {
                     if (stoken.stop_requested()) {
                         return;
                     }
@@ -1139,8 +1148,63 @@ void Liverpool::LookaheadThread(std::stop_token stoken) {
             packet += header->type3.NumWords() + 1;
         }
         lookahead_stop = packet;
-        lookahead_stopped_run.store(run, std::memory_order_release);
+        lookahead_scanned_run.store(run, std::memory_order_release);
         lookahead_perf.scan_ns.fetch_add(PerfNs() - scan_t0, std::memory_order_relaxed);
+    }
+}
+
+void Liverpool::SleepUntilLookaheadRun(std::stop_token stoken, u64 run) {
+    std::unique_lock lk{lookahead_mutex};
+    lookahead_sleepers.fetch_add(1);
+    lookahead_cv.wait(lk, stoken, [&] { return lookahead_started_run.load() != run; });
+    lookahead_sleepers.fetch_sub(1);
+}
+
+void Liverpool::LookaheadBindingThread(std::stop_token stoken) {
+    Common::SetCurrentThreadName("shadPS4:GpuLookaheadBind");
+    Common::SamplingProfiler::RegisterCurrentThread("GpuLookaheadBind");
+
+    // The last run this thread declared stopped, and the results it has finished.
+    u64 run = 0;
+    u64 ready = 0;
+    u32 idle_spins = 0;
+    while (!stoken.stop_requested()) {
+        const u64 started = lookahead_started_run.load(std::memory_order_acquire);
+        if (started == run) {
+            if (++idle_spins < LookaheadIdleSpins) {
+                ThreadPause();
+                continue;
+            }
+            idle_spins = 0;
+            SleepUntilLookaheadRun(stoken, run);
+            continue;
+        }
+        idle_spins = 0;
+        if (ready != lookahead_produced.load(std::memory_order_acquire)) {
+            // A result below lookahead_consumed that is not finished was dropped by the GPU
+            // thread: nobody takes it.
+            if (ready >= lookahead_consumed.load(std::memory_order_acquire)) {
+                const u64 bind_t0 = PerfNs();
+                Vulkan::DrawAhead& ahead = lookahead_draws[ready % NumLookaheadResults];
+                if (ahead.lookup.pipeline) {
+                    rasterizer->BindAhead(ahead, *lookahead_binding_perf);
+                }
+                lookahead_perf.stream_ns.fetch_add(PerfNs() - bind_t0, std::memory_order_relaxed);
+            } else {
+                lookahead_perf.stream_skips.fetch_add(1, std::memory_order_relaxed);
+            }
+            lookahead_ready.store(++ready, std::memory_order_release);
+            continue;
+        }
+        // The lookahead thread stores its last result of a run before it names the run scanned,
+        // and makes no result of the next run before this thread has named this one stopped.
+        if (lookahead_scanned_run.load(std::memory_order_acquire) == started &&
+            ready == lookahead_produced.load(std::memory_order_acquire)) {
+            run = started;
+            lookahead_stopped_run.store(run, std::memory_order_release);
+            continue;
+        }
+        ThreadPause();
     }
 }
 

@@ -148,6 +148,9 @@ struct CpPerf {
     std::array<u32, 3> db_unreusable;
     u32 resident_hits; ///< EnsureResident calls answered by the kept ranges
     u32 la_solo_runs;  ///< Runs without the lookahead thread
+    u32 va_used;       ///< Draws that took their vertex inputs from the lookahead
+    u32 va_checks;     ///< Of those, compared with the vertex inputs made at the draw
+    u32 va_diffs;      ///< Compares that differed
     /// Images registered and freed, by TextureCache::RegistrySite.
     std::array<u32, PerfTexSites> tex_sites;
     /// Page watcher updates of the whole cycle, and the part of them for images.
@@ -244,8 +247,10 @@ inline RecorderPerf recorder_perf;
 
 /// Work of the lookahead thread.
 struct LookaheadPerf {
-    std::atomic<u64> scan_ns; ///< Time scanning runs
-    std::atomic<u64> sleeps;  ///< Times the thread went to sleep with nothing to scan
+    std::atomic<u64> scan_ns;      ///< Time scanning runs
+    std::atomic<u64> sleeps;       ///< Times the thread went to sleep with nothing to scan
+    std::atomic<u64> stream_ns;    ///< Time the binding thread worked on results
+    std::atomic<u64> stream_skips; ///< Results the binding thread left out, nobody takes them
 };
 inline LookaheadPerf lookahead_perf;
 
@@ -642,6 +647,11 @@ private:
     bool CompareLookaheadState();
 
     void LookaheadThread(std::stop_token stoken);
+    /// Second stage of the lookahead: reads what the draws bind for the results the lookahead
+    /// thread has made, in their order.
+    void LookaheadBindingThread(std::stop_token stoken);
+    /// Sleeps until a run other than run is started.
+    void SleepUntilLookaheadRun(std::stop_token stoken, u64 run);
 
     std::unique_ptr<GfxStateCopy> lookahead_state;
     std::array<LookaheadResult, NumLookaheadResults> lookahead_results;
@@ -650,10 +660,12 @@ private:
     std::unique_ptr<Vulkan::DrawAhead[]> lookahead_draws;
     /// Probe timings of the lookahead thread's lookups, read while it is stopped.
     std::unique_ptr<CpPerf> lookahead_cp_perf;
+    /// The same for the binding thread.
+    std::unique_ptr<CpPerf> lookahead_binding_perf;
     /// Run the lookahead thread scans. Only changes while it is stopped.
     const u32* lookahead_run_begin{};
     const u32* lookahead_run_end{};
-    /// Where the lookahead thread stopped. Valid once lookahead_stopped_run names the run.
+    /// Where the lookahead thread stopped. Valid once lookahead_scanned_run names the run.
     const u32* lookahead_stop{};
     bool is_lookahead_running{};
     /// The packets up to the next Other packet hold no draw the lookahead thread prepares, so
@@ -668,10 +680,16 @@ private:
     bool perf_state_changed{};
     u64 lookahead_taken{};
     alignas(64) std::atomic<u64> lookahead_started_run{};
+    /// Run the lookahead thread has scanned to its end.
+    alignas(64) std::atomic<u64> lookahead_scanned_run{};
+    /// Run both threads are done with.
     alignas(64) std::atomic<u64> lookahead_stopped_run{};
+    /// Results the lookahead thread has made, and those the binding thread has finished. The
+    /// GPU thread takes finished ones.
     alignas(64) std::atomic<u64> lookahead_produced{};
+    alignas(64) std::atomic<u64> lookahead_ready{};
     alignas(64) std::atomic<u64> lookahead_consumed{};
-    alignas(64) std::atomic<bool> lookahead_sleeping{};
+    alignas(64) std::atomic<u32> lookahead_sleepers{};
     std::mutex lookahead_mutex;
     std::condition_variable_any lookahead_cv;
 
@@ -693,6 +711,7 @@ private:
 
 private:
     std::jthread lookahead_thread;
+    std::jthread lookahead_binding_thread;
 };
 
 } // namespace AmdGpu

@@ -215,24 +215,28 @@ DECLARE_ENUM_FLAG_OPERATORS(Info::ReadConstType);
 struct StageUserData {
     VAddr pgm_base{};
     std::span<const u32> user_data;
-    std::vector<u32> flattened_ud_buf;
+    /// The flattened user data: own_flat, or that of a lookup while its draw runs.
+    std::span<const u32> flattened_ud_buf;
+    std::vector<u32> own_flat;
 
     /// Takes what the last lookup of the stage left in its Info.
     void Load(const Info& info) {
         pgm_base = info.pgm_base;
         user_data = info.user_data;
-        flattened_ud_buf = info.flattened_ud_buf;
+        own_flat = info.flattened_ud_buf;
+        flattened_ud_buf = own_flat;
     }
 
     /// Reads the user data of the stage again.
     void Refresh(const Info& info, const ShaderParams& params) {
         pgm_base = params.Base();
         user_data = params.user_data;
-        flattened_ud_buf.resize(info.srt_info.flattened_bufsize_dw);
-        std::memcpy(flattened_ud_buf.data(), user_data.data(), user_data.size_bytes());
+        own_flat.resize(info.srt_info.flattened_bufsize_dw);
+        std::memcpy(own_flat.data(), user_data.data(), user_data.size_bytes());
         if (info.srt_info.walker_func) {
-            info.srt_info.walker_func(user_data.data(), flattened_ud_buf.data());
+            info.srt_info.walker_func(user_data.data(), own_flat.data());
         }
+        flattened_ud_buf = own_flat;
     }
 
     template <typename T>

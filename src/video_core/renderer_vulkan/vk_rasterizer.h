@@ -24,15 +24,32 @@ namespace Vulkan {
 class GraphicsPipeline;
 class Runtime;
 
-/// What the lookahead thread prepares for a draw it reaches before the GPU thread does.
+/// What the lookahead threads prepare for a draw they reach before the GPU thread does. The
+/// lookahead thread makes the lookup and takes the registers below, the binding thread the rest.
 struct DrawAhead {
     PipelineLookup lookup;
-    /// Count of the GPU's writes to guest memory before any of this was read from it.
+    /// Count of the GPU's writes to guest memory before the lookup read any of it.
     u64 gpu_write_epoch{};
+    u64 run{};
+    /// The bytes the index buffer binding of the draw covers, if it has one.
+    VAddr index_address{};
+    u64 index_size{};
+    u32 step_rate_0{};
+    u32 step_rate_1{};
+
+    /// Count of the GPU's writes to guest memory before the bytes of the bindings were read.
+    u64 binding_write_epoch{};
     /// Position of the buffer cache's reads ahead before those of this draw.
     u64 stream_position{};
     /// The bytes of the draw's read-only bindings the stream buffer could serve.
     std::vector<VideoCore::BufferCache::StreamHint> stream_hints;
+    /// The vertex inputs of the draw, from the V#s the lookup read, and the ranges of its vertex
+    /// buffers merged and in address order.
+    bool has_vertex_inputs{};
+    VertexInputs<vk::VertexInputAttributeDescription2EXT> attributes;
+    VertexInputs<vk::VertexInputBindingDescription2EXT> bindings;
+    VertexInputs<AmdGpu::Buffer> guest_buffers;
+    VertexInputs<std::pair<VAddr, VAddr>> vertex_ranges;
 };
 
 class Rasterizer {
@@ -102,11 +119,15 @@ public:
         return pipeline_cache;
     }
 
-    /// For the lookahead thread: prepares a draw from the registers it will run with. perf
-    /// gets the probe timings.
+    /// For the lookahead thread: looks the pipeline of a draw up from the registers it will run
+    /// with. perf gets the probe timings.
     /// run names the run of draws the draw belongs to.
     void LookAhead(DrawAhead& ahead, const AmdGpu::Regs& regs, bool is_indexed, u32 index_offset,
                    u64 run, AmdGpu::CpPerf& perf);
+
+    /// For the binding thread: reads the bytes of the bindings of a draw whose pipeline was
+    /// looked up ahead and makes its vertex inputs.
+    void BindAhead(DrawAhead& ahead, AmdGpu::CpPerf& perf);
 
     /// Hands over what the lookahead thread prepared for the next draw, if anything.
     void SetDrawAhead(const DrawAhead* ahead) {
@@ -162,10 +183,6 @@ private:
     /// reads; else, and for one lookup in LookupCheckInterval, all of it is read again.
     bool LoadStageUserDataAhead(const DrawAhead& ahead);
 
-    /// For the lookahead thread: reads the bytes of the draw's bindings.
-    void ReadStreamAhead(DrawAhead& ahead, const AmdGpu::Regs& regs, bool is_indexed,
-                         u32 index_offset, u64 run, AmdGpu::CpPerf& perf);
-
     void BindBuffers(const Shader::Info& stage, Shader::Backend::Bindings& binding,
                      Shader::PushData& push_data);
     void BindTextures(const Shader::Info& stage, Shader::Backend::Bindings& binding);
@@ -199,6 +216,10 @@ private:
     std::array<Shader::StageUserData, MaxShaderStages> stage_user_data;
     PipelineLookup own_lookup;
     const DrawAhead* draw_ahead{};
+    /// The lookahead result the pipeline of the draw came from, for its vertex inputs.
+    const DrawAhead* vertex_ahead{};
+    static constexpr u32 VertexAheadCheckInterval = 64;
+    u32 vertex_ahead_uses{};
     static constexpr u32 LookupCheckInterval = 64;
     u32 lookups_ahead{};
     /// For releasing the buffer cache's reads ahead: the tick the last draw prepared ahead
