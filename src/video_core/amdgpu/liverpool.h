@@ -153,6 +153,13 @@ struct CpPerf {
     u32 va_diffs;      ///< Compares that differed
     u32 db_expired;    ///< Depth target lookups made again because their time was up
     u32 early_flushes; ///< Submits made for GPU writes the game's threads wait for
+    u32 ra_stages;     ///< Stages bound with the V#s and texture keys the binding thread made
+    u32 ra_checks;     ///< Of those V#s and keys, compared with the ones made at the draw
+    u32 ra_diffs;      ///< Compares that differed
+    u32 la_run_waits;  ///< Runs whose first draw had to wait for its result
+    u64 la_run_wait_ns;
+    u32 la_woken_runs;    ///< Runs started while a lookahead thread slept
+    u64 la_woken_wait_ns; ///< Of la_run_wait_ns, in those runs
     /// Images registered and freed, by TextureCache::RegistrySite.
     std::array<u32, PerfTexSites> tex_sites;
     /// Page watcher updates of the whole cycle, and the part of them for images.
@@ -699,6 +706,9 @@ private:
     /// Probe: a context, uconfig or config register changed since the last draw.
     bool perf_state_changed{};
     u64 lookahead_taken{};
+    /// Probe: the first result of the run, and whether a thread slept when the run started.
+    u64 lookahead_run_first{};
+    bool lookahead_run_woke{};
     alignas(64) std::atomic<u64> lookahead_started_run{};
     /// Run the lookahead thread has scanned to its end.
     alignas(64) std::atomic<u64> lookahead_scanned_run{};

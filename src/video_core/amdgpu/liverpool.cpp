@@ -246,6 +246,8 @@ void Liverpool::Process(std::stop_token stoken) {
             "eager_n={} eager_windows={} eager_kb={} eager_gpu_us={} eager_us={} "
             "emulated_us={} db_expired={} eager_unmarked={} eager_skip_tick={} "
             "eager_skip_flight={} eager_known={} eager_new={} early_flushes={} "
+            "ra_stages={} ra_checks={} ra_diffs={} la_run_waits={} la_run_wait_us={} "
+            "la_woken_runs={} la_woken_wait_us={} "
             "emulated={} stg_same_inputs={} vk_vi_us={} vk_index_us={} vk_desc_us={} "
             "vk_dyn_us={} vk_draw_us={} rec_cmds={} rec_kb={} rec_publishes={} rec_wakes={} "
             "rec_syncs={} rec_sync_us={} rec_space_waits={} rec_run_us={} rec_sleeps={} "
@@ -331,11 +333,14 @@ void Liverpool::Process(std::stop_token stoken) {
             eager_readbacks.skip_flight.exchange(0, std::memory_order_relaxed),
             eager_readbacks.known_faults.exchange(0, std::memory_order_relaxed),
             eager_readbacks.new_faults.exchange(0, std::memory_order_relaxed),
-            cp_perf.early_flushes, readback_wait.emulated.exchange(0, std::memory_order_relaxed),
-            cp_perf.stg_same_inputs, cp_perf.vk_vi_ns / 1000, cp_perf.vk_index_ns / 1000,
-            cp_perf.vk_desc_ns / 1000, cp_perf.vk_dyn_ns / 1000, cp_perf.vk_draw_ns / 1000,
-            cp_perf.rec_cmds, cp_perf.rec_bytes / 1024, cp_perf.rec_publishes, cp_perf.rec_wakes,
-            cp_perf.rec_syncs, cp_perf.rec_sync_ns / 1000, cp_perf.rec_space_waits,
+            cp_perf.early_flushes, cp_perf.ra_stages, cp_perf.ra_checks, cp_perf.ra_diffs,
+            cp_perf.la_run_waits, cp_perf.la_run_wait_ns / 1000, cp_perf.la_woken_runs,
+            cp_perf.la_woken_wait_ns / 1000,
+            readback_wait.emulated.exchange(0, std::memory_order_relaxed), cp_perf.stg_same_inputs,
+            cp_perf.vk_vi_ns / 1000, cp_perf.vk_index_ns / 1000, cp_perf.vk_desc_ns / 1000,
+            cp_perf.vk_dyn_ns / 1000, cp_perf.vk_draw_ns / 1000, cp_perf.rec_cmds,
+            cp_perf.rec_bytes / 1024, cp_perf.rec_publishes, cp_perf.rec_wakes, cp_perf.rec_syncs,
+            cp_perf.rec_sync_ns / 1000, cp_perf.rec_space_waits,
             recorder_perf.run_ns.exchange(0, std::memory_order_relaxed) / 1000,
             recorder_perf.sleeps.exchange(0, std::memory_order_relaxed), cp_perf.sc_total_ns / 1000,
             cp_perf.sc_compare_ns / 1000, cp_perf.sc_guest_ns / 1000, cp_perf.sc_write_ns / 1000,
@@ -945,11 +950,14 @@ void Liverpool::StartLookaheadRun(std::span<const u32> dcb) {
     // Sequentially consistent with the two threads, which count themselves in
     // lookahead_sleepers and then read lookahead_started_run: one side sees the other's store.
     lookahead_started_run.store(++lookahead_run);
-    if (lookahead_sleepers.load() != 0) {
+    lookahead_run_first = lookahead_taken;
+    lookahead_run_woke = lookahead_sleepers.load() != 0;
+    if (lookahead_run_woke) {
         {
             std::scoped_lock lk{lookahead_mutex};
         }
         lookahead_cv.notify_all();
+        ++cp_perf.la_woken_runs;
     }
 }
 
@@ -1029,7 +1037,13 @@ void Liverpool::TakeLookaheadResult(std::span<const u32> dcb) {
                 PauseForLookahead();
             }
             ready = lookahead_ready.load(std::memory_order_acquire);
-            cp_perf.la_wait_ns += PerfNs() - wait_t0;
+            const u64 wait_ns = PerfNs() - wait_t0;
+            cp_perf.la_wait_ns += wait_ns;
+            if (lookahead_taken == lookahead_run_first) {
+                ++cp_perf.la_run_waits;
+                cp_perf.la_run_wait_ns += wait_ns;
+                cp_perf.la_woken_wait_ns += lookahead_run_woke ? wait_ns : 0;
+            }
         }
         if (ready != lookahead_taken) {
             const LookaheadResult& result =

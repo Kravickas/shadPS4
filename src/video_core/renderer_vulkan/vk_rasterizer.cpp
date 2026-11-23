@@ -34,6 +34,21 @@ static bool SameBits(const T& a, const T& b) {
     return std::memcmp(&a, &b, sizeof(T)) == 0;
 }
 
+static TextureKey MakeTextureKey(const AmdGpu::Image& tsharp, const Shader::ImageResource& desc,
+                                 u32 binding) {
+    TextureKey key{};
+    key.tsharp = tsharp;
+    key.is_depth = desc.is_depth;
+    key.is_array = desc.is_array;
+    key.is_written = desc.is_written;
+    key.mip_level = desc.mip_fallback_mode == Shader::MipStorageFallbackMode::ConstantIndex
+                        ? desc.constant_mip_index
+                    : desc.mip_fallback_mode == Shader::MipStorageFallbackMode::DynamicIndex
+                        ? binding
+                        : ~0U;
+    return key;
+}
+
 static Shader::PushData MakeUserData(const AmdGpu::Regs& regs) {
     // TODO(roamic): Add support for multiple viewports and geometry shaders when ViewportIndex
     // is encountered and implemented in the recompiler.
@@ -261,16 +276,37 @@ void Rasterizer::BindAhead(DrawAhead& ahead, AmdGpu::CpPerf& perf) {
 
     // In the order the draw binds them: the buffers of each stage, the vertex buffers, the
     // index buffer.
+    ahead.stage_sharps.clear();
+    ahead.buffer_sharps.clear();
+    ahead.image_keys.clear();
     for (u32 i = 0; i < lookup.num_stages; ++i) {
         const PipelineLookup::Stage& stage = lookup.stages[i];
         const Shader::StageUserDataView user_data{
             stage.pgm_base, {lookup.flats.data() + stage.flat_begin, stage.flat_size}};
-        for (const auto& desc : stage.info->buffers) {
-            if (desc.IsSpecial() || desc.is_written) {
+        ahead.stage_sharps.push_back({
+            .info = stage.info,
+            .first_buffer = static_cast<u32>(ahead.buffer_sharps.size()),
+            .first_image = static_cast<u32>(ahead.image_keys.size()),
+            .num_buffers = static_cast<u32>(stage.info->buffers.size()),
+            .num_images = static_cast<u32>(stage.info->images.size()),
+        });
+        const DrawAhead::StageSharps& stage_sharps = ahead.stage_sharps.back();
+        for (u32 buffer = 0; buffer < stage_sharps.num_buffers; ++buffer) {
+            const Shader::BufferResource& desc = stage.info->buffers[buffer];
+            if (desc.IsSpecial()) {
                 continue;
             }
             const auto vsharp = desc.GetSharp(user_data);
-            read(vsharp.base_address, vsharp.GetSize());
+            ahead.buffer_sharps.push_back(vsharp);
+            if (!desc.is_written) {
+                read(vsharp.base_address, vsharp.GetSize());
+            }
+        }
+        for (u32 image = 0; image < stage_sharps.num_images; ++image) {
+            const Shader::ImageResource& desc = stage.info->images[image];
+            DrawAhead::ImageKey& image_key = ahead.image_keys.emplace_back();
+            image_key.key = MakeTextureKey(desc.GetSharp(user_data), desc, 0);
+            image_key.hash = XXH3_64bits(&image_key.key, sizeof(image_key.key));
         }
     }
 
@@ -639,7 +675,10 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset) {
                 cmdbuf.draw(num_indices, num_instances, vertex_offset, instance_offset);
             }
         });
-        scheduler.PublishRecording();
+        // Whatever waits for the recorder thread hands the rest over.
+        if ((++draws_recorded & (PublishDrawInterval - 1)) == 0) {
+            scheduler.PublishRecording();
+        }
     }
     DebugState.IncDrawCall();
     AmdGpu::cp_perf.cmd_record_ns += AmdGpu::PerfInDrawNs() - rp_t1;
@@ -878,15 +917,17 @@ void Rasterizer::FlushPeriodically(bool is_dispatch) {
     ++draws_since_submit;
     // Auto: GPU writes to memory the game's threads are known to touch wait in the open command
     // buffer. They are submitted at the first draw behind the dispatches that made them, so
-    // that the GPU runs them and they can be downloaded before those threads get there.
+    // that the GPU runs them and they can be downloaded before those threads get there. The
+    // largest distance keeps what is submitted with them short enough for the GPU to run soon.
     const bool is_auto = submit_draw_interval == SubmitIntervalAuto;
-    const bool is_due = is_auto ? !is_dispatch && draws_since_submit >= AutoSubmitMinDraws &&
-                                      buffer_cache.IsEagerWritePending()
-                                : draws_since_submit >= submit_draw_interval;
+    const bool is_early = is_auto && !is_dispatch && draws_since_submit >= AutoSubmitMinDraws &&
+                          buffer_cache.IsEagerWritePending();
+    const bool is_due =
+        is_early || draws_since_submit >= (is_auto ? AutoSubmitMaxDraws : submit_draw_interval);
     if (is_due) {
         const AmdGpu::CpPerfScope perf_flush{AmdGpu::cp_perf.flush_ns};
         ++AmdGpu::cp_perf.flushes;
-        AmdGpu::cp_perf.early_flushes += is_auto;
+        AmdGpu::cp_perf.early_flushes += is_early;
         scheduler.Flush();
     }
 }
@@ -928,6 +969,24 @@ bool Rasterizer::BindResources(const Pipeline* pipeline) {
     image_infos.clear();
 
     bool uses_dma = false;
+
+    // The lookup of a draw holds while the draw runs, and with it what was made of its user
+    // data. One draw in SharpsAheadCheckInterval makes all of it again and compares.
+    sharps_ahead = pipeline->IsCompute() ? nullptr : vertex_ahead;
+    is_sharps_check = sharps_ahead && (++sharps_ahead_uses & (SharpsAheadCheckInterval - 1)) == 0;
+    if (sharps_ahead) {
+        for (const DrawAhead::ImageKey& image : sharps_ahead->image_keys) {
+            if (image.key.tsharp.Address() == 0) {
+                continue;
+            }
+            const auto* const slot =
+                reinterpret_cast<const u8*>(&texture_lookups[image.hash % texture_lookups.size()]);
+            for (std::size_t offset = 0; offset < sizeof(TextureLookup);
+                 offset += VideoCore::CacheLineSize) {
+                VideoCore::PrefetchRead(slot + offset);
+            }
+        }
+    }
 
     // Bind resource buffers and textures.
     Shader::Backend::Bindings binding{};
@@ -1177,6 +1236,27 @@ void Rasterizer::BindIndexBuffer(u32 index_offset, bool is_indirect) {
     });
 }
 
+void Rasterizer::NoteSharpsDiff(const Shader::Info& stage, std::string_view kind, u32 index) {
+    ++AmdGpu::cp_perf.ra_diffs;
+    if (sharps_logged_diffs < 16) {
+        ++sharps_logged_diffs;
+        LOG_ERROR(Render, "PERF ra_diff stage={:#x} {}={}", stage.pgm_hash, kind, index);
+    }
+}
+
+const DrawAhead::StageSharps* Rasterizer::FindSharpsAhead(const Shader::Info& stage) const {
+    if (!sharps_ahead) {
+        return nullptr;
+    }
+    for (const DrawAhead::StageSharps& sharps : sharps_ahead->stage_sharps) {
+        if (sharps.info == &stage && sharps.num_buffers == stage.buffers.size() &&
+            sharps.num_images == stage.images.size()) {
+            return &sharps;
+        }
+    }
+    return nullptr;
+}
+
 void Rasterizer::ResetBindings(bool is_compute) {
     const u64 reset_t0 = AmdGpu::PerfDrawNs();
     AmdGpu::cp_perf.bound_images += static_cast<u32>(bound_images.size());
@@ -1372,6 +1452,9 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
                              Shader::PushData& push_data) {
     const auto& user_data = stage_user_data[u32(stage.sw_stage)];
     const u64 alignment = instance.StorageMinAlignment();
+    const DrawAhead::StageSharps* const ahead = FindSharpsAhead(stage);
+    u32 ahead_buffer = ahead ? ahead->first_buffer : 0;
+    AmdGpu::cp_perf.ra_stages += ahead != nullptr;
     for (const auto& desc : stage.buffers) {
         const auto src_access =
             vk::AccessFlagBits2::eShaderRead |
@@ -1426,7 +1509,19 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
                 UNREACHABLE_MSG("Unexpected buffer type {}", u32(desc.buffer_type));
             }
         } else {
-            const auto vsharp = desc.GetSharp(user_data);
+            AmdGpu::Buffer vsharp;
+            if (ahead) {
+                vsharp = sharps_ahead->buffer_sharps[ahead_buffer++];
+                if (is_sharps_check) {
+                    ++AmdGpu::cp_perf.ra_checks;
+                    if (const auto own = desc.GetSharp(user_data); !SameBits(vsharp, own)) {
+                        NoteSharpsDiff(stage, "buffer", ahead_buffer - 1 - ahead->first_buffer);
+                        vsharp = own;
+                    }
+                }
+            } else {
+                vsharp = desc.GetSharp(user_data);
+            }
             if (vsharp.base_address == 0 || vsharp.GetSize() == 0) {
                 buffer_infos.emplace_back(VK_NULL_HANDLE, 0, VK_WHOLE_SIZE);
             } else {
@@ -1495,9 +1590,22 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
     // To emulate storing to explicit mip levels, build a descriptor array with each mip level.
     boost::container::small_vector<u32, 8> image_descriptor_array_sizes;
 
+    const DrawAhead::StageSharps* const ahead = FindSharpsAhead(stage);
+    u32 ahead_image = ahead ? ahead->first_image : 0;
     u32 num_images{};
     for (const auto& image_desc : stage.images) {
-        const auto tsharp = image_desc.GetSharp(user_data);
+        const DrawAhead::ImageKey* ahead_key =
+            ahead ? &sharps_ahead->image_keys[ahead_image++] : nullptr;
+        if (ahead_key && is_sharps_check) {
+            ++AmdGpu::cp_perf.ra_checks;
+            const TextureKey own = MakeTextureKey(image_desc.GetSharp(user_data), image_desc, 0);
+            if (!SameBits(ahead_key->key, own) ||
+                ahead_key->hash != XXH3_64bits(&own, sizeof(own))) {
+                NoteSharpsDiff(stage, "image", ahead_image - 1 - ahead->first_image);
+                ahead_key = nullptr;
+            }
+        }
+        const auto tsharp = ahead_key ? ahead_key->key.tsharp : image_desc.GetSharp(user_data);
         const auto data_fmt = tsharp.GetDataFmt();
         const auto num_fmt = tsharp.GetNumberFmt();
         if (tsharp.Address() == 0 || data_fmt == AmdGpu::DataFormat::FormatInvalid) {
@@ -1519,26 +1627,20 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
         }
 
         const Shader::MipStorageFallbackMode mip_fallback_mode = image_desc.mip_fallback_mode;
-        const u32 num_bindings = image_desc.NumBindings(stage);
+        const u32 num_bindings = image_desc.NumBindings(tsharp);
 
         for (auto i = 0; i < num_bindings; i++) {
             auto& [image_id, desc] = image_bindings[num_images++];
             ++AmdGpu::cp_perf.tex_lookups;
-            TextureKey key{};
-            key.tsharp = tsharp;
-            key.is_depth = image_desc.is_depth;
-            key.is_array = image_desc.is_array;
-            key.is_written = image_desc.is_written;
-            key.mip_level = mip_fallback_mode == Shader::MipStorageFallbackMode::ConstantIndex
-                                ? image_desc.constant_mip_index
-                            : mip_fallback_mode == Shader::MipStorageFallbackMode::DynamicIndex
-                                ? static_cast<u32>(i)
-                                : ~0U;
+            const bool is_ahead = ahead_key && i == 0;
+            const TextureKey key =
+                is_ahead ? ahead_key->key : MakeTextureKey(tsharp, image_desc, static_cast<u32>(i));
+            const u64 hash = is_ahead ? ahead_key->hash : XXH3_64bits(&key, sizeof(key));
             if (const u32 slot = num_images - 1; is_checked && slot < MaxCheckedSlots) {
                 checked_image_keys[slot] = key;
                 checked_image_has_key[slot] = true;
             }
-            auto& lookup = texture_lookups[XXH3_64bits(&key, sizeof(key)) % texture_lookups.size()];
+            auto& lookup = texture_lookups[hash % texture_lookups.size()];
             const u64 generation = texture_cache.RegistryGeneration();
             const u64 swaps = texture_cache.SwapGeneration();
             if (lookup.generation == generation && scheduler.CurrentTick() <= lookup.valid_until &&

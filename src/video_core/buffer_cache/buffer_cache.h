@@ -46,6 +46,15 @@ class TextureCache;
 class MemoryTracker;
 class PageManager;
 
+inline constexpr std::size_t CacheLineSize = 64;
+
+/// Tells the processor that the cache line of address is read soon.
+inline void PrefetchRead(const void* address) {
+#if defined(__GNUC__) || defined(__clang__)
+    __builtin_prefetch(address);
+#endif
+}
+
 enum class ObtainBufferFlags {
     None = 0,
     IsWritten = 1 << 0,
@@ -172,6 +181,13 @@ public:
         stream_hints = hints;
         stream_hint_cursor = 0;
         stream_hints_epoch = gpu_write_epoch;
+        // The bindings the hints are for look their last copy up.
+        for (const StreamHint& hint : hints) {
+            const auto* const copy = reinterpret_cast<const u8*>(
+                &stream_copies[StreamCopySlot(hint.device_addr, hint.size)]);
+            PrefetchRead(copy);
+            PrefetchRead(copy + sizeof(StreamCopy) - 1);
+        }
     }
 
     void ClearStreamHints() {
