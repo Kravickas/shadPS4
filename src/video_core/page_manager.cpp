@@ -448,8 +448,13 @@ struct SignalImpl : public PageManager::Impl {
         const auto size = std::min<u64>(8, PageManager::GetNextPageAddr(addr) - addr);
         const auto is_gpu_thread =
             std::this_thread::get_id() == rasterizer->GetGpuCommandProcessorThread();
-        if (!is_gpu_thread && TryEmulateAccess(context, addr)) {
-            return true;
+        if (!is_gpu_thread) {
+            const u64 emulate_t0 = AmdGpu::PerfNs();
+            if (TryEmulateAccess(context, addr)) {
+                AmdGpu::readback_wait.emulated_ns.fetch_add(AmdGpu::PerfNs() - emulate_t0,
+                                                            std::memory_order_relaxed);
+                return true;
+            }
         }
         DecodeFaultAccess(context);
         const u64 fault_t0 = AmdGpu::PerfNs();

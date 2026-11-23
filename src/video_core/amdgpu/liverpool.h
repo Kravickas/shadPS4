@@ -151,6 +151,7 @@ struct CpPerf {
     u32 va_used;       ///< Draws that took their vertex inputs from the lookahead
     u32 va_checks;     ///< Of those, compared with the vertex inputs made at the draw
     u32 va_diffs;      ///< Compares that differed
+    u32 db_expired;    ///< Depth target lookups made again because their time was up
     /// Images registered and freed, by TextureCache::RegistrySite.
     std::array<u32, PerfTexSites> tex_sites;
     /// Page watcher updates of the whole cycle, and the part of them for images.
@@ -263,9 +264,20 @@ struct ReadbackWaitPerf {
     std::atomic<u64> count;
     std::atomic<u64> wait_ns;
     std::atomic<u64> max_ns;
-    std::atomic<u64> emulated; ///< Accesses done beside GPU data without a readback
+    std::atomic<u64> emulated;    ///< Accesses done beside GPU data without a readback
+    std::atomic<u64> emulated_ns; ///< Time in the fault handler for them
 };
 inline ReadbackWaitPerf readback_wait;
+
+/// Downloads of the readback thread, ahead of the guest's faults.
+struct EagerReadbackPerf {
+    std::atomic<u64> downloads;
+    std::atomic<u64> windows;
+    std::atomic<u64> bytes;
+    std::atomic<u64> gpu_ns;   ///< Download submit to fence signalled
+    std::atomic<u64> total_ns; ///< Working time of the thread, the wait for the GPU included
+};
+inline EagerReadbackPerf eager_readbacks;
 
 /// Faults of guest threads on GPU mapped memory that were not emulated, since the last cycle.
 struct GuestFaultPerf {

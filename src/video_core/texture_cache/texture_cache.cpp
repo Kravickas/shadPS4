@@ -370,6 +370,8 @@ std::tuple<ImageId, int, int> TextureCache::ResolveOverlap(const ImageInfo& imag
     auto& cache_image = slot_images[cache_image_id];
     const bool safe_to_delete =
         scheduler.CurrentTick() - cache_image.tick_accessed_last > NUM_FRAMES_BEFORE_REMOVAL;
+    // The last use of an image only gets later, so up to this tick it is not safe to delete.
+    const u64 keep_until = cache_image.tick_accessed_last + NUM_FRAMES_BEFORE_REMOVAL;
 
     // Equal address
     if (image_info.guest_address == cache_image.info.guest_address) {
@@ -380,6 +382,8 @@ std::tuple<ImageId, int, int> TextureCache::ResolveOverlap(const ImageInfo& imag
             if (safe_to_delete) {
                 CountRegistryChange(RegistrySite::FreePool, image_info, &cache_image.info, binding);
                 FreeImage(cache_image_id);
+            } else {
+                find_valid_until = std::min(find_valid_until, keep_until);
             }
             return {merged_image_id, -1, -1};
         }
@@ -439,6 +443,8 @@ std::tuple<ImageId, int, int> TextureCache::ResolveOverlap(const ImageInfo& imag
             if (safe_to_delete) {
                 CountRegistryChange(RegistrySite::FreeTile, image_info, &cache_image.info, binding);
                 FreeImage(cache_image_id);
+            } else {
+                find_valid_until = std::min(find_valid_until, keep_until);
             }
             return {merged_image_id, -1, -1};
         }
@@ -573,6 +579,8 @@ std::tuple<ImageId, int, int> TextureCache::ResolveOverlap(const ImageInfo& imag
         if (safe_to_delete) {
             CountRegistryChange(RegistrySite::FreeChance, image_info, &cache_image.info, binding);
             FreeImage(cache_image_id);
+        } else {
+            find_valid_until = std::min(find_valid_until, keep_until);
         }
 
         return {{}, -1, -1};
@@ -680,6 +688,8 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_fmt) {
     SmallVector<ImageId, 8> image_ids;
     ForEachImageInRegion(info.guest_address, info.guest_size,
                          [&](ImageId image_id, Image& image) { image_ids.push_back(image_id); });
+    find_is_stable = true;
+    find_valid_until = ~0ULL;
 
     ImageId image_id{};
 
@@ -690,8 +700,12 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_fmt) {
         if (cache_image.info.guest_address != info.guest_address) {
             continue;
         }
-        if (desc.IsSubrectTexture(cache_image.info) && cache_image.HasGpuValidData()) {
-            subrect_source = cache_id;
+        if (desc.IsSubrectTexture(cache_image.info)) {
+            // Whether it is taken depends on the state of its data, not only on descriptions.
+            find_is_stable = false;
+            if (cache_image.HasGpuValidData()) {
+                subrect_source = cache_id;
+            }
         }
         if (cache_image.info.guest_size != info.guest_size) {
             continue;

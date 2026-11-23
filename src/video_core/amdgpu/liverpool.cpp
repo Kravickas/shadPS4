@@ -241,6 +241,8 @@ void Liverpool::Process(std::stop_token stoken) {
             "db_un_registry={} db_un_swap={} db_un_imperfect={} resident_hits={} gf_writes={} "
             "gf_write_us={} gf_write_next_page={} gf_reads={} gf_read_us={} la_solo_runs={} "
             "la_bind_us={} la_bind_skips={} va_used={} va_checks={} va_diffs={} "
+            "eager_n={} eager_windows={} eager_kb={} eager_gpu_us={} eager_us={} "
+            "emulated_us={} db_expired={} "
             "emulated={} stg_same_inputs={} vk_vi_us={} vk_index_us={} vk_desc_us={} "
             "vk_dyn_us={} vk_draw_us={} rec_cmds={} rec_kb={} rec_publishes={} rec_wakes={} "
             "rec_syncs={} rec_sync_us={} rec_space_waits={} rec_run_us={} rec_sleeps={} "
@@ -315,11 +317,17 @@ void Liverpool::Process(std::stop_token stoken) {
             lookahead_perf.stream_ns.exchange(0, std::memory_order_relaxed) / 1000,
             lookahead_perf.stream_skips.exchange(0, std::memory_order_relaxed), cp_perf.va_used,
             cp_perf.va_checks, cp_perf.va_diffs,
-            readback_wait.emulated.exchange(0, std::memory_order_relaxed), cp_perf.stg_same_inputs,
-            cp_perf.vk_vi_ns / 1000, cp_perf.vk_index_ns / 1000, cp_perf.vk_desc_ns / 1000,
-            cp_perf.vk_dyn_ns / 1000, cp_perf.vk_draw_ns / 1000, cp_perf.rec_cmds,
-            cp_perf.rec_bytes / 1024, cp_perf.rec_publishes, cp_perf.rec_wakes, cp_perf.rec_syncs,
-            cp_perf.rec_sync_ns / 1000, cp_perf.rec_space_waits,
+            eager_readbacks.downloads.exchange(0, std::memory_order_relaxed),
+            eager_readbacks.windows.exchange(0, std::memory_order_relaxed),
+            eager_readbacks.bytes.exchange(0, std::memory_order_relaxed) / 1024,
+            eager_readbacks.gpu_ns.exchange(0, std::memory_order_relaxed) / 1000,
+            eager_readbacks.total_ns.exchange(0, std::memory_order_relaxed) / 1000,
+            readback_wait.emulated_ns.exchange(0, std::memory_order_relaxed) / 1000,
+            cp_perf.db_expired, readback_wait.emulated.exchange(0, std::memory_order_relaxed),
+            cp_perf.stg_same_inputs, cp_perf.vk_vi_ns / 1000, cp_perf.vk_index_ns / 1000,
+            cp_perf.vk_desc_ns / 1000, cp_perf.vk_dyn_ns / 1000, cp_perf.vk_draw_ns / 1000,
+            cp_perf.rec_cmds, cp_perf.rec_bytes / 1024, cp_perf.rec_publishes, cp_perf.rec_wakes,
+            cp_perf.rec_syncs, cp_perf.rec_sync_ns / 1000, cp_perf.rec_space_waits,
             recorder_perf.run_ns.exchange(0, std::memory_order_relaxed) / 1000,
             recorder_perf.sleeps.exchange(0, std::memory_order_relaxed), cp_perf.sc_total_ns / 1000,
             cp_perf.sc_compare_ns / 1000, cp_perf.sc_guest_ns / 1000, cp_perf.sc_write_ns / 1000,

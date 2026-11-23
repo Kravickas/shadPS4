@@ -172,6 +172,13 @@ public:
     /// that image.
     [[nodiscard]] bool IsPerfectMatch(ImageId image_id, const ImageDesc& desc);
 
+    /// The last scheduler tick up to which FindImage(desc), which just returned image_id, gives
+    /// the same again without doing anything else, as long as no image is registered,
+    /// unregistered or swapped. 0 if that cannot be said.
+    [[nodiscard]] u64 FoundImageValidUntil(ImageId image_id, const ImageDesc& desc) {
+        return IsPerfectMatch(image_id, desc) ? ~0ULL : (find_is_stable ? find_valid_until : 0);
+    }
+
     /// Probe: the images registered in the range of info.
     [[nodiscard]] std::string DescribeRegion(const ImageInfo& info);
 
@@ -496,6 +503,11 @@ private:
     u64 gc_tick = 0;
     u64 registry_generation = 1;
     u64 swap_generation = 0;
+    /// Of the last FindImage call: whether what it decided depends only on the descriptions of
+    /// the registered images, and the tick up to which images it left registered because they
+    /// were used recently stay that way.
+    bool find_is_stable{};
+    u64 find_valid_until{};
     /// Range that holds every image swapped with its parked alias so far.
     VAddr swap_begin = ~0ULL;
     VAddr swap_end = 0;

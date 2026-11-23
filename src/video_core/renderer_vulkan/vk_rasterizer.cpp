@@ -411,8 +411,8 @@ void Rasterizer::PrepareRenderState(const GraphicsPipeline* pipeline) {
         auto& lookup = cb_lookups[cb];
         const u64 generation = texture_cache.RegistryGeneration();
         const u64 swaps = texture_cache.SwapGeneration();
-        if (lookup.generation == generation && SameBits(lookup.col_buf, col_buf) &&
-            lookup.hint.raw == hint.raw &&
+        if (lookup.generation == generation && scheduler.CurrentTick() <= lookup.valid_until &&
+            SameBits(lookup.col_buf, col_buf) && lookup.hint.raw == hint.raw &&
             texture_cache.IsSwapCurrent(lookup.swaps, lookup.binding.desc.info.guest_address,
                                         lookup.binding.desc.info.guest_size)) {
             desc = lookup.binding.desc;
@@ -421,9 +421,10 @@ void Rasterizer::PrepareRenderState(const GraphicsPipeline* pipeline) {
         } else {
             std::construct_at(&desc, col_buf, hint);
             image_id = texture_cache.FindImage(desc);
+            lookup.valid_until = texture_cache.FoundImageValidUntil(image_id, desc);
             const bool reusable = texture_cache.RegistryGeneration() == generation &&
                                   texture_cache.SwapGeneration() == swaps &&
-                                  texture_cache.IsPerfectMatch(image_id, desc);
+                                  lookup.valid_until != 0;
             lookup.generation = reusable ? generation : 0;
             lookup.swaps = swaps;
             lookup.col_buf = col_buf;
@@ -443,7 +444,8 @@ void Rasterizer::PrepareRenderState(const GraphicsPipeline* pipeline) {
         auto& lookup = db_lookups[regs.depth_control.depth_write_enable];
         const u64 generation = texture_cache.RegistryGeneration();
         const u64 swaps = texture_cache.SwapGeneration();
-        if (lookup.generation == generation && SameBits(lookup.depth_buffer, regs.depth_buffer) &&
+        if (lookup.generation == generation && scheduler.CurrentTick() <= lookup.valid_until &&
+            SameBits(lookup.depth_buffer, regs.depth_buffer) &&
             SameBits(lookup.depth_view, regs.depth_view) && lookup.htile_address == htile_address &&
             lookup.hint.raw == hint.raw &&
             texture_cache.IsSwapCurrent(lookup.swaps, lookup.binding.desc.info.guest_address,
@@ -453,6 +455,8 @@ void Rasterizer::PrepareRenderState(const GraphicsPipeline* pipeline) {
             texture_cache.TouchFoundImage(image_id);
         } else {
             auto& perf = AmdGpu::cp_perf;
+            perf.db_expired +=
+                lookup.generation == generation && scheduler.CurrentTick() > lookup.valid_until;
             ++perf.db_misses[lookup.generation == 0                              ? 0
                              : lookup.generation != generation                   ? 1
                              : !SameBits(lookup.depth_buffer, regs.depth_buffer) ? 2
@@ -464,8 +468,10 @@ void Rasterizer::PrepareRenderState(const GraphicsPipeline* pipeline) {
                               htile_address, hint);
             image_id = texture_cache.FindImage(desc);
             const bool is_perfect = texture_cache.IsPerfectMatch(image_id, desc);
+            lookup.valid_until = texture_cache.FoundImageValidUntil(image_id, desc);
             const bool reusable = texture_cache.RegistryGeneration() == generation &&
-                                  texture_cache.SwapGeneration() == swaps && is_perfect;
+                                  texture_cache.SwapGeneration() == swaps &&
+                                  lookup.valid_until != 0;
             if (!reusable) {
                 ++perf.db_unreusable[texture_cache.RegistryGeneration() != generation ? 0
                                      : texture_cache.SwapGeneration() != swaps        ? 1
@@ -1524,7 +1530,8 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
             auto& lookup = texture_lookups[XXH3_64bits(&key, sizeof(key)) % texture_lookups.size()];
             const u64 generation = texture_cache.RegistryGeneration();
             const u64 swaps = texture_cache.SwapGeneration();
-            if (lookup.generation == generation && SameBits(lookup.key, key) &&
+            if (lookup.generation == generation && scheduler.CurrentTick() <= lookup.valid_until &&
+                SameBits(lookup.key, key) &&
                 texture_cache.IsSwapCurrent(lookup.swaps, lookup.binding.desc.info.guest_address,
                                             lookup.binding.desc.info.guest_size)) {
                 ++AmdGpu::cp_perf.tex_hits;
@@ -1551,9 +1558,10 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
                 }
 
                 image_id = texture_cache.FindImage(desc);
+                lookup.valid_until = texture_cache.FoundImageValidUntil(image_id, desc);
                 const bool reusable = texture_cache.RegistryGeneration() == generation &&
                                       texture_cache.SwapGeneration() == swaps &&
-                                      texture_cache.IsPerfectMatch(image_id, desc);
+                                      lookup.valid_until != 0;
                 lookup.generation = reusable ? generation : 0;
                 lookup.swaps = swaps;
                 lookup.key = key;

@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <bit>
 #include <cstring>
+#include <functional>
 #include <limits>
 #include <Zydis/Zydis.h>
 #include <magic_enum/magic_enum.hpp>
@@ -129,6 +130,8 @@ BufferCache::BufferCache(const Vulkan::Instance& instance_, Vulkan::Scheduler& s
                                                      MemoryType::DeviceLocal, "Null Index Buffer");
         runtime.FillBuffer(null_index_buffer.get(), 0u, NULL_INDEX_BUFFER_SIZE, 0u);
     }
+
+    eager_readback_thread = std::jthread{std::bind_front(&BufferCache::EagerReadbackThread, this)};
 }
 
 BufferCache::~BufferCache() = default;
@@ -136,6 +139,77 @@ BufferCache::~BufferCache() = default;
 void BufferCache::TickFrame() {
     if (std::exchange(fault_process_pending, false)) {
         fault_manager->ProcessFaultBuffer();
+    }
+    // The tick has advanced: GPU writes recorded before it count as submitted.
+    if (has_eager_windows.load(std::memory_order_relaxed)) {
+        {
+            std::scoped_lock lk{eager_mutex};
+            ++eager_kicks;
+        }
+        eager_cv.notify_one();
+    }
+}
+
+void BufferCache::NoteFaultedWindow(const DownloadWindow& window) {
+    eager_windows[window.start] = {window.size, scheduler.CurrentTick()};
+    has_eager_windows.store(true, std::memory_order_relaxed);
+}
+
+void BufferCache::CollectEagerWindows(boost::container::small_vector<DownloadWindow, 16>& windows) {
+    const u64 current_tick = scheduler.CurrentTick();
+    for (auto it = eager_windows.begin(); it != eager_windows.end();) {
+        const VAddr start = it->first;
+        const auto [size, fault_tick] = it->second;
+        if (current_tick - fault_tick > EagerWindowTicks) {
+            it = eager_windows.erase(it);
+            continue;
+        }
+        ++it;
+        // The same tests as for a hot window.
+        const Buffer* arena = address_space[start >> ARENA_PAGE_BITS];
+        if (arena && arena == address_space[(start + size - 1) >> ARENA_PAGE_BITS] &&
+            !OverlapsDownloadInFlight(start, start + size) &&
+            memory_tracker->IsRegionGpuModified(start, size) && IsGpuWriteSubmitted(start, size)) {
+            windows.push_back({arena, start, size});
+        }
+    }
+    if (eager_windows.empty()) {
+        has_eager_windows.store(false, std::memory_order_relaxed);
+    }
+}
+
+void BufferCache::EagerReadbackThread(std::stop_token stoken) {
+    Common::SetCurrentThreadName("shadPS4:GpuReadback");
+    u64 seen_kicks = 0;
+    boost::container::small_vector<DownloadWindow, 16> windows;
+    while (true) {
+        {
+            std::unique_lock lk{eager_mutex};
+            if (!eager_cv.wait(lk, stoken, [&] { return eager_kicks != seen_kicks; })) {
+                return;
+            }
+            seen_kicks = eager_kicks;
+        }
+        const u64 t0 = AmdGpu::PerfNs();
+        ReadbackStats stats{};
+        windows.clear();
+        {
+            std::unique_lock lk{modified_mutex};
+            CollectEagerWindows(windows);
+            if (windows.empty()) {
+                continue;
+            }
+            DownloadAhead(lk, windows, stats);
+        }
+        if (stats.bytes == 0) {
+            continue;
+        }
+        auto& perf = AmdGpu::eager_readbacks;
+        perf.downloads.fetch_add(1, std::memory_order_relaxed);
+        perf.windows.fetch_add(stats.windows, std::memory_order_relaxed);
+        perf.bytes.fetch_add(stats.bytes, std::memory_order_relaxed);
+        perf.gpu_ns.fetch_add(stats.gpu_ns, std::memory_order_relaxed);
+        perf.total_ns.fetch_add(AmdGpu::PerfNs() - t0, std::memory_order_relaxed);
     }
 }
 
@@ -274,6 +348,7 @@ bool BufferCache::ReadMemoryOnCallingThread(VAddr device_addr, u64 size, bool is
         }
         window = GetDownloadWindow(arena, device_addr, size);
     } while (WaitDownloadsInFlight(lk, window.start, window.start + window.size, stats));
+    NoteFaultedWindow(window);
     if (IsGpuWriteSubmitted(window.start, window.size)) {
         hot_windows[window.start] = {window.size, scheduler.CurrentTick()};
     } else {
@@ -310,6 +385,7 @@ void BufferCache::ReadMemoryOnGpuThread(VAddr device_addr, u64 size, bool is_wri
     const bool ahead = !async && IsGpuWriteSubmitted(window.start, window.size);
     if (!async) {
         hot_windows[window.start] = {window.size, scheduler.CurrentTick()};
+        NoteFaultedWindow(window);
     }
     if (ahead) {
         boost::container::small_vector<DownloadWindow, 16> windows{window};
@@ -854,8 +930,24 @@ const BufferCache::StreamHint* BufferCache::FindStreamHint(VAddr device_addr, u3
             ++AmdGpu::cp_perf.sa_diffs;
             if (stream_hint_diffs_logged < MaxStreamHintDiffsLogged) {
                 ++stream_hint_diffs_logged;
-                LOG_INFO(Render, "PERF sa_diff addr={:#x} size={:#x} id={} hints={}", device_addr,
-                         size, hint->id, stream_hints.size());
+                // Where the bytes differ, and whether the GPU wrote guest memory meanwhile.
+                std::array<u8, STREAM_THRESHOLD> now;
+                memory->CopySparseMemory(device_addr, now.data(), size);
+                u32 first = size;
+                u32 last = 0;
+                u32 count = 0;
+                for (u32 i = 0; i < size; ++i) {
+                    if (now[i] != hint->data[i]) {
+                        first = std::min(first, i);
+                        last = i;
+                        ++count;
+                    }
+                }
+                LOG_INFO(Render,
+                         "PERF sa_diff addr={:#x} size={:#x} id={} hints={} first={:#x} "
+                         "last={:#x} bytes={} hint_epoch={} epoch={} tick={}",
+                         device_addr, size, hint->id, stream_hints.size(), first, last, count,
+                         stream_hints_epoch, memory->GpuWriteEpoch(), scheduler.CurrentTick());
             }
             return nullptr;
         }

@@ -405,6 +405,25 @@ private:
     /// A readback downloads all of them that are ready, so the CPU does not fault on each one.
     std::unordered_map<VAddr, std::pair<u64, u64>> hot_windows;
     static constexpr u64 HotWindowTicks = 4;
+    /// Windows a readback was needed for: start -> {size, scheduler tick of the last one}. A
+    /// game that reuses memory each frame faults on the same windows again, so the readback
+    /// thread downloads them as soon as their GPU writes are submitted, which is what a fault
+    /// at that moment would do. A window without a fault for EagerWindowTicks is dropped.
+    struct EagerWindow {
+        u64 size;
+        u64 fault_tick;
+    };
+    std::unordered_map<VAddr, EagerWindow> eager_windows;
+    static constexpr u64 EagerWindowTicks = 1024;
+    std::atomic<bool> has_eager_windows{};
+    std::mutex eager_mutex;
+    std::condition_variable_any eager_cv;
+    u64 eager_kicks{};
+
+    void NoteFaultedWindow(const DownloadWindow& window);
+    /// The eager windows whose GPU-modified data can be downloaded ahead now.
+    void CollectEagerWindows(boost::container::small_vector<DownloadWindow, 16>& windows);
+    void EagerReadbackThread(std::stop_token stoken);
     /// Windows whose GPU-modified ranges were taken out of gpu_modified_ranges and whose data
     /// is not written back yet.
     struct DownloadInFlight {
@@ -457,6 +476,9 @@ private:
     u32 block_shift{};
     u32 blocks_per_arena_page{};
     u32 blocks_per_arena_page_shift{};
+
+    /// Last member: it stops before anything it uses is destroyed.
+    std::jthread eager_readback_thread;
 };
 
 } // namespace VideoCore

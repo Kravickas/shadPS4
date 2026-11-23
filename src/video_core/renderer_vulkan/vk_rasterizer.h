@@ -245,9 +245,12 @@ private:
     /// Registers and result of the last render target lookup that found a perfect match. The
     /// same registers give the same image while the texture cache registry generation is equal
     /// and no image in its range was swapped with a parked alias.
+    /// A lookup holds while generation and swaps are those of the texture cache and the
+    /// scheduler tick is not past valid_until.
     struct ColorTargetLookup {
         u64 generation{};
         u64 swaps{};
+        u64 valid_until{};
         AmdGpu::ColorBuffer col_buf;
         AmdGpu::CbDbExtent hint;
         ImageBinding binding;
@@ -255,6 +258,7 @@ private:
     struct DepthTargetLookup {
         u64 generation{};
         u64 swaps{};
+        u64 valid_until{};
         AmdGpu::DepthBuffer depth_buffer;
         AmdGpu::DepthView depth_view;
         VAddr htile_address;
@@ -280,6 +284,7 @@ private:
     struct TextureLookup {
         u64 generation{};
         u64 swaps{};
+        u64 valid_until{};
         TextureKey key;
         ImageBinding binding;
     };
