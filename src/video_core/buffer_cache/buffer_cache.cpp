@@ -140,8 +140,8 @@ void BufferCache::TickFrame() {
     if (std::exchange(fault_process_pending, false)) {
         fault_manager->ProcessFaultBuffer();
     }
-    // The tick has advanced: GPU writes recorded before it count as submitted.
-    if (has_eager_windows.load(std::memory_order_relaxed)) {
+    // A tick was submitted: the readback thread waits for the GPU to run it.
+    if (has_eager_pages.load(std::memory_order_relaxed)) {
         {
             std::scoped_lock lk{eager_mutex};
             ++eager_kicks;
@@ -150,52 +150,71 @@ void BufferCache::TickFrame() {
     }
 }
 
-void BufferCache::NoteFaultedWindow(const DownloadWindow& window) {
-    eager_windows[window.start] = {window.size, scheduler.CurrentTick()};
-    has_eager_windows.store(true, std::memory_order_relaxed);
+void BufferCache::NoteFaultedPages(VAddr device_addr, u64 size) {
+    const VAddr page_end = Common::AlignUp(device_addr + size, BYTES_PER_PAGE);
+    const u64 tick = scheduler.CurrentTick();
+    for (VAddr page = Common::AlignDown(device_addr, BYTES_PER_PAGE); page < page_end;
+         page += BYTES_PER_PAGE) {
+        eager_pages[page] = tick;
+    }
+    has_eager_pages.store(true, std::memory_order_relaxed);
 }
 
-void BufferCache::CollectEagerWindows(boost::container::small_vector<DownloadWindow, 16>& windows) {
+void BufferCache::CollectEagerPages(u64 gpu_tick,
+                                    boost::container::small_vector<DownloadWindow, 16>& windows) {
     const u64 current_tick = scheduler.CurrentTick();
-    for (auto it = eager_windows.begin(); it != eager_windows.end();) {
-        const VAddr start = it->first;
-        const auto [size, fault_tick] = it->second;
-        if (current_tick - fault_tick > EagerWindowTicks) {
-            it = eager_windows.erase(it);
+    for (auto it = eager_pages.begin(); it != eager_pages.end();) {
+        const VAddr page = it->first;
+        if (current_tick - it->second > EagerPageTicks) {
+            it = eager_pages.erase(it);
             continue;
         }
         ++it;
-        // The same tests as for a hot window.
-        const Buffer* arena = address_space[start >> ARENA_PAGE_BITS];
-        if (arena && arena == address_space[(start + size - 1) >> ARENA_PAGE_BITS] &&
-            !OverlapsDownloadInFlight(start, start + size) &&
-            memory_tracker->IsRegionGpuModified(start, size) && IsGpuWriteSubmitted(start, size)) {
-            windows.push_back({arena, start, size});
+        const Buffer* arena = address_space[page >> ARENA_PAGE_BITS];
+        if (arena && !OverlapsDownloadInFlight(page, page + BYTES_PER_PAGE) &&
+            memory_tracker->IsRegionGpuModified(page, BYTES_PER_PAGE) &&
+            gpu_modified_ranges.Intersects(page, BYTES_PER_PAGE) &&
+            LastWriteTick(page, BYTES_PER_PAGE) <= gpu_tick) {
+            windows.push_back({arena, page, BYTES_PER_PAGE});
         }
     }
-    if (eager_windows.empty()) {
-        has_eager_windows.store(false, std::memory_order_relaxed);
+    if (eager_pages.empty()) {
+        has_eager_pages.store(false, std::memory_order_relaxed);
     }
 }
 
 void BufferCache::EagerReadbackThread(std::stop_token stoken) {
     Common::SetCurrentThreadName("shadPS4:GpuReadback");
+    auto* const work_semaphore = scheduler.GetWorkSemaphore();
     u64 seen_kicks = 0;
+    // The GPU tick the pages were last collected for.
+    u64 done_tick = 0;
     boost::container::small_vector<DownloadWindow, 16> windows;
-    while (true) {
-        {
-            std::unique_lock lk{eager_mutex};
-            if (!eager_cv.wait(lk, stoken, [&] { return eager_kicks != seen_kicks; })) {
-                return;
+    while (!stoken.stop_requested()) {
+        work_semaphore->Refresh();
+        u64 gpu_tick = work_semaphore->KnownGpuTick();
+        if (gpu_tick <= done_tick) {
+            if (done_tick + 1 >= scheduler.CurrentTick()) {
+                // Every submitted tick was handled.
+                std::unique_lock lk{eager_mutex};
+                if (!eager_cv.wait(lk, stoken, [&] { return eager_kicks != seen_kicks; })) {
+                    return;
+                }
+                seen_kicks = eager_kicks;
+                continue;
             }
-            seen_kicks = eager_kicks;
+            // Nothing is held in flight while the GPU runs the tick, so until then a faulting
+            // thread is served as without this thread.
+            work_semaphore->Wait(done_tick + 1);
+            gpu_tick = work_semaphore->KnownGpuTick();
         }
+        done_tick = gpu_tick;
         const u64 t0 = AmdGpu::PerfNs();
         ReadbackStats stats{};
         windows.clear();
         {
             std::unique_lock lk{modified_mutex};
-            CollectEagerWindows(windows);
+            CollectEagerPages(gpu_tick, windows);
             if (windows.empty()) {
                 continue;
             }
@@ -348,7 +367,7 @@ bool BufferCache::ReadMemoryOnCallingThread(VAddr device_addr, u64 size, bool is
         }
         window = GetDownloadWindow(arena, device_addr, size);
     } while (WaitDownloadsInFlight(lk, window.start, window.start + window.size, stats));
-    NoteFaultedWindow(window);
+    NoteFaultedPages(device_addr, size);
     if (IsGpuWriteSubmitted(window.start, window.size)) {
         hot_windows[window.start] = {window.size, scheduler.CurrentTick()};
     } else {
@@ -385,7 +404,7 @@ void BufferCache::ReadMemoryOnGpuThread(VAddr device_addr, u64 size, bool is_wri
     const bool ahead = !async && IsGpuWriteSubmitted(window.start, window.size);
     if (!async) {
         hot_windows[window.start] = {window.size, scheduler.CurrentTick()};
-        NoteFaultedWindow(window);
+        NoteFaultedPages(device_addr, size);
     }
     if (ahead) {
         boost::container::small_vector<DownloadWindow, 16> windows{window};

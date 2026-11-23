@@ -405,24 +405,21 @@ private:
     /// A readback downloads all of them that are ready, so the CPU does not fault on each one.
     std::unordered_map<VAddr, std::pair<u64, u64>> hot_windows;
     static constexpr u64 HotWindowTicks = 4;
-    /// Windows a readback was needed for: start -> {size, scheduler tick of the last one}. A
-    /// game that reuses memory each frame faults on the same windows again, so the readback
-    /// thread downloads them as soon as their GPU writes are submitted, which is what a fault
-    /// at that moment would do. A window without a fault for EagerWindowTicks is dropped.
-    struct EagerWindow {
-        u64 size;
-        u64 fault_tick;
-    };
-    std::unordered_map<VAddr, EagerWindow> eager_windows;
-    static constexpr u64 EagerWindowTicks = 1024;
-    std::atomic<bool> has_eager_windows{};
+    /// Pages a readback was needed for: page address -> scheduler tick of the last one. A game
+    /// that reuses memory each frame faults on the same pages again, so once the GPU has run
+    /// the last write to such a page the readback thread downloads it, which is what a fault
+    /// at that moment would do. A page without a fault for EagerPageTicks is dropped.
+    std::unordered_map<VAddr, u64> eager_pages;
+    static constexpr u64 EagerPageTicks = 1024;
+    std::atomic<bool> has_eager_pages{};
     std::mutex eager_mutex;
     std::condition_variable_any eager_cv;
     u64 eager_kicks{};
 
-    void NoteFaultedWindow(const DownloadWindow& window);
-    /// The eager windows whose GPU-modified data can be downloaded ahead now.
-    void CollectEagerWindows(boost::container::small_vector<DownloadWindow, 16>& windows);
+    void NoteFaultedPages(VAddr device_addr, u64 size);
+    /// The eager pages with GPU-modified data whose last write the GPU ran by gpu_tick.
+    void CollectEagerPages(u64 gpu_tick,
+                           boost::container::small_vector<DownloadWindow, 16>& windows);
     void EagerReadbackThread(std::stop_token stoken);
     /// Windows whose GPU-modified ranges were taken out of gpu_modified_ranges and whose data
     /// is not written back yet.
