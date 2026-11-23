@@ -192,8 +192,9 @@ struct DlssNrPass::Impl {
     bool Initialise();
     void CreatePipelines();
     void ResizeTargets(vk::Extent2D extent);
-    void Render(VideoCore::Image& color, const XfbVelocityPass::Outputs& inputs);
-    void SetTuning();
+    void Render(VideoCore::Image& color, const XfbVelocityPass::Outputs& inputs,
+                const Settings& settings);
+    void SetTuning(const Settings& settings);
 
     const Instance& instance;
     Scheduler& scheduler;
@@ -210,6 +211,7 @@ struct DlssNrPass::Impl {
     OwnParameters own_parameters;
     Ngx::Parameter* parameters{};
     void* feature{};
+    u32 feature_preset{};
     bool initialised{};
     bool failed{};
     bool reset{true};
@@ -427,17 +429,21 @@ void DlssNrPass::Impl::ResizeTargets(vk::Extent2D extent) {
     staging_view = Check<"create dlss nr view">(device.createImageViewUnique(view_ci));
 }
 
-// Defaults of the model's controls; read once when the feature is built, and again each evaluate.
-void DlssNrPass::Impl::SetTuning() {
-    parameters->Set("DLSSNR.Intensity", 1.0f);
-    parameters->Set("DLSSNR.Style", 0u);
-    parameters->Set("DLSSNR.LocalStructureStrength", 1.0f);
-    parameters->Set("DLSSNR.LocalToneStrength", 1.0f);
-    parameters->Set("DLSSNR.SkinStructureStrength", -1.0f);
-    parameters->Set("DLSSNR.UseAutoMask", 1u);
+void DlssNrPass::Impl::SetTuning(const Settings& settings) {
+    parameters->Set("DLSSNR.Intensity", settings.intensity);
+    parameters->Set("DLSSNR.Style", settings.style);
+    parameters->Set("DLSSNR.LocalStructureStrength", settings.local_structure);
+    parameters->Set("DLSSNR.LocalToneStrength", settings.local_tone);
+    parameters->Set("DLSSNR.SkinStructureStrength", settings.skin_structure);
+    parameters->Set("DLSSNR.UseAutoMask", settings.auto_mask ? 1u : 0u);
 }
 
-void DlssNrPass::Impl::Render(VideoCore::Image& color, const XfbVelocityPass::Outputs& inputs) {
+void DlssNrPass::Impl::Render(VideoCore::Image& color, const XfbVelocityPass::Outputs& inputs,
+                              const Settings& settings) {
+    if (!settings.enable) {
+        reset = true;
+        return;
+    }
     if (failed || (!initialised && !Initialise())) {
         return;
     }
@@ -451,6 +457,12 @@ void DlssNrPass::Impl::Render(VideoCore::Image& color, const XfbVelocityPass::Ou
         return;
     }
     ResizeTargets(extent);
+    if (feature && feature_preset != settings.preset) {
+        // The preset is read only when the feature is built.
+        scheduler.Finish();
+        release(feature);
+        feature = nullptr;
+    }
 
     const vk::CommandBuffer cmdbuf = scheduler.CommandBuffer();
     scheduler.EndRendering();
@@ -544,8 +556,8 @@ void DlssNrPass::Impl::Render(VideoCore::Image& color, const XfbVelocityPass::Ou
         parameters->Set("DLSSNR.Height", size.height);
         parameters->Set("CreationNodeMask", 1u);
         parameters->Set("VisibilityNodeMask", 1u);
-        parameters->Set("DLSSNR.Hint.Render.Preset", 0u);
-        SetTuning();
+        parameters->Set("DLSSNR.Hint.Render.Preset", settings.preset);
+        SetTuning(settings);
         parameters->Set("DLSSNR.UICorrection", 1u);
         const int result =
             create(command_buffer, Ngx::FeatureNeuralRendering, parameters, &feature);
@@ -556,6 +568,7 @@ void DlssNrPass::Impl::Render(VideoCore::Image& color, const XfbVelocityPass::Ou
             Fail("the model would not build a feature");
             return;
         }
+        feature_preset = settings.preset;
         reset = true;
     }
 
@@ -602,7 +615,7 @@ void DlssNrPass::Impl::Render(VideoCore::Image& color, const XfbVelocityPass::Ou
     // Vectors are already in pixels, current to previous.
     parameters->Set("DLSSNR.MVecScaleX", 1.0f);
     parameters->Set("DLSSNR.MVecScaleY", 1.0f);
-    SetTuning();
+    SetTuning(settings);
 
     const int evaluated = evaluate(command_buffer, feature, parameters);
     reset = false;
@@ -672,8 +685,9 @@ bool DlssNrPass::ModelPresent() {
     return std::filesystem::exists(ExecutableDir() / L"nvngx_dlssnr.dll");
 }
 
-void DlssNrPass::Render(VideoCore::Image& color, const XfbVelocityPass::Outputs& inputs) {
-    impl->Render(color, inputs);
+void DlssNrPass::Render(VideoCore::Image& color, const XfbVelocityPass::Outputs& inputs,
+                        const Settings& settings) {
+    impl->Render(color, inputs, settings);
 }
 
 } // namespace Vulkan::HostPasses
@@ -692,7 +706,7 @@ bool DlssNrPass::ModelPresent() {
     return false;
 }
 
-void DlssNrPass::Render(VideoCore::Image&, const XfbVelocityPass::Outputs&) {}
+void DlssNrPass::Render(VideoCore::Image&, const XfbVelocityPass::Outputs&, const Settings&) {}
 
 } // namespace Vulkan::HostPasses
 

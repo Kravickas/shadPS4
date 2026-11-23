@@ -431,6 +431,14 @@ struct GPUSettings {
     Setting<bool> fsr_enabled{false};
     Setting<bool> rcas_enabled{true};
     Setting<int> rcas_attenuation{250};
+    Setting<bool> dlss_nr_enabled{true};
+    Setting<u32> dlss_nr_preset{0};
+    Setting<u32> dlss_nr_style{0};
+    Setting<int> dlss_nr_intensity{1000};
+    Setting<int> dlss_nr_local_structure{1000};
+    Setting<int> dlss_nr_local_tone{1000};
+    Setting<int> dlss_nr_skin_structure{-1000};
+    Setting<bool> dlss_nr_auto_mask{false};
     Setting<bool> userfaultfd{false};
     Setting<bool> inline_fetch_shader{false};
     Setting<bool> fast_shader_math{false};
@@ -470,8 +478,10 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE(GPUSettings, window_width, window_height, int
                                    direct_memory_access_enabled, dump_shaders, patch_shaders,
                                    vblank_frequency, full_screen, full_screen_mode, present_mode,
                                    hdr_allowed, fsr_enabled, rcas_enabled, rcas_attenuation,
-                                   userfaultfd, inline_fetch_shader, fast_shader_math,
-                                   submit_draw_interval)
+                                   dlss_nr_enabled, dlss_nr_preset, dlss_nr_style,
+                                   dlss_nr_intensity, dlss_nr_local_structure, dlss_nr_local_tone,
+                                   dlss_nr_skin_structure, dlss_nr_auto_mask, userfaultfd,
+                                   inline_fetch_shader, fast_shader_math, submit_draw_interval)
 
 // -------------------------------
 // Vulkan settings
@@ -772,6 +782,14 @@ public:
     SETTING_FORWARD_BOOL(m_gpu, FsrEnabled, fsr_enabled)
     SETTING_FORWARD_BOOL(m_gpu, RcasEnabled, rcas_enabled)
     SETTING_FORWARD(m_gpu, RcasAttenuation, rcas_attenuation)
+    SETTING_FORWARD_BOOL(m_gpu, DlssNrEnabled, dlss_nr_enabled)
+    SETTING_FORWARD(m_gpu, DlssNrPreset, dlss_nr_preset)
+    SETTING_FORWARD(m_gpu, DlssNrStyle, dlss_nr_style)
+    SETTING_FORWARD(m_gpu, DlssNrIntensity, dlss_nr_intensity)
+    SETTING_FORWARD(m_gpu, DlssNrLocalStructure, dlss_nr_local_structure)
+    SETTING_FORWARD(m_gpu, DlssNrLocalTone, dlss_nr_local_tone)
+    SETTING_FORWARD(m_gpu, DlssNrSkinStructure, dlss_nr_skin_structure)
+    SETTING_FORWARD_BOOL(m_gpu, DlssNrAutoMask, dlss_nr_auto_mask)
     SETTING_FORWARD(m_gpu, ReadbacksMode, readbacks_mode)
     SETTING_FORWARD_BOOL(m_gpu, ReadbackLinearImagesEnabled, readback_linear_images_enabled)
     SETTING_FORWARD_BOOL(m_gpu, DirectMemoryAccessEnabled, direct_memory_access_enabled)

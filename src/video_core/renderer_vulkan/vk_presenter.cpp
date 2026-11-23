@@ -488,6 +488,14 @@ Presenter::Presenter(Frontend::WindowSDL& window_, AmdGpu::Liverpool* liverpool_
     fsr_settings.use_rcas = EmulatorSettings.IsRcasEnabled();
     fsr_settings.rcas_attenuation =
         static_cast<float>(EmulatorSettings.GetRcasAttenuation() / 1000.f);
+    dlss_nr_settings.enable = EmulatorSettings.IsDlssNrEnabled();
+    dlss_nr_settings.preset = EmulatorSettings.GetDlssNrPreset();
+    dlss_nr_settings.style = EmulatorSettings.GetDlssNrStyle();
+    dlss_nr_settings.intensity = EmulatorSettings.GetDlssNrIntensity() / 1000.f;
+    dlss_nr_settings.local_structure = EmulatorSettings.GetDlssNrLocalStructure() / 1000.f;
+    dlss_nr_settings.local_tone = EmulatorSettings.GetDlssNrLocalTone() / 1000.f;
+    dlss_nr_settings.skin_structure = EmulatorSettings.GetDlssNrSkinStructure() / 1000.f;
+    dlss_nr_settings.auto_mask = EmulatorSettings.IsDlssNrAutoMask();
 
     fsr_pass.Create(device, instance.GetAllocator(), num_images);
     pp_pass.Create(device, swapchain.GetSurfaceFormat().format);
@@ -521,6 +529,10 @@ Presenter::~Presenter() {
 
 bool Presenter::IsVideoOutSurface(const AmdGpu::ColorBuffer& color_buffer) const {
     return std::ranges::find(vo_buffers_addr, color_buffer.Address()) != vo_buffers_addr.cend();
+}
+
+bool Presenter::IsDlssNrAvailable() const {
+    return rasterizer->IsDlssNrAvailable();
 }
 
 void Presenter::RecreateFrame(Frame* frame, u32 width, u32 height) {
@@ -738,7 +750,7 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
         runtime.DownloadImage(&image, &readback.buffer, std::span{&copy_region, 1});
     }
 
-    rasterizer->EvaluateNr(image);
+    rasterizer->EvaluateNr(image, dlss_nr_settings);
 
     // Continue with host-side passes that draw the displayed (scaled) frame.
 

@@ -575,12 +575,13 @@ void Rasterizer::EndXfbFrame(vk::Extent2D output_extent) {
     xfb_output_extent = output_extent;
 }
 
-void Rasterizer::EvaluateNr(VideoCore::Image& color) {
+void Rasterizer::EvaluateNr(VideoCore::Image& color,
+                            const HostPasses::DlssNrPass::Settings& settings) {
     if (!dlss_nr || !xfb_velocity) {
         return;
     }
     if (const auto outputs = xfb_velocity->FrameOutputs()) {
-        dlss_nr->Render(color, *outputs);
+        dlss_nr->Render(color, *outputs, settings);
     }
 }
 

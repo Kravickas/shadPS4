@@ -1,4 +1,4 @@
-// SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
+// SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #pragma once
@@ -7,6 +7,7 @@
 
 #include "core/libraries/videoout/buffer.h"
 #include "imgui/imgui_texture.h"
+#include "video_core/renderer_vulkan/host_passes/dlss_nr_pass.h"
 #include "video_core/renderer_vulkan/host_passes/fsr_pass.h"
 #include "video_core/renderer_vulkan/host_passes/pp_pass.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
@@ -60,6 +61,12 @@ public:
     HostPasses::FsrPass::Settings& GetFsrSettingsRef() {
         return fsr_settings;
     }
+
+    HostPasses::DlssNrPass::Settings& GetDlssNrSettingsRef() {
+        return dlss_nr_settings;
+    }
+
+    bool IsDlssNrAvailable() const;
 
     Frontend::WindowSDL& GetWindow() const {
         return window;
@@ -117,6 +124,7 @@ private:
     Instance instance;
     HostPasses::FsrPass fsr_pass;
     HostPasses::FsrPass::Settings fsr_settings{};
+    HostPasses::DlssNrPass::Settings dlss_nr_settings{};
     HostPasses::PostProcessingPass::Settings pp_settings{};
     HostPasses::PostProcessingPass pp_pass;
     AmdGpu::Liverpool* liverpool;

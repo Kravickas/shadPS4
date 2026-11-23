@@ -124,6 +124,45 @@ void L::DrawMenuBar() {
 
                 ImGui::EndMenu();
             }
+            if (presenter->IsDlssNrAvailable() && BeginMenu("DLSS 5")) {
+                auto& nr = presenter->GetDlssNrSettingsRef();
+                Checkbox("DLSS 5 Enabled", &nr.enable);
+                BeginDisabled(!nr.enable);
+                {
+                    static constexpr const char* presets[] = {"Default", "Preset 1", "Preset 2"};
+                    int preset = static_cast<int>(nr.preset);
+                    if (Combo("Preset", &preset, presets, IM_ARRAYSIZE(presets))) {
+                        nr.preset = static_cast<u32>(preset);
+                    }
+                    int style = static_cast<int>(nr.style);
+                    if (SliderInt("Style", &style, 0, 2)) {
+                        nr.style = static_cast<u32>(style);
+                    }
+                    SliderFloat("Intensity", &nr.intensity, 0.0f, 2.0f);
+                    SliderFloat("Local Structure", &nr.local_structure, 0.0f, 2.0f);
+                    SliderFloat("Local Tone", &nr.local_tone, 0.0f, 2.0f);
+                    SliderFloat("Skin Structure", &nr.skin_structure, -1.0f, 2.0f);
+                    Checkbox("Auto Skin Mask", &nr.auto_mask);
+                }
+                EndDisabled();
+
+                if (Button("Save")) {
+                    EmulatorSettings.SetDlssNrEnabled(nr.enable);
+                    EmulatorSettings.SetDlssNrPreset(nr.preset);
+                    EmulatorSettings.SetDlssNrStyle(nr.style);
+                    EmulatorSettings.SetDlssNrIntensity(static_cast<int>(nr.intensity * 1000));
+                    EmulatorSettings.SetDlssNrLocalStructure(
+                        static_cast<int>(nr.local_structure * 1000));
+                    EmulatorSettings.SetDlssNrLocalTone(static_cast<int>(nr.local_tone * 1000));
+                    EmulatorSettings.SetDlssNrSkinStructure(
+                        static_cast<int>(nr.skin_structure * 1000));
+                    EmulatorSettings.SetDlssNrAutoMask(nr.auto_mask);
+                    EmulatorSettings.Save();
+                    CloseCurrentPopup();
+                }
+
+                ImGui::EndMenu();
+            }
             ImGui::EndMenu();
         }
         if (BeginMenu("Debug")) {

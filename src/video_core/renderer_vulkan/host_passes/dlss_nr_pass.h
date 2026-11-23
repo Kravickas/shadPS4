@@ -4,6 +4,7 @@
 #pragma once
 
 #include <memory>
+#include "common/types.h"
 #include "video_core/renderer_vulkan/host_passes/xfb_velocity_pass.h"
 
 namespace VideoCore {
@@ -23,13 +24,27 @@ namespace Vulkan::HostPasses {
 // and the forwarder nvngx.dll_dlssnr.dll sit beside the executable.
 class DlssNrPass {
 public:
+    // Defaults are the model's own values for an unset parameter. Preset 0 is not in the weight
+    // table, so the model falls back to its shipping preset 2; it has three styles.
+    struct Settings {
+        bool enable{true};
+        u32 preset{0};
+        u32 style{0};
+        float intensity{1.0f};
+        float local_structure{1.0f};
+        float local_tone{1.0f};
+        float skin_structure{-1.0f};
+        bool auto_mask{false};
+    };
+
     DlssNrPass(const Instance& instance, Scheduler& scheduler, Runtime& runtime);
     ~DlssNrPass();
 
     static bool ModelPresent();
 
     // Replaces the contents of color with the model's output.
-    void Render(VideoCore::Image& color, const XfbVelocityPass::Outputs& inputs);
+    void Render(VideoCore::Image& color, const XfbVelocityPass::Outputs& inputs,
+                const Settings& settings);
 
 private:
     struct Impl;
