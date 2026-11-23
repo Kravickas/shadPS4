@@ -140,6 +140,9 @@ void BufferCache::TickFrame() {
     if (std::exchange(fault_process_pending, false)) {
         fault_manager->ProcessFaultBuffer();
     }
+}
+
+void BufferCache::OnSubmit() {
     eager_write_pending.store(false, std::memory_order_relaxed);
     // A tick was submitted: the readback thread waits for the GPU to run it.
     if (has_eager_pages.load(std::memory_order_relaxed)) {

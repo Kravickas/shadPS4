@@ -63,6 +63,8 @@ Rasterizer::Rasterizer(const Instance& instance_, Scheduler& scheduler_, Runtime
     scheduler.SetSubmitCallback([this](Vulkan::SubmitInfo& info) {
         runtime.FlushBarriers();
         buffer_cache.SubmitPendingArenaBinds(info);
+        buffer_cache.OnSubmit();
+        DebugState.frame_submits.Add(1);
     });
 }
 
@@ -903,7 +905,6 @@ void Rasterizer::Finish() {
 }
 
 void Rasterizer::OnSubmit() {
-    DebugState.frame_submits.Add(1);
     buffer_cache.TickFrame();
     texture_cache.ProcessDownloadImages();
     texture_cache.RunGarbageCollector();

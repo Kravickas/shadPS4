@@ -100,6 +100,10 @@ public:
 
     void TickFrame();
 
+    /// Called at every submit of the GPU thread's command buffer, with the tick advanced.
+    /// TickFrame is only called once per frame.
+    void OnSubmit();
+
     /// Whether the open command buffer holds a GPU write to memory the readback thread
     /// downloads for the game's threads.
     [[nodiscard]] bool IsEagerWritePending() const {
