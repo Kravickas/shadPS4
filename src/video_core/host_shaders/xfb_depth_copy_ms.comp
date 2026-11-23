@@ -1,0 +1,19 @@
+// SPDX-FileCopyrightText: Copyright 2026 shadPS4 Emulator Project
+// SPDX-License-Identifier: GPL-2.0-or-later
+
+#version 450
+#extension GL_EXT_samplerless_texture_functions : require
+
+// Multisampled scene depth -> sample 0 as single-sample R32F, matching the motion resolve.
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(set = 0, binding = 0) uniform texture2DMS depth;
+layout(set = 0, binding = 1, r32f) uniform writeonly image2D depth_out;
+
+void main() {
+    const ivec2 coord = ivec2(gl_GlobalInvocationID.xy);
+    if (any(greaterThanEqual(coord, imageSize(depth_out)))) {
+        return;
+    }
+    imageStore(depth_out, coord, vec4(texelFetch(depth, coord, 0).r));
+}

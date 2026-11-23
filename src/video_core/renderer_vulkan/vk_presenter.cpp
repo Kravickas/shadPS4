@@ -665,6 +665,10 @@ static vk::Format GetFrameViewFormat(const Libraries::VideoOut::PixelFormat form
 
 Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& attribute,
                                VAddr cpu_address) {
+    // The flip is the frame boundary in the guest command stream: every draw before it belongs to
+    // the frame being presented.
+    rasterizer->EndXfbFrame({attribute.attrib.width, attribute.attrib.height});
+
     auto desc = VideoCore::TextureCache::ImageDesc{attribute, cpu_address};
     const auto image_id = texture_cache.FindImage(desc);
     texture_cache.UpdateImage(image_id);
@@ -734,6 +738,8 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
         runtime.DownloadImage(&image, &readback.buffer, std::span{&copy_region, 1});
     }
 
+    rasterizer->EvaluateNr(image);
+
     // Continue with host-side passes that draw the displayed (scaled) frame.
 
     runtime.Transit(&image, vk::ImageLayout::eShaderReadOnlyOptimal,
@@ -768,6 +774,10 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
 }
 
 Frame* Presenter::PrepareBlankFrame(bool present_thread) {
+    if (!present_thread) {
+        rasterizer->EndXfbFrame({});
+    }
+
     // Request a free presentation frame.
     Frame* frame = GetRenderFrame();
 

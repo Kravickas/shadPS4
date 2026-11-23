@@ -1,0 +1,31 @@
+// SPDX-FileCopyrightText: Copyright 2026 shadPS4 Emulator Project
+// SPDX-License-Identifier: GPL-2.0-or-later
+
+#version 450
+
+// The model's output -> values a blit writes back into the presented image unchanged. An sRGB
+// target is linearised here because the blit encodes on write.
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(set = 0, binding = 0, rgba16f) uniform readonly image2D model_output;
+layout(set = 0, binding = 1, rgba16f) uniform writeonly image2D staging;
+
+layout(push_constant) uniform Constants {
+    uint srgb_target;
+} pc;
+
+vec3 SrgbToLinear(vec3 c) {
+    return mix(c / 12.92, pow((c + 0.055) / 1.055, vec3(2.4)), step(vec3(0.04045), c));
+}
+
+void main() {
+    const ivec2 coord = ivec2(gl_GlobalInvocationID.xy);
+    if (any(greaterThanEqual(coord, imageSize(staging)))) {
+        return;
+    }
+    vec3 rgb = clamp(imageLoad(model_output, coord).rgb, 0.0, 1.0);
+    if (pc.srgb_target != 0u) {
+        rgb = SrgbToLinear(rgb);
+    }
+    imageStore(staging, coord, vec4(rgb, 1.0));
+}

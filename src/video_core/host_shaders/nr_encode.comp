@@ -1,0 +1,31 @@
+// SPDX-FileCopyrightText: Copyright 2026 shadPS4 Emulator Project
+// SPDX-License-Identifier: GPL-2.0-or-later
+
+#version 450
+#extension GL_EXT_samplerless_texture_functions : require
+
+// Presented image -> the model's input: display-encoded values in a float image.
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(set = 0, binding = 0) uniform texture2D color;
+layout(set = 0, binding = 1, rgba16f) uniform writeonly image2D model_input;
+
+layout(push_constant) uniform Constants {
+    uint srgb_view;
+} pc;
+
+vec3 LinearToSrgb(vec3 c) {
+    return mix(c * 12.92, 1.055 * pow(c, vec3(1.0 / 2.4)) - 0.055, step(vec3(0.0031308), c));
+}
+
+void main() {
+    const ivec2 coord = ivec2(gl_GlobalInvocationID.xy);
+    if (any(greaterThanEqual(coord, imageSize(model_input)))) {
+        return;
+    }
+    vec3 rgb = texelFetch(color, coord, 0).rgb;
+    if (pc.srgb_view != 0u) {
+        rgb = LinearToSrgb(clamp(rgb, 0.0, 1.0));
+    }
+    imageStore(model_input, coord, vec4(rgb, 1.0));
+}

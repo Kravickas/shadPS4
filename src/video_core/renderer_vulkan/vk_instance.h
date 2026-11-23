@@ -198,6 +198,21 @@ public:
         return provoking_vertex;
     }
 
+    /// Returns true when VK_EXT_transform_feedback is supported.
+    /// Whether the device has the NVX extensions DLSS Neural Rendering loads its kernels through.
+    bool IsNeuralRenderingSupported() const {
+        return neural_rendering;
+    }
+
+    bool IsTransformFeedbackSupported() const {
+        return transform_feedback;
+    }
+
+    /// Returns true when vkCmdDrawIndirectByteCountEXT is supported.
+    bool IsTransformFeedbackDrawSupported() const {
+        return transform_feedback && transform_feedback_props.transformFeedbackDraw;
+    }
+
     /// Returns true when VK_AMD_shader_image_load_store_lod is supported.
     bool IsImageLoadStoreLodSupported() const {
         return image_load_store_lod;
@@ -537,6 +552,9 @@ private:
     bool vertex_input_dynamic_state{};
     bool list_restart{};
     bool provoking_vertex{};
+    bool transform_feedback{};
+    bool neural_rendering{};
+    vk::PhysicalDeviceTransformFeedbackPropertiesEXT transform_feedback_props{};
     bool shader_stencil_export{};
     bool image_load_store_lod{};
     bool amd_gcn_shader{};

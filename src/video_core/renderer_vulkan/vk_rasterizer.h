@@ -3,13 +3,17 @@
 
 #pragma once
 
+#include <optional>
 #include "common/recursive_lock.h"
 #include "common/shared_first_mutex.h"
 #include "video_core/buffer_cache/buffer_cache.h"
 #include "video_core/page_manager.h"
+#include "video_core/renderer_vulkan/host_passes/dlss_nr_pass.h"
+#include "video_core/renderer_vulkan/host_passes/xfb_velocity_pass.h"
 #include "video_core/renderer_vulkan/vk_pipeline_cache.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/texture_cache/texture_cache.h"
+#include "video_core/xfb_capture.h"
 
 namespace AmdGpu {
 struct Liverpool;
@@ -83,6 +87,13 @@ public:
     void Finish();
     void OnSubmit();
     void OnFence();
+
+    /// Closes the transform feedback frame at a guest flip: renders motion vectors for the
+    /// draws captured since the previous flip and swaps the capture buffers.
+    void EndXfbFrame(vk::Extent2D output_extent);
+
+    /// Runs DLSS Neural Rendering over the presented image when the model is available.
+    void EvaluateNr(VideoCore::Image& color);
 
     PipelineCache& GetPipelineCache() {
         return pipeline_cache;
@@ -161,6 +172,11 @@ private:
     std::array<ImageBinding, Shader::NUM_IMAGES> image_bindings;
     std::array<ImageBinding, AmdGpu::NUM_COLOR_BUFFERS> cb_descs;
     ImageBinding db_desc;
+
+    std::optional<VideoCore::XfbCapture> xfb_capture;
+    std::optional<HostPasses::XfbVelocityPass> xfb_velocity;
+    std::optional<HostPasses::DlssNrPass> dlss_nr;
+    vk::Extent2D xfb_output_extent{};
 
     boost::container::static_vector<vk::DescriptorImageInfo, Shader::NUM_IMAGES> image_infos;
     boost::container::static_vector<vk::DescriptorBufferInfo, Shader::NUM_BUFFERS> buffer_infos;

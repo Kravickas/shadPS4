@@ -1,0 +1,141 @@
+// SPDX-FileCopyrightText: Copyright 2026 shadPS4 Emulator Project
+// SPDX-License-Identifier: GPL-2.0-or-later
+
+#version 450
+#extension GL_GOOGLE_include_directive : require
+
+// Takes the hypothesis with the most inliers and refits C to all of its inliers. Doubles because
+// clip z and w are nearly collinear.
+layout(local_size_x = 64) in;
+
+layout(set = 0, binding = 0, std430) readonly buffer Sums {
+    double sums[];
+};
+layout(set = 0, binding = 1, std430) readonly buffer Hypotheses {
+    double hypotheses[];
+};
+layout(set = 0, binding = 2, std430) writeonly buffer Camera {
+    vec4 clip_to_prev[4];
+    vec4 stats;
+} camera;
+
+layout(push_constant) uniform Constants {
+    uint region_count;
+    uint hypothesis_count;
+} pc;
+
+#include "xfb_camera_common.glsl"
+
+const uint Threads = 64u;
+const uint Refinements = 2u;
+const uint MinInliers = 8u;
+const uint HypothesisStride = 20u;
+
+shared double reduce_normal[Threads][NormalCount];
+shared dvec2 reduce_pair[Threads];
+shared dvec4 solution[4];
+shared bool solution_valid;
+
+void main() {
+    const uint lane = gl_LocalInvocationID.x;
+
+    // (inlier count, hypothesis index) of the best hypothesis.
+    dvec2 best = dvec2(0.0LF);
+    for (uint h = lane; h < pc.hypothesis_count; h += Threads) {
+        const double count = hypotheses[h * HypothesisStride + 16u];
+        if (count > best.x) {
+            best = dvec2(count, double(h));
+        }
+    }
+    reduce_pair[lane] = best;
+    barrier();
+    for (uint stride = Threads / 2u; stride > 0u; stride >>= 1u) {
+        if (lane < stride && reduce_pair[lane + stride].x > reduce_pair[lane].x) {
+            reduce_pair[lane] = reduce_pair[lane + stride];
+        }
+        barrier();
+    }
+    if (lane == 0u) {
+        const uint base = uint(reduce_pair[0].y) * HypothesisStride;
+        for (uint r = 0u; r < 4u; ++r) {
+            solution[r] = dvec4(hypotheses[base + r * 4u + 0u], hypotheses[base + r * 4u + 1u],
+                                hypotheses[base + r * 4u + 2u], hypotheses[base + r * 4u + 3u]);
+        }
+        solution_valid = reduce_pair[0].x >= double(MinInliers);
+    }
+    barrier();
+
+    for (uint refinement = 0u; refinement < Refinements; ++refinement) {
+        if (!solution_valid) {
+            break;
+        }
+        const dvec4 c[4] = dvec4[](solution[0], solution[1], solution[2], solution[3]);
+        double acc[NormalCount];
+        for (uint k = 0u; k < NormalCount; ++k) {
+            acc[k] = 0.0LF;
+        }
+        for (uint i = lane; i < pc.region_count; i += Threads) {
+            if (Usable(i) && RelativeResidual(i, c) < InlierResidual) {
+                Accumulate(i, acc);
+            }
+        }
+        for (uint k = 0u; k < NormalCount; ++k) {
+            reduce_normal[lane][k] = acc[k];
+        }
+        barrier();
+        for (uint stride = Threads / 2u; stride > 0u; stride >>= 1u) {
+            if (lane < stride) {
+                for (uint k = 0u; k < NormalCount; ++k) {
+                    reduce_normal[lane][k] += reduce_normal[lane + stride][k];
+                }
+            }
+            barrier();
+        }
+        if (lane == 0u) {
+            double normal[NormalCount];
+            for (uint k = 0u; k < NormalCount; ++k) {
+                normal[k] = reduce_normal[0][k];
+            }
+            dvec4 refined[4];
+            if (SolveNormal(normal, refined)) {
+                for (uint r = 0u; r < 4u; ++r) {
+                    solution[r] = refined[r];
+                }
+            }
+        }
+        barrier();
+    }
+
+    const dvec4 c[4] = dvec4[](solution[0], solution[1], solution[2], solution[3]);
+    dvec2 residual = dvec2(0.0LF);
+    if (solution_valid) {
+        for (uint i = lane; i < pc.region_count; i += Threads) {
+            if (!Usable(i)) {
+                continue;
+            }
+            const double r = RelativeResidual(i, c);
+            if (r < InlierResidual) {
+                residual += dvec2(r, 1.0LF);
+            }
+        }
+    }
+    reduce_pair[lane] = residual;
+    barrier();
+    for (uint stride = Threads / 2u; stride > 0u; stride >>= 1u) {
+        if (lane < stride) {
+            reduce_pair[lane] += reduce_pair[lane + stride];
+        }
+        barrier();
+    }
+
+    if (lane == 0u) {
+        const double inliers = reduce_pair[0].y;
+        const bool valid = solution_valid && inliers >= double(MinInliers);
+        for (uint r = 0u; r < 4u; ++r) {
+            camera.clip_to_prev[r] = vec4(solution[r]);
+        }
+        camera.stats = vec4(valid ? 1.0 : 0.0, float(inliers),
+                            float(reduce_pair[0].x / max(inliers, 1.0LF)),
+                            float(pc.region_count));
+    }
+}

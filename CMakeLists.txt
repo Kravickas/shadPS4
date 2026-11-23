@@ -1055,6 +1055,7 @@ set(SHADER_RECOMPILER src/shader_recompiler/profile.h
                       src/shader_recompiler/params.h
                       src/shader_recompiler/runtime_info.h
                       src/shader_recompiler/specialization.h
+                      src/shader_recompiler/xfb_layout.h
                       src/shader_recompiler/backend/bindings.h
                       src/shader_recompiler/backend/spirv/emit_spirv.cpp
                       src/shader_recompiler/backend/spirv/emit_spirv.h
@@ -1236,6 +1237,11 @@ set(VIDEO_CORE src/video_core/amdgpu/cb_db_extent.h
                src/video_core/renderer_vulkan/host_passes/fsr_pass.h
                src/video_core/renderer_vulkan/host_passes/pp_pass.cpp
                src/video_core/renderer_vulkan/host_passes/pp_pass.h
+               src/video_core/renderer_vulkan/host_passes/xfb_velocity_pass.cpp
+               src/video_core/renderer_vulkan/host_passes/xfb_velocity_pass.h
+               src/video_core/renderer_vulkan/host_passes/dlss_nr_pass.cpp
+               src/video_core/renderer_vulkan/host_passes/dlss_nr_pass.h
+               src/video_core/renderer_vulkan/host_passes/ngx_abi.h
                src/video_core/texture_cache/blit_helper.cpp
                src/video_core/texture_cache/blit_helper.h
                src/video_core/texture_cache/host_compatibility.cpp
@@ -1259,6 +1265,8 @@ set(VIDEO_CORE src/video_core/amdgpu/cb_db_extent.h
                src/video_core/page_manager.h
                src/video_core/renderdoc.cpp
                src/video_core/renderdoc.h
+               src/video_core/xfb_capture.cpp
+               src/video_core/xfb_capture.h
 )
 
 set(IMGUI src/imgui/imgui_config.h
@@ -1359,6 +1367,14 @@ add_executable(shadps4
     src/sdl_window.h
     src/sdl_window.cpp
 )
+
+# The Neural Rendering model only accepts calls from a module whose path contains "nvngx.dll".
+if (WIN32 AND MSVC)
+    add_library(dlssnr_forwarder SHARED
+                src/video_core/renderer_vulkan/host_passes/dlss_nr_forwarder.cpp)
+    set_target_properties(dlssnr_forwarder PROPERTIES OUTPUT_NAME "nvngx.dll_dlssnr")
+    add_dependencies(shadps4 dlssnr_forwarder)
+endif()
 
 create_target_directory_groups(shadps4)
 

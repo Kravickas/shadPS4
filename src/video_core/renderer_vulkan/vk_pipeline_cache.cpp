@@ -368,6 +368,7 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
         .supports_shader_stencil_export = instance_.IsShaderStencilExportSupported(),
         .fast_shader_math = EmulatorSettings.IsFastShaderMath(),
         .support_bda = instance_.IsBufferDeviceAddressSupported(),
+        .supports_transform_feedback = instance_.IsTransformFeedbackSupported(),
     };
     WarmUp();
 
