@@ -52,13 +52,6 @@ struct DrawAhead {
     u64 stream_position{};
     /// The bytes of the draw's read-only bindings the stream buffer could serve.
     std::vector<VideoCore::BufferCache::StreamHint> stream_hints;
-    /// The vertex inputs of the draw, from the V#s the lookup read, and the ranges of its vertex
-    /// buffers merged and in address order.
-    bool has_vertex_inputs{};
-    VertexInputs<vk::VertexInputAttributeDescription2EXT> attributes;
-    VertexInputs<vk::VertexInputBindingDescription2EXT> bindings;
-    VertexInputs<AmdGpu::Buffer> guest_buffers;
-    VertexInputs<std::pair<VAddr, VAddr>> vertex_ranges;
 
     /// From the user data the lookup read, for each stage: the V#s of its guest buffers, and
     /// the lookup key of the first binding of each of its images with the key's hash.
@@ -77,6 +70,14 @@ struct DrawAhead {
     boost::container::static_vector<StageSharps, MaxShaderStages> stage_sharps;
     std::vector<AmdGpu::Buffer> buffer_sharps;
     std::vector<ImageKey> image_keys;
+
+    /// The vertex inputs of the draw, from the V#s the lookup read, and the ranges of its vertex
+    /// buffers merged and in address order.
+    bool has_vertex_inputs{};
+    VertexInputs<vk::VertexInputAttributeDescription2EXT> attributes;
+    VertexInputs<vk::VertexInputBindingDescription2EXT> bindings;
+    VertexInputs<AmdGpu::Buffer> guest_buffers;
+    VertexInputs<std::pair<VAddr, VAddr>> vertex_ranges;
 };
 
 class Rasterizer {
@@ -155,6 +156,13 @@ public:
     /// For the binding thread: reads the bytes of the bindings of a draw whose pipeline was
     /// looked up ahead, and makes its vertex inputs, V#s and texture lookup keys.
     void BindAhead(DrawAhead& ahead, AmdGpu::CpPerf& perf);
+
+    /// The lookahead threads wrote what they prepared on other processors. Asks for the memory
+    /// the three draws behind the one taken read, each a step further than the one after it:
+    /// the table slots of next, the arrays of second, the entry of third. Null for a draw whose
+    /// result is not finished. The slots of taken are asked for if they were not as next.
+    void PrefetchDrawsAhead(const DrawAhead& taken, const DrawAhead* next, const DrawAhead* second,
+                            const DrawAhead* third);
 
     /// Hands over what the lookahead thread prepared for the next draw, if anything.
     void SetDrawAhead(const DrawAhead* ahead) {
@@ -257,6 +265,8 @@ private:
     u32 vertex_ahead_uses{};
     static constexpr u32 LookupCheckInterval = 64;
     u32 lookups_ahead{};
+    /// The lookahead result whose table slots PrefetchDrawsAhead asked for last.
+    const DrawAhead* slots_ahead{};
     /// The lookahead result the stages being bound take their V#s and texture keys from.
     const DrawAhead* sharps_ahead{};
     static constexpr u32 SharpsAheadCheckInterval = 64;
@@ -276,10 +286,11 @@ private:
     /// as: auto. Else after that many draws and dispatches.
     const u32 submit_draw_interval;
     static constexpr u32 SubmitIntervalAuto = ~0U;
-    /// In auto mode, the least and the largest number of draws and dispatches between two
-    /// submits.
+    /// In auto mode, the least number of draws and dispatches between two submits, the number
+    /// from which a submit is made once the GPU has run everything submitted, and the largest.
     static constexpr u32 AutoSubmitMinDraws = 128;
-    static constexpr u32 AutoSubmitMaxDraws = 1000;
+    static constexpr u32 AutoSubmitIdleDraws = 256;
+    static constexpr u32 AutoSubmitMaxDraws = 2000;
     u64 last_submit_tick{};
     u32 draws_since_submit{};
     const GraphicsPipeline* perf_last_pipeline{};

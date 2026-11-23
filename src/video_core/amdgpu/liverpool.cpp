@@ -143,9 +143,11 @@ void Liverpool::Process(std::stop_token stoken) {
     while (!stoken.stop_requested()) {
         {
             std::unique_lock lk{submit_mutex};
-            Common::CondvarWait(submit_cv, lk, stoken,
-                                [this] { return num_commands || num_submits || submit_done; });
+            const auto has_work = [this] { return num_commands || num_submits || submit_done; };
+            lookahead_gpu_idle.store(!has_work(), std::memory_order_relaxed);
+            Common::CondvarWait(submit_cv, lk, stoken, has_work);
         }
+        lookahead_gpu_idle.store(false, std::memory_order_relaxed);
         if (stoken.stop_requested()) {
             break;
         }
@@ -247,7 +249,9 @@ void Liverpool::Process(std::stop_token stoken) {
             "emulated_us={} db_expired={} eager_unmarked={} eager_skip_tick={} "
             "eager_skip_flight={} eager_known={} eager_new={} early_flushes={} "
             "ra_stages={} ra_checks={} ra_diffs={} la_run_waits={} la_run_wait_us={} "
-            "la_woken_runs={} la_woken_wait_us={} "
+            "la_woken_runs={} la_woken_wait_us={} la_ahead_1={} la_ahead_2={} la_ahead_3={} "
+            "mid_obtains={} mid_run_first={} mid_run_first_kb={} mid_tick_first={} "
+            "mid_tick_first_kb={} idle_flushes={} auto_checks={} auto_check_us={} "
             "emulated={} stg_same_inputs={} vk_vi_us={} vk_index_us={} vk_desc_us={} "
             "vk_dyn_us={} vk_draw_us={} rec_cmds={} rec_kb={} rec_publishes={} rec_wakes={} "
             "rec_syncs={} rec_sync_us={} rec_space_waits={} rec_run_us={} rec_sleeps={} "
@@ -335,7 +339,11 @@ void Liverpool::Process(std::stop_token stoken) {
             eager_readbacks.new_faults.exchange(0, std::memory_order_relaxed),
             cp_perf.early_flushes, cp_perf.ra_stages, cp_perf.ra_checks, cp_perf.ra_diffs,
             cp_perf.la_run_waits, cp_perf.la_run_wait_ns / 1000, cp_perf.la_woken_runs,
-            cp_perf.la_woken_wait_ns / 1000,
+            cp_perf.la_woken_wait_ns / 1000, cp_perf.la_finished_ahead[0],
+            cp_perf.la_finished_ahead[1], cp_perf.la_finished_ahead[2], cp_perf.mid_obtains,
+            cp_perf.mid_run_first, cp_perf.mid_run_first_bytes / 1024, cp_perf.mid_tick_first,
+            cp_perf.mid_tick_first_bytes / 1024, cp_perf.idle_flushes, cp_perf.auto_checks,
+            cp_perf.auto_check_ns / 1000,
             readback_wait.emulated.exchange(0, std::memory_order_relaxed), cp_perf.stg_same_inputs,
             cp_perf.vk_vi_ns / 1000, cp_perf.vk_index_ns / 1000, cp_perf.vk_desc_ns / 1000,
             cp_perf.vk_dyn_ns / 1000, cp_perf.vk_draw_ns / 1000, cp_perf.rec_cmds,
@@ -947,6 +955,7 @@ void Liverpool::StartLookaheadRun(std::span<const u32> dcb) {
     lookahead_run_end = dcb.data() + dcb.size();
     is_lookahead_running = true;
     ++cp_perf.la_runs;
+    ++perf_run_serial;
     // Sequentially consistent with the two threads, which count themselves in
     // lookahead_sleepers and then read lookahead_started_run: one side sees the other's store.
     lookahead_started_run.store(++lookahead_run);
@@ -1049,9 +1058,21 @@ void Liverpool::TakeLookaheadResult(std::span<const u32> dcb) {
             const LookaheadResult& result =
                 lookahead_results[lookahead_taken % NumLookaheadResults];
             if (result.packet == dcb.data()) {
-                rasterizer->SetDrawAhead(&lookahead_draws[lookahead_taken % NumLookaheadResults]);
+                const Vulkan::DrawAhead& taken =
+                    lookahead_draws[lookahead_taken % NumLookaheadResults];
+                rasterizer->SetDrawAhead(&taken);
                 lookahead_consumed.store(++lookahead_taken, std::memory_order_release);
                 ++cp_perf.la_results;
+                // Finished results are not written again before they are taken.
+                const auto finished = [&](u64 index) -> const Vulkan::DrawAhead* {
+                    return index < ready ? &lookahead_draws[index % NumLookaheadResults] : nullptr;
+                };
+                rasterizer->PrefetchDrawsAhead(taken, finished(lookahead_taken),
+                                               finished(lookahead_taken + 1),
+                                               finished(lookahead_taken + 2));
+                for (u32 distance = 0; distance < cp_perf.la_finished_ahead.size(); ++distance) {
+                    cp_perf.la_finished_ahead[distance] += lookahead_taken + distance < ready;
+                }
                 return;
             }
             ++cp_perf.la_mismatches;
@@ -1113,7 +1134,7 @@ void Liverpool::LookaheadThread(std::stop_token stoken) {
     while (!stoken.stop_requested()) {
         const u64 started = lookahead_started_run.load(std::memory_order_acquire);
         if (started == run) {
-            if (++idle_spins < LookaheadIdleSpins) {
+            if (SpinsForLookaheadRun(++idle_spins)) {
                 ThreadPause();
                 continue;
             }
@@ -1202,7 +1223,7 @@ void Liverpool::LookaheadBindingThread(std::stop_token stoken) {
     while (!stoken.stop_requested()) {
         const u64 started = lookahead_started_run.load(std::memory_order_acquire);
         if (started == run) {
-            if (++idle_spins < LookaheadIdleSpins) {
+            if (SpinsForLookaheadRun(++idle_spins)) {
                 ThreadPause();
                 continue;
             }
@@ -1289,6 +1310,7 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb) {
                         } else {
                             is_lookahead_solo = true;
                             ++cp_perf.la_solo_runs;
+                            ++perf_run_serial;
                         }
                     }
                     if (is_lookahead_solo) {

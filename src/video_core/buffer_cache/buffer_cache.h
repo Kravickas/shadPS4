@@ -55,6 +55,18 @@ inline void PrefetchRead(const void* address) {
 #endif
 }
 
+/// The same for every cache line with a byte of the range.
+inline void PrefetchRead(const void* address, std::size_t size) {
+    if (size == 0) {
+        return;
+    }
+    const auto* const bytes = static_cast<const u8*>(address);
+    for (std::size_t offset = 0; offset < size; offset += CacheLineSize) {
+        PrefetchRead(bytes + offset);
+    }
+    PrefetchRead(bytes + size - 1);
+}
+
 enum class ObtainBufferFlags {
     None = 0,
     IsWritten = 1 << 0,
@@ -181,12 +193,13 @@ public:
         stream_hints = hints;
         stream_hint_cursor = 0;
         stream_hints_epoch = gpu_write_epoch;
-        // The bindings the hints are for look their last copy up.
+    }
+
+    /// Asks for the entries the bindings of the hints look their last copy up in.
+    void PrefetchStreamCopies(std::span<const StreamHint> hints) const {
         for (const StreamHint& hint : hints) {
-            const auto* const copy = reinterpret_cast<const u8*>(
-                &stream_copies[StreamCopySlot(hint.device_addr, hint.size)]);
-            PrefetchRead(copy);
-            PrefetchRead(copy + sizeof(StreamCopy) - 1);
+            PrefetchRead(&stream_copies[StreamCopySlot(hint.device_addr, hint.size)],
+                         sizeof(StreamCopy));
         }
     }
 
@@ -503,6 +516,15 @@ private:
         u64 last_block{0};
     };
     std::array<ResidentHit, 4096> resident_hits{};
+    /// Probe: the run of draws and the tick a range was last obtained in.
+    struct MidObtain {
+        VAddr device_addr;
+        u32 size;
+        u64 run;
+        u64 tick;
+    };
+    std::array<MidObtain, 4096> mid_obtains{};
+    void NoteMidObtain(VAddr device_addr, u32 size);
 
     u32 arena_memory_type_index{};
     u32 block_size{};

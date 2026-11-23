@@ -214,15 +214,19 @@ public:
             return avg.load(std::memory_order_relaxed);
         }
     };
-    FrameStat frame_submits;       ///< Submits of the GPU thread's command buffer
-    FrameStat frame_gpu_thread_ns; ///< Working time of the GPU thread
-    FrameStat frame_drain_ns;      ///< Of it, waiting for the host GPU for a readback
-    FrameStat frame_guest_wait_ns; ///< Time the game's threads waited in readbacks
+    FrameStat frame_submits;            ///< Submits of the GPU thread's command buffer
+    FrameStat frame_inner_submits;      ///< Of them, made inside the frame by the submit interval
+    FrameStat frame_inner_submit_draws; ///< Draws and dispatches in front of those
+    FrameStat frame_gpu_thread_ns;      ///< Working time of the GPU thread
+    FrameStat frame_drain_ns;           ///< Of it, waiting for the host GPU for a readback
+    FrameStat frame_guest_wait_ns;      ///< Time the game's threads waited in readbacks
 
     void IncFlipFrameNum() {
         // Low weight on the newest frame, so the average settles instead of jumping around.
         static constexpr float smoothing = 0.05f;
         frame_submits.EndFrame(smoothing);
+        frame_inner_submits.EndFrame(smoothing);
+        frame_inner_submit_draws.EndFrame(smoothing);
         frame_gpu_thread_ns.EndFrame(smoothing);
         frame_drain_ns.EndFrame(smoothing);
         frame_guest_wait_ns.EndFrame(smoothing);

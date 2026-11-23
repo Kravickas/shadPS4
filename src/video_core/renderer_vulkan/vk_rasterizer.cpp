@@ -138,6 +138,53 @@ DrawFilterResult GetDrawFilter(const AmdGpu::Regs& regs) {
 
 } // Anonymous namespace
 
+void Rasterizer::PrefetchDrawsAhead(const DrawAhead& taken, const DrawAhead* next,
+                                    const DrawAhead* second, const DrawAhead* third) {
+    using VideoCore::PrefetchRead;
+    const auto slots = [this](const DrawAhead& ahead) {
+        if (!ahead.lookup.pipeline) {
+            return;
+        }
+        buffer_cache.PrefetchStreamCopies(ahead.stream_hints);
+        for (const DrawAhead::ImageKey& image : ahead.image_keys) {
+            if (image.key.tsharp.Address() != 0) {
+                PrefetchRead(&texture_lookups[image.hash % texture_lookups.size()],
+                             sizeof(TextureLookup));
+            }
+        }
+    };
+    if (&taken != slots_ahead) {
+        slots(taken);
+    }
+    slots_ahead = next;
+    if (next) {
+        slots(*next);
+    }
+    if (third) {
+        static constexpr std::size_t VertexInputsBytes = 2 * VideoCore::CacheLineSize;
+        const auto* const entry = reinterpret_cast<const u8*>(third);
+        PrefetchRead(entry, reinterpret_cast<const u8*>(&third->has_vertex_inputs) + 1 - entry);
+        const auto inputs = [](const auto& list) {
+            PrefetchRead(&list, VertexInputsBytes);
+            PrefetchRead(reinterpret_cast<const u8*>(&list + 1) - 1);
+        };
+        inputs(third->attributes);
+        inputs(third->bindings);
+        inputs(third->guest_buffers);
+        inputs(third->vertex_ranges);
+    }
+    if (second && second->lookup.pipeline) {
+        static constexpr std::size_t MaxFlatBytes = 4 * VideoCore::CacheLineSize;
+        const auto array = [](const auto& list, std::size_t max_bytes = ~std::size_t{}) {
+            PrefetchRead(list.data(), std::min(list.size() * sizeof(list[0]), max_bytes));
+        };
+        array(second->stream_hints);
+        array(second->buffer_sharps);
+        array(second->image_keys);
+        array(second->lookup.flats, MaxFlatBytes);
+    }
+}
+
 bool Rasterizer::NeedsPipeline(const AmdGpu::Regs& regs) {
     return GetDrawFilter(regs).filter == DrawFilter::None;
 }
@@ -917,17 +964,29 @@ void Rasterizer::FlushPeriodically(bool is_dispatch) {
     ++draws_since_submit;
     // Auto: GPU writes to memory the game's threads are known to touch wait in the open command
     // buffer. They are submitted at the first draw behind the dispatches that made them, so
-    // that the GPU runs them and they can be downloaded before those threads get there. The
-    // largest distance keeps what is submitted with them short enough for the GPU to run soon.
+    // that the GPU runs them and they can be downloaded before those threads get there.
     const bool is_auto = submit_draw_interval == SubmitIntervalAuto;
     const bool is_early = is_auto && !is_dispatch && draws_since_submit >= AutoSubmitMinDraws &&
                           buffer_cache.IsEagerWritePending();
-    const bool is_due =
-        is_early || draws_since_submit >= (is_auto ? AutoSubmitMaxDraws : submit_draw_interval);
+    // Auto: the GPU has run everything submitted, so what is recorded is all it could work on.
+    // A GPU that is behind gets its work at the largest distance.
+    bool is_idle = false;
+    if (is_auto && !is_early && draws_since_submit >= AutoSubmitIdleDraws &&
+        draws_since_submit < AutoSubmitMaxDraws && draws_since_submit % AutoSubmitMinDraws == 0) {
+        const u64 check_t0 = AmdGpu::PerfNs();
+        is_idle = scheduler.IsFree(scheduler.CurrentTick() - 1);
+        ++AmdGpu::cp_perf.auto_checks;
+        AmdGpu::cp_perf.auto_check_ns += AmdGpu::PerfNs() - check_t0;
+    }
+    const bool is_due = is_early || is_idle ||
+                        draws_since_submit >= (is_auto ? AutoSubmitMaxDraws : submit_draw_interval);
     if (is_due) {
         const AmdGpu::CpPerfScope perf_flush{AmdGpu::cp_perf.flush_ns};
         ++AmdGpu::cp_perf.flushes;
         AmdGpu::cp_perf.early_flushes += is_early;
+        AmdGpu::cp_perf.idle_flushes += is_idle;
+        DebugState.frame_inner_submits.Add(1);
+        DebugState.frame_inner_submit_draws.Add(draws_since_submit);
         scheduler.Flush();
     }
 }
@@ -974,20 +1033,6 @@ bool Rasterizer::BindResources(const Pipeline* pipeline) {
     // data. One draw in SharpsAheadCheckInterval makes all of it again and compares.
     sharps_ahead = pipeline->IsCompute() ? nullptr : vertex_ahead;
     is_sharps_check = sharps_ahead && (++sharps_ahead_uses & (SharpsAheadCheckInterval - 1)) == 0;
-    if (sharps_ahead) {
-        for (const DrawAhead::ImageKey& image : sharps_ahead->image_keys) {
-            if (image.key.tsharp.Address() == 0) {
-                continue;
-            }
-            const auto* const slot =
-                reinterpret_cast<const u8*>(&texture_lookups[image.hash % texture_lookups.size()]);
-            for (std::size_t offset = 0; offset < sizeof(TextureLookup);
-                 offset += VideoCore::CacheLineSize) {
-                VideoCore::PrefetchRead(slot + offset);
-            }
-        }
-    }
-
     // Bind resource buffers and textures.
     Shader::Backend::Bindings binding{};
     push_data = MakeUserData(liverpool->regs);

@@ -102,6 +102,10 @@ void FrameGraph::Draw() {
         if (const u32 interval = EmulatorSettings.GetSubmitDrawInterval();
             interval != 0 && interval != ~0U) {
             Text("Submits: %.0f (every %u draws)", DebugState.frame_submits.Get(), interval);
+        } else if (const float inner = DebugState.frame_inner_submits.Get();
+                   interval != 0 && inner >= 0.5f) {
+            Text("Submits: %.0f (auto: every %.0f draws on average)",
+                 DebugState.frame_submits.Get(), DebugState.frame_inner_submit_draws.Get() / inner);
         } else {
             Text("Submits: %.0f (%s)", DebugState.frame_submits.Get(),
                  interval != 0 ? "auto" : "frame end only");

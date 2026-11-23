@@ -153,13 +153,25 @@ struct CpPerf {
     u32 va_diffs;      ///< Compares that differed
     u32 db_expired;    ///< Depth target lookups made again because their time was up
     u32 early_flushes; ///< Submits made for GPU writes the game's threads wait for
-    u32 ra_stages;     ///< Stages bound with the V#s and texture keys the binding thread made
-    u32 ra_checks;     ///< Of those V#s and keys, compared with the ones made at the draw
-    u32 ra_diffs;      ///< Compares that differed
-    u32 la_run_waits;  ///< Runs whose first draw had to wait for its result
+    u32 idle_flushes;  ///< Submits made because the GPU had run everything submitted
+    u32 auto_checks;   ///< Times auto mode asked whether the GPU had
+    u64 auto_check_ns;
+    u32 ra_stages;    ///< Stages bound with the V#s and texture keys the binding thread made
+    u32 ra_checks;    ///< Of those V#s and keys, compared with the ones made at the draw
+    u32 ra_diffs;     ///< Compares that differed
+    u32 la_run_waits; ///< Runs whose first draw had to wait for its result
     u64 la_run_wait_ns;
     u32 la_woken_runs;    ///< Runs started while a lookahead thread slept
     u64 la_woken_wait_ns; ///< Of la_run_wait_ns, in those runs
+    /// Results taken with the result one, two and three draws further finished.
+    std::array<u32, 3> la_finished_ahead;
+    /// Read-only obtains of more than STREAM_THRESHOLD and up to twice that: all, the first of
+    /// their range in a run of draws, the first of their range in a tick, with the bytes.
+    u32 mid_obtains;
+    u32 mid_run_first;
+    u64 mid_run_first_bytes;
+    u32 mid_tick_first;
+    u64 mid_tick_first_bytes;
     /// Images registered and freed, by TextureCache::RegistrySite.
     std::array<u32, PerfTexSites> tex_sites;
     /// Page watcher updates of the whole cycle, and the part of them for images.
@@ -245,6 +257,8 @@ struct CpPerf {
     u32 dispatch_skips;      ///< DispatchDirect: dispatches BindResources handled itself
 };
 inline CpPerf cp_perf;
+/// Probe: counts the runs of draws between Other packets.
+inline u64 perf_run_serial = 0;
 
 /// Work of the command recorder thread.
 struct RecorderPerf {
@@ -625,6 +639,7 @@ private:
 
     static constexpr u32 LookaheadCompareInterval = 64;
     static constexpr u32 LookaheadIdleSpins = 4096;
+    static constexpr u32 LookaheadBusySpins = 1 << 20;
 
     GfxState LiveGfxState() {
         return {regs,           mapped_queues[GfxQueueId].cs_state, last_cb_extent,
@@ -679,6 +694,12 @@ private:
     void LookaheadBindingThread(std::stop_token stoken);
     /// Sleeps until a run other than run is started.
     void SleepUntilLookaheadRun(std::stop_token stoken, u64 run);
+    /// Whether a lookahead thread that found no run idle_spins times in a row keeps looking.
+    bool SpinsForLookaheadRun(u32 idle_spins) const {
+        return idle_spins < LookaheadIdleSpins ||
+               (idle_spins < LookaheadBusySpins &&
+                !lookahead_gpu_idle.load(std::memory_order_relaxed));
+    }
 
     std::unique_ptr<GfxStateCopy> lookahead_state;
     std::array<LookaheadResult, NumLookaheadResults> lookahead_results;
@@ -720,6 +741,9 @@ private:
     alignas(64) std::atomic<u64> lookahead_ready{};
     alignas(64) std::atomic<u64> lookahead_consumed{};
     alignas(64) std::atomic<u32> lookahead_sleepers{};
+    /// Set while the GPU thread waits for work. The lookahead threads only sleep then, or
+    /// after LookaheadBusySpins without a run.
+    std::atomic<bool> lookahead_gpu_idle{true};
     std::mutex lookahead_mutex;
     std::condition_variable_any lookahead_cv;
 
