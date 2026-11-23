@@ -151,7 +151,7 @@ void BufferCache::TickFrame() {
     }
 }
 
-void BufferCache::NoteFaultedPages(VAddr device_addr, u64 size) {
+void BufferCache::NoteFaultedPages(VAddr device_addr, u64 size, bool is_readback) {
     const VAddr page_end = Common::AlignUp(device_addr + size, BYTES_PER_PAGE);
     const u64 tick = scheduler.CurrentTick();
     auto& perf = AmdGpu::eager_readbacks;
@@ -160,10 +160,38 @@ void BufferCache::NoteFaultedPages(VAddr device_addr, u64 size) {
         const auto [it, is_new] = eager_pages.try_emplace(page, tick);
         if (is_new) {
             eager_chunks.insert(page >> EagerChunkBits);
-            perf.new_faults.fetch_add(1, std::memory_order_relaxed);
         } else {
             it->second = tick;
+        }
+        if (!is_readback) {
+            continue;
+        }
+        if (is_new) {
+            perf.new_faults.fetch_add(1, std::memory_order_relaxed);
+        } else {
             perf.known_faults.fetch_add(1, std::memory_order_relaxed);
+            if (AmdGpu::TakePerfLine(AmdGpu::perf_eager_fault_budget)) {
+                // Why the readback thread did not have the page ready.
+                std::string ranges;
+                gpu_modified_ranges.ForEachInRange(
+                    Common::AlignDown(page, 1ULL << EagerChunkBits), 1ULL << EagerChunkBits,
+                    [&](VAddr range_start, VAddr range_end) {
+                        if (range_start < page + BYTES_PER_PAGE && page < range_end) {
+                            fmt::format_to(std::back_inserter(ranges), " {:#x}-{:#x}", range_start,
+                                           range_end);
+                        }
+                    });
+                auto* const work_semaphore = scheduler.GetWorkSemaphore();
+                work_semaphore->Refresh();
+                LOG_INFO(Render,
+                         "PERF eager_fault page={:#x} addr={:#x} write_tick={} tick={} "
+                         "gpu_tick={} in_flight={} pending={} t={} ranges{}",
+                         page, device_addr, LastWriteTick(page, BYTES_PER_PAGE), tick,
+                         work_semaphore->KnownGpuTick(),
+                         OverlapsDownloadInFlight(page, page + BYTES_PER_PAGE),
+                         eager_write_pending.load(std::memory_order_relaxed), AmdGpu::PerfNs(),
+                         ranges);
+            }
         }
     }
     has_eager_pages.store(true, std::memory_order_relaxed);
@@ -329,6 +357,11 @@ bool BufferCache::AccessBesideGpuData(VAddr device_addr, u32 size, bool is_write
         return false;
     }
     AmdGpu::readback_wait.emulated.fetch_add(1, std::memory_order_relaxed);
+    // The page is one the game touches beside GPU data: a submit behind the next write to it
+    // lets the readback thread have it ready.
+    NoteFaultedPages(device_addr, size, false);
+    // The write it lies beside is in the open command buffer.
+    eager_write_pending.store(true, std::memory_order_relaxed);
     if (is_write) {
         if (!memory->TryWriteBacking(std::bit_cast<u8*>(device_addr), data, size)) {
             return false;
@@ -378,6 +411,7 @@ void BufferCache::ReadMemory(VAddr device_addr, u64 size, bool is_write, bool as
     const u64 rb_t1 = AmdGpu::PerfNs();
     if (!assume_locks) {
         const u64 wait_ns = rb_t1 - rb_t0;
+        DebugState.frame_guest_wait_ns.Add(wait_ns);
         auto& perf = AmdGpu::readback_wait;
         perf.count.fetch_add(1, std::memory_order_relaxed);
         perf.wait_ns.fetch_add(wait_ns, std::memory_order_relaxed);
@@ -389,11 +423,11 @@ void BufferCache::ReadMemory(VAddr device_addr, u64 size, bool is_write, bool as
     LOG_INFO(Render,
              "PERF rb addr={:#x} size={:#x} write={} gpu_thread={} path={} t0={} t1={} "
              "exec_t0={} in_flight_us={} ahead={} batch_windows={} dl_bytes={} wait_tick={} "
-             "gpu_tick={} gpu_us={} insn={} acc_bytes={} lock={} rep={} touches_gpu={} rip={:#x} "
-             "thread={}",
+             "gpu_tick={} gpu_us={} submit_us={} insn={} acc_bytes={} lock={} rep={} "
+             "touches_gpu={} rip={:#x} thread={}",
              device_addr, size, is_write, assume_locks, path, rb_t0, rb_t1, stats.exec_t0,
              stats.in_flight_ns / 1000, stats.ahead, stats.windows, stats.bytes, stats.wait_tick,
-             stats.gpu_tick, stats.gpu_ns / 1000,
+             stats.gpu_tick, stats.gpu_ns / 1000, stats.submit_ns / 1000,
              access.mnemonic != 0
                  ? ZydisMnemonicGetString(static_cast<ZydisMnemonic>(access.mnemonic))
                  : "none",
@@ -787,6 +821,7 @@ void BufferCache::DownloadAhead(std::unique_lock<std::mutex>& lk,
     stats.gpu_tick = work_semaphore->KnownGpuTick();
     const u64 gpu_t0 = AmdGpu::PerfNs();
     scheduler.SubmitOutOfBand(cmdbuf, *context->fence, wait_tick);
+    stats.submit_ns = AmdGpu::PerfNs() - gpu_t0;
     Vulkan::Check<"wait for readback">(
         device.waitForFences(*context->fence, true, std::numeric_limits<u64>::max()));
     stats.gpu_ns = AmdGpu::PerfNs() - gpu_t0;

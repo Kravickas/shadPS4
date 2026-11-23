@@ -222,6 +222,7 @@ private:
         u64 wait_tick; ///< Tick of the last GPU write to the downloaded windows
         u64 gpu_tick;  ///< Tick the GPU had reached when the download was submitted
         u64 gpu_ns;    ///< Download submit to fence signalled
+        u64 submit_ns; ///< Of it, the submit call with its wait for the submit mutex
         u32 windows;
         bool ahead;
     };
@@ -429,7 +430,9 @@ private:
     std::condition_variable_any eager_cv;
     u64 eager_kicks{};
 
-    void NoteFaultedPages(VAddr device_addr, u64 size);
+    /// Remembers the pages of an access that faulted on GPU-modified memory. is_readback: it
+    /// took a readback, else it was emulated.
+    void NoteFaultedPages(VAddr device_addr, u64 size, bool is_readback = true);
     /// The eager pages with GPU-modified data whose last write the GPU ran by gpu_tick.
     void CollectEagerPages(u64 gpu_tick,
                            boost::container::small_vector<DownloadWindow, 16>& windows);

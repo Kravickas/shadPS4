@@ -307,8 +307,10 @@ inline std::atomic<u32> perf_tex_site_budget{};
 /// The same for lines about depth targets that are not a perfect match, and about uploads.
 inline std::atomic<u32> perf_db_site_budget{};
 inline std::atomic<u32> perf_upload_site_budget{};
+inline std::atomic<u32> perf_eager_fault_budget{};
 inline constexpr u32 PerfDbSiteLines = 24;
 inline constexpr u32 PerfUploadSiteLines = 240;
+inline constexpr u32 PerfEagerFaultLines = 240;
 
 /// Takes one line of a budget, false if it is used up.
 inline bool TakePerfLine(std::atomic<u32>& budget) {

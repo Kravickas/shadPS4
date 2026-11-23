@@ -200,6 +200,8 @@ void Liverpool::Process(std::stop_token stoken) {
             submit_done = false;
         }
         const u64 cycle_t1 = PerfNs();
+        DebugState.frame_gpu_thread_ns.Add(cycle_t1 - cycle_t0);
+        DebugState.frame_drain_ns.Add(cp_perf.rb_finish_ns + cp_perf.img_finish_ns);
         // The profile is of gameplay: samples are taken while the last cycle had its draw count.
         const bool is_gameplay = cp_perf.draws >= PerfProfiledDraws;
         Common::SamplingProfiler::SetEnabled(is_gameplay);
@@ -367,6 +369,7 @@ void Liverpool::Process(std::stop_token stoken) {
                 perf_tex_site_budget.store(PerfTexSiteLines, std::memory_order_relaxed);
                 perf_db_site_budget.store(PerfDbSiteLines, std::memory_order_relaxed);
                 perf_upload_site_budget.store(PerfUploadSiteLines, std::memory_order_relaxed);
+                perf_eager_fault_budget.store(PerfEagerFaultLines, std::memory_order_relaxed);
             }
             std::string enders;
             for (u32 op = 0; op < perf_run_enders.size(); ++op) {

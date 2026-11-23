@@ -195,9 +195,37 @@ public:
         return is_guest_threads_paused;
     }
 
+    /// A value summed over a frame and averaged over the frames, for the overlay.
+    struct FrameStat {
+        std::atomic<u64> sum{};
+        std::atomic<float> avg{};
+
+        void Add(u64 value) noexcept {
+            sum.fetch_add(value, std::memory_order_relaxed);
+        }
+
+        void EndFrame(float smoothing) noexcept {
+            const float value = float(sum.exchange(0, std::memory_order_relaxed));
+            const float old = avg.load(std::memory_order_relaxed);
+            avg.store(old + (value - old) * smoothing, std::memory_order_relaxed);
+        }
+
+        [[nodiscard]] float Get() const noexcept {
+            return avg.load(std::memory_order_relaxed);
+        }
+    };
+    FrameStat frame_submits;       ///< Submits of the GPU thread's command buffer
+    FrameStat frame_gpu_thread_ns; ///< Working time of the GPU thread
+    FrameStat frame_drain_ns;      ///< Of it, waiting for the host GPU for a readback
+    FrameStat frame_guest_wait_ns; ///< Time the game's threads waited in readbacks
+
     void IncFlipFrameNum() {
         // Low weight on the newest frame, so the average settles instead of jumping around.
         static constexpr float smoothing = 0.05f;
+        frame_submits.EndFrame(smoothing);
+        frame_gpu_thread_ns.EndFrame(smoothing);
+        frame_drain_ns.EndFrame(smoothing);
+        frame_guest_wait_ns.EndFrame(smoothing);
         const auto draws = draw_call_count.exchange(0, std::memory_order_relaxed);
         const auto draws_avg = draw_call_count_avg.load(std::memory_order_relaxed);
         draw_call_count_avg.store(draws_avg + (float(draws) - draws_avg) * smoothing,

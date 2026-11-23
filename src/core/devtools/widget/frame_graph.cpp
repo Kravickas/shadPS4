@@ -98,6 +98,18 @@ void FrameGraph::Draw() {
              DebugState.gnm_frame_count.load());
         Text("Draw calls: %.0f   Dispatches: %.0f", DebugState.GetDrawCallsAvg(),
              DebugState.GetDispatchesAvg());
+        // -1 in the config reads as the largest value and stands for auto.
+        if (const u32 interval = EmulatorSettings.GetSubmitDrawInterval();
+            interval != 0 && interval != ~0U) {
+            Text("Submits: %.0f (every %u draws)", DebugState.frame_submits.Get(), interval);
+        } else {
+            Text("Submits: %.0f (%s)", DebugState.frame_submits.Get(),
+                 interval != 0 ? "auto" : "frame end only");
+        }
+        Text("GPU thread: %.1f ms   Readback drains: %.2f ms",
+             DebugState.frame_gpu_thread_ns.Get() / 1e6f, DebugState.frame_drain_ns.Get() / 1e6f);
+        Text("Game threads waiting for GPU data: %.1f ms",
+             DebugState.frame_guest_wait_ns.Get() / 1e6f);
         Text("Game Res: %dx%d", DebugState.game_resolution.first,
              DebugState.game_resolution.second);
         Text("Output Res: %dx%d", DebugState.output_resolution.first,

@@ -230,7 +230,12 @@ private:
     u64 stream_ahead_position{};
     const bool host_markers_enabled;
     const bool guest_markers_enabled;
+    /// 0: no submits inside a frame. SubmitIntervalAuto, which is what -1 in the config reads
+    /// as: auto. Else after that many draws and dispatches.
     const u32 submit_draw_interval;
+    static constexpr u32 SubmitIntervalAuto = ~0U;
+    /// In auto mode, the least number of draws and dispatches between two submits.
+    static constexpr u32 AutoSubmitMinDraws = 128;
     u64 last_submit_tick{};
     u32 draws_since_submit{};
     const GraphicsPipeline* perf_last_pipeline{};

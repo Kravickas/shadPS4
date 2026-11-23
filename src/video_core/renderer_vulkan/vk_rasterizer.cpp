@@ -873,16 +873,18 @@ void Rasterizer::FlushPeriodically(bool is_dispatch) {
         last_submit_tick = tick;
         draws_since_submit = 0;
     }
-    // GPU writes to memory the game's threads are known to touch soon wait in the open command
+    ++draws_since_submit;
+    // Auto: GPU writes to memory the game's threads are known to touch wait in the open command
     // buffer. They are submitted at the first draw behind the dispatches that made them, so
-    // that the GPU runs them and they can be downloaded before those threads get there; at
-    // most four times as often as the interval asks for.
-    const bool is_early = !is_dispatch && draws_since_submit >= submit_draw_interval / 4 &&
-                          buffer_cache.IsEagerWritePending();
-    if (++draws_since_submit >= submit_draw_interval || is_early) {
+    // that the GPU runs them and they can be downloaded before those threads get there.
+    const bool is_auto = submit_draw_interval == SubmitIntervalAuto;
+    const bool is_due = is_auto ? !is_dispatch && draws_since_submit >= AutoSubmitMinDraws &&
+                                      buffer_cache.IsEagerWritePending()
+                                : draws_since_submit >= submit_draw_interval;
+    if (is_due) {
         const AmdGpu::CpPerfScope perf_flush{AmdGpu::cp_perf.flush_ns};
         ++AmdGpu::cp_perf.flushes;
-        AmdGpu::cp_perf.early_flushes += is_early;
+        AmdGpu::cp_perf.early_flushes += is_auto;
         scheduler.Flush();
     }
 }
@@ -901,6 +903,7 @@ void Rasterizer::Finish() {
 }
 
 void Rasterizer::OnSubmit() {
+    DebugState.frame_submits.Add(1);
     buffer_cache.TickFrame();
     texture_cache.ProcessDownloadImages();
     texture_cache.RunGarbageCollector();
