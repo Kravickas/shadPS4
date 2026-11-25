@@ -1,6 +1,8 @@
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <algorithm>
+#include <string_view>
 #include <boost/container/static_vector.hpp>
 #include <fmt/format.h>
 #include <fmt/ranges.h>
@@ -623,12 +625,32 @@ bool Instance::CreateDevice() {
         device_chain.unlink<vk::PhysicalDeviceShaderClockFeaturesKHR>();
     }
 
-    auto [device_result, dev] = physical_device.createDeviceUnique(device_chain.get());
-    if (device_result != vk::Result::eSuccess) {
-        LOG_CRITICAL(Render_Vulkan, "Failed to create device: {}", vk::to_string(device_result));
+    auto device_result = physical_device.createDeviceUnique(device_chain.get());
+    const auto is_cuda_interop = [](const char* name) {
+        return std::string_view{name} == "VK_NVX_binary_import" ||
+               std::string_view{name} == "VK_NVX_image_view_handle";
+    };
+    if (device_result.result != vk::Result::eSuccess &&
+        std::ranges::any_of(enabled_extensions, is_cuda_interop)) {
+        // The driver brings up CUDA for these extensions, and that can fail on its own.
+        LOG_ERROR(Render_Vulkan, "Failed to create device with CUDA interop: {}, retrying without",
+                  vk::to_string(device_result.result));
+        HostPasses::DlssNrPass::LogCudaState();
+        enabled_extensions.erase(
+            std::remove_if(enabled_extensions.begin(), enabled_extensions.end(), is_cuda_interop),
+            enabled_extensions.end());
+        neural_rendering = false;
+        auto& device_info = device_chain.get<vk::DeviceCreateInfo>();
+        device_info.enabledExtensionCount = static_cast<u32>(enabled_extensions.size());
+        device_info.ppEnabledExtensionNames = enabled_extensions.data();
+        device_result = physical_device.createDeviceUnique(device_chain.get());
+    }
+    if (device_result.result != vk::Result::eSuccess) {
+        LOG_CRITICAL(Render_Vulkan, "Failed to create device: {}",
+                     vk::to_string(device_result.result));
         return false;
     }
-    device = std::move(dev);
+    device = std::move(device_result.value);
 
     VULKAN_HPP_DEFAULT_DISPATCHER.init(*device);
 

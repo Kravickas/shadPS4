@@ -685,6 +685,28 @@ bool DlssNrPass::ModelPresent() {
     return std::filesystem::exists(ExecutableDir() / L"nvngx_dlssnr.dll");
 }
 
+void DlssNrPass::LogCudaState() {
+    const HMODULE cuda = LoadLibraryW(L"nvcuda.dll");
+    if (!cuda) {
+        LOG_ERROR(Render_Vulkan, "DLSS NR: nvcuda.dll did not load, error {}", GetLastError());
+        return;
+    }
+    using PfnCuInit = int(__stdcall*)(unsigned int);
+    using PfnCuDriverGetVersion = int(__stdcall*)(int*);
+    const auto cu_init = reinterpret_cast<PfnCuInit>(GetProcAddress(cuda, "cuInit"));
+    const auto cu_driver_get_version =
+        reinterpret_cast<PfnCuDriverGetVersion>(GetProcAddress(cuda, "cuDriverGetVersion"));
+    if (!cu_init || !cu_driver_get_version) {
+        LOG_ERROR(Render_Vulkan, "DLSS NR: nvcuda.dll lacks cuInit or cuDriverGetVersion");
+        return;
+    }
+    int version{};
+    const int version_result = cu_driver_get_version(&version);
+    const int init_result = cu_init(0);
+    LOG_ERROR(Render_Vulkan, "DLSS NR: cuDriverGetVersion {} (version {}), cuInit {}",
+              version_result, version, init_result);
+}
+
 void DlssNrPass::Render(VideoCore::Image& color, const XfbVelocityPass::Outputs& inputs,
                         const Settings& settings) {
     impl->Render(color, inputs, settings);
@@ -705,6 +727,8 @@ DlssNrPass::~DlssNrPass() = default;
 bool DlssNrPass::ModelPresent() {
     return false;
 }
+
+void DlssNrPass::LogCudaState() {}
 
 void DlssNrPass::Render(VideoCore::Image&, const XfbVelocityPass::Outputs&, const Settings&) {}
 

@@ -42,6 +42,9 @@ public:
 
     static bool ModelPresent();
 
+    // Diagnoses a device that failed to create with the CUDA interop extensions.
+    static void LogCudaState();
+
     // Replaces the contents of color with the model's output.
     void Render(VideoCore::Image& color, const XfbVelocityPass::Outputs& inputs,
                 const Settings& settings);
