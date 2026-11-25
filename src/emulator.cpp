@@ -50,6 +50,7 @@
 #include "emulator.h"
 #include "video_core/cache_storage.h"
 #include "video_core/renderdoc.h"
+#include "video_core/renderer_vulkan/host_passes/dlss_nr_pass.h"
 
 #ifdef _WIN32
 #include <WinSock2.h>
@@ -570,6 +571,10 @@ void Emulator::Run(std::filesystem::path file, std::vector<std::string> args,
 
     // Create stdin/stdout/stderr
     Common::Singleton<FileSys::HandleTable>::Instance()->CreateStdHandles();
+
+    if (EmulatorSettings.IsDlssNrEnabled() && Vulkan::HostPasses::DlssNrPass::ModelPresent()) {
+        Vulkan::HostPasses::DlssNrPass::InitCuda();
+    }
 
     // Initialize components
     memory = Core::Memory::Instance();

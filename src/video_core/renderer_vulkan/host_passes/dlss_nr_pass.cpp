@@ -5,10 +5,12 @@
 
 #if defined(_WIN32) && defined(_MSC_VER)
 
+#include <algorithm>
 #include <array>
 #include <filesystem>
 #include <string>
 #include <unordered_map>
+#include <vector>
 
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
@@ -48,6 +50,34 @@ std::filesystem::path ExecutableDir() {
     std::array<wchar_t, MAX_PATH> path{};
     GetModuleFileNameW(nullptr, path.data(), static_cast<DWORD>(path.size()));
     return std::filesystem::path{path.data()}.parent_path();
+}
+
+struct AddressRange {
+    uintptr_t base;
+    size_t size;
+    DWORD state;
+};
+
+std::vector<AddressRange> SnapshotAddressSpace() {
+    std::vector<AddressRange> ranges;
+    MEMORY_BASIC_INFORMATION info{};
+    uintptr_t address = 0;
+    while (VirtualQuery(reinterpret_cast<void*>(address), &info, sizeof(info)) == sizeof(info)) {
+        const uintptr_t base = reinterpret_cast<uintptr_t>(info.BaseAddress);
+        ranges.push_back({base, info.RegionSize, info.State});
+        if (base + info.RegionSize <= address) {
+            break;
+        }
+        address = base + info.RegionSize;
+    }
+    return ranges;
+}
+
+bool WasFree(const std::vector<AddressRange>& before, uintptr_t address) {
+    const auto it = std::ranges::find_if(before, [address](const AddressRange& range) {
+        return address >= range.base && address - range.base < range.size;
+    });
+    return it != before.end() && it->state == MEM_FREE;
 }
 
 std::filesystem::path NgxCoreDir() {
@@ -685,6 +715,35 @@ bool DlssNrPass::ModelPresent() {
     return std::filesystem::exists(ExecutableDir() / L"nvngx_dlssnr.dll");
 }
 
+void DlssNrPass::InitCuda() {
+    const auto before = SnapshotAddressSpace();
+    const HMODULE cuda = LoadLibraryW(L"nvcuda.dll");
+    if (!cuda) {
+        LOG_ERROR(Render_Vulkan, "DLSS NR: nvcuda.dll did not load, error {}", GetLastError());
+        return;
+    }
+    using PfnCuInit = int(__stdcall*)(unsigned int);
+    const auto cu_init = reinterpret_cast<PfnCuInit>(GetProcAddress(cuda, "cuInit"));
+    if (!cu_init) {
+        LOG_ERROR(Render_Vulkan, "DLSS NR: nvcuda.dll lacks cuInit");
+        return;
+    }
+    const int init_result = cu_init(0);
+    const auto after = SnapshotAddressSpace();
+    LOG_INFO(Render_Vulkan, "DLSS NR: early cuInit {}", init_result);
+    size_t total{};
+    for (const auto& range : after) {
+        if (range.state == MEM_FREE || !WasFree(before, range.base)) {
+            continue;
+        }
+        total += range.size;
+        LOG_INFO(Render_Vulkan, "DLSS NR: CUDA took {:#x}-{:#x} ({:#x} bytes, {})", range.base,
+                 range.base + range.size - 1, range.size,
+                 range.state == MEM_COMMIT ? "committed" : "reserved");
+    }
+    LOG_INFO(Render_Vulkan, "DLSS NR: CUDA took {:#x} bytes of address space in total", total);
+}
+
 void DlssNrPass::LogCudaState() {
     const HMODULE cuda = LoadLibraryW(L"nvcuda.dll");
     if (!cuda) {
@@ -727,6 +786,8 @@ DlssNrPass::~DlssNrPass() = default;
 bool DlssNrPass::ModelPresent() {
     return false;
 }
+
+void DlssNrPass::InitCuda() {}
 
 void DlssNrPass::LogCudaState() {}
 

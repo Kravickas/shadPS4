@@ -42,6 +42,10 @@ public:
 
     static bool ModelPresent();
 
+    // CUDA reserves its own address space when it starts, so it has to start before the guest
+    // address space is reserved.
+    static void InitCuda();
+
     // Diagnoses a device that failed to create with the CUDA interop extensions.
     static void LogCudaState();
 
