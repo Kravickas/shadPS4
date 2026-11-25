@@ -1,4 +1,4 @@
-// SPDX-FileCopyrightText: Copyright 2025 shadPS4 Emulator Project
+// SPDX-FileCopyrightText: Copyright 2025-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #pragma once
@@ -359,6 +359,9 @@ private:
     /// Copies image memory back to CPU.
     void DownloadImageMemory(ImageId image_id,
                              DownloadMemoryFlags flags = DownloadMemoryFlags::None);
+
+    /// Writes image memory to the buffer cache and marks that range as GPU modified.
+    void WriteImageToBufferCache(ImageId image_id);
 
     /// Register image in the page table
     void RegisterImage(ImageId image);
