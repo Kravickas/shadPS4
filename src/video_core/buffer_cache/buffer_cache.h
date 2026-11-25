@@ -516,15 +516,6 @@ private:
         u64 last_block{0};
     };
     std::array<ResidentHit, 4096> resident_hits{};
-    /// Probe: the run of draws and the tick a range was last obtained in.
-    struct MidObtain {
-        VAddr device_addr;
-        u32 size;
-        u64 run;
-        u64 tick;
-    };
-    std::array<MidObtain, 4096> mid_obtains{};
-    void NoteMidObtain(VAddr device_addr, u32 size);
 
     u32 arena_memory_type_index{};
     u32 block_size{};

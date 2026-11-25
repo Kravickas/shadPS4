@@ -897,23 +897,6 @@ void BufferCache::ReleaseReadbackContext(ReadbackContext* context) {
     free_readback_contexts.push_back(context);
 }
 
-void BufferCache::NoteMidObtain(VAddr device_addr, u32 size) {
-    auto& perf = AmdGpu::cp_perf;
-    MidObtain& last = mid_obtains[StreamCopySlot(device_addr, size)];
-    const bool is_same = last.device_addr == device_addr && last.size == size;
-    const u64 tick = scheduler.CurrentTick();
-    ++perf.mid_obtains;
-    if (!is_same || last.run != AmdGpu::perf_run_serial) {
-        ++perf.mid_run_first;
-        perf.mid_run_first_bytes += size;
-    }
-    if (!is_same || last.tick != tick) {
-        ++perf.mid_tick_first;
-        perf.mid_tick_first_bytes += size;
-    }
-    last = {device_addr, size, AmdGpu::perf_run_serial, tick};
-}
-
 std::pair<const Buffer*, u64> BufferCache::ObtainBuffer(VAddr device_addr, u32 size,
                                                         ObtainBufferFlags flags) {
     const bool is_written = True(flags & ObtainBufferFlags::IsWritten);
@@ -1005,9 +988,6 @@ std::pair<const Buffer*, u64> BufferCache::ObtainBuffer(VAddr device_addr, u32 s
     const u64 last_block = (device_addr + size - 1) >> block_shift;
     const auto* arena = GetArena(first_block, last_block);
     EnsureResident(arena, first_block, last_block);
-    if (!is_written && size > STREAM_THRESHOLD && size <= 2 * STREAM_THRESHOLD) {
-        NoteMidObtain(device_addr, size);
-    }
     if (!is_written) {
         ++AmdGpu::cp_perf.cached_obtain_sizes[size <= 16_KB    ? 0
                                               : size <= 64_KB  ? 1

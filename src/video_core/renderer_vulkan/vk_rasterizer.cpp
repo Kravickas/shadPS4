@@ -969,9 +969,10 @@ void Rasterizer::FlushPeriodically(bool is_dispatch) {
     const bool is_early = is_auto && !is_dispatch && draws_since_submit >= AutoSubmitMinDraws &&
                           buffer_cache.IsEagerWritePending();
     // Auto: the GPU has run everything submitted, so what is recorded is all it could work on.
-    // A GPU that is behind gets its work at the largest distance.
+    // A GPU that is behind gets its work at the largest distance, and so does every GPU while
+    // the GPU thread has no time to spare: a submit takes its time.
     bool is_idle = false;
-    if (is_auto && !is_early && draws_since_submit >= AutoSubmitIdleDraws &&
+    if (is_auto && has_submit_slack && !is_early && draws_since_submit >= AutoSubmitIdleDraws &&
         draws_since_submit < AutoSubmitMaxDraws && draws_since_submit % AutoSubmitMinDraws == 0) {
         const u64 check_t0 = AmdGpu::PerfNs();
         is_idle = scheduler.IsFree(scheduler.CurrentTick() - 1);
@@ -1500,6 +1501,10 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
     const DrawAhead::StageSharps* const ahead = FindSharpsAhead(stage);
     u32 ahead_buffer = ahead ? ahead->first_buffer : 0;
     AmdGpu::cp_perf.ra_stages += ahead != nullptr;
+    BindingsProbe& probe = bindings_probe[u32(stage.sw_stage)];
+    const bool is_probe_stage = probe.buffer_info == &stage;
+    u32 probe_buffers = 0;
+    u32 probe_same = 0;
     for (const auto& desc : stage.buffers) {
         const auto src_access =
             vk::AccessFlagBits2::eShaderRead |
@@ -1567,6 +1572,10 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
             } else {
                 vsharp = desc.GetSharp(user_data);
             }
+            AmdGpu::Buffer& probe_sharp = probe.buffers[&desc - stage.buffers.data()];
+            ++probe_buffers;
+            probe_same += is_probe_stage && SameBits(vsharp, probe_sharp);
+            probe_sharp = vsharp;
             if (vsharp.base_address == 0 || vsharp.GetSize() == 0) {
                 buffer_infos.emplace_back(VK_NULL_HANDLE, 0, VK_WHOLE_SIZE);
             } else {
@@ -1616,6 +1625,19 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
         set_write.pBufferInfo = &buffer_infos.back();
         ++binding.buffer;
     }
+    if (probe_buffers != 0) {
+        auto& perf = AmdGpu::cp_perf;
+        const u64 tick = scheduler.CurrentTick();
+        const bool is_tick = is_probe_stage && probe.buffer_tick == tick;
+        perf.bb_total += probe_buffers;
+        perf.bb_same += probe_same;
+        perf.bb_same_tick += is_tick ? probe_same : 0;
+        ++perf.bs_total;
+        perf.bs_same_tick += is_tick && probe_same == probe_buffers;
+        perf.bs_one_diff += is_tick && probe_same + 1 == probe_buffers;
+        probe.buffer_info = &stage;
+        probe.buffer_tick = tick;
+    }
 }
 
 void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindings& binding) {
@@ -1637,6 +1659,10 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
 
     const DrawAhead::StageSharps* const ahead = FindSharpsAhead(stage);
     u32 ahead_image = ahead ? ahead->first_image : 0;
+    BindingsProbe& probe = bindings_probe[u32(stage.sw_stage)];
+    const bool is_probe_stage = probe.image_info == &stage;
+    u32 probe_images = 0;
+    u32 probe_same = 0;
     u32 num_images{};
     for (const auto& image_desc : stage.images) {
         const DrawAhead::ImageKey* ahead_key =
@@ -1651,6 +1677,14 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
             }
         }
         const auto tsharp = ahead_key ? ahead_key->key.tsharp : image_desc.GetSharp(user_data);
+        {
+            const TextureKey probe_key =
+                ahead_key ? ahead_key->key : MakeTextureKey(tsharp, image_desc, 0);
+            TextureKey& last_key = probe.images[&image_desc - stage.images.data()];
+            ++probe_images;
+            probe_same += is_probe_stage && SameBits(probe_key, last_key);
+            last_key = probe_key;
+        }
         const auto data_fmt = tsharp.GetDataFmt();
         const auto num_fmt = tsharp.GetNumberFmt();
         if (tsharp.Address() == 0 || data_fmt == AmdGpu::DataFormat::FormatInvalid) {
@@ -1744,6 +1778,20 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
         }
 
         image_descriptor_array_sizes.push_back(num_bindings);
+    }
+
+    if (probe_images != 0) {
+        auto& perf = AmdGpu::cp_perf;
+        const u64 tick = scheduler.CurrentTick();
+        const bool is_tick = is_probe_stage && probe.image_tick == tick;
+        perf.tb_total += probe_images;
+        perf.tb_same += probe_same;
+        perf.tb_same_tick += is_tick ? probe_same : 0;
+        ++perf.ts_total;
+        perf.ts_same_tick += is_tick && probe_same == probe_images;
+        perf.ts_one_diff += is_tick && probe_same + 1 == probe_images;
+        probe.image_info = &stage;
+        probe.image_tick = tick;
     }
 
     const u64 second_t0 = is_timed ? AmdGpu::PerfNs() : 0;

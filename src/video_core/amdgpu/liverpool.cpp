@@ -203,6 +203,18 @@ void Liverpool::Process(std::stop_token stoken) {
         }
         const u64 cycle_t1 = PerfNs();
         DebugState.frame_gpu_thread_ns.Add(cycle_t1 - cycle_t0);
+        // Submits inside a frame take this thread's time. The share of the last cycles it
+        // waited for work says whether it has that time.
+        if (last_cycle_end != 0) {
+            const s64 idle_ns = std::min<s64>(cycle_t0 - last_cycle_end, MaxIdleSampleNs);
+            busy_avg_ns += (static_cast<s64>(cycle_t1 - cycle_t0) - busy_avg_ns) / CycleSmoothing;
+            idle_avg_ns += (idle_ns - idle_avg_ns) / CycleSmoothing;
+        }
+        last_cycle_end = cycle_t1;
+        has_submit_slack = idle_avg_ns * 100 >= (idle_avg_ns + busy_avg_ns) * MinIdlePercent;
+        if (rasterizer) {
+            rasterizer->SetSubmitSlack(has_submit_slack);
+        }
         DebugState.frame_drain_ns.Add(cp_perf.rb_finish_ns + cp_perf.img_finish_ns);
         // The profile is of gameplay: samples are taken while the last cycle had its draw count.
         const bool is_gameplay = cp_perf.draws >= PerfProfiledDraws;
@@ -250,8 +262,10 @@ void Liverpool::Process(std::stop_token stoken) {
             "eager_skip_flight={} eager_known={} eager_new={} early_flushes={} "
             "ra_stages={} ra_checks={} ra_diffs={} la_run_waits={} la_run_wait_us={} "
             "la_woken_runs={} la_woken_wait_us={} la_ahead_1={} la_ahead_2={} la_ahead_3={} "
-            "mid_obtains={} mid_run_first={} mid_run_first_kb={} mid_tick_first={} "
-            "mid_tick_first_kb={} idle_flushes={} auto_checks={} auto_check_us={} "
+            "idle_flushes={} auto_checks={} auto_check_us={} gpu_idle_permille={} "
+            "submit_slack={} bb_total={} bb_same={} bb_same_tick={} bs_total={} bs_same_tick={} "
+            "bs_one_diff={} tb_total={} tb_same={} tb_same_tick={} ts_total={} ts_same_tick={} "
+            "ts_one_diff={} "
             "emulated={} stg_same_inputs={} vk_vi_us={} vk_index_us={} vk_desc_us={} "
             "vk_dyn_us={} vk_draw_us={} rec_cmds={} rec_kb={} rec_publishes={} rec_wakes={} "
             "rec_syncs={} rec_sync_us={} rec_space_waits={} rec_run_us={} rec_sleeps={} "
@@ -340,10 +354,13 @@ void Liverpool::Process(std::stop_token stoken) {
             cp_perf.early_flushes, cp_perf.ra_stages, cp_perf.ra_checks, cp_perf.ra_diffs,
             cp_perf.la_run_waits, cp_perf.la_run_wait_ns / 1000, cp_perf.la_woken_runs,
             cp_perf.la_woken_wait_ns / 1000, cp_perf.la_finished_ahead[0],
-            cp_perf.la_finished_ahead[1], cp_perf.la_finished_ahead[2], cp_perf.mid_obtains,
-            cp_perf.mid_run_first, cp_perf.mid_run_first_bytes / 1024, cp_perf.mid_tick_first,
-            cp_perf.mid_tick_first_bytes / 1024, cp_perf.idle_flushes, cp_perf.auto_checks,
-            cp_perf.auto_check_ns / 1000,
+            cp_perf.la_finished_ahead[1], cp_perf.la_finished_ahead[2], cp_perf.idle_flushes,
+            cp_perf.auto_checks, cp_perf.auto_check_ns / 1000,
+            idle_avg_ns * 1000 / std::max<s64>(idle_avg_ns + busy_avg_ns, 1),
+            static_cast<u32>(has_submit_slack), cp_perf.bb_total, cp_perf.bb_same,
+            cp_perf.bb_same_tick, cp_perf.bs_total, cp_perf.bs_same_tick, cp_perf.bs_one_diff,
+            cp_perf.tb_total, cp_perf.tb_same, cp_perf.tb_same_tick, cp_perf.ts_total,
+            cp_perf.ts_same_tick, cp_perf.ts_one_diff,
             readback_wait.emulated.exchange(0, std::memory_order_relaxed), cp_perf.stg_same_inputs,
             cp_perf.vk_vi_ns / 1000, cp_perf.vk_index_ns / 1000, cp_perf.vk_desc_ns / 1000,
             cp_perf.vk_dyn_ns / 1000, cp_perf.vk_draw_ns / 1000, cp_perf.rec_cmds,
@@ -955,7 +972,6 @@ void Liverpool::StartLookaheadRun(std::span<const u32> dcb) {
     lookahead_run_end = dcb.data() + dcb.size();
     is_lookahead_running = true;
     ++cp_perf.la_runs;
-    ++perf_run_serial;
     // Sequentially consistent with the two threads, which count themselves in
     // lookahead_sleepers and then read lookahead_started_run: one side sees the other's store.
     lookahead_started_run.store(++lookahead_run);
@@ -1310,7 +1326,6 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb) {
                         } else {
                             is_lookahead_solo = true;
                             ++cp_perf.la_solo_runs;
-                            ++perf_run_serial;
                         }
                     }
                     if (is_lookahead_solo) {

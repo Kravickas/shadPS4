@@ -165,13 +165,22 @@ struct CpPerf {
     u64 la_woken_wait_ns; ///< Of la_run_wait_ns, in those runs
     /// Results taken with the result one, two and three draws further finished.
     std::array<u32, 3> la_finished_ahead;
-    /// Read-only obtains of more than STREAM_THRESHOLD and up to twice that: all, the first of
-    /// their range in a run of draws, the first of their range in a tick, with the bytes.
-    u32 mid_obtains;
-    u32 mid_run_first;
-    u64 mid_run_first_bytes;
-    u32 mid_tick_first;
-    u64 mid_tick_first_bytes;
+    /// Guest buffers bound by V#: all, those with the V# the last draw had at the same place of
+    /// the same shader, those of them in the same tick; stages with such buffers, stages with
+    /// all of them the same in the same tick, stages with all but one. Then the same for the
+    /// images by their lookup key.
+    u32 bb_total;
+    u32 bb_same;
+    u32 bb_same_tick;
+    u32 bs_total;
+    u32 bs_same_tick;
+    u32 bs_one_diff;
+    u32 tb_total;
+    u32 tb_same;
+    u32 tb_same_tick;
+    u32 ts_total;
+    u32 ts_same_tick;
+    u32 ts_one_diff;
     /// Images registered and freed, by TextureCache::RegistrySite.
     std::array<u32, PerfTexSites> tex_sites;
     /// Page watcher updates of the whole cycle, and the part of them for images.
@@ -257,8 +266,6 @@ struct CpPerf {
     u32 dispatch_skips;      ///< DispatchDirect: dispatches BindResources handled itself
 };
 inline CpPerf cp_perf;
-/// Probe: counts the runs of draws between Other packets.
-inline u64 perf_run_serial = 0;
 
 /// Work of the command recorder thread.
 struct RecorderPerf {
@@ -727,6 +734,15 @@ private:
     /// Probe: a context, uconfig or config register changed since the last draw.
     bool perf_state_changed{};
     u64 lookahead_taken{};
+    /// Working and waiting time of the GPU thread per cycle, averaged over the last cycles,
+    /// and whether the waiting share is at least MinIdlePercent.
+    static constexpr s64 CycleSmoothing = 16;
+    static constexpr s64 MaxIdleSampleNs = 50'000'000;
+    static constexpr s64 MinIdlePercent = 10;
+    u64 last_cycle_end{};
+    s64 busy_avg_ns{};
+    s64 idle_avg_ns{};
+    bool has_submit_slack{true};
     /// Probe: the first result of the run, and whether a thread slept when the run started.
     u64 lookahead_run_first{};
     bool lookahead_run_woke{};

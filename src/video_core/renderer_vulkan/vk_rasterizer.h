@@ -169,6 +169,11 @@ public:
         draw_ahead = ahead;
     }
 
+    /// Whether the GPU thread has time left for the submits auto mode makes for the host GPU.
+    void SetSubmitSlack(bool has_slack) {
+        has_submit_slack = has_slack;
+    }
+
     /// Whether a draw with these registers gets as far as looking its pipeline up.
     static bool NeedsPipeline(const AmdGpu::Regs& regs);
 
@@ -273,6 +278,17 @@ private:
     u32 sharps_ahead_uses{};
     bool is_sharps_check{};
     u32 sharps_logged_diffs{};
+    /// Probe: what the last draw bound per stage and place, and in which tick.
+    struct BindingsProbe {
+        const Shader::Info* buffer_info;
+        const Shader::Info* image_info;
+        u64 buffer_tick;
+        u64 image_tick;
+        std::array<AmdGpu::Buffer, Shader::NUM_BUFFERS> buffers;
+        std::array<TextureKey, Shader::NUM_IMAGES> images;
+    };
+    std::array<BindingsProbe, MaxShaderStages> bindings_probe{};
+    bool has_submit_slack{true};
     /// Draws between two hand-overs of recorded commands to the recorder thread.
     static constexpr u32 PublishDrawInterval = 4;
     u32 draws_recorded{};
