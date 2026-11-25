@@ -239,7 +239,7 @@ public:
     [[nodiscard]] ImageId ExpandImage(const ImageInfo& info, ImageId image_id);
 
     /// Reuploads image contents.
-    void RefreshImage(Image& image, u32 first_level = 0);
+    void RefreshImage(Image& image);
 
     /// Retrieves the sampler that matches the provided S# descriptor.
     [[nodiscard]] vk::Sampler GetSampler(const AmdGpu::Sampler& sampler,
@@ -422,6 +422,9 @@ private:
     /// Copies image memory back to CPU.
     void DownloadImageMemory(ImageId image_id,
                              DownloadMemoryFlags flags = DownloadMemoryFlags::None);
+
+    /// Writes image memory to the buffer cache and marks that range as GPU modified.
+    void WriteImageToBufferCache(ImageId image_id);
 
     /// Register image in the page table
     void RegisterImage(ImageId image, bool is_swap = false);

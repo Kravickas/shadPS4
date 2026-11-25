@@ -111,22 +111,11 @@ void TextureCache::ProcessDownloadImages() {
     scheduler.PopPendingOperations();
 }
 
-void TextureCache::DownloadImageMemory(ImageId image_id, DownloadMemoryFlags flags) {
-    Image& image = slot_images[image_id];
-    if (False(image.flags & ImageFlagBits::GpuModified)) {
-        return;
-    }
-    const auto image_addr = image.info.guest_address;
-    const auto image_size = image.info.guest_size;
-    const auto image_mips = image.info.resources.levels;
-    const auto is_sync = True(flags & DownloadMemoryFlags::Sync);
-    const auto is_priority = True(flags & DownloadMemoryFlags::Priority);
-    const auto discard_buffer_cache = True(flags & DownloadMemoryFlags::DiscardBufferCache);
-    ASSERT(!(is_sync && is_priority));
-
+/// Fills copies of every level of an image in its guest memory layout, returns their total size.
+static u32 GetGuestLayoutCopies(const Image& image,
+                                boost::container::small_vector<vk::BufferImageCopy, 8>& copies) {
     u32 copy_size = 0;
-    boost::container::small_vector<vk::BufferImageCopy, 8> buffer_copies;
-    for (u32 mip = 0; mip < image_mips; ++mip) {
+    for (u32 mip = 0; mip < image.info.resources.levels; ++mip) {
         const u32 width = std::max(image.info.size.width >> mip, 1u);
         const u32 height = std::max(image.info.size.height >> mip, 1u);
         const u32 depth =
@@ -134,7 +123,7 @@ void TextureCache::DownloadImageMemory(ImageId image_id, DownloadMemoryFlags fla
         const auto [mip_size, mip_pitch, mip_height, mip_offset] = image.info.mips_layout[mip];
         const u32 extent_width = mip_pitch ? std::min<u32>(mip_pitch, width) : width;
         const u32 extent_height = mip_height ? std::min<u32>(mip_height, height) : height;
-        buffer_copies.push_back(vk::BufferImageCopy{
+        copies.push_back(vk::BufferImageCopy{
             .bufferOffset = mip_offset,
             .bufferRowLength = mip_pitch,
             .bufferImageHeight = mip_height,
@@ -149,6 +138,23 @@ void TextureCache::DownloadImageMemory(ImageId image_id, DownloadMemoryFlags fla
         });
         copy_size += mip_size;
     }
+    return copy_size;
+}
+
+void TextureCache::DownloadImageMemory(ImageId image_id, DownloadMemoryFlags flags) {
+    Image& image = slot_images[image_id];
+    if (False(image.flags & ImageFlagBits::GpuModified)) {
+        return;
+    }
+    const auto image_addr = image.info.guest_address;
+    const auto image_size = image.info.guest_size;
+    const auto is_sync = True(flags & DownloadMemoryFlags::Sync);
+    const auto is_priority = True(flags & DownloadMemoryFlags::Priority);
+    const auto discard_buffer_cache = True(flags & DownloadMemoryFlags::DiscardBufferCache);
+    ASSERT(!(is_sync && is_priority));
+
+    boost::container::small_vector<vk::BufferImageCopy, 8> buffer_copies;
+    const u32 copy_size = GetGuestLayoutCopies(image, buffer_copies);
     if (buffer_copies.empty()) {
         return;
     }
@@ -182,6 +188,18 @@ void TextureCache::DownloadImageMemory(ImageId image_id, DownloadMemoryFlags fla
     } else {
         scheduler.DeferOperation(std::move(write_data));
     }
+}
+
+void TextureCache::WriteImageToBufferCache(ImageId image_id) {
+    Image& image = slot_images[image_id];
+    boost::container::small_vector<vk::BufferImageCopy, 8> buffer_copies;
+    GetGuestLayoutCopies(image, buffer_copies);
+    if (buffer_copies.empty()) {
+        return;
+    }
+    const auto [buffer, offset] = buffer_cache.ObtainBuffer(
+        image.info.guest_address, image.info.guest_size, ObtainBufferFlags::IsWritten);
+    tile_manager.TileImage(image, buffer_copies, buffer, offset);
 }
 
 void TextureCache::MarkAsMaybeDirty(ImageId image_id, Image& image) {
@@ -410,16 +428,6 @@ std::tuple<ImageId, int, int> TextureCache::ResolveOverlap(const ImageInfo& imag
             cache_image.info.resources.levels == 1 && image_info.resources.layers == 1 &&
             cache_image.info.resources.layers == 1;
 
-        // Different format and the cached image lacks the requested levels or layers: expand
-        // it so its GPU data is kept, instead of freeing it after the view lookup fails.
-        if (!merged_image_id && image_info.pixel_format != cache_image.info.pixel_format &&
-            image_info.type == cache_image.info.type &&
-            image_info.tile_mode == cache_image.info.tile_mode &&
-            !cache_image.info.resources.Contains(image_info.resources) &&
-            IsVulkanFormatCompatible(cache_image.info.pixel_format, image_info.pixel_format)) {
-            return {ExpandImage(image_info, cache_image_id), -1, -1};
-        }
-
         // Size and resources are less than or equal, use image view.
         if (image_info.pixel_format != cache_image.info.pixel_format ||
             image_info.guest_size <= cache_image.info.guest_size || guest_size_only) {
@@ -624,28 +632,6 @@ std::tuple<ImageId, int, int> TextureCache::ResolveOverlap(const ImageInfo& imag
     return {merged_image_id, -1, -1};
 }
 
-// Number of leading levels of dst that CopyImage from src overwrites completely.
-static u32 FullyCopiedLevels(const ImageInfo& src, const ImageInfo& dst) {
-    if (src.type != dst.type || src.props.is_volume || dst.props.is_volume ||
-        dst.props.has_stencil || src.resources.layers < dst.resources.layers) {
-        return 0;
-    }
-    const auto blocks = [](u32 texels, bool is_block) {
-        return is_block ? Common::DivCeil(texels, 4u) : texels;
-    };
-    const u32 num_levels = std::min(src.resources.levels, dst.resources.levels);
-    for (u32 m = 0; m < num_levels; ++m) {
-        const u32 copy_w = blocks(std::max(src.size.width >> m, 1u), src.props.is_block);
-        const u32 copy_h = blocks(std::max(src.size.height >> m, 1u), src.props.is_block);
-        const u32 dst_w = blocks(std::max(dst.size.width >> m, 1u), dst.props.is_block);
-        const u32 dst_h = blocks(std::max(dst.size.height >> m, 1u), dst.props.is_block);
-        if (copy_w < dst_w || copy_h < dst_h) {
-            return m;
-        }
-    }
-    return num_levels;
-}
-
 ImageId TextureCache::ExpandImage(const ImageInfo& info, ImageId image_id) {
     const auto new_image_id = slot_images.Insert(instance, runtime, slot_image_views, info);
     RegisterImage(new_image_id);
@@ -659,8 +645,7 @@ ImageId TextureCache::ExpandImage(const ImageInfo& info, ImageId image_id) {
     // copying it would overwrite the fresh upload with old data.
     const bool src_has_gpu_data = src_image.HasGpuValidData();
 
-    // Levels the copy below overwrites need no upload from guest memory.
-    RefreshImage(new_image, src_has_gpu_data ? FullyCopiedLevels(src_image.info, info) : 0);
+    RefreshImage(new_image);
 
     if (src_image.binding.is_bound || src_image.binding.is_target) {
         src_image.binding.needs_rebind = 1u;
@@ -751,8 +736,12 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_fmt) {
             // Cannot reuse this image as we need the exact requested format.
             image_id = {};
         } else if (!image_resolved.info.resources.Contains(info.resources)) {
-            // The image was clearly picked up wrong.
+            // The image was clearly picked up wrong. Its GPU data is kept in guest memory, where
+            // the new image reads it with its own layout.
             CountRegistryChange(RegistrySite::FreeWrong, info, &image_resolved.info, desc.type);
+            if (image_resolved.CanBeDownloaded()) {
+                WriteImageToBufferCache(image_id);
+            }
             FreeImage(image_id);
             image_id = {};
             LOG_WARNING(Render_Vulkan, "Image overlap resolve failed");
@@ -957,7 +946,7 @@ void TextureCache::AssociateStencil(ImageId depth_id, const ImageInfo& depth_inf
     stencil_image.AssociateDepth(depth_id, slot_images[depth_id].image_uid);
 }
 
-void TextureCache::RefreshImage(Image& image, u32 first_level) {
+void TextureCache::RefreshImage(Image& image) {
     if (False(image.flags & ImageFlagBits::Dirty) || image.info.num_samples > 1) {
         return;
     }
@@ -991,7 +980,7 @@ void TextureCache::RefreshImage(Image& image, u32 first_level) {
     const u32 num_mips = image.info.resources.levels;
 
     SmallVector<vk::BufferImageCopy, 14> image_copies;
-    for (u32 m = first_level; m < num_mips; m++) {
+    for (u32 m = 0; m < num_mips; m++) {
         const u32 width = std::max(image.info.size.width >> m, 1u);
         const u32 height = std::max(image.info.size.height >> m, 1u);
         const u32 depth =
