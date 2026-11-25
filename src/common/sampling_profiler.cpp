@@ -304,6 +304,10 @@ void SetEnabled(bool is_enabled) {
     enabled.store(is_enabled, std::memory_order_relaxed);
 }
 
+unsigned CurrentProcessor() {
+    return GetCurrentProcessorNumber();
+}
+
 } // namespace Common::SamplingProfiler
 
 #else
@@ -313,6 +317,10 @@ namespace Common::SamplingProfiler {
 void RegisterCurrentThread(const char*) {}
 
 void SetEnabled(bool) {}
+
+unsigned CurrentProcessor() {
+    return 0;
+}
 
 } // namespace Common::SamplingProfiler
 

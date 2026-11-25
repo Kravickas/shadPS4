@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2025 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <span>
 #include "common/alignment.h"
 #include "video_core/buffer_cache/buffer.h"
 #include "video_core/renderer_vulkan/liverpool_to_vk.h"
@@ -830,11 +831,11 @@ void Runtime::FlushBarriers() {
     memory_barrier.srcAccessMask = vk::AccessFlagBits2::eNone;
 
     image_barriers.clear();
-    for (auto& resource : resources) {
-        resource.read_ranges.Clear();
-        resource.write_ranges.Clear();
+    for (auto& used : std::span{resources}.first(num_resources)) {
+        used.read_ranges.Clear();
+        used.write_ranges.Clear();
     }
-    resources.clear();
+    num_resources = 0;
     resource = nullptr;
 }
 
@@ -842,12 +843,17 @@ void Runtime::MakeCurrent(const VideoCore::Buffer* handle) {
     if (resource && resource->handle == handle) {
         return;
     }
-    auto it = std::ranges::find(resources, handle, &BufferBarriers::handle);
-    if (it != resources.end()) {
+    const auto used = std::span{resources}.first(num_resources);
+    const auto it = std::ranges::find(used, handle, &BufferBarriers::handle);
+    if (it != used.end()) {
         resource = std::addressof(*it);
         return;
     }
-    resource = &resources.emplace_back(handle);
+    if (num_resources == resources.size()) {
+        resources.emplace_back();
+    }
+    resource = &resources[num_resources++];
+    resource->handle = handle;
 }
 
 } // namespace Vulkan

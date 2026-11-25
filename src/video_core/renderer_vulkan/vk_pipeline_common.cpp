@@ -62,56 +62,65 @@ void Pipeline::BindResources(DescriptorWrites& set_writes,
         return;
     }
 
-    if (uses_push_descriptors) {
-        // The writes are followed by the descriptor infos they point to.
-        const std::size_t writes_size = set_writes.size() * sizeof(vk::WriteDescriptorSet);
-        std::size_t data_size = writes_size;
-        for (const auto& set_write : set_writes) {
-            data_size += set_write.descriptorCount *
-                         DescriptorInfoSize(IsBufferDescriptor(set_write.descriptorType));
+    vk::DescriptorSet desc_set{};
+    if (!uses_push_descriptors) {
+        desc_set = desc_heap.Commit(*desc_layout);
+        for (auto& set_write : set_writes) {
+            set_write.dstSet = desc_set;
         }
-        scheduler.Record(
-            data_size,
-            [&](u8* data) {
-                auto* const writes = reinterpret_cast<vk::WriteDescriptorSet*>(data);
-                std::memcpy(writes, set_writes.data(), writes_size);
-                u8* infos = data + writes_size;
-                for (std::size_t i = 0; i < set_writes.size(); ++i) {
-                    const auto& set_write = set_writes[i];
-                    if (set_write.descriptorCount == 0) {
-                        continue;
-                    }
-                    const bool is_buffer = IsBufferDescriptor(set_write.descriptorType);
-                    const std::size_t size =
-                        set_write.descriptorCount * DescriptorInfoSize(is_buffer);
-                    if (is_buffer) {
-                        std::memcpy(infos, set_write.pBufferInfo, size);
-                        writes[i].pBufferInfo =
-                            reinterpret_cast<const vk::DescriptorBufferInfo*>(infos);
-                    } else {
-                        std::memcpy(infos, set_write.pImageInfo, size);
-                        writes[i].pImageInfo =
-                            reinterpret_cast<const vk::DescriptorImageInfo*>(infos);
-                    }
-                    infos += size;
-                }
-            },
-            [bind_point, layout = *pipeline_layout, count = static_cast<u32>(set_writes.size())](
-                vk::CommandBuffer cmdbuf, const u8* data) {
-                cmdbuf.pushDescriptorSetKHR(bind_point, layout, 0, count,
-                                            reinterpret_cast<const vk::WriteDescriptorSet*>(data));
-            });
+    }
+
+    // The writes are followed by the descriptor infos they point to.
+    const std::size_t writes_size = set_writes.size() * sizeof(vk::WriteDescriptorSet);
+    std::size_t data_size = writes_size;
+    for (const auto& set_write : set_writes) {
+        data_size += set_write.descriptorCount *
+                     DescriptorInfoSize(IsBufferDescriptor(set_write.descriptorType));
+    }
+    const auto copy_writes = [&](u8* data) {
+        auto* const writes = reinterpret_cast<vk::WriteDescriptorSet*>(data);
+        std::memcpy(writes, set_writes.data(), writes_size);
+        u8* infos = data + writes_size;
+        for (std::size_t i = 0; i < set_writes.size(); ++i) {
+            const auto& set_write = set_writes[i];
+            if (set_write.descriptorCount == 0) {
+                continue;
+            }
+            const bool is_buffer = IsBufferDescriptor(set_write.descriptorType);
+            const std::size_t size = set_write.descriptorCount * DescriptorInfoSize(is_buffer);
+            if (is_buffer) {
+                std::memcpy(infos, set_write.pBufferInfo, size);
+                writes[i].pBufferInfo = reinterpret_cast<const vk::DescriptorBufferInfo*>(infos);
+            } else {
+                std::memcpy(infos, set_write.pImageInfo, size);
+                writes[i].pImageInfo = reinterpret_cast<const vk::DescriptorImageInfo*>(infos);
+            }
+            infos += size;
+        }
+    };
+    const u32 count = static_cast<u32>(set_writes.size());
+
+    if (uses_push_descriptors) {
+        scheduler.Record(data_size, copy_writes,
+                         [bind_point, layout = *pipeline_layout, count](vk::CommandBuffer cmdbuf,
+                                                                        const u8* data) {
+                             cmdbuf.pushDescriptorSetKHR(
+                                 bind_point, layout, 0, count,
+                                 reinterpret_cast<const vk::WriteDescriptorSet*>(data));
+                         });
         return;
     }
 
-    const auto desc_set = desc_heap.Commit(*desc_layout);
-    for (auto& set_write : set_writes) {
-        set_write.dstSet = desc_set;
-    }
-    instance.GetDevice().updateDescriptorSets(set_writes, {});
-    scheduler.Record([bind_point, layout = *pipeline_layout, desc_set](vk::CommandBuffer cmdbuf) {
-        cmdbuf.bindDescriptorSets(bind_point, layout, 0, desc_set, {});
-    });
+    // The set is written where its bind is recorded. Nothing else uses the set, and only access
+    // to the set itself has to be synchronized for the update.
+    scheduler.Record(data_size, copy_writes,
+                     [device = instance.GetDevice(), bind_point, layout = *pipeline_layout,
+                      desc_set, count](vk::CommandBuffer cmdbuf, const u8* data) {
+                         device.updateDescriptorSets(
+                             count, reinterpret_cast<const vk::WriteDescriptorSet*>(data), 0,
+                             nullptr);
+                         cmdbuf.bindDescriptorSets(bind_point, layout, 0, desc_set, {});
+                     });
 }
 
 std::string Pipeline::GetDebugString() const {

@@ -165,22 +165,10 @@ struct CpPerf {
     u64 la_woken_wait_ns; ///< Of la_run_wait_ns, in those runs
     /// Results taken with the result one, two and three draws further finished.
     std::array<u32, 3> la_finished_ahead;
-    /// Guest buffers bound by V#: all, those with the V# the last draw had at the same place of
-    /// the same shader, those of them in the same tick; stages with such buffers, stages with
-    /// all of them the same in the same tick, stages with all but one. Then the same for the
-    /// images by their lookup key.
-    u32 bb_total;
-    u32 bb_same;
-    u32 bb_same_tick;
-    u32 bs_total;
-    u32 bs_same_tick;
-    u32 bs_one_diff;
-    u32 tb_total;
-    u32 tb_same;
-    u32 tb_same_tick;
-    u32 ts_total;
-    u32 ts_same_tick;
-    u32 ts_one_diff;
+    /// The logical processor the GPU thread ran on at the end of the cycle, and how often it
+    /// differed between the start and the end of a cycle and from the cycle before.
+    u32 gpu_cpu;
+    u32 gpu_cpu_moves;
     /// Images registered and freed, by TextureCache::RegistrySite.
     std::array<u32, PerfTexSites> tex_sites;
     /// Page watcher updates of the whole cycle, and the part of them for images.
@@ -261,9 +249,11 @@ struct CpPerf {
     u32 bc_image_stages;
     u32 bc_image_stages_same;  ///< Stages with all image bindings as in the draw before
     u32 bc_image_stages_quiet; ///< ...equal results, nothing recorded, same registry
-    u32 bc_draws;
-    u32 bc_draws_state_same; ///< Draws with no context or uconfig register changed since the last
-    u32 dispatch_skips;      ///< DispatchDirect: dispatches BindResources handled itself
+    u32 ds_skips;              ///< Draws that kept the dynamic state values of the draw before
+    u32 ds_checks;             ///< Of those, made again and compared
+    u32 ds_diffs;              ///< Compares that differed
+    u32 ds_compares;           ///< State packets compared with the registers
+    u32 dispatch_skips;        ///< DispatchDirect: dispatches BindResources handled itself
 };
 inline CpPerf cp_perf;
 
@@ -272,6 +262,7 @@ struct RecorderPerf {
     std::atomic<u64> run_ns;          ///< Time running recorded commands
     std::atomic<u64> sleeps;          ///< Times the thread went to sleep with nothing to run
     std::atomic<u64> stream_write_ns; ///< Sampled draws: stream buffer writes
+    std::atomic<u32> cpu;             ///< Logical processor the thread last ran on
 };
 inline RecorderPerf recorder_perf;
 
@@ -281,6 +272,8 @@ struct LookaheadPerf {
     std::atomic<u64> sleeps;       ///< Times the thread went to sleep with nothing to scan
     std::atomic<u64> stream_ns;    ///< Time the binding thread worked on results
     std::atomic<u64> stream_skips; ///< Results the binding thread left out, nobody takes them
+    std::atomic<u32> scan_cpu;     ///< Logical processor the lookahead thread last ran on
+    std::atomic<u32> bind_cpu;     ///< Logical processor the binding thread last ran on
 };
 inline LookaheadPerf lookahead_perf;
 
@@ -478,6 +471,12 @@ public:
         return num_submits == 0;
     }
 
+    /// Equal at two calls: no register counted in state_regs_generation changed in between.
+    u64 TakeStateRegsGeneration() {
+        has_state_regs_change = false;
+        return state_regs_generation;
+    }
+
     void SetVoPort(Libraries::VideoOut::VideoOutPort* port) {
         vo_port = port;
     }
@@ -655,9 +654,6 @@ private:
 
     enum class PacketClass { State, Draw, Other };
 
-    /// Probe: whether a state packet gives a config, context or uconfig register a new value.
-    bool ChangesStateRegs(const PM4Header* header) const;
-
     /// Whether a packet only sets state, is a draw or dispatch, or does anything else.
     static PacketClass ClassifyPacket(const PM4Header* header, bool guest_markers_enabled);
 
@@ -672,9 +668,23 @@ private:
     /// stops. It prepares the direct draws only.
     bool HasLookaheadDraw(std::span<const u32> dcb) const;
 
+    /// Called for a state packet before it is applied: counts it in state_regs_generation if
+    /// it gives a register another value.
+    void NoteStatePacket(const PM4Header* header);
+    void NoteStateRegsChange() {
+        ++state_regs_generation;
+        has_state_regs_change = true;
+    }
+
     /// Applies a packet of a run without the lookahead thread to the lookahead state. The
     /// thread is stopped then.
     void ApplySoloPacketState(const PM4Header* header, std::size_t words_available);
+
+    /// In a run or a stretch without the lookahead thread: applies the packets at the start of
+    /// dcb that only set state, whatever their payload, and returns what is behind them.
+    /// Commands of other threads run every StatePacketsPerCommandCheck packets.
+    std::span<const u32> ApplyStatePackets(const GfxState& gfx_state, std::span<const u32> dcb);
+    static constexpr u32 StatePacketsPerCommandCheck = 64;
 
     /// Lets the lookahead thread scan the packets from the start of dcb up to the first one that
     /// is neither a state packet nor a draw.
@@ -726,13 +736,19 @@ private:
     /// The packets up to the next Other packet hold no draw the lookahead thread prepares, so
     /// the GPU thread runs them without it and applies them to the lookahead state itself.
     bool is_lookahead_solo{};
+    /// Counts the packets that give a register another value through SetConfigReg,
+    /// SetContextReg, SetUconfigReg or ClearState, and every packet that is neither a state nor
+    /// a draw packet. What IndexType, NumInstances, IndexBase and the draw packets write
+    /// (index buffer type and base, instance and index counts, draw initiator) is not counted.
+    u64 state_regs_generation{1};
+    /// A change was counted since the count was last taken: the packets up to the next take
+    /// need no compare.
+    bool has_state_regs_change{};
     bool lookahead_needs_copy{true};
     u32 lookahead_compare_countdown{};
     u32 lookahead_logged_mismatches{};
     u64 lookahead_run{};
     u32 perf_cycles{};
-    /// Probe: a context, uconfig or config register changed since the last draw.
-    bool perf_state_changed{};
     u64 lookahead_taken{};
     /// Working and waiting time of the GPU thread per cycle, averaged over the last cycles,
     /// and whether the waiting share is at least MinIdlePercent.
@@ -740,6 +756,8 @@ private:
     static constexpr s64 MaxIdleSampleNs = 50'000'000;
     static constexpr s64 MinIdlePercent = 10;
     u64 last_cycle_end{};
+    /// Probe: the logical processor the GPU thread ran on at the end of the last cycle.
+    u32 last_gpu_cpu{};
     s64 busy_avg_ns{};
     s64 idle_avg_ns{};
     bool has_submit_slack{true};

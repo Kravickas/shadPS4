@@ -68,6 +68,12 @@ public:
         std::size_t m = 0;
 
         auto [first, last] = OverlapRun(value.start, value.end);
+        if constexpr (std::same_as<IV, Interval>) {
+            // Inside one interval: splitting it and merging the parts again changes nothing.
+            if (first != last && first->start <= value.start && value.end <= first->end) {
+                return;
+            }
+        }
         if (first != last) {
             if (first->start < value.start) {
                 out[m++] = first->SubRange(first->start, value.start);

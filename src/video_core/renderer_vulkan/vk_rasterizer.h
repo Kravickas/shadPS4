@@ -199,6 +199,8 @@ private:
     void EliminateFastClear();
 
     void UpdateDynamicState(const GraphicsPipeline* pipeline, bool is_indexed) const;
+    /// The dynamic state values that are made from the registers alone.
+    void UpdateRegsDynamicState(bool is_indexed) const;
     void UpdateViewportScissorState() const;
     void UpdateDepthStencilState() const;
     void UpdatePrimitiveState(bool is_indexed) const;
@@ -277,17 +279,13 @@ private:
     static constexpr u32 SharpsAheadCheckInterval = 64;
     u32 sharps_ahead_uses{};
     bool is_sharps_check{};
+    /// What the dynamic state values taken from the registers were made for last.
+    mutable u64 dynamic_regs_generation{};
+    mutable bool dynamic_is_indexed{};
+    static constexpr u32 DynamicCheckInterval = 32;
+    mutable u32 dynamic_skips{};
+    mutable u32 dynamic_logged_diffs{};
     u32 sharps_logged_diffs{};
-    /// Probe: what the last draw bound per stage and place, and in which tick.
-    struct BindingsProbe {
-        const Shader::Info* buffer_info;
-        const Shader::Info* image_info;
-        u64 buffer_tick;
-        u64 image_tick;
-        std::array<AmdGpu::Buffer, Shader::NUM_BUFFERS> buffers;
-        std::array<TextureKey, Shader::NUM_IMAGES> images;
-    };
-    std::array<BindingsProbe, MaxShaderStages> bindings_probe{};
     bool has_submit_slack{true};
     /// Draws between two hand-overs of recorded commands to the recorder thread.
     static constexpr u32 PublishDrawInterval = 4;

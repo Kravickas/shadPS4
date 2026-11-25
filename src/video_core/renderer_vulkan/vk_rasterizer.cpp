@@ -964,9 +964,11 @@ void Rasterizer::FlushPeriodically(bool is_dispatch) {
     ++draws_since_submit;
     // Auto: GPU writes to memory the game's threads are known to touch wait in the open command
     // buffer. They are submitted at the first draw behind the dispatches that made them, so
-    // that the GPU runs them and they can be downloaded before those threads get there.
+    // that the GPU runs them and they can be downloaded before those threads get there. Only
+    // while the GPU thread has time to spare, as below.
     const bool is_auto = submit_draw_interval == SubmitIntervalAuto;
-    const bool is_early = is_auto && !is_dispatch && draws_since_submit >= AutoSubmitMinDraws &&
+    const bool is_early = is_auto && has_submit_slack && !is_dispatch &&
+                          draws_since_submit >= AutoSubmitMinDraws &&
                           buffer_cache.IsEagerWritePending();
     // Auto: the GPU has run everything submitted, so what is recorded is all it could work on.
     // A GPU that is behind gets its work at the largest distance, and so does every GPU while
@@ -1501,10 +1503,6 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
     const DrawAhead::StageSharps* const ahead = FindSharpsAhead(stage);
     u32 ahead_buffer = ahead ? ahead->first_buffer : 0;
     AmdGpu::cp_perf.ra_stages += ahead != nullptr;
-    BindingsProbe& probe = bindings_probe[u32(stage.sw_stage)];
-    const bool is_probe_stage = probe.buffer_info == &stage;
-    u32 probe_buffers = 0;
-    u32 probe_same = 0;
     for (const auto& desc : stage.buffers) {
         const auto src_access =
             vk::AccessFlagBits2::eShaderRead |
@@ -1572,10 +1570,6 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
             } else {
                 vsharp = desc.GetSharp(user_data);
             }
-            AmdGpu::Buffer& probe_sharp = probe.buffers[&desc - stage.buffers.data()];
-            ++probe_buffers;
-            probe_same += is_probe_stage && SameBits(vsharp, probe_sharp);
-            probe_sharp = vsharp;
             if (vsharp.base_address == 0 || vsharp.GetSize() == 0) {
                 buffer_infos.emplace_back(VK_NULL_HANDLE, 0, VK_WHOLE_SIZE);
             } else {
@@ -1597,7 +1591,8 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
                 if (desc.is_written) {
                     AmdGpu::cp_perf.ow_obtain_ns += AmdGpu::PerfNs() - obtain_t0;
                 }
-                const u64 offset_aligned = Common::AlignDown(offset, alignment);
+                // The limit is a power of two.
+                const u64 offset_aligned = Common::AlignDownPow2(offset, alignment);
                 const u64 adjust = offset - offset_aligned;
                 if (adjust % 4 != 0) {
                     LOG_WARNING(Render_Vulkan, "Buffer binding in shader {:#x} isn't dword aligned",
@@ -1625,19 +1620,6 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
         set_write.pBufferInfo = &buffer_infos.back();
         ++binding.buffer;
     }
-    if (probe_buffers != 0) {
-        auto& perf = AmdGpu::cp_perf;
-        const u64 tick = scheduler.CurrentTick();
-        const bool is_tick = is_probe_stage && probe.buffer_tick == tick;
-        perf.bb_total += probe_buffers;
-        perf.bb_same += probe_same;
-        perf.bb_same_tick += is_tick ? probe_same : 0;
-        ++perf.bs_total;
-        perf.bs_same_tick += is_tick && probe_same == probe_buffers;
-        perf.bs_one_diff += is_tick && probe_same + 1 == probe_buffers;
-        probe.buffer_info = &stage;
-        probe.buffer_tick = tick;
-    }
 }
 
 void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindings& binding) {
@@ -1659,10 +1641,6 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
 
     const DrawAhead::StageSharps* const ahead = FindSharpsAhead(stage);
     u32 ahead_image = ahead ? ahead->first_image : 0;
-    BindingsProbe& probe = bindings_probe[u32(stage.sw_stage)];
-    const bool is_probe_stage = probe.image_info == &stage;
-    u32 probe_images = 0;
-    u32 probe_same = 0;
     u32 num_images{};
     for (const auto& image_desc : stage.images) {
         const DrawAhead::ImageKey* ahead_key =
@@ -1677,14 +1655,6 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
             }
         }
         const auto tsharp = ahead_key ? ahead_key->key.tsharp : image_desc.GetSharp(user_data);
-        {
-            const TextureKey probe_key =
-                ahead_key ? ahead_key->key : MakeTextureKey(tsharp, image_desc, 0);
-            TextureKey& last_key = probe.images[&image_desc - stage.images.data()];
-            ++probe_images;
-            probe_same += is_probe_stage && SameBits(probe_key, last_key);
-            last_key = probe_key;
-        }
         const auto data_fmt = tsharp.GetDataFmt();
         const auto num_fmt = tsharp.GetNumberFmt();
         if (tsharp.Address() == 0 || data_fmt == AmdGpu::DataFormat::FormatInvalid) {
@@ -1778,20 +1748,6 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
         }
 
         image_descriptor_array_sizes.push_back(num_bindings);
-    }
-
-    if (probe_images != 0) {
-        auto& perf = AmdGpu::cp_perf;
-        const u64 tick = scheduler.CurrentTick();
-        const bool is_tick = is_probe_stage && probe.image_tick == tick;
-        perf.tb_total += probe_images;
-        perf.tb_same += probe_same;
-        perf.tb_same_tick += is_tick ? probe_same : 0;
-        ++perf.ts_total;
-        perf.ts_same_tick += is_tick && probe_same == probe_images;
-        perf.ts_one_diff += is_tick && probe_same + 1 == probe_images;
-        probe.image_info = &stage;
-        probe.image_tick = tick;
     }
 
     const u64 second_t0 = is_timed ? AmdGpu::PerfNs() : 0;
@@ -2260,14 +2216,52 @@ void Rasterizer::UnmapMemory(VAddr addr, u64 size) {
     }
 }
 
-void Rasterizer::UpdateDynamicState(const GraphicsPipeline* pipeline, const bool is_indexed) const {
+void Rasterizer::UpdateRegsDynamicState(const bool is_indexed) const {
     UpdateViewportScissorState();
     UpdateDepthStencilState();
     UpdatePrimitiveState(is_indexed);
     UpdateRasterizationState();
+}
+
+void Rasterizer::UpdateDynamicState(const GraphicsPipeline* pipeline, const bool is_indexed) const {
+    auto& dynamic_state = scheduler.GetDynamicState();
+    // The values UpdateRegsDynamicState sets depend on config, context and uconfig registers
+    // alone, and nothing else sets them: they hold while no such register changed.
+    const u64 generation = liverpool->TakeStateRegsGeneration();
+    if (generation != dynamic_regs_generation || is_indexed != dynamic_is_indexed) {
+        UpdateRegsDynamicState(is_indexed);
+        dynamic_regs_generation = generation;
+        dynamic_is_indexed = is_indexed;
+    } else {
+        ++AmdGpu::cp_perf.ds_skips;
+        if (dynamic_skips++ % DynamicCheckInterval == 0) {
+            // A setter marks a value dirty only when it changes it.
+            using DirtyBits = std::array<u8, sizeof(dynamic_state.dirty_state)>;
+            DirtyBits was_dirty;
+            std::memcpy(&was_dirty, &dynamic_state.dirty_state, sizeof(was_dirty));
+            std::memset(&dynamic_state.dirty_state, 0, sizeof(dynamic_state.dirty_state));
+            UpdateRegsDynamicState(is_indexed);
+            DirtyBits changed;
+            std::memcpy(&changed, &dynamic_state.dirty_state, sizeof(changed));
+            ++AmdGpu::cp_perf.ds_checks;
+            if (changed != DirtyBits{}) {
+                ++AmdGpu::cp_perf.ds_diffs;
+                if (dynamic_logged_diffs < 32) {
+                    ++dynamic_logged_diffs;
+                    u32 bits{};
+                    std::memcpy(&bits, &changed, std::min(sizeof(bits), sizeof(changed)));
+                    LOG_ERROR(Render_Vulkan, "PERF ds_diff dirty={:#x} generation={}", bits,
+                              generation);
+                }
+            }
+            for (std::size_t i = 0; i < changed.size(); ++i) {
+                changed[i] |= was_dirty[i];
+            }
+            std::memcpy(&dynamic_state.dirty_state, &changed, sizeof(changed));
+        }
+    }
     UpdateColorBlendingState(pipeline);
 
-    auto& dynamic_state = scheduler.GetDynamicState();
     const AmdGpu::VkCallPerf vk_perf{AmdGpu::cp_perf.vk_dyn_ns};
     dynamic_state.Commit(instance, scheduler);
 }

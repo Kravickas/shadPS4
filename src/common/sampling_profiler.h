@@ -12,4 +12,7 @@ void RegisterCurrentThread(const char* name);
 /// Samples are only taken while enabled.
 void SetEnabled(bool is_enabled);
 
+/// Probe: the logical processor the calling thread runs on. 0 where it is not known.
+unsigned CurrentProcessor();
+
 } // namespace Common::SamplingProfiler

@@ -256,6 +256,10 @@ void Scheduler::RecorderThread(std::stop_token stoken) {
             AmdGpu::recorder_perf.sleeps.fetch_add(1, std::memory_order_relaxed);
             continue;
         }
+        if (idle_spins != 0) {
+            AmdGpu::recorder_perf.cpu.store(Common::SamplingProfiler::CurrentProcessor(),
+                                            std::memory_order_relaxed);
+        }
         idle_spins = 0;
 
         const u64 run_t0 = AmdGpu::PerfNs();
