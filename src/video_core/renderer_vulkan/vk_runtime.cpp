@@ -3,6 +3,7 @@
 
 #include <span>
 #include "common/alignment.h"
+#include "video_core/amdgpu/liverpool.h"
 #include "video_core/buffer_cache/buffer.h"
 #include "video_core/renderer_vulkan/liverpool_to_vk.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
@@ -111,13 +112,15 @@ void Runtime::TickFrame() {
 
 void Runtime::CopyBuffer(const VideoCore::Buffer* src, const VideoCore::Buffer* dst,
                          std::span<const vk::BufferCopy> copies) {
-    scheduler.EndRendering();
+    scheduler.EndRendering(Scheduler::RenderEnd::Copy);
 
     bool needs_flush{};
     for (const auto& copy : copies) {
         needs_flush |= IsBufferAccessed(src, copy.srcOffset, copy.size);
         needs_flush |= IsBufferAccessed(dst, copy.dstOffset, copy.size, true);
     }
+    ++AmdGpu::cp_perf.cb_copies;
+    AmdGpu::cp_perf.cb_conflicts += needs_flush;
     if (needs_flush) {
         FlushBarriers();
     }
@@ -782,6 +785,7 @@ void Runtime::AccessBuffer(const VideoCore::Buffer* handle, u64 offset, u64 size
         vk::AccessFlagBits2::eDepthStencilAttachmentWrite | vk::AccessFlagBits2::eTransferWrite |
         vk::AccessFlagBits2::eMemoryWrite | vk::AccessFlagBits2::eTransformFeedbackWriteEXT;
 
+    ++AmdGpu::cp_perf.br_adds;
     if (src_access & WRITE_MASK) {
         resource->write_ranges.Add(range);
     }
@@ -809,7 +813,8 @@ void Runtime::FlushBarriers() {
         return;
     }
 
-    scheduler.EndRendering();
+    ++AmdGpu::cp_perf.br_flushes;
+    scheduler.EndRendering(Scheduler::RenderEnd::Barrier);
     scheduler.Record(
         image_barriers.size() * sizeof(vk::ImageMemoryBarrier2),
         [&](u8* data) {

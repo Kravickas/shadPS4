@@ -86,7 +86,7 @@ void Scheduler::BeginRendering(const RenderState& new_state) {
     if (is_rendering && render_state == new_state) {
         return;
     }
-    EndRendering();
+    EndRendering(RenderEnd::State);
     is_rendering = true;
     render_state = new_state;
     ++AmdGpu::cp_perf.render_passes;
@@ -142,10 +142,11 @@ void Scheduler::BeginRendering(const RenderState& new_state) {
     });
 }
 
-void Scheduler::EndRendering() {
+void Scheduler::EndRendering(RenderEnd cause) {
     if (!is_rendering) {
         return;
     }
+    ++AmdGpu::cp_perf.rp_ends[static_cast<u32>(cause)];
     is_rendering = false;
     Record([](vk::CommandBuffer cmdbuf) { cmdbuf.endRendering(); });
 }
@@ -369,7 +370,7 @@ void Scheduler::EndSession() {
         Check(session.upload.end());
     }
 
-    EndRendering();
+    EndRendering(RenderEnd::Submit);
     SyncRecording();
     Check(session.primary.end());
 }

@@ -382,8 +382,11 @@ public:
     /// Starts a new rendering scope with provided state.
     void BeginRendering(const RenderState& new_state);
 
+    /// Probe: what ends a rendering scope.
+    enum class RenderEnd : u32 { Other, State, Barrier, Copy, Dispatch, Submit };
+
     /// Ends current rendering scope.
-    void EndRendering();
+    void EndRendering(RenderEnd cause = RenderEnd::Other);
 
     /// Starts a new session.
     void BeginSession();

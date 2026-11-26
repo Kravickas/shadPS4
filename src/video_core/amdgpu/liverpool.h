@@ -247,13 +247,18 @@ struct CpPerf {
     u32 bc_images_same;  ///< Same T# and use as the same slot of the draw before, same run
     u32 bc_images_equal; ///< ...and resolved to the same view and layout
     u32 bc_image_stages;
-    u32 bc_image_stages_same;  ///< Stages with all image bindings as in the draw before
-    u32 bc_image_stages_quiet; ///< ...equal results, nothing recorded, same registry
-    u32 ds_skips;              ///< Draws that kept the dynamic state values of the draw before
-    u32 ds_checks;             ///< Of those, made again and compared
-    u32 ds_diffs;              ///< Compares that differed
-    u32 ds_compares;           ///< State packets compared with the registers
-    u32 dispatch_skips;        ///< DispatchDirect: dispatches BindResources handled itself
+    u32 bc_image_stages_same;   ///< Stages with all image bindings as in the draw before
+    u32 bc_image_stages_quiet;  ///< ...equal results, nothing recorded, same registry
+    u32 ds_skips;               ///< Draws that kept the dynamic state values of the draw before
+    u32 ds_checks;              ///< Of those, made again and compared
+    u32 ds_diffs;               ///< Compares that differed
+    u32 ds_compares;            ///< State packets compared with the registers
+    std::array<u32, 6> rp_ends; ///< Rendering scopes ended, by Scheduler::RenderEnd
+    u32 cb_copies;              ///< Runtime::CopyBuffer calls
+    u32 cb_conflicts;           ///< Of those, with a range used since the last barrier flush
+    u32 br_flushes;             ///< Barrier flushes that recorded a barrier
+    u32 br_adds;                ///< Buffer ranges added to the barrier lists
+    u32 dispatch_skips;         ///< DispatchDirect: dispatches BindResources handled itself
 };
 inline CpPerf cp_perf;
 

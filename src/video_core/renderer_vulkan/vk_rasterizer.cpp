@@ -888,7 +888,7 @@ void Rasterizer::DispatchDirect() {
         runtime.FlushBarriers();
     }
 
-    scheduler.EndRendering();
+    scheduler.EndRendering(Scheduler::RenderEnd::Dispatch);
     pipeline->BindResources(set_writes, push_data);
 
     scheduler.Record([handle = pipeline->Handle(), dim_x = cs_program.dim_x,
@@ -939,7 +939,7 @@ void Rasterizer::DispatchIndirect(VAddr address, u32 offset, u32 size) {
         runtime.FlushBarriers();
     }
 
-    scheduler.EndRendering();
+    scheduler.EndRendering(Scheduler::RenderEnd::Dispatch);
     pipeline->BindResources(set_writes, push_data);
 
     scheduler.Record([handle = pipeline->Handle(), buffer = buffer->Handle(),
@@ -964,11 +964,9 @@ void Rasterizer::FlushPeriodically(bool is_dispatch) {
     ++draws_since_submit;
     // Auto: GPU writes to memory the game's threads are known to touch wait in the open command
     // buffer. They are submitted at the first draw behind the dispatches that made them, so
-    // that the GPU runs them and they can be downloaded before those threads get there. Only
-    // while the GPU thread has time to spare, as below.
+    // that the GPU runs them and they can be downloaded before those threads get there.
     const bool is_auto = submit_draw_interval == SubmitIntervalAuto;
-    const bool is_early = is_auto && has_submit_slack && !is_dispatch &&
-                          draws_since_submit >= AutoSubmitMinDraws &&
+    const bool is_early = is_auto && !is_dispatch && draws_since_submit >= AutoSubmitMinDraws &&
                           buffer_cache.IsEagerWritePending();
     // Auto: the GPU has run everything submitted, so what is recorded is all it could work on.
     // A GPU that is behind gets its work at the largest distance, and so does every GPU while

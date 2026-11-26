@@ -287,7 +287,9 @@ void Liverpool::Process(std::stop_token stoken) {
             "ow_upload_us={} ow_uploads={} ow_upload_kb={} ow_watch_pages={} ow_protects={} "
             "bc_on={} bc_images={} bc_images_same={} "
             "bc_images_equal={} bc_image_stages={} bc_image_stages_same={} "
-            "bc_image_stages_quiet={} ds_skips={} ds_checks={} ds_diffs={} ds_compares={}",
+            "bc_image_stages_quiet={} ds_skips={} ds_checks={} ds_diffs={} ds_compares={} "
+            "rp_end_other={} rp_end_state={} rp_end_barrier={} rp_end_copy={} rp_end_dispatch={} "
+            "rp_end_submit={} cb_copies={} cb_conflicts={} br_flushes={} br_adds={}",
             cycle_t0, cycle_t1, cp_perf.tasks, was_submit_done, (cycle_t1 - flush_t0) / 1000,
             cp_perf.vo_block_ns / 1000, cp_perf.vo_blocks, cp_perf.vo_spin_ns / 1000,
             cp_perf.mem_spin_ns / 1000, cp_perf.mem_spins, cp_perf.asc_spin_ns / 1000,
@@ -395,7 +397,9 @@ void Liverpool::Process(std::stop_token stoken) {
             perf_bind_check ? 1 : 0, cp_perf.bc_images, cp_perf.bc_images_same,
             cp_perf.bc_images_equal, cp_perf.bc_image_stages, cp_perf.bc_image_stages_same,
             cp_perf.bc_image_stages_quiet, cp_perf.ds_skips, cp_perf.ds_checks, cp_perf.ds_diffs,
-            cp_perf.ds_compares);
+            cp_perf.ds_compares, cp_perf.rp_ends[0], cp_perf.rp_ends[1], cp_perf.rp_ends[2],
+            cp_perf.rp_ends[3], cp_perf.rp_ends[4], cp_perf.rp_ends[5], cp_perf.cb_copies,
+            cp_perf.cb_conflicts, cp_perf.br_flushes, cp_perf.br_adds);
         if (++perf_run_log_cycles == 2048) {
             perf_run_log_cycles = 0;
             if (is_gameplay && perf_tex_site_refills < PerfTexSiteRefills) {
