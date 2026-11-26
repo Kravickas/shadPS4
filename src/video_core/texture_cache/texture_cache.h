@@ -139,14 +139,41 @@ public:
     /// Retrieves the image handle of the image with the provided attributes.
     [[nodiscard]] ImageId FindImage(ImageDesc& desc, bool exact_fmt = false);
 
-    /// Changes whenever an image is registered or unregistered.
+    /// Changes whenever an image is registered or unregistered, except when an image is swapped
+    /// with its parked alias.
     [[nodiscard]] u64 RegistryGeneration() const noexcept {
         return registry_generation;
     }
 
+    /// Changes whenever an image is swapped with its parked alias.
+    [[nodiscard]] u64 SwapGeneration() const noexcept {
+        return swap_generation;
+    }
+
+    /// Whether a lookup in the range made at swap generation swaps still holds. A swap replaces
+    /// a registered image by one of the same range, so it only changes what is found there.
+    [[nodiscard]] bool IsSwapCurrent(u64& swaps, VAddr address, u64 size) const noexcept {
+        if (swaps == swap_generation) {
+            return true;
+        }
+        if (address < swap_end && swap_begin < address + size) {
+            return false;
+        }
+        swaps = swap_generation;
+        return true;
+    }
+
     /// Whether FindImage(desc) returned image_id through its perfect match. While the registry
-    /// generation stays the same, FindImage(desc) keeps returning that image.
+    /// generation stays the same and no swap is in its range, FindImage(desc) keeps returning
+    /// that image.
     [[nodiscard]] bool IsPerfectMatch(ImageId image_id, const ImageDesc& desc);
+
+    /// The last scheduler tick up to which FindImage(desc), which just returned image_id, gives
+    /// the same again without doing anything else, as long as no image is registered,
+    /// unregistered or swapped. 0 if that cannot be said.
+    [[nodiscard]] u64 FoundImageValidUntil(ImageId image_id, const ImageDesc& desc) {
+        return IsPerfectMatch(image_id, desc) ? ~0ULL : (find_is_stable ? find_valid_until : 0);
+    }
 
     /// Accounts the access of a FindImage result that is used again without repeating the lookup.
     void TouchFoundImage(ImageId image_id);
@@ -188,7 +215,7 @@ public:
     [[nodiscard]] ImageId ExpandImage(const ImageInfo& info, ImageId image_id);
 
     /// Reuploads image contents.
-    void RefreshImage(Image& image, u32 first_level = 0);
+    void RefreshImage(Image& image);
 
     /// Retrieves the sampler that matches the provided S# descriptor.
     [[nodiscard]] vk::Sampler GetSampler(const AmdGpu::Sampler& sampler,
@@ -372,11 +399,14 @@ private:
     void DownloadImageMemory(ImageId image_id,
                              DownloadMemoryFlags flags = DownloadMemoryFlags::None);
 
+    /// Writes image memory to the buffer cache and marks that range as GPU modified.
+    void WriteImageToBufferCache(ImageId image_id);
+
     /// Register image in the page table
-    void RegisterImage(ImageId image);
+    void RegisterImage(ImageId image, bool is_swap = false);
 
     /// Unregister image from the page table
-    void UnregisterImage(ImageId image);
+    void UnregisterImage(ImageId image, bool is_swap = false);
 
     /// Track CPU reads and writes for image
     void TrackImage(ImageId image_id);
@@ -396,6 +426,19 @@ private:
 
     /// Removes the image and any views/surface metas that reference it.
     void DeleteImage(ImageId image_id);
+
+    /// Removes what refers to an unregistered image by its address: surface metas and downloads.
+    void ReleaseImageRefs(ImageId image_id);
+
+    /// Schedules the image and its views for destruction.
+    void DestroyImage(ImageId image_id);
+
+    /// Brings back the parked alias of the image in place of it, with the contents of the image,
+    /// if it is the image new_info describes. Returns its id, or a null id.
+    [[nodiscard]] ImageId SwapWithParkedAlias(ImageId image_id, const ImageInfo& new_info);
+
+    /// Unregisters the image and keeps it as the parked alias of new_image_id.
+    void ParkImage(ImageId image_id, ImageId new_image_id);
 
     /// Touch the image in the LRU cache.
     void TouchImage(Image& image);
@@ -438,6 +481,27 @@ private:
     u64 critical_gc_samplers = 0;
     u64 gc_tick = 0;
     u64 registry_generation = 1;
+    u64 swap_generation = 0;
+    /// Of the last FindImage call: whether what it decided depends only on the descriptions of
+    /// the registered images, and the tick up to which images it left registered because they
+    /// were used recently stay that way.
+    bool find_is_stable{};
+    u64 find_valid_until{};
+    /// Range that holds every image swapped with its parked alias so far.
+    VAddr swap_begin = ~0ULL;
+    VAddr swap_end = 0;
+
+    /// Last stencil association. The same depth image and stencil range give the same stencil
+    /// image while no image is registered or unregistered.
+    struct StencilLookup {
+        u64 generation{};
+        u64 swaps{};
+        ImageId depth_id{};
+        VAddr stencil_addr{};
+        u64 stencil_size{};
+        ImageId stencil_id{};
+    };
+    StencilLookup stencil_lookup{};
     Common::LRUCache<Image> image_lru_cache;
     Common::LRUCache<Sampler> sampler_lru_cache;
     const bool readback_linear_images;

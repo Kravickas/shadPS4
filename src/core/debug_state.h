@@ -1,9 +1,10 @@
-// SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
+// SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #pragma once
 
 #include <atomic>
+#include <chrono>
 #include <mutex>
 #include <shared_mutex>
 #include <unordered_map>
@@ -153,6 +154,8 @@ class DebugStateImpl {
 
     s32 gnm_frame_dump_request_count = -1;
     std::unordered_map<size_t, FrameDump*> waiting_reg_dumps;
+    /// Whether waiting_reg_dumps has entries, for the draws that ask without the lock.
+    std::atomic_bool has_waiting_reg_dumps = false;
     std::unordered_map<size_t, std::string> waiting_reg_dumps_dbg;
     bool waiting_submit_pause = false;
     bool should_show_frame_dump = false;
@@ -193,9 +196,45 @@ public:
         return is_guest_threads_paused;
     }
 
+    /// A value summed over a frame and averaged over the frames, for the overlay.
+    struct FrameStat {
+        std::atomic<u64> sum{};
+        std::atomic<float> avg{};
+
+        void Add(u64 value) noexcept {
+            sum.fetch_add(value, std::memory_order_relaxed);
+        }
+
+        void Add(std::chrono::nanoseconds time) noexcept {
+            Add(static_cast<u64>(time.count()));
+        }
+
+        void EndFrame(float smoothing) noexcept {
+            const float value = float(sum.exchange(0, std::memory_order_relaxed));
+            const float old = avg.load(std::memory_order_relaxed);
+            avg.store(old + (value - old) * smoothing, std::memory_order_relaxed);
+        }
+
+        [[nodiscard]] float Get() const noexcept {
+            return avg.load(std::memory_order_relaxed);
+        }
+    };
+    FrameStat frame_submits;            ///< Submits of the GPU thread's command buffer
+    FrameStat frame_inner_submits;      ///< Of them, made inside the frame by the submit interval
+    FrameStat frame_inner_submit_draws; ///< Draws and dispatches in front of those
+    FrameStat frame_gpu_thread_ns;      ///< Working time of the GPU thread
+    FrameStat frame_drain_ns;           ///< Of it, waiting for the host GPU for a readback
+    FrameStat frame_guest_wait_ns;      ///< Time the game's threads waited in readbacks
+
     void IncFlipFrameNum() {
         // Low weight on the newest frame, so the average settles instead of jumping around.
         static constexpr float smoothing = 0.05f;
+        frame_submits.EndFrame(smoothing);
+        frame_inner_submits.EndFrame(smoothing);
+        frame_inner_submit_draws.EndFrame(smoothing);
+        frame_gpu_thread_ns.EndFrame(smoothing);
+        frame_drain_ns.EndFrame(smoothing);
+        frame_guest_wait_ns.EndFrame(smoothing);
         const auto draws = draw_call_count.exchange(0, std::memory_order_relaxed);
         const auto draws_avg = draw_call_count_avg.load(std::memory_order_relaxed);
         draw_call_count_avg.store(draws_avg + (float(draws) - draws_avg) * smoothing,
@@ -237,9 +276,8 @@ public:
         return gnm_frame_dump_request_count > 0;
     }
 
-    bool DumpingCurrentReg() {
-        std::shared_lock lock{frame_dump_list_mutex};
-        return !waiting_reg_dumps.empty();
+    bool DumpingCurrentReg() const {
+        return has_waiting_reg_dumps;
     }
 
     bool ShouldPauseInSubmit() const {

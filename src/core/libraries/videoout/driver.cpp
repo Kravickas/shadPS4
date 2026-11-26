@@ -356,6 +356,9 @@ void VideoOutDriver::PresentThread(std::stop_token token) {
     Common::SetCurrentThreadRealtime(vblank_period);
 
     Common::AccurateTimer timer{vblank_period};
+    // When the last frame was presented, by a flip or for the overlay.
+    static constexpr std::chrono::nanoseconds KeepDrawingPeriod{1'000'000'000 / 60};
+    std::chrono::steady_clock::time_point last_present{};
 
     const auto receive_request = [this] -> Request {
         std::scoped_lock lk{mutex};
@@ -369,6 +372,7 @@ void VideoOutDriver::PresentThread(std::stop_token token) {
 
     while (!token.stop_requested()) {
         timer.Start();
+        const auto vblank_tick = std::chrono::steady_clock::now();
 
         if (DebugState.IsGuestThreadsPaused()) {
             DrawLastFrame();
@@ -384,12 +388,17 @@ void VideoOutDriver::PresentThread(std::stop_token token) {
                 if (timer.GetTotalWait().count() < 0) { // Dont draw too fast
                     if (!main_port.is_open) {
                         DrawBlankFrame();
-                    } else if (ImGui::Core::MustKeepDrawing()) {
+                    } else if (ImGui::Core::MustKeepDrawing() &&
+                               vblank_tick - last_present >= KeepDrawingPeriod) {
+                        // The overlay only needs the last frame again when no flip showed it
+                        // lately; the vblank frequency can be far above the display's.
                         DrawLastFrame();
+                        last_present = vblank_tick;
                     }
                 }
             } else {
                 Flip(request);
+                last_present = vblank_tick;
                 FRAME_END;
             }
         }

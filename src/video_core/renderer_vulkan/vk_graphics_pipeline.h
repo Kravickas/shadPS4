@@ -102,12 +102,15 @@ public:
         return key;
     }
 
-    /// Gets the attributes and bindings for vertex inputs.
+    /// Gets the attributes and bindings for vertex inputs. The sharps are those given, one per
+    /// attribute of the fetch shader; without them they are read from vs_data, or from the
+    /// vertex stage's Info without it.
     template <typename Attribute, typename Binding>
     void GetVertexInputs(VertexInputs<Attribute>& attributes, VertexInputs<Binding>& bindings,
                          VertexInputs<vk::VertexInputBindingDivisorDescriptionEXT>& divisors,
                          VertexInputs<AmdGpu::Buffer>& guest_buffers, u32 step_rate_0,
-                         u32 step_rate_1) const;
+                         u32 step_rate_1, const Shader::StageUserData* vs_data = nullptr,
+                         std::span<const AmdGpu::Buffer> sharps = {}) const;
 
 private:
     void BuildDescSetLayout(bool preloading);

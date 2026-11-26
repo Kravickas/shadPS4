@@ -1,4 +1,4 @@
-// SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
+// SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #pragma once
@@ -146,6 +146,9 @@ public:
     VAddr track_addr_end = 0;
     ImageId depth_id{};
     u64 depth_uid{};
+    /// The image this one replaced when the guest used a depth buffer as a color image or the
+    /// other way around. It is kept, unregistered, to take over again when the use switches back.
+    ImageId parked_alias{};
 
     vk::ImageUsageFlags usage_flags;
     vk::FormatFeatureFlags2 format_features;

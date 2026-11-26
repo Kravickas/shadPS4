@@ -24,6 +24,62 @@ namespace Vulkan {
 class GraphicsPipeline;
 class Runtime;
 
+/// Inputs of a texture lookup: the T# and the shader resource fields ImageDesc reads.
+struct TextureKey {
+    AmdGpu::Image tsharp;
+    u32 is_depth;
+    u32 is_array;
+    u32 is_written;
+    u32 mip_level; ///< Mip the binding is limited to by the storage fallback, or ~0U
+};
+
+/// What the lookahead threads prepare for a draw they reach before the GPU thread does. The
+/// lookahead thread makes the lookup and takes the registers below, the binding thread the rest.
+struct DrawAhead {
+    PipelineLookup lookup;
+    /// Count of the GPU's writes to guest memory before the lookup read any of it.
+    u64 gpu_write_epoch{};
+    u64 run{};
+    /// The bytes the index buffer binding of the draw covers, if it has one.
+    VAddr index_address{};
+    u64 index_size{};
+    u32 step_rate_0{};
+    u32 step_rate_1{};
+
+    /// Count of the GPU's writes to guest memory before the bytes of the bindings were read.
+    u64 binding_write_epoch{};
+    /// Position of the buffer cache's reads ahead before those of this draw.
+    u64 stream_position{};
+    /// The bytes of the draw's read-only bindings the stream buffer could serve.
+    std::vector<VideoCore::BufferCache::StreamHint> stream_hints;
+
+    /// From the user data the lookup read, for each stage: the V#s of its guest buffers, and
+    /// the lookup key of the first binding of each of its images with the key's hash.
+    struct StageSharps {
+        const Shader::Info* info;
+        u32 first_buffer;
+        u32 first_image;
+        /// Buffers and images the stage had when they were made.
+        u32 num_buffers;
+        u32 num_images;
+    };
+    struct ImageKey {
+        TextureKey key;
+        u64 hash;
+    };
+    boost::container::static_vector<StageSharps, MaxShaderStages> stage_sharps;
+    std::vector<AmdGpu::Buffer> buffer_sharps;
+    std::vector<ImageKey> image_keys;
+
+    /// The vertex inputs of the draw, from the V#s the lookup read, and the ranges of its vertex
+    /// buffers merged and in address order.
+    bool has_vertex_inputs{};
+    VertexInputs<vk::VertexInputAttributeDescription2EXT> attributes;
+    VertexInputs<vk::VertexInputBindingDescription2EXT> bindings;
+    VertexInputs<AmdGpu::Buffer> guest_buffers;
+    VertexInputs<std::pair<VAddr, VAddr>> vertex_ranges;
+};
+
 class Rasterizer {
 public:
     explicit Rasterizer(const Instance& instance, Scheduler& scheduler, Runtime& runtime,
@@ -91,6 +147,35 @@ public:
         return pipeline_cache;
     }
 
+    /// For the lookahead thread: looks the pipeline of a draw up from the registers it will run
+    /// with. run names the run of draws the draw belongs to.
+    void LookAhead(DrawAhead& ahead, const AmdGpu::Regs& regs, bool is_indexed, u32 index_offset,
+                   u64 run);
+
+    /// For the binding thread: reads the bytes of the bindings of a draw whose pipeline was
+    /// looked up ahead, and makes its vertex inputs, V#s and texture lookup keys.
+    void BindAhead(DrawAhead& ahead);
+
+    /// The lookahead threads wrote what they prepared on other processors. Asks for the memory
+    /// the three draws behind the one taken read, each a step further than the one after it:
+    /// the table slots of next, the arrays of second, the entry of third. Null for a draw whose
+    /// result is not finished. The slots of taken are asked for if they were not as next.
+    void PrefetchDrawsAhead(const DrawAhead& taken, const DrawAhead* next, const DrawAhead* second,
+                            const DrawAhead* third);
+
+    /// Hands over what the lookahead thread prepared for the next draw, if anything.
+    void SetDrawAhead(const DrawAhead* ahead) {
+        draw_ahead = ahead;
+    }
+
+    /// Whether the GPU thread has time left for the submits auto mode makes for the host GPU.
+    void SetSubmitSlack(bool has_slack) {
+        has_submit_slack = has_slack;
+    }
+
+    /// Whether a draw with these registers gets as far as looking its pipeline up.
+    static bool NeedsPipeline(const AmdGpu::Regs& regs);
+
     template <typename Func>
     void ForEachMappedRangeInRange(VAddr addr, u64 size, Func&& func) {
         const auto range = decltype(mapped_ranges)::interval_type::right_open(addr, addr + size);
@@ -113,6 +198,8 @@ private:
     void EliminateFastClear();
 
     void UpdateDynamicState(const GraphicsPipeline* pipeline, bool is_indexed) const;
+    /// The dynamic state values that are made from the registers alone.
+    void UpdateRegsDynamicState(bool is_indexed) const;
     void UpdateViewportScissorState() const;
     void UpdateDepthStencilState() const;
     void UpdatePrimitiveState(bool is_indexed) const;
@@ -121,17 +208,39 @@ private:
 
     bool FilterDraw();
 
+    /// Returns the pipeline of the draw and loads its stages' user data, using the lookup made
+    /// ahead when its inputs still hold.
+    const GraphicsPipeline* LookupPipeline(const DrawIndirectParams& params);
+
+    /// Takes the lock of the pipeline cache's lookups, running the commands of other threads
+    /// while the lookahead thread holds it.
+    std::unique_lock<std::mutex> LockPipelineLookups();
+
+    /// Loads the user data of the stages of the GPU thread's own lookup.
+    void LoadStageUserData(const PipelineLookup& lookup);
+
+    /// Loads the user data of the stages of a lookup made ahead, if the lookup holds for the
+    /// draw. Without GPU writes to guest memory since, what the lookup read is what the draw
+    /// reads; else all of it is read again.
+    bool LoadStageUserDataAhead(const DrawAhead& ahead);
+
     void BindBuffers(const Shader::Info& stage, Shader::Backend::Bindings& binding,
                      Shader::PushData& push_data);
     void BindTextures(const Shader::Info& stage, Shader::Backend::Bindings& binding);
     bool BindResources(const Pipeline* pipeline);
+
+    /// What the binding thread made of the stage's user data, if the draw's lookup came from
+    /// the lookahead.
+    const DrawAhead::StageSharps* FindSharpsAhead(const Shader::Info& stage) const;
 
     void BindVertexBuffers(const GraphicsPipeline* pipeline);
     void BindIndexBuffer(u32 index_offset = 0, bool is_indirect = false);
 
     void ResetBindings(bool is_compute);
 
-    void FlushPeriodically();
+    /// Submits when enough was recorded since the last submit. is_dispatch: called for a
+    /// dispatch, not a draw.
+    void FlushPeriodically(bool is_dispatch = false);
 
     bool IsComputeMetaClear(const Pipeline* pipeline);
     bool IsComputeImageCopy(const Pipeline* pipeline);
@@ -151,9 +260,37 @@ private:
     boost::icl::interval_set<VAddr> mapped_ranges;
     Common::SharedFirstMutex mapped_ranges_mutex;
     PipelineCache pipeline_cache;
+    std::array<Shader::StageUserData, MaxShaderStages> stage_user_data;
+    PipelineLookup own_lookup;
+    const DrawAhead* draw_ahead{};
+    /// The lookahead result the pipeline of the draw came from, for its vertex inputs.
+    const DrawAhead* vertex_ahead{};
+    /// The lookahead result whose table slots PrefetchDrawsAhead asked for last.
+    const DrawAhead* slots_ahead{};
+    /// The lookahead result the stages being bound take their V#s and texture keys from.
+    const DrawAhead* sharps_ahead{};
+    /// What the dynamic state values taken from the registers were made for last.
+    mutable u64 dynamic_regs_generation{};
+    mutable bool dynamic_is_indexed{};
+    bool has_submit_slack{true};
+    /// Draws between two hand-overs of recorded commands to the recorder thread.
+    static constexpr u32 PublishDrawInterval = 4;
+    u32 draws_recorded{};
+    /// For releasing the buffer cache's reads ahead: the tick the last draw prepared ahead
+    /// started in, and where the reads stood before those of that draw.
+    u64 stream_ahead_tick{};
+    u64 stream_ahead_position{};
     const bool host_markers_enabled;
     const bool guest_markers_enabled;
+    /// 0: no submits inside a frame. SubmitIntervalAuto, which is what -1 in the config reads
+    /// as: auto. Else after that many draws and dispatches.
     const u32 submit_draw_interval;
+    static constexpr u32 SubmitIntervalAuto = ~0U;
+    /// In auto mode, the least number of draws and dispatches between two submits, the number
+    /// from which a submit is made once the GPU has run everything submitted, and the largest.
+    static constexpr u32 AutoSubmitMinDraws = 128;
+    static constexpr u32 AutoSubmitIdleDraws = 256;
+    static constexpr u32 AutoSubmitMaxDraws = 2000;
     u64 last_submit_tick{};
     u32 draws_since_submit{};
 
@@ -166,41 +303,56 @@ private:
     ImageBinding db_desc;
 
     /// Registers and result of the last render target lookup that found a perfect match. The
-    /// same registers give the same image while the texture cache registry generation is equal.
+    /// same registers give the same image while the texture cache registry generation is equal
+    /// and no image in its range was swapped with a parked alias.
+    /// A lookup holds while generation and swaps are those of the texture cache and the
+    /// scheduler tick is not past valid_until.
     struct ColorTargetLookup {
         u64 generation{};
+        u64 swaps{};
+        u64 valid_until{};
         AmdGpu::ColorBuffer col_buf;
         AmdGpu::CbDbExtent hint;
         ImageBinding binding;
     };
     struct DepthTargetLookup {
         u64 generation{};
+        u64 swaps{};
+        u64 valid_until{};
         AmdGpu::DepthBuffer depth_buffer;
         AmdGpu::DepthView depth_view;
-        AmdGpu::DepthControl depth_control;
         VAddr htile_address;
         AmdGpu::CbDbExtent hint;
         ImageBinding binding;
     };
     std::array<ColorTargetLookup, AmdGpu::NUM_COLOR_BUFFERS> cb_lookups{};
-    DepthTargetLookup db_lookup{};
+    /// Of the depth control register the lookup only reads depth_write_enable, which is the
+    /// index here.
+    std::array<DepthTargetLookup, 2> db_lookups{};
 
-    /// Inputs of a texture lookup: the T# and the shader resource fields ImageDesc reads.
-    struct TextureKey {
-        AmdGpu::Image tsharp;
-        u32 is_depth;
-        u32 is_array;
-        u32 is_written;
-        u32 mip_level; ///< Mip the binding is limited to by the storage fallback, or ~0U
-    };
-    /// Last texture lookup that found a perfect match, per hash slot of its key. The same key
-    /// gives the same image while the texture cache registry generation is equal.
+    /// Last texture lookup of a key. The same key gives the same image while the texture cache
+    /// registry generation is equal and no image in its range was swapped with a parked alias.
     struct TextureLookup {
         u64 generation{};
+        u64 swaps{};
+        u64 valid_until{};
         TextureKey key;
         ImageBinding binding;
     };
-    std::array<TextureLookup, 512> texture_lookups{};
+    /// The lookups are kept in sets of TextureLookupWays, chosen by the hash of the key. A set
+    /// has the hashes of its lookups and when each was used last in one cache line.
+    static constexpr u32 TextureLookupWays = 4;
+    static constexpr u32 TextureLookupSets = 2048;
+    struct alignas(64) TextureLookupSet {
+        std::array<u64, TextureLookupWays> hashes{};
+        std::array<u64, TextureLookupWays> last_uses{};
+    };
+    std::array<TextureLookupSet, TextureLookupSets> texture_lookup_sets{};
+    std::array<TextureLookup, TextureLookupSets * TextureLookupWays> texture_lookups{};
+    u64 texture_lookup_clock{};
+    /// The lookup of the key, or the one of its set that was used longest ago, for the caller
+    /// to fill with the key.
+    TextureLookup& FindTextureLookup(const TextureKey& key, u64 hash);
 
     boost::container::static_vector<vk::DescriptorImageInfo, Shader::NUM_IMAGES> image_infos;
     boost::container::static_vector<vk::DescriptorBufferInfo, Shader::NUM_BUFFERS> buffer_infos;

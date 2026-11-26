@@ -400,8 +400,6 @@ bool Instance::CreateDevice() {
         .queueCount = queue_count,
         .pQueuePriorities = queue_priorities.data(),
     };
-    LOG_INFO(Render_Vulkan, "Queue family {} has {} queues, using {}", queue_family_index,
-             family_properties[queue_family_index].queueCount, queue_count);
 
     const auto vk11_features = feature_chain.get<vk::PhysicalDeviceVulkan11Features>();
     vk12_features = feature_chain.get<vk::PhysicalDeviceVulkan12Features>();

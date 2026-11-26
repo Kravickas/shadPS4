@@ -1,4 +1,4 @@
-// SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
+// SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <imgui.h>
@@ -134,6 +134,7 @@ void DebugStateImpl::PushQueueDump(QueueDump dump) {
                     reinterpret_cast<uintptr_t>(header) - reinterpret_cast<uintptr_t>(initial_data);
                 const auto addr = dump.base_addr + offset;
                 waiting_reg_dumps.emplace(addr, &frame);
+                has_waiting_reg_dumps = true;
                 waiting_reg_dumps_dbg.emplace(
                     addr,
                     fmt::format("#{} h({}) queue {} {} {}",
@@ -153,6 +154,7 @@ std::optional<RegDump*> DebugStateImpl::GetRegDump(uintptr_t base_addr, uintptr_
     }
     auto& frame = *it->second;
     waiting_reg_dumps.erase(it);
+    has_waiting_reg_dumps = !waiting_reg_dumps.empty();
     waiting_reg_dumps_dbg.erase(waiting_reg_dumps_dbg.find(header_addr));
     return &frame.regs[header_addr - base_addr];
 }

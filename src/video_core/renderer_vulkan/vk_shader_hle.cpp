@@ -1,4 +1,4 @@
-// SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
+// SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include "shader_recompiler/info.h"
@@ -12,15 +12,15 @@ namespace Vulkan {
 
 static constexpr u64 COPY_SHADER_HASH = 0xfefebf9f;
 
-static bool ExecuteCopyShaderHLE(const Shader::Info& info, const AmdGpu::ComputeProgram& cs_program,
-                                 Rasterizer& rasterizer) {
+static bool ExecuteCopyShaderHLE(const Shader::Info& info, const Shader::StageUserData& user_data,
+                                 const AmdGpu::ComputeProgram& cs_program, Rasterizer& rasterizer) {
     auto& runtime = rasterizer.GetRuntime();
     auto& buffer_cache = rasterizer.GetBufferCache();
 
     // Copy shader defines three formatted buffers as inputs: control, source, and destination.
-    const auto ctl_buf_sharp = info.buffers[0].GetSharp(info);
-    const auto src_buf_sharp = info.buffers[1].GetSharp(info);
-    const auto dst_buf_sharp = info.buffers[2].GetSharp(info);
+    const auto ctl_buf_sharp = info.buffers[0].GetSharp(user_data);
+    const auto src_buf_sharp = info.buffers[1].GetSharp(user_data);
+    const auto dst_buf_sharp = info.buffers[2].GetSharp(user_data);
     const auto buf_stride = src_buf_sharp.GetStride();
     ASSERT(buf_stride == dst_buf_sharp.GetStride());
 
@@ -71,11 +71,12 @@ static bool ExecuteCopyShaderHLE(const Shader::Info& info, const AmdGpu::Compute
     return true;
 }
 
-bool ExecuteShaderHLE(const Shader::Info& info, const AmdGpu::Regs& regs,
-                      const AmdGpu::ComputeProgram& cs_program, Rasterizer& rasterizer) {
+bool ExecuteShaderHLE(const Shader::Info& info, const Shader::StageUserData& user_data,
+                      const AmdGpu::Regs& regs, const AmdGpu::ComputeProgram& cs_program,
+                      Rasterizer& rasterizer) {
     switch (info.pgm_hash) {
     case COPY_SHADER_HASH:
-        return ExecuteCopyShaderHLE(info, cs_program, rasterizer);
+        return ExecuteCopyShaderHLE(info, user_data, cs_program, rasterizer);
     default:
         return false;
     }

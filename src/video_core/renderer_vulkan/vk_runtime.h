@@ -99,7 +99,10 @@ private:
         AccessList write_ranges;
     };
     BufferBarriers* resource{};
+    /// The first num_resources entries are in use. The others are empty and keep the storage
+    /// of their lists for the buffers after the next flush.
     std::vector<BufferBarriers> resources;
+    std::size_t num_resources{};
     VideoCore::Image::Barriers image_barriers;
     vk::MemoryBarrier2 memory_barrier{};
 };

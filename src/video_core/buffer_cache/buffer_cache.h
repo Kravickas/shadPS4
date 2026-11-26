@@ -11,6 +11,7 @@
 #include <span>
 #include <thread>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 #include <boost/container/small_vector.hpp>
 
@@ -44,6 +45,27 @@ namespace VideoCore {
 class TextureCache;
 class MemoryTracker;
 class PageManager;
+
+inline constexpr std::size_t CacheLineSize = 64;
+
+/// Tells the processor that the cache line of address is read soon.
+inline void PrefetchRead(const void* address) {
+#if defined(__GNUC__) || defined(__clang__)
+    __builtin_prefetch(address);
+#endif
+}
+
+/// The same for every cache line with a byte of the range.
+inline void PrefetchRead(const void* address, std::size_t size) {
+    if (size == 0) {
+        return;
+    }
+    const auto* const bytes = static_cast<const u8*>(address);
+    for (std::size_t offset = 0; offset < size; offset += CacheLineSize) {
+        PrefetchRead(bytes + offset);
+    }
+    PrefetchRead(bytes + size - 1);
+}
 
 enum class ObtainBufferFlags {
     None = 0,
@@ -99,6 +121,16 @@ public:
 
     void TickFrame();
 
+    /// Called at every submit of the GPU thread's command buffer, with the tick advanced.
+    /// TickFrame is only called once per frame.
+    void OnSubmit();
+
+    /// Whether the open command buffer holds a GPU write to memory the readback thread
+    /// downloads for the game's threads.
+    [[nodiscard]] bool IsEagerWritePending() const {
+        return eager_write_pending.load(std::memory_order_relaxed);
+    }
+
     /// Invalidates any buffer in the logical page range.
     void InvalidateMemory(VAddr device_addr, u64 size, bool assume_locks = false);
 
@@ -126,6 +158,53 @@ public:
     /// Finds a buffer for the specified region.
     [[nodiscard]] std::pair<const Buffer*, u64> ObtainBuffer(
         VAddr device_addr, u32 size, ObtainBufferFlags flags = ObtainBufferFlags::None);
+
+    /// Bytes of a read-only binding, read from guest memory ahead of the draw that binds it.
+    struct StreamHint {
+        VAddr device_addr;
+        u32 size;
+        u64 id; ///< Names the bytes: hints with the same id hold the same bytes
+        const u8* data;
+    };
+
+    /// For the lookahead thread: reads the bytes of a binding the stream buffer could serve.
+    /// The bytes stay where the hint points until the hints of a later draw are released.
+    /// run names the run of draws the binding belongs to, gpu_write_epoch is the count of GPU
+    /// writes to guest memory from before the draw's reads. A range already read in the same
+    /// run with no GPU write to guest memory since is not read again. Returns false if there
+    /// is no hint for the binding.
+    bool ReadStreamAhead(VAddr device_addr, u64 size, u64 run, u64 gpu_write_epoch,
+                         StreamHint& hint);
+
+    /// For the lookahead thread: where its next bytes go. Hints made after this was read point
+    /// to bytes not more than StreamAheadWindow behind it.
+    u64 StreamAheadPosition() const noexcept {
+        return stream_ahead_position;
+    }
+
+    /// Lets the lookahead thread reuse the space of bytes no hint made at position or later
+    /// can point to. Nothing recorded for the GPU may still read hints made before position.
+    void ReleaseStreamAhead(u64 position);
+
+    /// Hints for the ObtainBuffer calls of the draw in progress, made when the count of GPU
+    /// writes to guest memory was gpu_write_epoch.
+    void SetStreamHints(std::span<const StreamHint> hints, u64 gpu_write_epoch) {
+        stream_hints = hints;
+        stream_hint_cursor = 0;
+        stream_hints_epoch = gpu_write_epoch;
+    }
+
+    /// Asks for the entries the bindings of the hints look their last copy up in.
+    void PrefetchStreamCopies(std::span<const StreamHint> hints) const {
+        for (const StreamHint& hint : hints) {
+            PrefetchRead(&stream_copies[StreamCopySlot(hint.device_addr, hint.size)],
+                         sizeof(StreamCopy));
+        }
+    }
+
+    void ClearStreamHints() {
+        stream_hints = {};
+    }
 
     /// Attempts to obtain a buffer without modifying the cache contents.
     [[nodiscard]] std::pair<const Buffer*, u64> ObtainBufferForImage(VAddr device_addr, u32 size);
@@ -237,6 +316,13 @@ private:
         return ((device_addr ^ (size << 40)) * 0x9E3779B97F4A7C15ULL) >> (64 - StreamCopySlotBits);
     }
 
+    static constexpr u64 StreamAheadSlot(VAddr device_addr, u64 size) {
+        return ((device_addr ^ (size << 40)) * 0x9E3779B97F4A7C15ULL) >> (64 - StreamAheadSlotBits);
+    }
+
+    /// The hint of the draw in progress for a binding, if it has one that still holds.
+    const StreamHint* FindStreamHint(VAddr device_addr, u32 size);
+
     bool SynchronizeMemoryFromImage(const Buffer* arena, VAddr device_addr, u32 size);
 
     const Vulkan::Instance& instance;
@@ -259,6 +345,8 @@ private:
         u64 tick;
         u64 stream_offset;
         u64 shadow_offset;
+        /// Id of the hint the copy was made from, 0 when its bytes are in the shadow.
+        u64 ahead_id;
     };
     static constexpr u64 StreamCopySlotBits = 12;
     std::array<StreamCopy, 1ULL << StreamCopySlotBits> stream_copies{};
@@ -266,6 +354,31 @@ private:
     std::vector<u8> stream_shadow;
     u64 stream_shadow_used{};
     u64 stream_shadow_tick{};
+    std::span<const StreamHint> stream_hints;
+    u32 stream_hint_cursor{};
+    u64 stream_hints_epoch{};
+
+    /// Bytes the lookahead thread read, in a ring it fills in order. A position is a count of
+    /// bytes since the start; the bytes at a position are at position % StreamAheadSize.
+    static constexpr u64 StreamAheadSize = 128_MB;
+    static constexpr u64 StreamAheadWindow = 32_MB;
+    /// The last read of each range, to give equal bytes the same id. Lookahead thread only.
+    struct StreamAheadCopy {
+        VAddr device_addr;
+        u64 size;
+        u64 position;
+        u64 id;
+        /// The run the bytes were last read or compared in, and the epoch of that read.
+        u64 run;
+        u64 gpu_write_epoch;
+    };
+    static constexpr u64 StreamAheadSlotBits = 15;
+    alignas(64) std::unique_ptr<u8[]> stream_ahead_data;
+    std::unique_ptr<StreamAheadCopy[]> stream_ahead_copies;
+    u64 stream_ahead_position{};
+    u64 stream_ahead_last_id{};
+    /// Positions below this are free. Set by the GPU thread, read by the lookahead thread.
+    alignas(64) std::atomic<u64> stream_ahead_released{};
     Buffer gds_buffer;
     std::unique_ptr<Buffer> null_index_buffer;
     /// Guards the GPU-modified state against readbacks running on guest threads: the tracker's
@@ -303,16 +416,38 @@ private:
     };
     std::unordered_map<u64, EmulatedAccesses> emulated_accesses;
     static constexpr u32 MaxEmulatedAccesses = 512;
-    /// Scheduler tick of the last writable binding per WriteTickChunk bytes of guest memory.
-    std::unordered_map<u64, u64> write_ticks;
+    /// Scheduler tick of the last writable binding of each page of guest memory, as ranges of
+    /// pages with the same tick.
+    RangeMap<u64> write_ticks;
     static constexpr u64 WriteTickChunkBits = 16;
-    /// The same per page, to tell for a few pages whether their own GPU writes were submitted.
-    std::unordered_map<u64, u64> page_write_ticks;
     static constexpr u64 MaxPageTickRange = 1ULL << WriteTickChunkBits;
     /// Readback windows that held GPU-modified data recently: start -> {size, scheduler tick}.
     /// A readback downloads all of them that are ready, so the CPU does not fault on each one.
     std::unordered_map<VAddr, std::pair<u64, u64>> hot_windows;
     static constexpr u64 HotWindowTicks = 4;
+    /// Pages a readback was needed for: page address -> scheduler tick of the last one. A game
+    /// that reuses memory each frame faults on the same pages again, so once the GPU has run
+    /// the last write to such a page the readback thread downloads it, which is what a fault
+    /// at that moment would do. A page without a fault for EagerPageTicks is dropped.
+    std::unordered_map<VAddr, u64> eager_pages;
+    static constexpr u64 EagerPageTicks = 1024;
+    std::atomic<bool> has_eager_pages{};
+    /// The 64 KB chunks that hold eager pages, to find them from a written range.
+    static constexpr u64 EagerChunkBits = 16;
+    std::unordered_set<u64> eager_chunks;
+    /// A GPU write to an eager page was recorded since the last submit.
+    std::atomic<bool> eager_write_pending{};
+    [[nodiscard]] bool WritesEagerPage(VAddr device_addr, u64 size) const;
+    std::mutex eager_mutex;
+    std::condition_variable_any eager_cv;
+    u64 eager_kicks{};
+
+    /// Remembers the pages of an access that faulted on GPU-modified memory.
+    void NoteFaultedPages(VAddr device_addr, u64 size);
+    /// The eager pages with GPU-modified data whose last write the GPU ran by gpu_tick.
+    void CollectEagerPages(u64 gpu_tick,
+                           boost::container::small_vector<DownloadWindow, 16>& windows);
+    void EagerReadbackThread(std::stop_token stoken);
     /// Windows whose GPU-modified ranges were taken out of gpu_modified_ranges and whose data
     /// is not written back yet.
     struct DownloadInFlight {
@@ -352,12 +487,22 @@ private:
         }
     };
     IntervalList<Backing> resident_ranges;
+    /// Block ranges found resident, per slot of their first block. Resident ranges are only
+    /// added, so such a range stays resident.
+    struct ResidentHit {
+        u64 first_block{1};
+        u64 last_block{0};
+    };
+    std::array<ResidentHit, 4096> resident_hits{};
 
     u32 arena_memory_type_index{};
     u32 block_size{};
     u32 block_shift{};
     u32 blocks_per_arena_page{};
     u32 blocks_per_arena_page_shift{};
+
+    /// Last member: it stops before anything it uses is destroyed.
+    std::jthread eager_readback_thread;
 };
 
 } // namespace VideoCore

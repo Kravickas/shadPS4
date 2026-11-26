@@ -227,6 +227,44 @@ bool MemoryManager::TryWriteBacking(void* address, const void* data, u64 size) {
     return true;
 }
 
+bool MemoryManager::WriteBackingFromGpu(void* address, const void* data, u64 size) {
+    const GpuWrite write{std::bit_cast<VAddr>(address), size};
+    {
+        std::scoped_lock lk{gpu_writes_mutex};
+        gpu_writes_active.push_back(write);
+        ++num_gpu_writes_active;
+    }
+    const bool is_written = TryWriteBacking(address, data, size);
+    {
+        std::scoped_lock lk{gpu_writes_mutex};
+        const auto it = std::ranges::find_if(gpu_writes_active, [&](const GpuWrite& active) {
+            return active.address == write.address && active.size == write.size;
+        });
+        gpu_writes_active.erase(it);
+        const u64 epoch = gpu_write_epoch.load(std::memory_order_relaxed) + 1;
+        gpu_writes[epoch % NumGpuWrites] = write;
+        // In this order for IsFreeOfGpuWrites.
+        gpu_write_epoch.store(epoch);
+        --num_gpu_writes_active;
+    }
+    return is_written;
+}
+
+bool MemoryManager::IsGpuWrittenSince(u64 epoch, VAddr address, u64 size) {
+    std::scoped_lock lk{gpu_writes_mutex};
+    const u64 current = gpu_write_epoch.load(std::memory_order_relaxed);
+    if (current - epoch > NumGpuWrites) {
+        return true;
+    }
+    for (u64 later = epoch + 1; later <= current; ++later) {
+        if (gpu_writes[later % NumGpuWrites].Overlaps(address, size)) {
+            return true;
+        }
+    }
+    return std::ranges::any_of(
+        gpu_writes_active, [&](const GpuWrite& active) { return active.Overlaps(address, size); });
+}
+
 PAddr MemoryManager::PoolExpand(PAddr search_start, PAddr search_end, u64 size, u64 alignment) {
     std::scoped_lock lk{mutex, unmap_mutex};
     alignment = alignment > 0 ? alignment : 64_KB;

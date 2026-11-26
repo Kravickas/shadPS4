@@ -3,12 +3,15 @@
 
 #include <algorithm>
 #include <bit>
+#include <chrono>
 #include <cstring>
+#include <functional>
 #include <limits>
 #include <magic_enum/magic_enum.hpp>
 #include <xxhash.h>
 
 #include "common/alignment.h"
+#include "common/thread.h"
 #include "core/debug_state.h"
 #include "core/memory.h"
 #include "video_core/amdgpu/liverpool.h"
@@ -88,6 +91,8 @@ BufferCache::BufferCache(const Vulkan::Instance& instance_, Vulkan::Scheduler& s
       stream_buffer{instance, scheduler, MemoryType::Stream, STREAM_BUFFER_SIZE},
       gds_buffer{instance, 0, GDS_BUFFER_SIZE, MemoryType::Stream, "GDS Buffer"},
       stream_shadow(STREAM_SHADOW_SIZE),
+      stream_ahead_data{std::make_unique_for_overwrite<u8[]>(StreamAheadSize)},
+      stream_ahead_copies{std::make_unique<StreamAheadCopy[]>(1ULL << StreamAheadSlotBits)},
       emulated_chunks{std::make_unique<std::atomic<u64>[]>(NumEmulatedChunkWords)},
       memory_semaphore{instance} {
     const vk::BufferCreateInfo probe_ci = {
@@ -125,6 +130,8 @@ BufferCache::BufferCache(const Vulkan::Instance& instance_, Vulkan::Scheduler& s
                                                      MemoryType::DeviceLocal, "Null Index Buffer");
         runtime.FillBuffer(null_index_buffer.get(), 0u, NULL_INDEX_BUFFER_SIZE, 0u);
     }
+
+    eager_readback_thread = std::jthread{std::bind_front(&BufferCache::EagerReadbackThread, this)};
 }
 
 BufferCache::~BufferCache() = default;
@@ -132,6 +139,130 @@ BufferCache::~BufferCache() = default;
 void BufferCache::TickFrame() {
     if (std::exchange(fault_process_pending, false)) {
         fault_manager->ProcessFaultBuffer();
+    }
+}
+
+void BufferCache::OnSubmit() {
+    eager_write_pending.store(false, std::memory_order_relaxed);
+    // A tick was submitted: the readback thread waits for the GPU to run it.
+    if (has_eager_pages.load(std::memory_order_relaxed)) {
+        {
+            std::scoped_lock lk{eager_mutex};
+            ++eager_kicks;
+        }
+        eager_cv.notify_one();
+    }
+}
+
+void BufferCache::NoteFaultedPages(VAddr device_addr, u64 size) {
+    const VAddr page_end = Common::AlignUp(device_addr + size, BYTES_PER_PAGE);
+    const u64 tick = scheduler.CurrentTick();
+    for (VAddr page = Common::AlignDown(device_addr, BYTES_PER_PAGE); page < page_end;
+         page += BYTES_PER_PAGE) {
+        const auto [it, is_new] = eager_pages.try_emplace(page, tick);
+        if (is_new) {
+            eager_chunks.insert(page >> EagerChunkBits);
+        } else {
+            it->second = tick;
+        }
+    }
+    has_eager_pages.store(true, std::memory_order_relaxed);
+}
+
+bool BufferCache::WritesEagerPage(VAddr device_addr, u64 size) const {
+    if (size == 0) {
+        return false;
+    }
+    const VAddr end = device_addr + size;
+    for (u64 chunk = device_addr >> EagerChunkBits; chunk <= (end - 1) >> EagerChunkBits; ++chunk) {
+        if (!eager_chunks.contains(chunk)) {
+            continue;
+        }
+        const VAddr chunk_begin = chunk << EagerChunkBits;
+        const VAddr page_end = std::min<VAddr>(end, chunk_begin + (1ULL << EagerChunkBits));
+        for (VAddr page = Common::AlignDown(std::max(device_addr, chunk_begin), BYTES_PER_PAGE);
+             page < page_end; page += BYTES_PER_PAGE) {
+            if (eager_pages.contains(page)) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+void BufferCache::CollectEagerPages(u64 gpu_tick,
+                                    boost::container::small_vector<DownloadWindow, 16>& windows) {
+    const u64 current_tick = scheduler.CurrentTick();
+    bool is_erased = false;
+    for (auto it = eager_pages.begin(); it != eager_pages.end();) {
+        const VAddr page = it->first;
+        if (current_tick - it->second > EagerPageTicks) {
+            it = eager_pages.erase(it);
+            is_erased = true;
+            continue;
+        }
+        ++it;
+        const VAddr page_end = page + BYTES_PER_PAGE;
+        const Buffer* arena = address_space[page >> ARENA_PAGE_BITS];
+        if (!arena || !memory_tracker->IsRegionGpuModified(page, BYTES_PER_PAGE)) {
+            continue;
+        }
+        if (OverlapsDownloadInFlight(page, page_end) || OverlapsDeferredDownload(page, page_end)) {
+            continue;
+        }
+        if (!gpu_modified_ranges.Intersects(page, BYTES_PER_PAGE)) {
+            // Marked GPU-modified without GPU data: unmarked as FinishReadback does at a fault.
+            memory_tracker->UnmarkRegionAsGpuModified(page, BYTES_PER_PAGE, false);
+            continue;
+        }
+        if (LastWriteTick(page, BYTES_PER_PAGE) > gpu_tick) {
+            continue;
+        }
+        windows.push_back({arena, page, BYTES_PER_PAGE});
+    }
+    if (is_erased) {
+        eager_chunks.clear();
+        for (const auto& [page, tick] : eager_pages) {
+            eager_chunks.insert(page >> EagerChunkBits);
+        }
+    }
+    if (eager_pages.empty()) {
+        has_eager_pages.store(false, std::memory_order_relaxed);
+    }
+}
+
+void BufferCache::EagerReadbackThread(std::stop_token stoken) {
+    Common::SetCurrentThreadName("shadPS4:GpuReadback");
+    auto* const work_semaphore = scheduler.GetWorkSemaphore();
+    u64 seen_kicks = 0;
+    // The GPU tick the pages were last collected for.
+    u64 done_tick = 0;
+    boost::container::small_vector<DownloadWindow, 16> windows;
+    while (!stoken.stop_requested()) {
+        work_semaphore->Refresh();
+        u64 gpu_tick = work_semaphore->KnownGpuTick();
+        if (gpu_tick <= done_tick) {
+            if (done_tick + 1 >= scheduler.CurrentTick()) {
+                // Every submitted tick was handled.
+                std::unique_lock lk{eager_mutex};
+                if (!eager_cv.wait(lk, stoken, [&] { return eager_kicks != seen_kicks; })) {
+                    return;
+                }
+                seen_kicks = eager_kicks;
+                continue;
+            }
+            // Nothing is held in flight while the GPU runs the tick, so until then a faulting
+            // thread is served as without this thread.
+            work_semaphore->Wait(done_tick + 1);
+            gpu_tick = work_semaphore->KnownGpuTick();
+        }
+        done_tick = gpu_tick;
+        windows.clear();
+        std::unique_lock lk{modified_mutex};
+        CollectEagerPages(gpu_tick, windows);
+        if (!windows.empty()) {
+            DownloadAhead(lk, windows);
+        }
     }
 }
 
@@ -179,6 +310,11 @@ bool BufferCache::AccessBesideGpuData(VAddr device_addr, u32 size, bool is_write
         accesses.count = 0;
         return false;
     }
+    // The page is one the game touches beside GPU data: a submit behind the next write to it
+    // lets the readback thread have it ready.
+    NoteFaultedPages(device_addr, size);
+    // The write it lies beside is in the open command buffer.
+    eager_write_pending.store(true, std::memory_order_relaxed);
     if (is_write) {
         if (!memory->TryWriteBacking(std::bit_cast<u8*>(device_addr), data, size)) {
             return false;
@@ -196,7 +332,7 @@ void BufferCache::WriteAndUnmarkGpuModified(VAddr device_addr, const u8* data, u
     std::unique_lock lk{modified_mutex};
     // A download in flight would write the older buffer cache data over this data.
     WaitDownloadsInFlight(lk, device_addr, device_addr + size);
-    memory->TryWriteBacking(std::bit_cast<u8*>(device_addr), data, size);
+    memory->WriteBackingFromGpu(std::bit_cast<u8*>(device_addr), data, size);
     memory_tracker->UnmarkRegionAsGpuModified(device_addr, size, true);
     gpu_modified_ranges.Subtract(device_addr, size);
 }
@@ -204,13 +340,16 @@ void BufferCache::WriteAndUnmarkGpuModified(VAddr device_addr, const u8* data, u
 void BufferCache::ReadMemory(VAddr device_addr, u64 size, bool is_write, bool async,
                              bool assume_locks) {
     if (assume_locks) {
-        // Already on the GPU thread.
         ReadMemoryOnGpuThread(device_addr, size, is_write, async);
-    } else if (async || !ReadMemoryOnCallingThread(device_addr, size, is_write)) {
+        return;
+    }
+    const auto wait_start = std::chrono::steady_clock::now();
+    if (async || !ReadMemoryOnCallingThread(device_addr, size, is_write)) {
         liverpool->SendCommand<true>([this, device_addr, size, is_write, async] {
             ReadMemoryOnGpuThread(device_addr, size, is_write, async);
         });
     }
+    DebugState.frame_guest_wait_ns.Add(std::chrono::steady_clock::now() - wait_start);
 }
 
 bool BufferCache::ReadMemoryOnCallingThread(VAddr device_addr, u64 size, bool is_write) {
@@ -230,6 +369,7 @@ bool BufferCache::ReadMemoryOnCallingThread(VAddr device_addr, u64 size, bool is
         }
         window = GetDownloadWindow(arena, device_addr, size);
     } while (WaitDownloadsInFlight(lk, window.start, window.start + window.size));
+    NoteFaultedPages(device_addr, size);
     if (IsGpuWriteSubmitted(window.start, window.size)) {
         hot_windows[window.start] = {window.size, scheduler.CurrentTick()};
     } else {
@@ -264,6 +404,7 @@ void BufferCache::ReadMemoryOnGpuThread(VAddr device_addr, u64 size, bool is_wri
     const bool ahead = !async && IsGpuWriteSubmitted(window.start, window.size);
     if (!async) {
         hot_windows[window.start] = {window.size, scheduler.CurrentTick()};
+        NoteFaultedPages(device_addr, size);
     }
     if (ahead) {
         boost::container::small_vector<DownloadWindow, 16> windows{window};
@@ -324,22 +465,12 @@ bool BufferCache::IsGpuWriteSubmitted(VAddr device_addr, u64 size) const {
 }
 
 u64 BufferCache::LastWriteTick(VAddr device_addr, u64 size) const {
+    const u64 granule = size <= MaxPageTickRange ? BYTES_PER_PAGE : 1ULL << WriteTickChunkBits;
+    const VAddr begin = Common::AlignDown(device_addr, granule);
+    const VAddr end = Common::AlignUp(device_addr + size, granule);
     u64 last_tick = 0;
-    if (size <= MaxPageTickRange) {
-        for (u64 page = device_addr / BYTES_PER_PAGE;
-             page <= (device_addr + size - 1) / BYTES_PER_PAGE; ++page) {
-            if (const auto it = page_write_ticks.find(page); it != page_write_ticks.end()) {
-                last_tick = std::max(last_tick, it->second);
-            }
-        }
-        return last_tick;
-    }
-    for (u64 chunk = device_addr >> WriteTickChunkBits;
-         chunk <= (device_addr + size - 1) >> WriteTickChunkBits; ++chunk) {
-        if (const auto it = write_ticks.find(chunk); it != write_ticks.end()) {
-            last_tick = std::max(last_tick, it->second);
-        }
-    }
+    write_ticks.ForEachInRange(
+        begin, end - begin, [&](VAddr, VAddr, u64 tick) { last_tick = std::max(last_tick, tick); });
     return last_tick;
 }
 
@@ -473,8 +604,8 @@ void BufferCache::DownloadMemory(std::unique_lock<std::mutex>& lk, const Buffer*
         download.Invalidate();
         for (const auto& copy : copies) {
             auto* dst_addr = std::bit_cast<u8*>(arena_base + copy.srcOffset);
-            memory->TryWriteBacking(dst_addr, download.mapped + (copy.dstOffset - download.offset),
-                                    copy.size);
+            memory->WriteBackingFromGpu(
+                dst_addr, download.mapped + (copy.dstOffset - download.offset), copy.size);
         }
         {
             std::scoped_lock modified_lk{modified_mutex};
@@ -497,7 +628,9 @@ void BufferCache::DownloadMemory(std::unique_lock<std::mutex>& lk, const Buffer*
     if (async) {
         scheduler.DeferOperation(std::move(write_data));
     } else {
+        const auto drain_start = std::chrono::steady_clock::now();
         scheduler.Finish();
+        DebugState.frame_drain_ns.Add(std::chrono::steady_clock::now() - drain_start);
         write_data();
     }
     lk.lock();
@@ -593,8 +726,8 @@ void BufferCache::DownloadAhead(std::unique_lock<std::mutex>& lk,
     for (size_t i = 0; i < windows.size(); ++i) {
         const VAddr arena_base = windows[i].arena->cpu_addr;
         for (const auto& copy : window_copies[i].copies) {
-            memory->TryWriteBacking(std::bit_cast<u8*>(arena_base + copy.srcOffset),
-                                    staging_data + copy.dstOffset, copy.size);
+            memory->WriteBackingFromGpu(std::bit_cast<u8*>(arena_base + copy.srcOffset),
+                                        staging_data + copy.dstOffset, copy.size);
         }
     }
     if (context->staging->SizeBytes() > MaxReadbackStagingSize) {
@@ -664,8 +797,28 @@ std::pair<const Buffer*, u64> BufferCache::ObtainBuffer(VAddr device_addr, u32 s
     if (!is_written && !skip_stream_buffer && size <= STREAM_THRESHOLD &&
         !IsRegionGpuModified(device_addr, size)) {
         auto& copy = stream_copies[StreamCopySlot(device_addr, size)];
-        if (copy.tick == scheduler.CurrentTick() && copy.device_addr == device_addr &&
-            copy.size == size &&
+        const bool is_copied = copy.tick == scheduler.CurrentTick() &&
+                               copy.device_addr == device_addr && copy.size == size;
+        if (const StreamHint* const hint = FindStreamHint(device_addr, size)) {
+            if (is_copied && copy.ahead_id == hint->id) {
+                return {&stream_buffer, copy.stream_offset};
+            }
+            const auto [data, offset] = stream_buffer.Map(size, instance.UniformMinAlignment());
+            if (stream_buffer.is_coherent) {
+                // The hint keeps its bytes until the tick ends, and the commands that read the
+                // stream buffer are recorded after this one.
+                scheduler.Record([data = data, bytes = hint->data, size](vk::CommandBuffer) {
+                    std::memcpy(data, bytes, size);
+                });
+            } else {
+                std::memcpy(data, hint->data, size);
+            }
+            // Mapping can wait for the GPU and submit, which starts a new tick.
+            copy = {device_addr, size, scheduler.CurrentTick(), offset, 0, hint->id};
+            stream_buffer.Commit();
+            return {&stream_buffer, offset};
+        }
+        if (is_copied && copy.ahead_id == 0 &&
             memory->CompareSparseMemory(device_addr, stream_shadow.data() + copy.shadow_offset,
                                         size)) {
             return {&stream_buffer, copy.stream_offset};
@@ -681,8 +834,16 @@ std::pair<const Buffer*, u64> BufferCache::ObtainBuffer(VAddr device_addr, u32 s
             // The stream buffer gets the very bytes that are kept to compare with.
             u8* const shadow = stream_shadow.data() + stream_shadow_used;
             memory->CopySparseMemory(device_addr, shadow, size);
-            std::memcpy(data, shadow, size);
-            copy = {device_addr, size, tick, offset, stream_shadow_used};
+            if (stream_buffer.is_coherent) {
+                // The shadow keeps these bytes until the tick ends, and the commands that read
+                // the stream buffer are recorded after this one.
+                scheduler.Record([data = data, shadow, size](vk::CommandBuffer) {
+                    std::memcpy(data, shadow, size);
+                });
+            } else {
+                std::memcpy(data, shadow, size);
+            }
+            copy = {device_addr, size, tick, offset, stream_shadow_used, 0};
             stream_shadow_used += size;
         } else {
             memory->CopySparseMemory(device_addr, data, size);
@@ -699,6 +860,77 @@ std::pair<const Buffer*, u64> BufferCache::ObtainBuffer(VAddr device_addr, u32 s
     }
     SynchronizeMemory(arena, device_addr, size, is_written, is_texel_buffer);
     return {arena, arena->Offset(device_addr)};
+}
+
+const BufferCache::StreamHint* BufferCache::FindStreamHint(VAddr device_addr, u32 size) {
+    const auto is_for_binding = [&](const StreamHint& hint) {
+        return hint.device_addr == device_addr && hint.size == size;
+    };
+    const StreamHint* hint;
+    if (stream_hint_cursor < stream_hints.size() &&
+        is_for_binding(stream_hints[stream_hint_cursor])) {
+        // The bindings of a draw come in the order their hints were made in.
+        hint = &stream_hints[stream_hint_cursor++];
+    } else {
+        const auto it = std::ranges::find_if(stream_hints, is_for_binding);
+        if (it == stream_hints.end()) {
+            return nullptr;
+        }
+        hint = &*it;
+    }
+    // Bytes the GPU wrote to guest memory since the hint was made are missing from it.
+    if (!memory->IsFreeOfGpuWrites(stream_hints_epoch) &&
+        memory->IsGpuWrittenSince(stream_hints_epoch, device_addr, size)) {
+        return nullptr;
+    }
+    return hint;
+}
+
+bool BufferCache::ReadStreamAhead(VAddr device_addr, u64 size, u64 run, u64 gpu_write_epoch,
+                                  StreamHint& hint) {
+    if (device_addr == 0 || size == 0 || size > STREAM_THRESHOLD ||
+        device_addr + size > (1ULL << ADDRESS_SPACE_BITS)) {
+        return false;
+    }
+    auto& copy = stream_ahead_copies[StreamAheadSlot(device_addr, size)];
+    if (copy.id != 0 && copy.device_addr == device_addr && copy.size == size &&
+        stream_ahead_position - copy.position <= StreamAheadWindow) {
+        const u8* const data = stream_ahead_data.get() + copy.position % StreamAheadSize;
+        if (copy.run == run && memory->IsFreeOfGpuWrites(copy.gpu_write_epoch)) {
+            // The guest gets no signal from the GPU inside a run, so only the GPU can have
+            // changed what a draw of the run reads.
+            hint = {device_addr, static_cast<u32>(size), copy.id, data};
+            return true;
+        }
+        if (memory->CompareSparseMemory(device_addr, data, size)) {
+            copy.run = run;
+            copy.gpu_write_epoch = gpu_write_epoch;
+            hint = {device_addr, static_cast<u32>(size), copy.id, data};
+            return true;
+        }
+    }
+    u64 position = stream_ahead_position;
+    if (position % StreamAheadSize + size > StreamAheadSize) {
+        // The bytes of a hint are contiguous.
+        position = Common::AlignUp(position, StreamAheadSize);
+    }
+    if (position + size - stream_ahead_released.load(std::memory_order_acquire) > StreamAheadSize) {
+        // The space is still in use. The draw reads guest memory itself.
+        return false;
+    }
+    u8* const data = stream_ahead_data.get() + position % StreamAheadSize;
+    memory->CopySparseMemory(device_addr, data, size);
+    copy = {device_addr, size, position, ++stream_ahead_last_id, run, gpu_write_epoch};
+    stream_ahead_position = position + size;
+    hint = {device_addr, static_cast<u32>(size), copy.id, data};
+    return true;
+}
+
+void BufferCache::ReleaseStreamAhead(u64 position) {
+    const u64 released = position > StreamAheadWindow ? position - StreamAheadWindow : 0;
+    if (released > stream_ahead_released.load(std::memory_order_relaxed)) {
+        stream_ahead_released.store(released, std::memory_order_release);
+    }
 }
 
 std::pair<const Buffer*, u64> BufferCache::ObtainBufferForImage(VAddr device_addr, u32 size) {
@@ -781,8 +1013,8 @@ void BufferCache::ReadEdgeImagePages(const Image& image) {
             for (const auto& copy : copies) {
                 const VAddr copy_device_addr = base + copy.srcOffset;
                 const u64 dst_offset = copy.dstOffset - download.offset;
-                memory->TryWriteBacking(std::bit_cast<u8*>(copy_device_addr),
-                                        download.mapped + dst_offset, copy.size);
+                memory->WriteBackingFromGpu(std::bit_cast<u8*>(copy_device_addr),
+                                            download.mapped + dst_offset, copy.size);
             }
             {
                 std::scoped_lock lk{modified_mutex};
@@ -861,12 +1093,18 @@ const Buffer* BufferCache::GetArena(u64 first_block, u64 last_block) {
 }
 
 void BufferCache::EnsureResident(const Buffer* arena, u64 first_block, u64 last_block) {
+    auto& hit = resident_hits[first_block % resident_hits.size()];
+    if (hit.first_block <= first_block && last_block <= hit.last_block) {
+        return;
+    }
     u32 resident_blocks{};
     IntervalList bind_ranges;
     resident_ranges.ForEachGap(first_block, last_block + 1, [&](u64 start, u64 end) {
         resident_blocks += end - start;
         bind_ranges.Add({start, end});
     });
+    // Either the range has no gap, or the gaps are made resident below.
+    hit = {first_block, last_block};
 
     if (bind_ranges.Empty()) {
         return;
@@ -965,14 +1203,15 @@ bool BufferCache::SynchronizeMemory(const Buffer* arena, VAddr device_addr, u32 
         }
         if (is_written) {
             gpu_modified_ranges.Add(device_addr, size);
-            const u64 tick = scheduler.CurrentTick();
-            for (u64 chunk = device_addr >> WriteTickChunkBits;
-                 chunk <= (device_addr + size - 1) >> WriteTickChunkBits; ++chunk) {
-                write_ticks[chunk] = tick;
+            if (!eager_chunks.empty() && !eager_write_pending.load(std::memory_order_relaxed) &&
+                WritesEagerPage(device_addr, size)) {
+                eager_write_pending.store(true, std::memory_order_relaxed);
             }
-            for (u64 page = device_addr / BYTES_PER_PAGE;
-                 page <= (device_addr + size - 1) / BYTES_PER_PAGE; ++page) {
-                page_write_ticks[page] = tick;
+            const VAddr tick_begin = Common::AlignDown(device_addr, BYTES_PER_PAGE);
+            const u64 tick_size = Common::AlignUp(device_addr + size, BYTES_PER_PAGE) - tick_begin;
+            if (tick_size != 0) {
+                write_ticks.Subtract(tick_begin, tick_size);
+                write_ticks.Add(tick_begin, tick_size, scheduler.CurrentTick());
             }
         }
     }
