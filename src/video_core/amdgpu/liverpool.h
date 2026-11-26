@@ -259,7 +259,14 @@ struct CpPerf {
     u32 cb_conflicts;           ///< Of those, with a range used since the last barrier flush
     u32 br_flushes;             ///< Barrier flushes that recorded a barrier
     u32 br_adds;                ///< Buffer ranges added to the barrier lists
-    u32 dispatch_skips;         ///< DispatchDirect: dispatches BindResources handled itself
+    u32 sh_uploads;             ///< Upload probe: uploads of read-only bindings looked at
+    u32 sh_uploads_known;       ///< Of those, with every page kept from its last upload
+    u32 sh_uploads_same;        ///< Of those, with the bound bytes of every page as uploaded last
+    u32 sh_pages;               ///< Pages of the uploads looked at
+    u32 sh_pages_known;
+    u32 sh_pages_same_bound; ///< Bound bytes as uploaded last
+    u32 sh_pages_same_whole; ///< Whole page as uploaded last
+    u32 dispatch_skips;      ///< DispatchDirect: dispatches BindResources handled itself
 };
 inline CpPerf cp_perf;
 

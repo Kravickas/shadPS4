@@ -289,7 +289,9 @@ void Liverpool::Process(std::stop_token stoken) {
             "bc_images_equal={} bc_image_stages={} bc_image_stages_same={} "
             "bc_image_stages_quiet={} ds_skips={} ds_checks={} ds_diffs={} ds_compares={} "
             "rp_end_other={} rp_end_state={} rp_end_barrier={} rp_end_copy={} rp_end_dispatch={} "
-            "rp_end_submit={} cb_copies={} cb_conflicts={} br_flushes={} br_adds={}",
+            "rp_end_submit={} cb_copies={} cb_conflicts={} br_flushes={} br_adds={} "
+            "sh_uploads={} sh_uploads_known={} sh_uploads_same={} sh_pages={} sh_pages_known={} "
+            "sh_pages_same_bound={} sh_pages_same_whole={}",
             cycle_t0, cycle_t1, cp_perf.tasks, was_submit_done, (cycle_t1 - flush_t0) / 1000,
             cp_perf.vo_block_ns / 1000, cp_perf.vo_blocks, cp_perf.vo_spin_ns / 1000,
             cp_perf.mem_spin_ns / 1000, cp_perf.mem_spins, cp_perf.asc_spin_ns / 1000,
@@ -399,7 +401,9 @@ void Liverpool::Process(std::stop_token stoken) {
             cp_perf.bc_image_stages_quiet, cp_perf.ds_skips, cp_perf.ds_checks, cp_perf.ds_diffs,
             cp_perf.ds_compares, cp_perf.rp_ends[0], cp_perf.rp_ends[1], cp_perf.rp_ends[2],
             cp_perf.rp_ends[3], cp_perf.rp_ends[4], cp_perf.rp_ends[5], cp_perf.cb_copies,
-            cp_perf.cb_conflicts, cp_perf.br_flushes, cp_perf.br_adds);
+            cp_perf.cb_conflicts, cp_perf.br_flushes, cp_perf.br_adds, cp_perf.sh_uploads,
+            cp_perf.sh_uploads_known, cp_perf.sh_uploads_same, cp_perf.sh_pages,
+            cp_perf.sh_pages_known, cp_perf.sh_pages_same_bound, cp_perf.sh_pages_same_whole);
         if (++perf_run_log_cycles == 2048) {
             perf_run_log_cycles = 0;
             if (is_gameplay && perf_tex_site_refills < PerfTexSiteRefills) {
