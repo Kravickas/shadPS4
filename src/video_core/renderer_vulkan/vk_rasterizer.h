@@ -346,9 +346,8 @@ private:
     /// index here.
     std::array<DepthTargetLookup, 2> db_lookups{};
 
-    /// Last texture lookup that found a perfect match, per hash slot of its key. The same key
-    /// gives the same image while the texture cache registry generation is equal and no image
-    /// in its range was swapped with a parked alias.
+    /// Last texture lookup of a key. The same key gives the same image while the texture cache
+    /// registry generation is equal and no image in its range was swapped with a parked alias.
     struct TextureLookup {
         u64 generation{};
         u64 swaps{};
@@ -356,7 +355,20 @@ private:
         TextureKey key;
         ImageBinding binding;
     };
-    std::array<TextureLookup, 4096> texture_lookups{};
+    /// The lookups are kept in sets of TextureLookupWays, chosen by the hash of the key. A set
+    /// has the hashes of its lookups and when each was used last in one cache line.
+    static constexpr u32 TextureLookupWays = 4;
+    static constexpr u32 TextureLookupSets = 2048;
+    struct alignas(64) TextureLookupSet {
+        std::array<u64, TextureLookupWays> hashes{};
+        std::array<u64, TextureLookupWays> last_uses{};
+    };
+    std::array<TextureLookupSet, TextureLookupSets> texture_lookup_sets{};
+    std::array<TextureLookup, TextureLookupSets * TextureLookupWays> texture_lookups{};
+    u64 texture_lookup_clock{};
+    /// The lookup of the key, or the one of its set that was used longest ago, for the caller
+    /// to fill with the key.
+    TextureLookup& FindTextureLookup(const TextureKey& key, u64 hash);
 
     /// Probe: what the image slots of each graphics stage resolved to in the last draw.
     struct CheckedImage {

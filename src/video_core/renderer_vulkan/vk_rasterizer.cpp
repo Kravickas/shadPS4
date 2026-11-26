@@ -138,6 +138,27 @@ DrawFilterResult GetDrawFilter(const AmdGpu::Regs& regs) {
 
 } // Anonymous namespace
 
+Rasterizer::TextureLookup& Rasterizer::FindTextureLookup(const TextureKey& key, const u64 hash) {
+    const u32 set_index = hash % TextureLookupSets;
+    auto& set = texture_lookup_sets[set_index];
+    TextureLookup* const lookups = &texture_lookups[set_index * TextureLookupWays];
+    const u64 now = ++texture_lookup_clock;
+    u32 oldest = 0;
+    for (u32 way = 0; way < TextureLookupWays; ++way) {
+        if (set.hashes[way] == hash && SameBits(lookups[way].key, key)) {
+            set.last_uses[way] = now;
+            return lookups[way];
+        }
+        if (set.last_uses[way] < set.last_uses[oldest]) {
+            oldest = way;
+        }
+    }
+    AmdGpu::cp_perf.tex_evictions += set.last_uses[oldest] != 0;
+    set.hashes[oldest] = hash;
+    set.last_uses[oldest] = now;
+    return lookups[oldest];
+}
+
 void Rasterizer::PrefetchDrawsAhead(const DrawAhead& taken, const DrawAhead* next,
                                     const DrawAhead* second, const DrawAhead* third) {
     using VideoCore::PrefetchRead;
@@ -147,9 +168,17 @@ void Rasterizer::PrefetchDrawsAhead(const DrawAhead& taken, const DrawAhead* nex
         }
         buffer_cache.PrefetchStreamCopies(ahead.stream_hints);
         for (const DrawAhead::ImageKey& image : ahead.image_keys) {
-            if (image.key.tsharp.Address() != 0) {
-                PrefetchRead(&texture_lookups[image.hash % texture_lookups.size()],
-                             sizeof(TextureLookup));
+            if (image.key.tsharp.Address() == 0) {
+                continue;
+            }
+            const u32 set_index = image.hash % TextureLookupSets;
+            const auto& set = texture_lookup_sets[set_index];
+            for (u32 way = 0; way < TextureLookupWays; ++way) {
+                if (set.hashes[way] == image.hash) {
+                    PrefetchRead(&texture_lookups[set_index * TextureLookupWays + way],
+                                 sizeof(TextureLookup));
+                    break;
+                }
             }
         }
     };
@@ -1687,7 +1716,7 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
                 checked_image_keys[slot] = key;
                 checked_image_has_key[slot] = true;
             }
-            auto& lookup = texture_lookups[hash % texture_lookups.size()];
+            auto& lookup = FindTextureLookup(key, hash);
             const u64 generation = texture_cache.RegistryGeneration();
             const u64 swaps = texture_cache.SwapGeneration();
             if (lookup.generation == generation && scheduler.CurrentTick() <= lookup.valid_until &&
