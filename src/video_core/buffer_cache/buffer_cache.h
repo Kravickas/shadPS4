@@ -366,27 +366,13 @@ private:
     };
     static constexpr u64 StreamCopySlotBits = 12;
 
-    /// Probe: what the uploads of read-only bindings carry. For UploadProbeBuildFrames frames in
-    /// UploadProbePeriod the bytes of every uploaded page are kept, and in the frame behind them
-    /// an upload is compared with what its pages had when they were uploaded last.
-    struct UploadProbePage {
-        u64 page;
-        std::array<u8, 4096> bytes;
+    /// Ranges of write_ticks that were given a tick last, by their first page.
+    struct TickedRange {
+        VAddr begin;
+        u64 size;
+        u64 tick;
     };
-    static constexpr u64 UploadProbePeriod = 256;
-    static constexpr u64 UploadProbeBuildFrames = 4;
-    static constexpr u64 UploadProbePages = 8192;
-    std::vector<UploadProbePage> upload_probe_pages;
-    u64 upload_probe_frame{};
-    bool is_upload_probe_on{};
-    bool is_upload_probe_measuring{};
-    struct UploadProbeResult {
-        bool is_known{true};
-        bool is_same{true};
-    };
-    void ProbeUpload(VAddr bound_begin, VAddr bound_end, VAddr copy_addr, u64 copy_size,
-                     UploadProbeResult& result);
-    void ForgetProbePages(VAddr device_addr, u64 size);
+    std::array<TickedRange, 64> ticked_ranges{};
     std::array<StreamCopy, 1ULL << StreamCopySlotBits> stream_copies{};
     /// Host copy of the bytes written to the stream buffer in the current tick, to compare with.
     std::vector<u8> stream_shadow;

@@ -140,60 +140,6 @@ void BufferCache::TickFrame() {
     if (std::exchange(fault_process_pending, false)) {
         fault_manager->ProcessFaultBuffer();
     }
-    const u64 phase = ++upload_probe_frame % UploadProbePeriod;
-    if (phase == 0) {
-        // Uploads since the last period are not in the kept pages.
-        upload_probe_pages.resize(UploadProbePages);
-        for (auto& kept : upload_probe_pages) {
-            kept.page = 0;
-        }
-    }
-    is_upload_probe_on = phase <= UploadProbeBuildFrames && !upload_probe_pages.empty();
-    is_upload_probe_measuring = is_upload_probe_on && phase == UploadProbeBuildFrames;
-}
-
-void BufferCache::ProbeUpload(VAddr bound_begin, VAddr bound_end, VAddr copy_addr, u64 copy_size,
-                              UploadProbeResult& result) {
-    auto& perf = AmdGpu::cp_perf;
-    if (copy_addr % BYTES_PER_PAGE != 0 || copy_size % BYTES_PER_PAGE != 0) {
-        result.is_known = false;
-        return;
-    }
-    std::array<u8, BYTES_PER_PAGE> now;
-    for (VAddr page_addr = copy_addr; page_addr < copy_addr + copy_size;
-         page_addr += BYTES_PER_PAGE) {
-        memory->CopySparseMemory(page_addr, now.data(), now.size());
-        const u64 page = page_addr / BYTES_PER_PAGE;
-        auto& kept = upload_probe_pages[page % UploadProbePages];
-        if (is_upload_probe_measuring) {
-            ++perf.sh_pages;
-            if (kept.page == page) {
-                ++perf.sh_pages_known;
-                const VAddr begin = std::max(bound_begin, page_addr);
-                const VAddr end = std::min(bound_end, page_addr + BYTES_PER_PAGE);
-                const bool is_same =
-                    begin >= end || std::memcmp(kept.bytes.data() + (begin - page_addr),
-                                                now.data() + (begin - page_addr), end - begin) == 0;
-                perf.sh_pages_same_bound += is_same;
-                perf.sh_pages_same_whole += kept.bytes == now;
-                result.is_same &= is_same;
-            } else {
-                result.is_known = false;
-            }
-        }
-        kept.page = page;
-        kept.bytes = now;
-    }
-}
-
-void BufferCache::ForgetProbePages(VAddr device_addr, u64 size) {
-    for (u64 page = device_addr / BYTES_PER_PAGE; page <= (device_addr + size - 1) / BYTES_PER_PAGE;
-         ++page) {
-        auto& kept = upload_probe_pages[page % UploadProbePages];
-        if (kept.page == page) {
-            kept.page = 0;
-        }
-    }
 }
 
 void BufferCache::OnSubmit() {
@@ -1448,9 +1394,6 @@ bool BufferCache::SynchronizeMemory(const Buffer* arena, VAddr device_addr, u32 
             }
         }
         if (is_written) {
-            if (is_upload_probe_on) {
-                ForgetProbePages(device_addr, size);
-            }
             gpu_modified_ranges.Add(device_addr, size);
             if (!eager_chunks.empty() && !eager_write_pending.load(std::memory_order_relaxed) &&
                 WritesEagerPage(device_addr, size)) {
@@ -1459,8 +1402,16 @@ bool BufferCache::SynchronizeMemory(const Buffer* arena, VAddr device_addr, u32 
             const VAddr tick_begin = Common::AlignDown(device_addr, BYTES_PER_PAGE);
             const u64 tick_size = Common::AlignUp(device_addr + size, BYTES_PER_PAGE) - tick_begin;
             if (tick_size != 0) {
-                write_ticks.Subtract(tick_begin, tick_size);
-                write_ticks.Add(tick_begin, tick_size, scheduler.CurrentTick());
+                // write_ticks changes nowhere else, so a range that got this tick has it still.
+                const u64 tick = scheduler.CurrentTick();
+                auto& ticked = ticked_ranges[(tick_begin / BYTES_PER_PAGE) % ticked_ranges.size()];
+                if (ticked.begin == tick_begin && ticked.size == tick_size && ticked.tick == tick) {
+                    ++perf.ow_tick_skips;
+                } else {
+                    write_ticks.Subtract(tick_begin, tick_size);
+                    write_ticks.Add(tick_begin, tick_size, tick);
+                    ticked = {tick_begin, tick_size, tick};
+                }
             }
             perf.ow_mark_ns += AmdGpu::PerfNs() - mark_t0;
         }
@@ -1477,17 +1428,6 @@ bool BufferCache::SynchronizeMemory(const Buffer* arena, VAddr device_addr, u32 
                      device_addr, size, total_size_bytes, copies.size(), scheduler.CurrentTick());
         }
         const auto staging = staging_pool.Request(total_size_bytes, MemoryType::HostUncached);
-        if (is_upload_probe_on && !is_written) {
-            UploadProbeResult probe;
-            for (const auto& copy : copies) {
-                ProbeUpload(device_addr, device_addr + size, copy.dstOffset, copy.size, probe);
-            }
-            if (is_upload_probe_measuring) {
-                ++perf.sh_uploads;
-                perf.sh_uploads_known += probe.is_known;
-                perf.sh_uploads_same += probe.is_known && probe.is_same;
-            }
-        }
         for (auto& copy : copies) {
             memory->CopySparseMemory(copy.dstOffset, staging.mapped + copy.srcOffset, copy.size);
             copy.srcOffset += staging.offset;

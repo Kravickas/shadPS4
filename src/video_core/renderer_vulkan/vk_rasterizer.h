@@ -279,6 +279,12 @@ private:
     static constexpr u32 SharpsAheadCheckInterval = 64;
     u32 sharps_ahead_uses{};
     bool is_sharps_check{};
+    /// Probe: the V# each buffer of a compute stage had at the dispatch before.
+    struct DispatchProbeSharp {
+        const Shader::Info* info;
+        AmdGpu::Buffer sharp;
+    };
+    std::array<DispatchProbeSharp, 32> dispatch_probe_sharps{};
     /// What the dynamic state values taken from the registers were made for last.
     mutable u64 dynamic_regs_generation{};
     mutable bool dynamic_is_indexed{};

@@ -1612,11 +1612,31 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
                 if (desc.is_formatted) {
                     flags |= VideoCore::ObtainBufferFlags::IsTexelBuffer;
                 }
-                const u64 obtain_t0 = desc.is_written ? AmdGpu::PerfNs() : 0;
+                const bool is_dispatch_probe =
+                    AmdGpu::perf_bind_check && stage.sw_stage == Shader::SwStage::Compute;
+                const u64 obtain_t0 = desc.is_written || is_dispatch_probe ? AmdGpu::PerfNs() : 0;
                 const auto [buffer, offset] =
                     buffer_cache.ObtainBuffer(vsharp.base_address, size, flags);
                 if (desc.is_written) {
                     AmdGpu::cp_perf.ow_obtain_ns += AmdGpu::PerfNs() - obtain_t0;
+                }
+                if (is_dispatch_probe) {
+                    auto& perf = AmdGpu::cp_perf;
+                    bool is_same = false;
+                    if (binding.buffer < dispatch_probe_sharps.size()) {
+                        auto& last = dispatch_probe_sharps[binding.buffer];
+                        is_same = last.info == &stage && SameBits(last.sharp, vsharp);
+                        last = {&stage, vsharp};
+                    }
+                    if (desc.is_written) {
+                        ++perf.dsp_w_obtains;
+                        perf.dsp_w_same += is_same;
+                    } else {
+                        ++perf.dsp_ro_obtains;
+                        perf.dsp_ro_same += is_same;
+                        perf.dsp_ro_bytes += size;
+                        perf.dsp_ro_ns += AmdGpu::PerfNs() - obtain_t0;
+                    }
                 }
                 // The limit is a power of two.
                 const u64 offset_aligned = Common::AlignDownPow2(offset, alignment);
