@@ -259,12 +259,7 @@ struct CpPerf {
     u32 cb_conflicts;           ///< Of those, with a range used since the last barrier flush
     u32 br_flushes;             ///< Barrier flushes that recorded a barrier
     u32 br_adds;                ///< Buffer ranges added to the barrier lists
-    u32 la_patch_packets;       ///< State packets applied from the lookahead thread's lists
-    u32 la_patch_skipped;       ///< State packets of those draws that are not in the lists
-    u32 la_patch_overflows;     ///< Draws whose list did not hold all packets
-    u32 la_scan_waits;          ///< Waits for the lookahead thread to get to the next draw
-    u64 la_scan_wait_ns;
-    u32 dispatch_skips; ///< DispatchDirect: dispatches BindResources handled itself
+    u32 dispatch_skips;         ///< DispatchDirect: dispatches BindResources handled itself
 };
 inline CpPerf cp_perf;
 
@@ -482,11 +477,6 @@ public:
         return num_submits == 0;
     }
 
-    /// To call before and after a write to regs from outside of the command processor.
-    void NoteRegsWrittenOutside() {
-        lookahead_regs_touched.store(true, std::memory_order_release);
-    }
-
     /// Equal at two calls: no register counted in state_regs_generation changed in between.
     u64 TakeStateRegsGeneration() {
         has_state_regs_change = false;
@@ -654,22 +644,9 @@ private:
         }
     };
 
-    /// What the lookahead thread found up to a draw. The state packets in front of the draw
-    /// that are not in patches set registers to the values they have.
-    struct alignas(64) LookaheadResult {
+    struct LookaheadResult {
         const u32* packet;
-        /// The first packet behind the draw before, or of the run.
-        const u32* state_begin;
-        /// PatchOverflow: the packets do not fit in patches.
-        u16 num_patches;
-        u16 num_skipped;
-        /// Word offsets from state_begin. With PatchGeneral the packet is one ProcessGraphics
-        /// has to see.
-        std::array<u16, 22> patches;
     };
-    static_assert(sizeof(LookaheadResult) == 64);
-    static constexpr u16 PatchOverflow = 0xffff;
-    static constexpr u16 PatchGeneral = 0x8000;
     static constexpr std::size_t NumLookaheadResults = 4096;
 
     static constexpr u32 LookaheadCompareInterval = 64;
@@ -688,10 +665,6 @@ private:
 
     /// Applies what a state packet or a draw sets in the graphics queue state.
     static void ApplyPacketState(const GfxState& state, const PM4Header* header);
-
-    /// Whether ApplyPacketState does more with a state packet than to set registers to the
-    /// values they have in state.
-    static bool ChangesState(const GfxState& state, const PM4Header* header);
 
     /// Whether ClassifyPacket and ApplyPacketState can run on a packet that words_available
     /// words are readable from, without reading or writing out of bounds or asserting.
@@ -718,12 +691,6 @@ private:
     /// Commands of other threads run every StatePacketsPerCommandCheck packets.
     std::span<const u32> ApplyStatePackets(const GfxState& gfx_state, std::span<const u32> dcb);
     static constexpr u32 StatePacketsPerCommandCheck = 64;
-
-    /// In a run: applies the state packets up to the next draw the lookahead thread found, from
-    /// its list of those that change the state, and returns dcb from the next packet
-    /// ProcessGraphics has to see. Behind the last draw of the run, and where the list cannot be
-    /// used, it is ApplyStatePackets.
-    std::span<const u32> ApplyAheadState(const GfxState& gfx_state, std::span<const u32> dcb);
 
     /// Lets the lookahead thread scan the packets from the start of dcb up to the first one that
     /// is neither a state packet nor a draw.
@@ -784,16 +751,11 @@ private:
     /// need no compare.
     bool has_state_regs_change{};
     bool lookahead_needs_copy{true};
-    /// Set around a write to regs that is not a packet of the command processor. The lookahead
-    /// state does not have it until it is copied again.
-    std::atomic<bool> lookahead_regs_touched{};
     u32 lookahead_compare_countdown{};
     u32 lookahead_logged_mismatches{};
     u64 lookahead_run{};
     u32 perf_cycles{};
     u64 lookahead_taken{};
-    /// A value lookahead_produced had, so that it is not read for every draw.
-    u64 lookahead_produced_seen{};
     /// Working and waiting time of the GPU thread per cycle, averaged over the last cycles,
     /// and whether the waiting share is at least MinIdlePercent.
     static constexpr s64 CycleSmoothing = 16;
