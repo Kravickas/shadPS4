@@ -337,6 +337,13 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset) {
             const VideoCore::XfbRegion region{
                 .key = XfbDrawKey(vs_info, fetch_shader, index_base, vertex_offset,
                                   regs.num_indices, regs.primitive_type),
+                .shaders =
+                    {
+                        .vs = vs_info.pgm_hash,
+                        .ps = gkey.stage_hashes[u32(Shader::SwStage::Fragment)] != 0
+                                  ? pipeline->GetStage(Shader::SwStage::Fragment).pgm_hash
+                                  : 0,
+                    },
                 .offset = 0,
                 .max_vertices = XfbMaxVertices(regs.primitive_type, regs.num_indices,
                                                regs.num_instances.NumInstances()),
@@ -575,8 +582,7 @@ void Rasterizer::EndXfbFrame(vk::Extent2D output_extent) {
     xfb_output_extent = output_extent;
 }
 
-void Rasterizer::EvaluateNr(VideoCore::Image& color,
-                            const HostPasses::DlssNrPass::Settings& settings) {
+void Rasterizer::EvaluateNr(VideoCore::Image& color, HostPasses::DlssNrPass::Settings& settings) {
     if (!dlss_nr || !xfb_velocity) {
         return;
     }

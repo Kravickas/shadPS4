@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <span>
 #include <vector>
+#include "common/hash.h"
 #include "common/types.h"
 #include "video_core/buffer_cache/buffer.h"
 #include "video_core/texture_cache/types.h"
@@ -42,8 +43,23 @@ struct XfbDrawState {
     bool negative_one_to_one;
 };
 
+// Guest program hashes of a draw, as in dumped shader names. 0 when the stage is off.
+struct XfbShaders {
+    u64 vs;
+    u64 ps;
+
+    bool operator==(const XfbShaders&) const = default;
+};
+
+struct XfbShadersHash {
+    size_t operator()(const XfbShaders& shaders) const noexcept {
+        return static_cast<size_t>(HashCombine(shaders.vs, shaders.ps));
+    }
+};
+
 struct XfbRegion {
     u64 key;
+    XfbShaders shaders;
     u32 offset;
     u32 max_vertices;
     u32 counter_offset;

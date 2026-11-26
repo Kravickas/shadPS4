@@ -3,7 +3,9 @@
 
 #include "layer.h"
 
+#include <mutex>
 #include <SDL3/SDL_events.h>
+#include <fmt/format.h>
 #include <imgui.h>
 
 #include "SDL3/SDL_log.h"
@@ -139,10 +141,14 @@ void L::DrawMenuBar() {
                         nr.style = static_cast<u32>(style);
                     }
                     SliderFloat("Intensity", &nr.intensity, 0.0f, 2.0f);
-                    SliderFloat("Local Structure", &nr.local_structure, 0.0f, 2.0f);
-                    SliderFloat("Local Tone", &nr.local_tone, 0.0f, 2.0f);
-                    SliderFloat("Skin Structure", &nr.skin_structure, -1.0f, 2.0f);
+                    SliderFloat("Local Structure", &nr.local_structure, 0.0f, 4.0f);
+                    SliderFloat("Local Tone", &nr.local_tone, 0.0f, 4.0f);
+                    SliderFloat("Skin Structure", &nr.skin_structure, -1.0f, 4.0f);
                     Checkbox("Auto Skin Mask", &nr.auto_mask);
+                    int passes = static_cast<int>(nr.passes);
+                    if (SliderInt("Passes", &passes, 1, 30)) {
+                        nr.passes = static_cast<u32>(passes);
+                    }
                 }
                 EndDisabled();
 
@@ -157,8 +163,83 @@ void L::DrawMenuBar() {
                     EmulatorSettings.SetDlssNrSkinStructure(
                         static_cast<int>(nr.skin_structure * 1000));
                     EmulatorSettings.SetDlssNrAutoMask(nr.auto_mask);
+                    EmulatorSettings.SetDlssNrPasses(nr.passes);
                     EmulatorSettings.Save();
                     CloseCurrentPopup();
+                }
+                SameLine();
+                if (Button("Reset")) {
+                    const Vulkan::HostPasses::DlssNrPass::Settings defaults;
+                    nr.preset = defaults.preset;
+                    nr.style = defaults.style;
+                    nr.intensity = defaults.intensity;
+                    nr.local_structure = defaults.local_structure;
+                    nr.local_tone = defaults.local_tone;
+                    nr.skin_structure = defaults.skin_structure;
+                    nr.auto_mask = defaults.auto_mask;
+                    nr.passes = defaults.passes;
+                }
+
+                Separator();
+                TextUnformatted("Components");
+                auto& components = nr.components;
+                {
+                    std::scoped_lock lock{components.mutex};
+                    for (u32 i = 0; i < components.components.size(); ++i) {
+                        PushID(static_cast<int>(i));
+                        auto& component = components.components[i];
+                        SliderFloat(component.name.c_str(), &component.strength, 0.0f, 1.0f);
+                        bool removed = false;
+                        if (i != 0) {
+                            SameLine();
+                            removed = SmallButton("Remove");
+                        }
+                        PopID();
+                        if (removed) {
+                            components.RemoveComponent(i);
+                            break;
+                        }
+                    }
+                    static char new_component[64]{};
+                    InputText("##new_component", new_component, sizeof(new_component));
+                    SameLine();
+                    if (Button("Add") && new_component[0] != '\0') {
+                        components.components.push_back({.name = new_component});
+                        new_component[0] = '\0';
+                    }
+
+                    if (Button(components.pick_armed ? "Click the game image" : "Pick")) {
+                        components.pick_armed = !components.pick_armed;
+                    }
+                    if (components.pick_done && components.picked) {
+                        const auto picked = *components.picked;
+                        TextUnformatted(
+                            fmt::format("VS {:#018x} PS {:#018x}", picked.vs, picked.ps).c_str());
+                        const auto tag = components.tags.find(picked);
+                        const u32 current = tag != components.tags.end() ? tag->second : 0;
+                        if (BeginCombo("Component", components.components[current].name.c_str())) {
+                            for (u32 i = 0; i < components.components.size(); ++i) {
+                                if (Selectable(components.components[i].name.c_str(),
+                                               i == current)) {
+                                    if (i == 0) {
+                                        components.tags.erase(picked);
+                                    } else {
+                                        components.tags[picked] = i;
+                                    }
+                                }
+                            }
+                            EndCombo();
+                        }
+                    } else if (components.pick_done) {
+                        TextUnformatted("No captured draw owns that pixel");
+                    }
+                    TextUnformatted(fmt::format("{} tagged draws", components.tags.size()).c_str());
+                    if (components.Active()) {
+                        TextDisabled("Auto Skin Mask is off while a component is below 1");
+                    }
+                }
+                if (Button("Save Components")) {
+                    components.Save();
                 }
 
                 ImGui::EndMenu();

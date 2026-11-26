@@ -46,6 +46,9 @@ constexpr u64 CameraResultSize = 5 * 4 * sizeof(float);
 
 constexpr vk::Format MotionFormat = vk::Format::eR16G16Sfloat;
 constexpr vk::Format MaskFormat = vk::Format::eR8Unorm;
+// Float, not R32UI: integer color attachments need not support multisampling. Exact up to 2^24.
+constexpr vk::Format OwnerFormat = vk::Format::eR32Sfloat;
+constexpr u32 OwnerConstantOffset = 48;
 
 namespace {
 
@@ -118,6 +121,8 @@ XfbVelocityPass::XfbVelocityPass(const Instance& instance_, Scheduler& scheduler
       mask_image{instance.GetDevice(), instance.GetAllocator()},
       motion_ms_image{instance.GetDevice(), instance.GetAllocator()},
       mask_ms_image{instance.GetDevice(), instance.GetAllocator()},
+      owner_image{instance.GetDevice(), instance.GetAllocator()},
+      owner_ms_image{instance.GetDevice(), instance.GetAllocator()},
       depth_out{instance.GetDevice(), instance.GetAllocator()} {
     const vk::Device device = instance.GetDevice();
 
@@ -156,17 +161,25 @@ XfbVelocityPass::XfbVelocityPass(const Instance& instance_, Scheduler& scheduler
             .pBindings = bindings.data(),
         }));
 
-    const vk::PushConstantRange push_constants{
-        .stageFlags = vk::ShaderStageFlagBits::eVertex | vk::ShaderStageFlagBits::eFragment,
-        .offset = 0,
-        .size = sizeof(PushConstants),
+    static_assert(OwnerConstantOffset == sizeof(PushConstants));
+    const std::array push_constants = {
+        vk::PushConstantRange{
+            .stageFlags = vk::ShaderStageFlagBits::eVertex | vk::ShaderStageFlagBits::eFragment,
+            .offset = 0,
+            .size = sizeof(PushConstants),
+        },
+        vk::PushConstantRange{
+            .stageFlags = vk::ShaderStageFlagBits::eFragment,
+            .offset = OwnerConstantOffset,
+            .size = sizeof(u32),
+        },
     };
     pipeline_layout = Check<"create xfb velocity pipeline layout">(
         device.createPipelineLayoutUnique(vk::PipelineLayoutCreateInfo{
             .setLayoutCount = 1,
             .pSetLayouts = &*desc_set_layout,
-            .pushConstantRangeCount = 1,
-            .pPushConstantRanges = &push_constants,
+            .pushConstantRangeCount = static_cast<u32>(push_constants.size()),
+            .pPushConstantRanges = push_constants.data(),
         }));
 
     resolve_module = CompileSPV(XFB_VELOCITY_RESOLVE_COMP, device);
@@ -194,6 +207,18 @@ XfbVelocityPass::XfbVelocityPass(const Instance& instance_, Scheduler& scheduler
         },
         vk::DescriptorSetLayoutBinding{
             .binding = 3,
+            .descriptorType = vk::DescriptorType::eStorageImage,
+            .descriptorCount = 1,
+            .stageFlags = vk::ShaderStageFlagBits::eCompute,
+        },
+        vk::DescriptorSetLayoutBinding{
+            .binding = 4,
+            .descriptorType = vk::DescriptorType::eSampledImage,
+            .descriptorCount = 1,
+            .stageFlags = vk::ShaderStageFlagBits::eCompute,
+        },
+        vk::DescriptorSetLayoutBinding{
+            .binding = 5,
             .descriptorType = vk::DescriptorType::eStorageImage,
             .descriptorCount = 1,
             .stageFlags = vk::ShaderStageFlagBits::eCompute,
@@ -507,7 +532,7 @@ vk::Pipeline XfbVelocityPass::GetPipeline(const PipelineKey& key) {
         },
     };
 
-    const std::array color_formats = {MotionFormat, MaskFormat};
+    const std::array color_formats = {MotionFormat, MaskFormat, OwnerFormat};
     const vk::PipelineRenderingCreateInfo rendering_ci{
         .colorAttachmentCount = static_cast<u32>(color_formats.size()),
         .pColorAttachmentFormats = color_formats.data(),
@@ -557,6 +582,10 @@ vk::Pipeline XfbVelocityPass::GetPipeline(const PipelineKey& key) {
         vk::PipelineColorBlendAttachmentState{
             .blendEnable = false,
             .colorWriteMask = vk::ColorComponentFlagBits::eR | vk::ColorComponentFlagBits::eG,
+        },
+        vk::PipelineColorBlendAttachmentState{
+            .blendEnable = false,
+            .colorWriteMask = vk::ColorComponentFlagBits::eR,
         },
         vk::PipelineColorBlendAttachmentState{
             .blendEnable = false,
@@ -617,6 +646,10 @@ void XfbVelocityPass::ResizeTargets(u32 width, u32 height, vk::SampleCountFlagBi
     mask_image.Destroy();
     motion_ms_image.Destroy();
     mask_ms_image.Destroy();
+    owner_view.reset();
+    owner_ms_view.reset();
+    owner_image.Destroy();
+    owner_ms_image.Destroy();
     depth_out_view.reset();
     depth_out.Destroy();
 
@@ -662,6 +695,13 @@ void XfbVelocityPass::ResizeTargets(u32 width, u32 height, vk::SampleCountFlagBi
     mask_view = Check<"create xfb mask view">(device.createImageViewUnique(view_ci));
     SetObjectName(device, *mask_view, "XFB Velocity Mask View");
 
+    image_ci.format = OwnerFormat;
+    owner_image.Create(image_ci);
+    SetObjectName(device, static_cast<vk::Image>(owner_image), "XFB Velocity Owner");
+    view_ci.image = owner_image;
+    view_ci.format = OwnerFormat;
+    owner_view = Check<"create xfb owner view">(device.createImageViewUnique(view_ci));
+
     image_ci.format = vk::Format::eR32Sfloat;
     image_ci.usage = vk::ImageUsageFlagBits::eStorage | vk::ImageUsageFlagBits::eSampled;
     depth_out.Create(image_ci);
@@ -688,6 +728,13 @@ void XfbVelocityPass::ResizeTargets(u32 width, u32 height, vk::SampleCountFlagBi
     view_ci.image = mask_ms_image;
     view_ci.format = MaskFormat;
     mask_ms_view = Check<"create xfb mask ms view">(device.createImageViewUnique(view_ci));
+
+    image_ci.format = OwnerFormat;
+    owner_ms_image.Create(image_ci);
+    SetObjectName(device, static_cast<vk::Image>(owner_ms_image), "XFB Velocity Owner MS");
+    view_ci.image = owner_ms_image;
+    view_ci.format = OwnerFormat;
+    owner_ms_view = Check<"create xfb owner ms view">(device.createImageViewUnique(view_ci));
 }
 
 std::optional<XfbVelocityPass::Outputs> XfbVelocityPass::FrameOutputs() const {
@@ -699,6 +746,9 @@ std::optional<XfbVelocityPass::Outputs> XfbVelocityPass::FrameOutputs() const {
         .motion_view = *motion_view,
         .depth = depth_out,
         .depth_view = *depth_out_view,
+        .owner = owner_image,
+        .owner_view = *owner_view,
+        .owner_shaders = owner_shaders,
         .size = size,
     };
 }
@@ -780,10 +830,8 @@ void XfbVelocityPass::Resolve(vk::CommandBuffer cmdbuf) {
         };
     };
     const std::array barriers = {
-        to_sampled(motion_ms_image),
-        to_sampled(mask_ms_image),
-        to_storage(motion_image),
-        to_storage(mask_image),
+        to_sampled(motion_ms_image), to_sampled(mask_ms_image), to_sampled(owner_ms_image),
+        to_storage(motion_image),    to_storage(mask_image),    to_storage(owner_image),
     };
     cmdbuf.pipelineBarrier2(vk::DependencyInfo{
         .imageMemoryBarrierCount = static_cast<u32>(barriers.size()),
@@ -807,14 +855,23 @@ void XfbVelocityPass::Resolve(vk::CommandBuffer cmdbuf) {
             .imageView = *mask_view,
             .imageLayout = vk::ImageLayout::eGeneral,
         },
+        vk::DescriptorImageInfo{
+            .imageView = *owner_ms_view,
+            .imageLayout = vk::ImageLayout::eShaderReadOnlyOptimal,
+        },
+        vk::DescriptorImageInfo{
+            .imageView = *owner_view,
+            .imageLayout = vk::ImageLayout::eGeneral,
+        },
     };
-    std::array<vk::WriteDescriptorSet, 4> writes{};
+    std::array<vk::WriteDescriptorSet, 6> writes{};
     for (u32 i = 0; i < writes.size(); ++i) {
+        const bool sampled = i < 2 || i == 4;
         writes[i] = vk::WriteDescriptorSet{
             .dstBinding = i,
             .descriptorCount = 1,
             .descriptorType =
-                i < 2 ? vk::DescriptorType::eSampledImage : vk::DescriptorType::eStorageImage,
+                sampled ? vk::DescriptorType::eSampledImage : vk::DescriptorType::eStorageImage,
             .pImageInfo = &image_infos[i],
         };
     }
@@ -851,8 +908,11 @@ void XfbVelocityPass::Render(const VideoCore::XfbCapture& capture, vk::Extent2D 
                                                  : static_cast<vk::Image>(motion_image);
     const vk::Image mask_target =
         multisampled ? static_cast<vk::Image>(mask_ms_image) : static_cast<vk::Image>(mask_image);
+    const vk::Image owner_target =
+        multisampled ? static_cast<vk::Image>(owner_ms_image) : static_cast<vk::Image>(owner_image);
     const vk::ImageView motion_target_view = multisampled ? *motion_ms_view : *motion_view;
     const vk::ImageView mask_target_view = multisampled ? *mask_ms_view : *mask_view;
+    const vk::ImageView owner_target_view = multisampled ? *owner_ms_view : *owner_view;
 
     // Only previous draws against the previous scene depth are candidates. The same mesh drawn
     // into a reflection or shadow pass shares the key, and its occurrence would otherwise shift
@@ -888,6 +948,7 @@ void XfbVelocityPass::Render(const VideoCore::XfbCapture& capture, vk::Extent2D 
     std::unordered_map<u64, u32> occurrence;
     std::vector<const VideoCore::XfbRegion*> draws;
     entries.clear();
+    owner_shaders.clear();
     u64 matched = 0;
     for (const auto& region : cur_regions) {
         if (region.depth_id != main->depth_id) {
@@ -920,6 +981,7 @@ void XfbVelocityPass::Render(const VideoCore::XfbCapture& capture, vk::Extent2D 
             .pad = {},
         });
         draws.push_back(&region);
+        owner_shaders.push_back(region.shaders);
     }
     const u64 scene_draws = draws.size();
 
@@ -1010,7 +1072,8 @@ void XfbVelocityPass::Render(const VideoCore::XfbCapture& capture, vk::Extent2D 
             },
         };
     };
-    const std::array image_barriers = {target_barrier(motion_target), target_barrier(mask_target)};
+    const std::array image_barriers = {target_barrier(motion_target), target_barrier(mask_target),
+                                       target_barrier(owner_target)};
     cmdbuf.pipelineBarrier2(vk::DependencyInfo{
         .bufferMemoryBarrierCount = static_cast<u32>(buffer_barriers.size()),
         .pBufferMemoryBarriers = buffer_barriers.data(),
@@ -1038,6 +1101,15 @@ void XfbVelocityPass::Render(const VideoCore::XfbCapture& capture, vk::Extent2D 
             .clearValue =
                 vk::ClearValue{
                     .color = vk::ClearColorValue{.float32 = std::array{1.0f, 0.0f, 0.0f, 0.0f}}},
+        },
+        vk::RenderingAttachmentInfo{
+            .imageView = owner_target_view,
+            .imageLayout = vk::ImageLayout::eColorAttachmentOptimal,
+            .loadOp = vk::AttachmentLoadOp::eClear,
+            .storeOp = vk::AttachmentStoreOp::eStore,
+            .clearValue =
+                vk::ClearValue{
+                    .color = vk::ClearColorValue{.float32 = std::array{0.0f, 0.0f, 0.0f, 0.0f}}},
         },
     };
     const vk::RenderingAttachmentInfo depth_attachment{
@@ -1098,6 +1170,9 @@ void XfbVelocityPass::Render(const VideoCore::XfbCapture& capture, vk::Extent2D 
         cmdbuf.pushConstants(*pipeline_layout,
                              vk::ShaderStageFlagBits::eVertex | vk::ShaderStageFlagBits::eFragment,
                              0, sizeof(PushConstants), &entries[i].constants);
+        const u32 owner = static_cast<u32>(i + 1);
+        cmdbuf.pushConstants(*pipeline_layout, vk::ShaderStageFlagBits::eFragment,
+                             OwnerConstantOffset, sizeof(owner), &owner);
 
         // Counter is relative to the bound range, which already starts at the region.
         cmdbuf.drawIndirectByteCountEXT(1, 0, capture.CurrentCounters(), region.counter_offset, 0,
@@ -1141,6 +1216,19 @@ void XfbVelocityPass::Render(const VideoCore::XfbCapture& capture, vk::Extent2D 
             .oldLayout = vk::ImageLayout::eGeneral,
             .newLayout = vk::ImageLayout::eGeneral,
             .image = depth_out,
+            .subresourceRange = color_range,
+        },
+        vk::ImageMemoryBarrier2{
+            .srcStageMask = multisampled ? vk::PipelineStageFlagBits2::eComputeShader
+                                         : vk::PipelineStageFlagBits2::eColorAttachmentOutput,
+            .srcAccessMask = multisampled ? vk::AccessFlagBits2::eShaderStorageWrite
+                                          : vk::AccessFlagBits2::eColorAttachmentWrite,
+            .dstStageMask = vk::PipelineStageFlagBits2::eAllCommands,
+            .dstAccessMask = vk::AccessFlagBits2::eMemoryRead,
+            .oldLayout =
+                multisampled ? vk::ImageLayout::eGeneral : vk::ImageLayout::eColorAttachmentOptimal,
+            .newLayout = vk::ImageLayout::eGeneral,
+            .image = owner_image,
             .subresourceRange = color_range,
         },
     };

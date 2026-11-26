@@ -7,9 +7,11 @@
 
 #include <algorithm>
 #include <array>
+#include <cstring>
 #include <filesystem>
 #include <string>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 #define WIN32_LEAN_AND_MEAN
@@ -18,6 +20,7 @@
 #include "common/assert.h"
 #include "common/logging/log.h"
 #include "common/path_util.h"
+#include "video_core/host_shaders/nr_control_mask_comp.h"
 #include "video_core/host_shaders/nr_decode_comp.h"
 #include "video_core/host_shaders/nr_encode_comp.h"
 #include "video_core/renderer_vulkan/host_passes/ngx_abi.h"
@@ -33,6 +36,9 @@ namespace Vulkan::HostPasses {
 namespace {
 
 constexpr vk::Format WorkingFormat = vk::Format::eR16G16B16A16Sfloat;
+constexpr vk::Format MaskFormat = vk::Format::eR8Unorm;
+// Each pass runs the model on the previous pass's output, on a feature of its own.
+constexpr u32 MaxPasses = 30;
 // NVSDK_NGX_Result_Fail.
 constexpr Ngx::Result NgxFail = static_cast<Ngx::Result>(0xBAD00000u);
 
@@ -196,22 +202,35 @@ struct DlssNrPass::Impl {
         : instance{instance_}, scheduler{scheduler_}, runtime{runtime_},
           input{instance.GetDevice(), instance.GetAllocator()},
           output{instance.GetDevice(), instance.GetAllocator()},
-          staging{instance.GetDevice(), instance.GetAllocator()} {}
+          staging{instance.GetDevice(), instance.GetAllocator()},
+          pass_output{instance.GetDevice(), instance.GetAllocator()},
+          control_mask{instance.GetDevice(), instance.GetAllocator()},
+          draw_strengths{instance, 0, sizeof(float) * VideoCore::XfbCapture::MaxRegions,
+                         VideoCore::MemoryType::DeviceLocal, "DLSS NR Draw Strengths"},
+          pick_readback{instance, 0, sizeof(float), VideoCore::MemoryType::HostCached,
+                        "DLSS NR Pick"} {}
 
     ~Impl() {
         const vk::Device device = instance.GetDevice();
-        if (feature && release) {
+        if ((feature || !pass_features.empty()) && release) {
             // Never release under the GPU.
             (void)device.waitIdle();
-            release(feature);
+            if (feature) {
+                release(feature);
+            }
+            for (void* pass_feature : pass_features) {
+                release(pass_feature);
+            }
         }
         if (core_parameters && core_destroy) {
             core_destroy(core_parameters);
         }
         encode_pipeline.reset();
         decode_pipeline.reset();
+        mask_pipeline.reset();
         device.destroyShaderModule(encode_module);
         device.destroyShaderModule(decode_module);
+        device.destroyShaderModule(mask_module);
     }
 
     void Fail(const char* reason) {
@@ -223,8 +242,13 @@ struct DlssNrPass::Impl {
     void CreatePipelines();
     void ResizeTargets(vk::Extent2D extent);
     void Render(VideoCore::Image& color, const XfbVelocityPass::Outputs& inputs,
-                const Settings& settings);
+                Settings& settings);
     void SetTuning(const Settings& settings);
+    int CreateFeature(VkCommandBuffer command_buffer, const Settings& settings, void** out);
+    void ReleasePasses(size_t keep);
+    void Pick(const XfbVelocityPass::Outputs& inputs, DlssNrComponents& components);
+    bool BuildControlMask(vk::CommandBuffer cmdbuf, const XfbVelocityPass::Outputs& inputs,
+                          DlssNrComponents& components);
 
     const Instance& instance;
     Scheduler& scheduler;
@@ -242,6 +266,10 @@ struct DlssNrPass::Impl {
     Ngx::Parameter* parameters{};
     void* feature{};
     u32 feature_preset{};
+    // Passes after the first, each with its own temporal history.
+    std::vector<void*> pass_features;
+    std::vector<bool> pass_resets;
+    bool passes_failed{};
     bool initialised{};
     bool failed{};
     bool reset{true};
@@ -256,6 +284,10 @@ struct DlssNrPass::Impl {
     vk::UniquePipelineLayout decode_layout;
     vk::UniquePipeline encode_pipeline;
     vk::UniquePipeline decode_pipeline;
+    vk::ShaderModule mask_module;
+    vk::UniqueDescriptorSetLayout mask_set_layout;
+    vk::UniquePipelineLayout mask_layout;
+    vk::UniquePipeline mask_pipeline;
 
     vk::Extent2D size{};
     VideoCore::UniqueImage input;
@@ -264,6 +296,13 @@ struct DlssNrPass::Impl {
     vk::UniqueImageView output_view;
     VideoCore::UniqueImage staging;
     vk::UniqueImageView staging_view;
+    VideoCore::UniqueImage pass_output;
+    vk::UniqueImageView pass_output_view;
+    VideoCore::UniqueImage control_mask;
+    vk::UniqueImageView control_mask_view;
+    VideoCore::Buffer draw_strengths;
+    VideoCore::Buffer pick_readback;
+    std::vector<float> strengths;
 };
 
 bool DlssNrPass::Impl::Initialise() {
@@ -401,6 +440,48 @@ void DlssNrPass::Impl::CreatePipelines() {
     decode_layout = pipeline_layout(*decode_set_layout);
     encode_pipeline = pipeline(encode_module, *encode_layout);
     decode_pipeline = pipeline(decode_module, *decode_layout);
+
+    mask_module = CompileSPV(NR_CONTROL_MASK_COMP, device);
+    ASSERT(mask_module);
+    const std::array mask_bindings = {
+        vk::DescriptorSetLayoutBinding{
+            .binding = 0,
+            .descriptorType = vk::DescriptorType::eSampledImage,
+            .descriptorCount = 1,
+            .stageFlags = vk::ShaderStageFlagBits::eCompute,
+        },
+        vk::DescriptorSetLayoutBinding{
+            .binding = 1,
+            .descriptorType = vk::DescriptorType::eStorageBuffer,
+            .descriptorCount = 1,
+            .stageFlags = vk::ShaderStageFlagBits::eCompute,
+        },
+        vk::DescriptorSetLayoutBinding{
+            .binding = 2,
+            .descriptorType = vk::DescriptorType::eStorageImage,
+            .descriptorCount = 1,
+            .stageFlags = vk::ShaderStageFlagBits::eCompute,
+        },
+    };
+    mask_set_layout = Check<"create dlss nr mask descriptor set layout">(
+        device.createDescriptorSetLayoutUnique(vk::DescriptorSetLayoutCreateInfo{
+            .flags = vk::DescriptorSetLayoutCreateFlagBits::ePushDescriptorKHR,
+            .bindingCount = static_cast<u32>(mask_bindings.size()),
+            .pBindings = mask_bindings.data(),
+        }));
+    const vk::PushConstantRange mask_constants{
+        .stageFlags = vk::ShaderStageFlagBits::eCompute,
+        .offset = 0,
+        .size = sizeof(float) + sizeof(u32),
+    };
+    mask_layout = Check<"create dlss nr mask pipeline layout">(
+        device.createPipelineLayoutUnique(vk::PipelineLayoutCreateInfo{
+            .setLayoutCount = 1,
+            .pSetLayouts = &*mask_set_layout,
+            .pushConstantRangeCount = 1,
+            .pPushConstantRanges = &mask_constants,
+        }));
+    mask_pipeline = pipeline(mask_module, *mask_layout);
 }
 
 void DlssNrPass::Impl::ResizeTargets(vk::Extent2D extent) {
@@ -414,12 +495,17 @@ void DlssNrPass::Impl::ResizeTargets(vk::Extent2D extent) {
         release(feature);
         feature = nullptr;
     }
+    ReleasePasses(0);
+    pass_output_view.reset();
+    pass_output.Destroy();
     input_view.reset();
     output_view.reset();
     staging_view.reset();
+    control_mask_view.reset();
     input.Destroy();
     output.Destroy();
     staging.Destroy();
+    control_mask.Destroy();
 
     size = extent;
     reset = true;
@@ -438,7 +524,9 @@ void DlssNrPass::Impl::ResizeTargets(vk::Extent2D extent) {
     input.Create(image_ci);
     output.Create(image_ci);
     staging.Create(image_ci);
+    pass_output.Create(image_ci);
     SetObjectName(device, static_cast<vk::Image>(input), "DLSS NR Input");
+    SetObjectName(device, static_cast<vk::Image>(pass_output), "DLSS NR Pass Output");
     SetObjectName(device, static_cast<vk::Image>(output), "DLSS NR Output");
     SetObjectName(device, static_cast<vk::Image>(staging), "DLSS NR Staging");
 
@@ -457,6 +545,42 @@ void DlssNrPass::Impl::ResizeTargets(vk::Extent2D extent) {
     output_view = Check<"create dlss nr view">(device.createImageViewUnique(view_ci));
     view_ci.image = staging;
     staging_view = Check<"create dlss nr view">(device.createImageViewUnique(view_ci));
+    view_ci.image = pass_output;
+    pass_output_view = Check<"create dlss nr view">(device.createImageViewUnique(view_ci));
+
+    image_ci.format = MaskFormat;
+    image_ci.usage = vk::ImageUsageFlagBits::eStorage | vk::ImageUsageFlagBits::eSampled;
+    control_mask.Create(image_ci);
+    SetObjectName(device, static_cast<vk::Image>(control_mask), "DLSS NR Control Mask");
+    view_ci.image = control_mask;
+    view_ci.format = MaskFormat;
+    control_mask_view = Check<"create dlss nr view">(device.createImageViewUnique(view_ci));
+}
+
+int DlssNrPass::Impl::CreateFeature(VkCommandBuffer command_buffer, const Settings& settings,
+                                    void** out) {
+    parameters->Set("DLSSNR.Enabled", 1u);
+    parameters->Set("DLSSNR.Width", size.width);
+    parameters->Set("DLSSNR.Height", size.height);
+    parameters->Set("CreationNodeMask", 1u);
+    parameters->Set("VisibilityNodeMask", 1u);
+    parameters->Set("DLSSNR.Hint.Render.Preset", settings.preset);
+    SetTuning(settings);
+    parameters->Set("DLSSNR.UICorrection", 1u);
+    return create(command_buffer, Ngx::FeatureNeuralRendering, parameters, out);
+}
+
+void DlssNrPass::Impl::ReleasePasses(size_t keep) {
+    if (pass_features.size() <= keep) {
+        return;
+    }
+    // Never release under the GPU.
+    scheduler.Finish();
+    for (size_t pass = keep; pass < pass_features.size(); ++pass) {
+        release(pass_features[pass]);
+    }
+    pass_features.resize(keep);
+    pass_resets.resize(keep);
 }
 
 void DlssNrPass::Impl::SetTuning(const Settings& settings) {
@@ -468,8 +592,191 @@ void DlssNrPass::Impl::SetTuning(const Settings& settings) {
     parameters->Set("DLSSNR.UseAutoMask", settings.auto_mask ? 1u : 0u);
 }
 
+void DlssNrPass::Impl::Pick(const XfbVelocityPass::Outputs& inputs, DlssNrComponents& components) {
+    std::optional<std::array<float, 2>> position;
+    {
+        std::scoped_lock lock{components.mutex};
+        position = std::exchange(components.pick_position, std::nullopt);
+    }
+    if (!position) {
+        return;
+    }
+    const auto texel = [](float coordinate, u32 extent) {
+        return static_cast<s32>(
+            std::min(static_cast<u32>(std::max(coordinate, 0.0f) * extent), extent - 1));
+    };
+    scheduler.EndRendering();
+    const vk::CommandBuffer cmdbuf = scheduler.CommandBuffer();
+    const vk::BufferImageCopy copy{
+        .bufferOffset = 0,
+        .bufferRowLength = 0,
+        .bufferImageHeight = 0,
+        .imageSubresource{
+            .aspectMask = vk::ImageAspectFlagBits::eColor,
+            .mipLevel = 0,
+            .baseArrayLayer = 0,
+            .layerCount = 1,
+        },
+        .imageOffset = {texel((*position)[0], inputs.size.width),
+                        texel((*position)[1], inputs.size.height), 0},
+        .imageExtent = {1, 1, 1},
+    };
+    cmdbuf.copyImageToBuffer(inputs.owner, vk::ImageLayout::eGeneral, pick_readback.Handle(), copy);
+    const vk::BufferMemoryBarrier2 to_host{
+        .srcStageMask = vk::PipelineStageFlagBits2::eTransfer,
+        .srcAccessMask = vk::AccessFlagBits2::eTransferWrite,
+        .dstStageMask = vk::PipelineStageFlagBits2::eHost,
+        .dstAccessMask = vk::AccessFlagBits2::eHostRead,
+        .buffer = pick_readback.Handle(),
+        .offset = 0,
+        .size = vk::WholeSize,
+    };
+    cmdbuf.pipelineBarrier2(vk::DependencyInfo{
+        .bufferMemoryBarrierCount = 1,
+        .pBufferMemoryBarriers = &to_host,
+    });
+    scheduler.Finish();
+    pick_readback.Invalidate(0, sizeof(float));
+    float value{};
+    std::memcpy(&value, pick_readback.mapped_data.data(), sizeof(value));
+    const u32 index = static_cast<u32>(value);
+
+    std::scoped_lock lock{components.mutex};
+    components.pick_done = true;
+    components.picked = std::nullopt;
+    if (index != 0 && index <= inputs.owner_shaders.size()) {
+        components.picked = inputs.owner_shaders[index - 1];
+    }
+}
+
+bool DlssNrPass::Impl::BuildControlMask(vk::CommandBuffer cmdbuf,
+                                        const XfbVelocityPass::Outputs& inputs,
+                                        DlssNrComponents& components) {
+    struct {
+        float untagged;
+        u32 draw_count;
+    } constants{};
+    {
+        std::scoped_lock lock{components.mutex};
+        if (!components.Active()) {
+            return false;
+        }
+        strengths.resize(inputs.owner_shaders.size());
+        std::ranges::transform(inputs.owner_shaders, strengths.begin(),
+                               [&components](const VideoCore::XfbShaders& shaders) {
+                                   return components.StrengthOf(shaders);
+                               });
+        constants.untagged = components.components[0].strength;
+    }
+    constants.draw_count = static_cast<u32>(strengths.size());
+
+    const vk::BufferMemoryBarrier2 before_upload{
+        .srcStageMask = vk::PipelineStageFlagBits2::eComputeShader,
+        .srcAccessMask = vk::AccessFlagBits2::eShaderStorageRead,
+        .dstStageMask = vk::PipelineStageFlagBits2::eTransfer,
+        .dstAccessMask = vk::AccessFlagBits2::eTransferWrite,
+        .buffer = draw_strengths.Handle(),
+        .offset = 0,
+        .size = vk::WholeSize,
+    };
+    cmdbuf.pipelineBarrier2(vk::DependencyInfo{
+        .bufferMemoryBarrierCount = 1,
+        .pBufferMemoryBarriers = &before_upload,
+    });
+    // vkCmdUpdateBuffer takes at most 65536 bytes per call.
+    constexpr size_t StrengthsPerUpdate = 65536 / sizeof(float);
+    for (size_t first = 0; first < strengths.size(); first += StrengthsPerUpdate) {
+        const size_t count = std::min(StrengthsPerUpdate, strengths.size() - first);
+        cmdbuf.updateBuffer(draw_strengths.Handle(), first * sizeof(float), count * sizeof(float),
+                            static_cast<const void*>(strengths.data() + first));
+    }
+
+    const vk::ImageSubresourceRange color_range{
+        .aspectMask = vk::ImageAspectFlagBits::eColor,
+        .levelCount = 1,
+        .layerCount = 1,
+    };
+    const vk::BufferMemoryBarrier2 after_upload{
+        .srcStageMask = vk::PipelineStageFlagBits2::eTransfer,
+        .srcAccessMask = vk::AccessFlagBits2::eTransferWrite,
+        .dstStageMask = vk::PipelineStageFlagBits2::eComputeShader,
+        .dstAccessMask = vk::AccessFlagBits2::eShaderStorageRead,
+        .buffer = draw_strengths.Handle(),
+        .offset = 0,
+        .size = vk::WholeSize,
+    };
+    const vk::ImageMemoryBarrier2 to_write{
+        .srcStageMask = vk::PipelineStageFlagBits2::eAllCommands,
+        .srcAccessMask = vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite,
+        .dstStageMask = vk::PipelineStageFlagBits2::eComputeShader,
+        .dstAccessMask = vk::AccessFlagBits2::eShaderStorageWrite,
+        .oldLayout = vk::ImageLayout::eUndefined,
+        .newLayout = vk::ImageLayout::eGeneral,
+        .image = control_mask,
+        .subresourceRange = color_range,
+    };
+    cmdbuf.pipelineBarrier2(vk::DependencyInfo{
+        .bufferMemoryBarrierCount = 1,
+        .pBufferMemoryBarriers = &after_upload,
+        .imageMemoryBarrierCount = 1,
+        .pImageMemoryBarriers = &to_write,
+    });
+
+    const vk::DescriptorImageInfo owner_info{
+        .imageView = inputs.owner_view,
+        .imageLayout = vk::ImageLayout::eGeneral,
+    };
+    const vk::DescriptorBufferInfo strengths_info{draw_strengths.Handle(), 0, vk::WholeSize};
+    const vk::DescriptorImageInfo mask_info{
+        .imageView = *control_mask_view,
+        .imageLayout = vk::ImageLayout::eGeneral,
+    };
+    const std::array writes = {
+        vk::WriteDescriptorSet{
+            .dstBinding = 0,
+            .descriptorCount = 1,
+            .descriptorType = vk::DescriptorType::eSampledImage,
+            .pImageInfo = &owner_info,
+        },
+        vk::WriteDescriptorSet{
+            .dstBinding = 1,
+            .descriptorCount = 1,
+            .descriptorType = vk::DescriptorType::eStorageBuffer,
+            .pBufferInfo = &strengths_info,
+        },
+        vk::WriteDescriptorSet{
+            .dstBinding = 2,
+            .descriptorCount = 1,
+            .descriptorType = vk::DescriptorType::eStorageImage,
+            .pImageInfo = &mask_info,
+        },
+    };
+    cmdbuf.bindPipeline(vk::PipelineBindPoint::eCompute, *mask_pipeline);
+    cmdbuf.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute, *mask_layout, 0, writes);
+    cmdbuf.pushConstants(*mask_layout, vk::ShaderStageFlagBits::eCompute, 0, sizeof(constants),
+                         &constants);
+    cmdbuf.dispatch((size.width + 7) / 8, (size.height + 7) / 8, 1);
+
+    const vk::ImageMemoryBarrier2 to_model{
+        .srcStageMask = vk::PipelineStageFlagBits2::eComputeShader,
+        .srcAccessMask = vk::AccessFlagBits2::eShaderStorageWrite,
+        .dstStageMask = vk::PipelineStageFlagBits2::eAllCommands,
+        .dstAccessMask = vk::AccessFlagBits2::eMemoryRead,
+        .oldLayout = vk::ImageLayout::eGeneral,
+        .newLayout = vk::ImageLayout::eGeneral,
+        .image = control_mask,
+        .subresourceRange = color_range,
+    };
+    cmdbuf.pipelineBarrier2(vk::DependencyInfo{
+        .imageMemoryBarrierCount = 1,
+        .pImageMemoryBarriers = &to_model,
+    });
+    return true;
+}
+
 void DlssNrPass::Impl::Render(VideoCore::Image& color, const XfbVelocityPass::Outputs& inputs,
-                              const Settings& settings) {
+                              Settings& settings) {
+    Pick(inputs, settings.components);
     if (!settings.enable) {
         reset = true;
         return;
@@ -492,7 +799,10 @@ void DlssNrPass::Impl::Render(VideoCore::Image& color, const XfbVelocityPass::Ou
         scheduler.Finish();
         release(feature);
         feature = nullptr;
+        ReleasePasses(0);
     }
+    const size_t extra_passes = std::clamp(settings.passes, 1u, MaxPasses) - 1;
+    ReleasePasses(extra_passes);
 
     const vk::CommandBuffer cmdbuf = scheduler.CommandBuffer();
     scheduler.EndRendering();
@@ -529,6 +839,8 @@ void DlssNrPass::Impl::Render(VideoCore::Image& color, const XfbVelocityPass::Ou
                 vk::AccessFlagBits2::eShaderStorageWrite),
         barrier(output, vk::ImageLayout::eUndefined, vk::ImageLayout::eGeneral, all, any_access,
                 all, any_access),
+        barrier(pass_output, vk::ImageLayout::eUndefined, vk::ImageLayout::eGeneral, all,
+                any_access, all, any_access),
         barrier(staging, vk::ImageLayout::eUndefined, vk::ImageLayout::eGeneral, all, any_access,
                 vk::PipelineStageFlagBits2::eComputeShader,
                 vk::AccessFlagBits2::eShaderStorageWrite),
@@ -578,19 +890,11 @@ void DlssNrPass::Impl::Render(VideoCore::Image& color, const XfbVelocityPass::Ou
         .imageMemoryBarrierCount = static_cast<u32>(to_model.size()),
         .pImageMemoryBarriers = to_model.data(),
     });
+    const bool masked = BuildControlMask(cmdbuf, inputs, settings.components);
 
     const auto command_buffer = static_cast<VkCommandBuffer>(cmdbuf);
     if (!feature) {
-        parameters->Set("DLSSNR.Enabled", 1u);
-        parameters->Set("DLSSNR.Width", size.width);
-        parameters->Set("DLSSNR.Height", size.height);
-        parameters->Set("CreationNodeMask", 1u);
-        parameters->Set("VisibilityNodeMask", 1u);
-        parameters->Set("DLSSNR.Hint.Render.Preset", settings.preset);
-        SetTuning(settings);
-        parameters->Set("DLSSNR.UICorrection", 1u);
-        const int result =
-            create(command_buffer, Ngx::FeatureNeuralRendering, parameters, &feature);
+        const int result = CreateFeature(command_buffer, settings, &feature);
         LOG_INFO(Render_Vulkan, "DLSS NR: feature create {:#x} at {}x{}", static_cast<u32>(result),
                  size.width, size.height);
         if (result != Ngx::Success || !feature) {
@@ -600,6 +904,20 @@ void DlssNrPass::Impl::Render(VideoCore::Image& color, const XfbVelocityPass::Ou
         }
         feature_preset = settings.preset;
         reset = true;
+    }
+    // A pass feature is built on one frame and first evaluated on the next, one per frame.
+    size_t ready_passes = pass_features.size();
+    if (ready_passes < extra_passes && !passes_failed) {
+        void* pass_feature{};
+        const int result = CreateFeature(command_buffer, settings, &pass_feature);
+        LOG_INFO(Render_Vulkan, "DLSS NR: pass {} feature create {:#x}", ready_passes + 2,
+                 static_cast<u32>(result));
+        if (result == Ngx::Success && pass_feature) {
+            pass_features.push_back(pass_feature);
+            pass_resets.push_back(true);
+        } else {
+            passes_failed = true;
+        }
     }
 
     const auto resource = [](vk::Image image, vk::ImageView view, vk::Format format,
@@ -623,19 +941,26 @@ void DlssNrPass::Impl::Render(VideoCore::Image& color, const XfbVelocityPass::Ou
     Ngx::ResourceVk motion_resource =
         resource(inputs.motion, inputs.motion_view, vk::Format::eR16G16Sfloat, size, false);
     Ngx::ResourceVk output_resource = resource(output, *output_view, WorkingFormat, size, true);
+    Ngx::ResourceVk output_read = resource(output, *output_view, WorkingFormat, size, false);
+    Ngx::ResourceVk pass_output_resource =
+        resource(pass_output, *pass_output_view, WorkingFormat, size, true);
+    Ngx::ResourceVk pass_output_read =
+        resource(pass_output, *pass_output_view, WorkingFormat, size, false);
+    Ngx::ResourceVk mask_resource =
+        resource(control_mask, *control_mask_view, MaskFormat, size, false);
 
-    parameters->Set("DLSSNR.Color", static_cast<void*>(&color_resource));
     parameters->Set("DLSSNR.Depth", static_cast<void*>(&depth_resource));
     parameters->Set("DLSSNR.MVec", static_cast<void*>(&motion_resource));
-    parameters->Set("DLSSNR.Output", static_cast<void*>(&output_resource));
+    // Without a mask the model keeps its own skin mask; MaskBlendMode 0 turns that off with one.
+    parameters->Set("DLSSNR.ControlMask",
+                    masked ? static_cast<void*>(&mask_resource) : static_cast<void*>(nullptr));
     parameters->Set("DLSSNR.Enabled", 1u);
     parameters->Set("DLSSNR.Width", size.width);
     parameters->Set("DLSSNR.Height", size.height);
     // The velocity pass sees clears at 1.0 as far in the games checked so far.
     parameters->Set("DLSSNR.DepthInverted", 0u);
-    parameters->Set("DLSSNR.Reset", reset ? 1u : 0u);
     for (const char* rect : {"DLSSNR.ColorSubrect", "DLSSNR.OutputSubrect", "DLSSNR.DepthSubrect",
-                             "DLSSNR.MVecSubrect"}) {
+                             "DLSSNR.MVecSubrect", "DLSSNR.ControlMaskSubrect"}) {
         const std::string prefix{rect};
         parameters->Set((prefix + "BaseX").c_str(), 0u);
         parameters->Set((prefix + "BaseY").c_str(), 0u);
@@ -647,28 +972,44 @@ void DlssNrPass::Impl::Render(VideoCore::Image& color, const XfbVelocityPass::Ou
     parameters->Set("DLSSNR.MVecScaleY", 1.0f);
     SetTuning(settings);
 
-    const int evaluated = evaluate(command_buffer, feature, parameters);
-    reset = false;
-    if (evaluated != Ngx::Success) {
-        LOG_ERROR(Render_Vulkan, "DLSS NR: evaluate {:#x}", static_cast<u32>(evaluated));
-        Fail("the model refused to evaluate");
-        return;
+    // Pass 1 reads the game image; each later pass reads the previous pass's output, alternating
+    // between the two output images.
+    for (size_t pass = 0; pass <= ready_passes; ++pass) {
+        const bool to_output = pass % 2 == 0;
+        Ngx::ResourceVk* source =
+            pass == 0 ? &color_resource : (to_output ? &pass_output_read : &output_read);
+        parameters->Set("DLSSNR.Color", static_cast<void*>(source));
+        parameters->Set("DLSSNR.Output",
+                        static_cast<void*>(to_output ? &output_resource : &pass_output_resource));
+        const bool pass_reset = reset || (pass > 0 && pass_resets[pass - 1]);
+        parameters->Set("DLSSNR.Reset", pass_reset ? 1u : 0u);
+        const int evaluated =
+            evaluate(command_buffer, pass == 0 ? feature : pass_features[pass - 1], parameters);
+        if (evaluated != Ngx::Success) {
+            LOG_ERROR(Render_Vulkan, "DLSS NR: pass {} evaluate {:#x}", pass + 1,
+                      static_cast<u32>(evaluated));
+            Fail("the model refused to evaluate");
+            return;
+        }
+        if (pass > 0) {
+            pass_resets[pass - 1] = false;
+        }
+        const auto written = barrier(
+            to_output ? static_cast<vk::Image>(output) : static_cast<vk::Image>(pass_output),
+            vk::ImageLayout::eGeneral, vk::ImageLayout::eGeneral, all, any_access, all, any_access);
+        cmdbuf.pipelineBarrier2(vk::DependencyInfo{
+            .imageMemoryBarrierCount = 1,
+            .pImageMemoryBarriers = &written,
+        });
     }
+    reset = false;
     if (frames++ == 0) {
         LOG_INFO(Render_Vulkan, "DLSS NR: first frame evaluated at {}x{}", size.width, size.height);
     }
 
-    const std::array from_model = {
-        barrier(output, vk::ImageLayout::eGeneral, vk::ImageLayout::eGeneral, all, any_access,
-                vk::PipelineStageFlagBits2::eComputeShader,
-                vk::AccessFlagBits2::eShaderStorageRead),
-    };
-    cmdbuf.pipelineBarrier2(vk::DependencyInfo{
-        .imageMemoryBarrierCount = static_cast<u32>(from_model.size()),
-        .pImageMemoryBarriers = from_model.data(),
-    });
+    const vk::ImageView result_view = ready_passes % 2 == 0 ? *output_view : *pass_output_view;
     dispatch(*decode_pipeline, *decode_layout, vk::DescriptorType::eStorageImage,
-             {.imageView = *output_view, .imageLayout = vk::ImageLayout::eGeneral},
+             {.imageView = result_view, .imageLayout = vk::ImageLayout::eGeneral},
              {.imageView = *staging_view, .imageLayout = vk::ImageLayout::eGeneral},
              srgb ? 1u : 0u);
 
@@ -767,7 +1108,7 @@ void DlssNrPass::LogCudaState() {
 }
 
 void DlssNrPass::Render(VideoCore::Image& color, const XfbVelocityPass::Outputs& inputs,
-                        const Settings& settings) {
+                        Settings& settings) {
     impl->Render(color, inputs, settings);
 }
 
@@ -791,7 +1132,7 @@ void DlssNrPass::InitCuda() {}
 
 void DlssNrPass::LogCudaState() {}
 
-void DlssNrPass::Render(VideoCore::Image&, const XfbVelocityPass::Outputs&, const Settings&) {}
+void DlssNrPass::Render(VideoCore::Image&, const XfbVelocityPass::Outputs&, Settings&) {}
 
 } // namespace Vulkan::HostPasses
 

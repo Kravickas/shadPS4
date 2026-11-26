@@ -13,6 +13,7 @@ layout (push_constant) uniform Constants {
     vec2 depth_range;
     uint blended;
     uint negative_one_to_one;
+    uint owner;
 } pc;
 
 // Clip to previous clip transform of static geometry, solved by xfb_camera_solve.comp.
@@ -29,6 +30,8 @@ layout(location = 2) in float in_invalid;
 layout(location = 0) out vec2 out_motion;
 // 0 per-vertex motion, 0.25 camera reprojection, 0.5 untrusted, 1 (clear) not covered.
 layout(location = 1) out float out_mask;
+// Index of the draw that owns the pixel plus one; 0 (clear) not covered.
+layout(location = 2) out float out_owner;
 
 // The fragment passed an EQUAL test, so gl_FragCoord.z is the stored scene depth.
 bool CameraMotion(out vec2 motion) {
@@ -53,6 +56,7 @@ bool CameraMotion(out vec2 motion) {
 }
 
 void main() {
+    out_owner = float(pc.owner);
     if (in_invalid > 0.0 || in_prev.w <= 0.0) {
         vec2 motion;
         if (pc.blended == 0u && CameraMotion(motion)) {

@@ -439,6 +439,7 @@ struct GPUSettings {
     Setting<int> dlss_nr_local_tone{1000};
     Setting<int> dlss_nr_skin_structure{-1000};
     Setting<bool> dlss_nr_auto_mask{false};
+    Setting<u32> dlss_nr_passes{1};
     Setting<bool> userfaultfd{false};
     Setting<bool> inline_fetch_shader{false};
     Setting<bool> fast_shader_math{false};
@@ -472,16 +473,14 @@ struct GPUSettings {
         };
     }
 };
-NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE(GPUSettings, window_width, window_height, internal_screen_width,
-                                   internal_screen_height, null_gpu, copy_gpu_buffers,
-                                   readbacks_mode, readback_linear_images_enabled,
-                                   direct_memory_access_enabled, dump_shaders, patch_shaders,
-                                   vblank_frequency, full_screen, full_screen_mode, present_mode,
-                                   hdr_allowed, fsr_enabled, rcas_enabled, rcas_attenuation,
-                                   dlss_nr_enabled, dlss_nr_preset, dlss_nr_style,
-                                   dlss_nr_intensity, dlss_nr_local_structure, dlss_nr_local_tone,
-                                   dlss_nr_skin_structure, dlss_nr_auto_mask, userfaultfd,
-                                   inline_fetch_shader, fast_shader_math, submit_draw_interval)
+NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE(
+    GPUSettings, window_width, window_height, internal_screen_width, internal_screen_height,
+    null_gpu, copy_gpu_buffers, readbacks_mode, readback_linear_images_enabled,
+    direct_memory_access_enabled, dump_shaders, patch_shaders, vblank_frequency, full_screen,
+    full_screen_mode, present_mode, hdr_allowed, fsr_enabled, rcas_enabled, rcas_attenuation,
+    dlss_nr_enabled, dlss_nr_preset, dlss_nr_style, dlss_nr_intensity, dlss_nr_local_structure,
+    dlss_nr_local_tone, dlss_nr_skin_structure, dlss_nr_auto_mask, dlss_nr_passes, userfaultfd,
+    inline_fetch_shader, fast_shader_math, submit_draw_interval)
 
 // -------------------------------
 // Vulkan settings
@@ -790,6 +789,7 @@ public:
     SETTING_FORWARD(m_gpu, DlssNrLocalTone, dlss_nr_local_tone)
     SETTING_FORWARD(m_gpu, DlssNrSkinStructure, dlss_nr_skin_structure)
     SETTING_FORWARD_BOOL(m_gpu, DlssNrAutoMask, dlss_nr_auto_mask)
+    SETTING_FORWARD(m_gpu, DlssNrPasses, dlss_nr_passes)
     SETTING_FORWARD(m_gpu, ReadbacksMode, readbacks_mode)
     SETTING_FORWARD_BOOL(m_gpu, ReadbackLinearImagesEnabled, readback_linear_images_enabled)
     SETTING_FORWARD_BOOL(m_gpu, DirectMemoryAccessEnabled, direct_memory_access_enabled)

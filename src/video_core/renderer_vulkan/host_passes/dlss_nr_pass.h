@@ -5,6 +5,7 @@
 
 #include <memory>
 #include "common/types.h"
+#include "video_core/renderer_vulkan/host_passes/dlss_nr_components.h"
 #include "video_core/renderer_vulkan/host_passes/xfb_velocity_pass.h"
 
 namespace VideoCore {
@@ -35,6 +36,9 @@ public:
         float local_tone{1.0f};
         float skin_structure{-1.0f};
         bool auto_mask{false};
+        // How many times the model runs on each frame, each pass on the previous one's output.
+        u32 passes{1};
+        DlssNrComponents components;
     };
 
     DlssNrPass(const Instance& instance, Scheduler& scheduler, Runtime& runtime);
@@ -51,7 +55,7 @@ public:
 
     // Replaces the contents of color with the model's output.
     void Render(VideoCore::Image& color, const XfbVelocityPass::Outputs& inputs,
-                const Settings& settings);
+                Settings& settings);
 
 private:
     struct Impl;

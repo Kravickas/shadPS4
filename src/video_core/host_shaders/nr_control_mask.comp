@@ -1,0 +1,30 @@
+// SPDX-FileCopyrightText: Copyright 2026 shadPS4 Emulator Project
+// SPDX-License-Identifier: GPL-2.0-or-later
+
+#version 450
+#extension GL_EXT_samplerless_texture_functions : require
+
+layout(local_size_x = 8, local_size_y = 8) in;
+
+// Index of the owning draw plus one, 0 where no draw owns the pixel.
+layout(set = 0, binding = 0) uniform texture2D owner;
+layout(set = 0, binding = 1, std430) readonly buffer Strengths {
+    float strength[];
+};
+// The model reads only the red channel: its output weight is saturate(intensity * red).
+layout(set = 0, binding = 2, r8) uniform writeonly image2D control_mask;
+
+layout(push_constant) uniform Constants {
+    float untagged;
+    uint draw_count;
+} pc;
+
+void main() {
+    const ivec2 coord = ivec2(gl_GlobalInvocationID.xy);
+    if (any(greaterThanEqual(coord, imageSize(control_mask)))) {
+        return;
+    }
+    const uint index = uint(texelFetch(owner, coord, 0).r);
+    const float value = index != 0u && index <= pc.draw_count ? strength[index - 1u] : pc.untagged;
+    imageStore(control_mask, coord, vec4(value));
+}

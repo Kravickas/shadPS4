@@ -56,6 +56,7 @@ add_host_shader(xfb_depth_copy.comp xfb_depth_copy_comp)
 add_host_shader(xfb_depth_copy_ms.comp xfb_depth_copy_ms_comp)
 add_host_shader(nr_encode.comp nr_encode_comp)
 add_host_shader(nr_decode.comp nr_decode_comp)
+add_host_shader(nr_control_mask.comp nr_control_mask_comp)
 
 foreach(BPP IN ITEMS 8 16 32 64 96 128)
     add_host_shader(tiling.comp tiling_micro_${BPP}_comp BITS_PER_PIXEL=${BPP} IS_MACRO_TILED=0)

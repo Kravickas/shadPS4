@@ -93,7 +93,7 @@ public:
     void EndXfbFrame(vk::Extent2D output_extent);
 
     /// Runs DLSS Neural Rendering over the presented image when the model is available.
-    void EvaluateNr(VideoCore::Image& color, const HostPasses::DlssNrPass::Settings& settings);
+    void EvaluateNr(VideoCore::Image& color, HostPasses::DlssNrPass::Settings& settings);
 
     bool IsDlssNrAvailable() const {
         return dlss_nr.has_value();

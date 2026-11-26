@@ -10,6 +10,8 @@ layout(set = 0, binding = 0) uniform texture2DMS motion_ms;
 layout(set = 0, binding = 1) uniform texture2DMS mask_ms;
 layout(set = 0, binding = 2, rg16f) uniform writeonly image2D motion_out;
 layout(set = 0, binding = 3, r8) uniform writeonly image2D mask_out;
+layout(set = 0, binding = 4) uniform texture2DMS owner_ms;
+layout(set = 0, binding = 5, r32f) uniform writeonly image2D owner_out;
 
 // Sample 0, not an average: blending vectors of two surfaces at an edge yields motion neither has.
 void main() {
@@ -19,4 +21,5 @@ void main() {
     }
     imageStore(motion_out, coord, texelFetch(motion_ms, coord, 0));
     imageStore(mask_out, coord, texelFetch(mask_ms, coord, 0));
+    imageStore(owner_out, coord, texelFetch(owner_ms, coord, 0));
 }

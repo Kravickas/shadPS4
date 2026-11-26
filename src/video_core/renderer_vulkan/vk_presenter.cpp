@@ -38,6 +38,7 @@
 #include <iomanip>
 #include <limits>
 #include <memory>
+#include <mutex>
 #include <span>
 #include <sstream>
 #include <system_error>
@@ -496,6 +497,8 @@ Presenter::Presenter(Frontend::WindowSDL& window_, AmdGpu::Liverpool* liverpool_
     dlss_nr_settings.local_tone = EmulatorSettings.GetDlssNrLocalTone() / 1000.f;
     dlss_nr_settings.skin_structure = EmulatorSettings.GetDlssNrSkinStructure() / 1000.f;
     dlss_nr_settings.auto_mask = EmulatorSettings.IsDlssNrAutoMask();
+    dlss_nr_settings.passes = EmulatorSettings.GetDlssNrPasses();
+    dlss_nr_settings.components.Load(Common::ElfInfo::Instance().GameSerial());
 
     fsr_pass.Create(device, instance.GetAllocator(), num_images);
     pp_pass.Create(device, swapchain.GetSurfaceFormat().format);
@@ -1002,6 +1005,18 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame)
 
                 ImGui::SetCursorPos(ImGui::GetCursorStartPos() + offset);
                 ImGui::Image(game_texture, size);
+                if (ImGui::IsItemClicked(ImGuiMouseButton_Left)) {
+                    auto& components = dlss_nr_settings.components;
+                    std::scoped_lock lock{components.mutex};
+                    if (components.pick_armed) {
+                        const ImVec2 min = ImGui::GetItemRectMin();
+                        const ImVec2 mouse = ImGui::GetIO().MousePos;
+                        components.pick_position = {(mouse.x - min.x) / size.x,
+                                                    (mouse.y - min.y) / size.y};
+                        components.pick_armed = false;
+                        components.pick_done = false;
+                    }
+                }
 
                 if (EmulatorSettings.IsNullGPU()) {
                     Core::Devtools::Layer::DrawNullGpuNotice();

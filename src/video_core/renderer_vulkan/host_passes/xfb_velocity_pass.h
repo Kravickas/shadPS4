@@ -5,16 +5,17 @@
 
 #include <array>
 #include <optional>
+#include <span>
 #include <unordered_map>
 #include <vector>
 #include "common/types.h"
 #include "video_core/buffer_cache/buffer.h"
 #include "video_core/renderer_vulkan/vk_common.h"
 #include "video_core/texture_cache/image.h"
+#include "video_core/xfb_capture.h"
 
 namespace VideoCore {
 class TextureCache;
-class XfbCapture;
 } // namespace VideoCore
 
 namespace Vulkan {
@@ -35,13 +36,18 @@ public:
 
     void Render(const VideoCore::XfbCapture& capture, vk::Extent2D output_extent);
 
-    // Single-sample motion (RG16F, pixels) and depth (R32F) of the last rendered frame, both in
-    // eGeneral. Empty until a frame was rendered.
+    // Single-sample motion (RG16F, pixels), depth (R32F) and owner (R32F) of the last rendered
+    // frame, all in eGeneral. The owner holds the index of the draw that owns each pixel plus
+    // one, 0 where no draw does; owner_shaders lists those draws' programs in index order. Empty
+    // until a frame was rendered.
     struct Outputs {
         vk::Image motion;
         vk::ImageView motion_view;
         vk::Image depth;
         vk::ImageView depth_view;
+        vk::Image owner;
+        vk::ImageView owner_view;
+        std::span<const VideoCore::XfbShaders> owner_shaders;
         vk::Extent2D size;
     };
     std::optional<Outputs> FrameOutputs() const;
@@ -65,7 +71,8 @@ private:
         size_t operator()(const PipelineKey& key) const noexcept;
     };
 
-    // Mirrors the push constant block of xfb_velocity.vert and xfb_velocity.frag.
+    // Mirrors the push constant block of xfb_velocity.vert and xfb_velocity.frag. The fragment
+    // stage's block continues with the owner index (OwnerConstantOffset).
     struct PushConstants {
         u32 cur_offset;
         u32 prev_offset;
@@ -144,6 +151,11 @@ private:
     vk::UniqueImageView motion_ms_view;
     VideoCore::UniqueImage mask_ms_image;
     vk::UniqueImageView mask_ms_view;
+    VideoCore::UniqueImage owner_image;
+    vk::UniqueImageView owner_view;
+    VideoCore::UniqueImage owner_ms_image;
+    vk::UniqueImageView owner_ms_view;
+    std::vector<VideoCore::XfbShaders> owner_shaders;
     VideoCore::UniqueImage depth_out;
     vk::UniqueImageView depth_out_view;
     vk::ShaderModule depth_copy_module;
