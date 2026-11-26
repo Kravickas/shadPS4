@@ -3,10 +3,14 @@
 
 #pragma once
 
+#include <functional>
 #include <map>
 #include <mutex>
+#include <set>
 #include <string>
 #include <string_view>
+#include <unordered_map>
+#include <vector>
 #include "common/enum.h"
 #include "common/shared_first_mutex.h"
 #include "common/singleton.h"
@@ -29,6 +33,9 @@ class MemoryMapViewer;
 namespace Core {
 
 constexpr u64 DEFAULT_MAPPING_BASE = 0x200000000;
+// Measured on hardware (FW 12.02): a search without an address hint only uses the space below the
+// main thread stack area, which sits here when the process has no ASLR offset.
+constexpr u64 DEFAULT_MAPPING_END = 0x7EEC00000;
 constexpr u64 GUEST_PAGE_BITS = 14;
 constexpr u64 GUEST_PAGE_SIZE = 1ULL << GUEST_PAGE_BITS;
 
@@ -74,6 +81,13 @@ struct PhysicalMemoryArea {
     u64 size = 0;
     s32 memory_type = 0;
     PhysicalMemoryType dma_type = PhysicalMemoryType::Free;
+    // The memory type was set by MapDirectMemory2. Measured on hardware (DmemTest DT5, DT7, DT8):
+    // such an area never merges with its neighbours again, until it is released.
+    bool type_from_map2 = false;
+    // Order in which the area was made (allocated or added to the pool), compared by
+    // DirectMemoryQuery at the end of a pool block (DmemTest Q20-Q34). An area merged into its left
+    // neighbour takes that neighbour's.
+    u64 seq = 0;
 
     PAddr GetEnd() const {
         return base + size;
@@ -81,6 +95,9 @@ struct PhysicalMemoryArea {
 
     bool CanMergeWith(const PhysicalMemoryArea& next) const {
         if (base + size != next.base) {
+            return false;
+        }
+        if (type_from_map2 || next.type_from_map2) {
             return false;
         }
         if (memory_type != next.memory_type) {
@@ -113,8 +130,41 @@ struct VirtualMemoryArea {
     VMAType type = VMAType::Free;
     MemoryProt prot = MemoryProt::NoAccess;
     std::string name = "";
+    // For pool memory: the start of the reservation this area belongs to.
+    VAddr pool_base = 0;
     s32 fd = 0;
     bool disallow_merge = false;
+    // A file mapping whose file cannot be written (opened without write access, or a read-only
+    // backend).
+    bool file_read_only = false;
+    // File mappings: the file offset of the area's start, and whether it merges with neighbouring
+    // mappings of the same file. Measured on hardware (DmemTest CO5-CO7): shared and read-only
+    // private mappings merge when mapped; read-write private ones never merge.
+    u64 file_offset = 0;
+    bool file_merges = false;
+    // A mapping of a file made with MAP_SHARED.
+    bool file_shared = false;
+    // A direct mapping's caller, from its name "anon:" and the caller's address; 0 otherwise.
+    VAddr caller = 0;
+    // A file opened without read access (DmemTest TF3): mapped without CPU access, and mprotect
+    // cannot give CPU read.
+    bool file_write_only = false;
+    // A reservation made by mmap with MAP_VOID that ends where the reserved range it was made in
+    // ends, and did not merge when made. Measured on hardware (DmemTest CO2, CO3, CO13, CO14): a
+    // mapping made later to its left never merges with it.
+    bool no_merge_from_left = false;
+    // For an area made by ReserveVirtualRange: where that reserved range ended, kept when the area
+    // is split, so a reservation made inside it can tell whether it ends at the range's end.
+    VAddr reserve_end = 0;
+    // An anonymous mapping made with any access. Measured on hardware (DmemTest CO1, CO9, CO15:
+    // read only as well): it never merges, also after mprotect (fpPS4 kern: a credential in
+    // vm_map_simplify_entry, set for writable ones only there).
+    bool charged = false;
+    // A reservation made by mmap with MAP_VOID and without MAP_SHARED, or an anonymous mapping made
+    // without any access. Measured on hardware (DmemTest CO3, CO16): such an area merges with its
+    // left neighbour when made, with its right one only when it did not merge left, and mprotect
+    // does not merge it.
+    bool void_private = false;
 
     bool Contains(VAddr addr, u64 size) const {
         return addr >= base && (addr + size) <= (base + this->size);
@@ -132,7 +182,12 @@ struct VirtualMemoryArea {
         return type != VMAType::Free && type != VMAType::Reserved && type != VMAType::PoolReserved;
     }
 
-    bool CanMergeWith(VirtualMemoryArea& next) {
+    static bool IsCallerName(const std::string& n) {
+        return n.starts_with("anon:");
+    }
+
+    // ignore_callers: from SDK 5.50 on, direct mappings from different callers merge.
+    bool CanMergeWith(VirtualMemoryArea& next, bool ignore_callers = false) {
         if (disallow_merge || next.disallow_merge) {
             return false;
         }
@@ -150,7 +205,37 @@ struct VirtualMemoryArea {
         if (prot != next.prot || type != next.type) {
             return false;
         }
-        if (name.compare(next.name) != 0) {
+        // Anonymous mappings charged to the budget (made writable) never merge, at any SDK
+        // version and whatever their protection now: vm_map_simplify_entry returns early for
+        // entries with a credential (fpPS4 kern, reconstructed from the PS4 kernel; measured in
+        // DmemTest CO1, CO9, FW6).
+        if (charged || next.charged) {
+            return false;
+        }
+        if (next.no_merge_from_left) {
+            return false;
+        }
+        if (type == VMAType::File && (!file_merges || !next.file_merges || fd != next.fd ||
+                                      next.file_offset != file_offset + size)) {
+            return false;
+        }
+        // Measured on hardware: each pool reservation stays its own area.
+        if ((type == VMAType::PoolReserved || type == VMAType::Pooled) &&
+            pool_base != next.pool_base) {
+            return false;
+        }
+        // Measured on hardware (DmemTest FW7, FW8): a direct mapping records its caller apart from
+        // its name. Below SDK 5.50 direct mappings from different callers never merge, renamed or
+        // not; from 5.50 the caller is not compared, so two named after their callers merge too.
+        const bool both_direct = type == VMAType::Direct && next.type == VMAType::Direct;
+        if (both_direct && caller != next.caller && !ignore_callers) {
+            return false;
+        }
+        // Otherwise areas with different names never merge, at any SDK version, call-site names
+        // included (measured on hardware: DmemTest FW6, FW9, five and two mappings from as many
+        // call sites, 1.00-12.00; CO2, CO3, CO11-CO14).
+        if (name.compare(next.name) != 0 &&
+            !(both_direct && ignore_callers && IsCallerName(name) && IsCallerName(next.name))) {
             return false;
         }
 
@@ -258,6 +343,13 @@ public:
 
     bool TryWriteBacking(void* address, const void* data, u64 size);
 
+    u64 GuestWritablePrefix(VAddr virtual_addr, u64 size);
+
+    bool IsInGuestAreas(VAddr virtual_addr, u64 size);
+
+    // Forgets the bytes kept past the end of a file (see SaveFileTail); called when it is deleted.
+    void DropFileTail(const std::string& host_path);
+
     void SetupMemoryRegions(u64 flexible_size, bool use_extended_mem1, bool use_extended_mem2);
 
     PAddr PoolExpand(PAddr search_start, PAddr search_end, u64 size, u64 alignment);
@@ -273,9 +365,25 @@ public:
                   bool validate_dmem = false, PAddr phys_addr = -1, u64 alignment = 0);
 
     s32 MapFile(void** out_addr, VAddr virtual_addr, u64 size, MemoryProt prot,
-                MemoryMapFlags flags, s32 fd, s64 phys_addr);
+                MemoryMapFlags flags, s32 fd, s64 phys_addr, std::string_view name = "anon");
 
     s32 PoolDecommit(VAddr virtual_addr, u64 size);
+
+    s32 PoolMove(VAddr dest_addr, VAddr src_addr, u64 size);
+
+    bool IsPhysicalMemoryAliased(VAddr addr, u64 size);
+
+    bool IsWithinOnePoolReservation(VAddr addr, u64 size);
+
+    bool ContainsNoCpuAccess(VAddr addr, u64 size);
+
+    s32 CheckMapAreaEnd(VAddr addr, u64 size, bool fixed, bool stack) const;
+
+    void SaveFileTail(const VirtualMemoryArea& vma, VAddr virtual_addr, u64 size);
+
+    void RestoreFileTail(const std::string& host_path, u64 file_size, VAddr virtual_addr, u64 size,
+                         u64 offset, const std::function<void(u8*, u64, u32)>& protect,
+                         MemoryProt prot);
 
     s32 UnmapMemory(VAddr virtual_addr, u64 size);
 
@@ -298,11 +406,22 @@ public:
 
     s32 IsStack(VAddr addr, void** start, void** end);
 
-    s32 SetDirectMemoryType(VAddr addr, u64 size, s32 memory_type);
+    bool ContainsFlexibleMemory(VAddr addr, u64 size);
+
+    bool ContainsVmaType(VAddr addr, u64 size, VMAType type);
+
+    bool HasDirectMemoryType(VAddr addr, u64 size, s32 memory_type);
+
+    bool IsRangeMapped(VAddr addr, u64 size);
+
+    s32 SetDirectMemoryType(VAddr addr, u64 size, s32 memory_type, bool from_map_direct2 = false);
 
     void NameVirtualRange(VAddr virtual_addr, u64 size, std::string_view name);
 
     s32 GetMemoryPoolStats(::Libraries::Kernel::OrbisKernelMemoryPoolBlockStats* stats);
+
+    s32 PoolReserve(void** out_addr, VAddr virtual_addr, u64 size, MemoryMapFlags flags,
+                    u64 alignment, std::string_view name = "anon");
 
     void InvalidateMemory(VAddr addr, u64 size) const;
 
@@ -319,7 +438,7 @@ private:
         return std::prev(fmem_map.upper_bound(target));
     }
 
-    bool HasPhysicalBacking(const VirtualMemoryArea& vma) {
+    bool HasPhysicalBacking(VirtualMemoryArea vma) {
         return vma.type == VMAType::Direct || vma.type == VMAType::Flexible ||
                vma.type == VMAType::Pooled;
     }
@@ -327,9 +446,13 @@ private:
     VMAHandle CreateArea(VAddr virtual_addr, u64 size, MemoryProt prot, MemoryMapFlags flags,
                          VMAType type, std::string_view name, u64 alignment);
 
-    VAddr SearchFree(VAddr virtual_addr, u64 size, u32 alignment);
+    VAddr SearchFree(VAddr virtual_addr, u64 size, u64 alignment);
 
     VMAHandle MergeAdjacent(VMAMap& map, VMAHandle iter);
+
+    bool MergeWithNext(VMAMap& map, VMAHandle iter);
+
+    VMAHandle MergeWithPrev(VMAMap& map, VMAHandle iter);
 
     PhysHandle MergeAdjacent(PhysMap& map, PhysHandle iter);
 
@@ -340,6 +463,16 @@ private:
     VMAHandle Split(VMAHandle vma_handle, u64 offset_in_vma);
 
     PhysHandle Split(PhysMap& map, PhysHandle dmem_handle, u64 offset_in_area);
+
+    // Measured on hardware: a pool reservation holds one block per started GiB.
+    static constexpr u64 PoolReservationBlocks(u64 size) {
+        return (size + 1_GB - 1) / 1_GB;
+    }
+
+    void TakePoolBlocks(u64 count, bool cached, bool draw_cached_first);
+    void ReturnPoolBlocks(u64 count, bool cached);
+    void ReturnCommittedPoolBlocks(PAddr base, u64 size);
+    void SetCommittedPoolBlockType(PAddr base, u64 size, s32 memory_type);
 
     u64 UnmapBytesFromEntry(VAddr virtual_addr, VirtualMemoryArea vma_base, u64 size);
 
@@ -356,7 +489,23 @@ private:
     u64 total_flexible_size{};
     u64 flexible_usage{};
     u64 pool_budget{};
+    // Pool block counters (64 KiB blocks) as reported by sceKernelMemoryPoolGetBlockStats.
+    u64 pool_avail_flushed{};
+    u64 pool_avail_cached{};
+    u64 pool_alloc_flushed{};
+    u64 pool_alloc_cached{};
+    std::set<PAddr> pool_flushed_blocks;
+    std::map<VAddr, u64> pool_reservations;
     s32 sdk_version{};
+    u64 dmem_seq = 0;
+    // Bytes past the end of a file inside its last 16 KiB page, kept from shared mappings of it
+    // (Windows hosts; see SaveFileTail).
+    struct FileTail {
+        u64 file_size = 0;
+        std::vector<u8> bytes;
+    };
+    // Keyed by the host path: on hardware the bytes outlast close and open (DmemTest MFT1).
+    std::unordered_map<std::string, FileTail> file_tails;
     Vulkan::Rasterizer* rasterizer{};
 
     struct PrtArea {

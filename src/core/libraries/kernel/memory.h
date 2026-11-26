@@ -69,6 +69,9 @@ struct OrbisVirtualQueryInfo {
     u8 is_stack : 1;
     u8 is_pooled : 1;
     u8 is_committed : 1;
+    // The other three bits of the byte. Measured on hardware (DmemTest VQ18): the call writes
+    // the whole byte, with these bits 0.
+    u8 unused_flags : 3;
     char name[ORBIS_KERNEL_MAXIMUM_NAME_LENGTH];
 };
 static_assert(sizeof(OrbisVirtualQueryInfo) == 72,

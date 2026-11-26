@@ -14,6 +14,11 @@ void LinkSymbolImpl(Core::Loader::SymbolsResolver* sym, char const* nid, char co
     LinkSymbolImpl(sym, nid, lib, libversion, mod, reinterpret_cast<u64>(HOST_CALL(function)),     \
                    Core::Loader::SymbolType::Function)
 
+#define LIB_FUNCTION_WITH_CALLER(nid, lib, libversion, mod, function)                              \
+    LinkSymbolImpl(sym, nid, lib, libversion, mod,                                                 \
+                   reinterpret_cast<u64>(HOST_CALL_WITH_CALLER(function)),                         \
+                   Core::Loader::SymbolType::Function)
+
 #define LIB_OBJ(nid, lib, libversion, mod, obj)                                                    \
     LinkSymbolImpl(sym, nid, lib, libversion, mod, reinterpret_cast<u64>(obj),                     \
                    Core::Loader::SymbolType::Object)

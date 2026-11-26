@@ -59,4 +59,18 @@ struct HostCallWrapperImpl<func> {
 
 #define HOST_CALL(func) (Core::HostCallWrapperImpl<func>::wrap)
 
+template <auto f>
+struct HostCallCallerWrapperImpl;
+
+/// Like HostCallWrapperImpl, and passes the guest return address of the call as the first
+/// argument. The guest calls wrap directly, so its return address is the guest's call site.
+template <class ReturnType, class... Args, PS4_SYSV_ABI ReturnType (*func)(VAddr, Args...)>
+struct HostCallCallerWrapperImpl<func> {
+    static ReturnType PS4_SYSV_ABI wrap(Args... args) {
+        return func(reinterpret_cast<VAddr>(__builtin_return_address(0)), args...);
+    }
+};
+
+#define HOST_CALL_WITH_CALLER(func) (Core::HostCallCallerWrapperImpl<func>::wrap)
+
 } // namespace Core

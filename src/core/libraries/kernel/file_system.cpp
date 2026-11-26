@@ -2525,6 +2525,9 @@ s32 PS4_SYSV_ABI posix_unlink(const char* path) {
     } else if (auto* host = file->GetHostFile()) {
         host->Unlink();
     }
+    // A file made again under this name is another file: the bytes kept past the end of this one
+    // (see MemoryManager::SaveFileTail) are not its.
+    Core::Memory::Instance()->DropFileTail(host_path.generic_string());
 
     mnt->InvalidateCache(path);
 

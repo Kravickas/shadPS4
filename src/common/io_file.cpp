@@ -225,6 +225,10 @@ IOFile::IOFile(IOFile&& other) noexcept {
     std::swap(file_access_mode, other.file_access_mode);
     std::swap(file_type, other.file_type);
     std::swap(file, other.file);
+    std::swap(file_mapping, other.file_mapping);
+    std::swap(owns_file_mapping, other.owns_file_mapping);
+    std::swap(file_mapping_size, other.file_mapping_size);
+    std::swap(retired_file_mappings, other.retired_file_mappings);
 }
 
 IOFile& IOFile::operator=(IOFile&& other) noexcept {
@@ -232,6 +236,10 @@ IOFile& IOFile::operator=(IOFile&& other) noexcept {
     std::swap(file_access_mode, other.file_access_mode);
     std::swap(file_type, other.file_type);
     std::swap(file, other.file);
+    std::swap(file_mapping, other.file_mapping);
+    std::swap(owns_file_mapping, other.owns_file_mapping);
+    std::swap(file_mapping_size, other.file_mapping_size);
+    std::swap(retired_file_mappings, other.retired_file_mappings);
     return *this;
 }
 
@@ -284,10 +292,17 @@ void IOFile::Close() {
     file = nullptr;
 
 #ifdef _WIN64
-    if (file_mapping && file_access_mode == FileAccessMode::ReadWrite) {
+    if (file_mapping && owns_file_mapping) {
         CloseHandle(std::bit_cast<HANDLE>(file_mapping));
     }
+    for (const uintptr_t retired : retired_file_mappings) {
+        CloseHandle(std::bit_cast<HANDLE>(retired));
+    }
 #endif
+    retired_file_mappings.clear();
+    file_mapping = 0;
+    owns_file_mapping = false;
+    file_mapping_size = 0;
 }
 
 void IOFile::Unlink() {
@@ -317,20 +332,40 @@ void IOFile::Unlink() {
 }
 
 uintptr_t IOFile::GetFileMapping() {
-    if (file_mapping) {
+#ifdef _WIN64
+    // A section has the size the file had when it was created, and a view cannot reach past it
+    // (MapViewOfFile3 fails with ERROR_ACCESS_DENIED). Once the file has grown, e.g. by a write
+    // past its end, a new section is created; views of the old one stay valid and, for a local
+    // file, see the same pages. The old one is kept until Close (see retired_file_mappings).
+    const u64 file_size = GetSize();
+    if (file_mapping && file_size <= file_mapping_size) {
         return file_mapping;
     }
-#ifdef _WIN64
+    if (file_mapping && owns_file_mapping) {
+        retired_file_mappings.push_back(file_mapping);
+    }
+    file_mapping = 0;
+    owns_file_mapping = false;
+    file_mapping_size = file_size;
+
     const int fd = fileno(file);
 
     HANDLE hfile = reinterpret_cast<HANDLE>(_get_osfhandle(fd));
     HANDLE mapping = nullptr;
 
     if (file_access_mode == FileAccessMode::ReadWrite) {
-        mapping = CreateFileMapping2(hfile, NULL, FILE_MAP_WRITE, PAGE_READWRITE, SEC_COMMIT, 0,
-                                     NULL, NULL, 0);
+        mapping = CreateFileMapping2(hfile, NULL, FILE_MAP_READ | FILE_MAP_WRITE, PAGE_READWRITE,
+                                     SEC_COMMIT, 0, NULL, NULL, 0);
+        owns_file_mapping = mapping != nullptr;
     } else {
-        mapping = hfile;
+        // A read-only section keeps a file mapping a shared view of the file, as on hardware.
+        // A file that has no section (an empty file) is mapped by reading its contents in.
+        mapping = CreateFileMapping2(hfile, NULL, FILE_MAP_READ, PAGE_READONLY, SEC_COMMIT, 0, NULL,
+                                     NULL, 0);
+        owns_file_mapping = mapping != nullptr;
+        if (mapping == nullptr) {
+            mapping = hfile;
+        }
     }
 
     file_mapping = std::bit_cast<uintptr_t>(mapping);

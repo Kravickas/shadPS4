@@ -89,7 +89,8 @@ public:
     void* Map(VAddr virtual_addr, u64 size, PAddr phys_addr = -1, bool exec = false);
 
     /// Memory maps a specified file descriptor.
-    void* MapFile(VAddr virtual_addr, u64 size, u64 offset, u32 prot, uintptr_t fd);
+    void* MapFile(VAddr virtual_addr, u64 size, u64 offset, u32 prot, uintptr_t fd,
+                  u64 file_size = 0);
 
     /// Unmaps specified virtual memory area and marks it free in the address space.
     VAddr Unmap(VAddr virtual_addr, u64* size);
