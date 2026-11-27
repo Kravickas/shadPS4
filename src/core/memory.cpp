@@ -754,6 +754,9 @@ MemoryManager::VMAHandle MemoryManager::CreateArea(VAddr virtual_addr, u64 size,
     new_vma.void_private = (type == VMAType::Reserved && True(flags & MemoryMapFlags::Void) &&
                             False(flags & MemoryMapFlags::Shared)) ||
                            (type == VMAType::Flexible && prot == MemoryProt::NoAccess);
+    new_vma.void_shared = type == VMAType::Reserved && True(flags & MemoryMapFlags::Void) &&
+                          True(flags & MemoryMapFlags::Shared);
+    new_vma.merge_object = 0;
     new_vma.prot = prot;
     new_vma.name = name;
     new_vma.type = type;
@@ -993,21 +996,31 @@ s32 MemoryManager::MapMemory(void** out_addr, VAddr virtual_addr, u64 size, Memo
         // Measured on hardware (DmemTest CO2, CO3, CO11-CO14) for reservations made by mmap with
         // MAP_VOID: a new one merges with its left neighbour; with MAP_SHARED also with its right
         // one, without it only when it did not merge left. One that ends where the reserved range
-        // it was made in ends and merged with nothing is never merged into from the left later.
-        // Not so when its left neighbour is itself such a reservation without MAP_SHARED, kept
-        // apart from it only by its name: the two merge once they have one name (DmemTest FR11,
-        // every SDK; not measured with MAP_SHARED).
+        // it was made in ends and merged with nothing is never merged into from the left later;
+        // not so when its left neighbour was a reservation of its kind already (DmemTest FR11,
+        // FR30, FR32: those merge once they have one name).
+        // Without MAP_SHARED the new one belongs with a left neighbour of its kind from now on
+        // (see VirtualMemoryArea::merge_object).
         // (compared by start address: a merge erases new_vma_handle)
         const VAddr own_base = new_vma_handle->second.base;
-        const bool left_is_void_private =
-            new_vma_handle != vma_map.begin() &&
-            std::prev(new_vma_handle)->second.type == VMAType::Reserved &&
-            std::prev(new_vma_handle)->second.void_private;
+        bool left_of_kind = false;
+        if (new_vma_handle != vma_map.begin()) {
+            auto& own = new_vma_handle->second;
+            auto& left = std::prev(new_vma_handle)->second;
+            left_of_kind = left.type == own.type && left.void_private == own.void_private &&
+                           left.void_shared == own.void_shared;
+            if (left_of_kind && own.void_private) {
+                if (left.merge_object == 0) {
+                    left.merge_object = ++last_merge_object;
+                }
+                own.merge_object = left.merge_object;
+            }
+        }
         const auto merged = MergeWithPrev(vma_map, new_vma_handle);
         const bool merged_left = merged->second.base != own_base;
         const bool merged_right = (True(flags & MemoryMapFlags::Shared) || !merged_left) &&
                                   MergeWithNext(vma_map, merged);
-        if (!merged_left && !merged_right && at_reserved_end && !left_is_void_private) {
+        if (!merged_left && !merged_right && at_reserved_end && !left_of_kind) {
             merged->second.no_merge_from_left = true;
         }
     } else if (new_vma.type != VMAType::Direct || sdk_version >= Common::ElfInfo::FW_200) {
@@ -1657,6 +1670,28 @@ void MemoryManager::RemoveDirectMapping(PAddr phys_addr, u64 size) {
     mark_allocated(cursor, end);
 }
 
+bool MemoryManager::IsCpuReadable(VAddr virtual_addr, u64 size) {
+    std::shared_lock lk{mutex};
+    const VAddr end = virtual_addr + size;
+    if (end < virtual_addr || !IsValidMapping(virtual_addr, size)) {
+        return false;
+    }
+    auto it = FindVMA(virtual_addr);
+    VAddr current = virtual_addr;
+    while (current < end) {
+        if (it == vma_map.end()) {
+            return false;
+        }
+        const auto& vma = it->second;
+        if (!vma.IsMapped() || False(vma.prot & MemoryProt::CpuRead)) {
+            return false;
+        }
+        current = vma.base + vma.size;
+        ++it;
+    }
+    return true;
+}
+
 u64 MemoryManager::UnmapBytesFromEntry(VAddr virtual_addr, VirtualMemoryArea vma_base, u64 size) {
     const auto start_in_vma = virtual_addr - vma_base.base;
     const auto size_in_vma = std::min<u64>(vma_base.size - start_in_vma, size);
@@ -1742,6 +1777,8 @@ u64 MemoryManager::UnmapBytesFromEntry(VAddr virtual_addr, VirtualMemoryArea vma
     vma.reserve_end = 0;
     vma.charged = false;
     vma.void_private = false;
+    vma.void_shared = false;
+    vma.merge_object = 0;
     vma.file_read_only = false;
     vma.file_write_only = false;
     vma.file_merges = false;
@@ -2391,17 +2428,56 @@ void MemoryManager::NameVirtualRange(VAddr virtual_addr, u64 size, std::string_v
         }
     }
 
-    // Measured on hardware (DmemTest FW9): renamed areas merge with their neighbours like any other
-    // (two inaccessible anonymous mappings from two call sites merge once they have one name, at
-    // every SDK version); where they could not merge before, a rename changes nothing (CO1-CO9,
-    // FW6, FW7 below 5.50).
+    // Measured on hardware: renamed areas merge with their neighbours like any other; where they
+    // could not merge before, a rename changes nothing (DmemTest CO1-CO9, FW6, FW7 below 5.50).
     // Direct mappings never merge below SDK 2.00, renamed or not (DmemTest CO4, CO10, FW8), as in
     // MapMemory.
+    // Void reservations and inaccessible anonymous mappings (DmemTest FR1-FR4, FR9-FR33, FW9,
+    // FW10, CO3, CO16; see VirtualMemoryArea::merge_object for which pairs merge):
+    // - the first one of the range merges with the area before the range;
+    // - then each merges with the one before it. Up to SDK 5.50 this stops for the rest of the
+    //   range at the first pair that does not merge; at 12.00 it goes on. No SDK between the two
+    //   was measured: they are taken as 5.50;
+    // - the last one merges with the area after the range (measured for ranges of one area).
+    constexpr u32 FW_1200 = 0x12000000;
+    const bool goes_on = static_cast<u32>(sdk_version) >= FW_1200;
+    const bool alone_merge = static_cast<u32>(sdk_version) >= Common::ElfInfo::FW_550;
+    const VAddr range_end = aligned_addr + aligned_size;
+    const auto of_kind = [](const VirtualMemoryArea& vma) {
+        return vma.void_private || vma.void_shared;
+    };
+    const auto merges = [&](VirtualMemoryArea& left, VirtualMemoryArea& right) {
+        if (left.merge_object == 0 && right.merge_object == 0 && !alone_merge) {
+            return false;
+        }
+        return left.CanMergeWith(right);
+    };
+    bool stopped = false;
     it = FindVMA(aligned_addr);
-    while (it != vma_map.end() && it->second.base < aligned_addr + aligned_size) {
-        if (!it->second.IsFree() &&
-            (it->second.type != VMAType::Direct || sdk_version >= Common::ElfInfo::FW_200)) {
+    while (it != vma_map.end() && it->second.base < range_end) {
+        if (it->second.IsFree() ||
+            (it->second.type == VMAType::Direct && sdk_version < Common::ElfInfo::FW_200)) {
+            ++it;
+            continue;
+        }
+        if (!of_kind(it->second)) {
             it = MergeAdjacent(vma_map, it);
+            ++it;
+            continue;
+        }
+        // The areas were carved at the start of the range: only the first one starts there.
+        const bool first = it->second.base == aligned_addr;
+        if (it != vma_map.begin() && of_kind(std::prev(it)->second) && (first || !stopped)) {
+            if (merges(std::prev(it)->second, it->second)) {
+                it = MergeWithPrev(vma_map, it);
+            } else if (!first && !goes_on) {
+                stopped = true;
+            }
+        }
+        const auto next = std::next(it);
+        if (!stopped && next != vma_map.end() && next->second.base >= range_end &&
+            of_kind(next->second) && merges(it->second, next->second)) {
+            MergeWithNext(vma_map, it);
         }
         ++it;
     }

@@ -1232,14 +1232,12 @@ static void* PosixMmapImpl(void* addr, u64 len, s32 prot, s32 flags, s32 fd, s64
         result = memory->MapMemory(&addr_out, aligned_addr, aligned_size, mem_prot, mem_flags,
                                    Core::VMAType::Stack, "anon", false);
     } else if (True(mem_flags & Core::MemoryMapFlags::Void)) {
-        // Reserves memory. Measured on hardware (DmemTest FR9-FR12, every SDK): a void
-        // reservation made by sceKernelMmap without MAP_SHARED is named like an anonymous mapping,
-        // "anon:" and the return address of the call. Not measured with MAP_SHARED.
-        const std::string_view void_name =
-            False(mem_flags & Core::MemoryMapFlags::Shared) ? name : "anon";
+        // Reserves memory. Measured on hardware (DmemTest FR9-FR12, FR30, FR31, every SDK): a void
+        // reservation made by sceKernelMmap, with or without MAP_SHARED, is named like an
+        // anonymous mapping, "anon:" and the return address of the call.
         result =
             memory->MapMemory(&addr_out, aligned_addr, aligned_size, Core::MemoryProt::NoAccess,
-                              mem_flags, Core::VMAType::Reserved, void_name, false);
+                              mem_flags, Core::VMAType::Reserved, name, false);
     } else {
         // Default to file mapping
         // Measured on hardware (DmemTest FM2): an offset inside a page maps from the start of that
@@ -1524,11 +1522,50 @@ static s32 PS4_SYSV_ABI MmapFromGuest(VAddr caller, void* addr, u64 len, s32 pro
     return KernelMmapImpl(addr, len, prot, flags, fd, phys_addr, res, CallerName(caller));
 }
 
-// Guest entry. Measured on hardware (DmemTest PX1, PX3): a POSIX mmap is named "anon:" and the
-// return address of the call too, as sceKernelMmap.
-static void* PS4_SYSV_ABI PosixMmapFromGuest(VAddr caller, void* addr, u64 len, s32 prot, s32 flags,
-                                             s32 fd, s64 phys_addr) {
-    return PosixMmapImpl(addr, len, prot, flags, fd, phys_addr, CallerName(caller));
+// Measured on hardware (DmemTest PX1, PX3, PX4 at SDK 5.50 and 12.00; PX6, PX7 at 12.00): the
+// mapping of a POSIX mmap is named after the word at rbp + 8 at the call: "anon:" and that word in
+// 12 hex digits. In code built with frame pointers the word is the return address of the function
+// that calls mmap. When it cannot be read (rbp 0, rbp in a reserved page) the name is "(NoName)"
+// and the first 12 characters of the executable's file name, the form the areas the PS4 itself
+// makes for a process have (DmemTest K4, K6: "(NoName)eboot.bin", and "(NoName)eboot_0x0170" for
+// eboot_0x01708001.bin).
+static std::string FrameName(VAddr frame) {
+    const VAddr word = frame + sizeof(u64);
+    if (word > frame && Core::Memory::Instance()->IsCpuReadable(word, sizeof(u64))) {
+        return CallerName(*reinterpret_cast<const u64*>(word));
+    }
+    const auto* linker = Common::Singleton<Core::Linker>::Instance();
+    const std::string executable = linker->GetModule(0)->file.filename().string();
+    return "(NoName)" + executable.substr(0, 12);
+}
+
+// Guest entry of the POSIX mmap, in assembly: it passes the guest's frame pointer on. The guest
+// calls it directly, so rbp is still the guest's.
+extern "C" void* PS4_SYSV_ABI PosixMmapGuestEntry(void* addr, u64 len, s32 prot, s32 flags, s32 fd,
+                                                  s64 phys_addr) asm("_PosixMmapGuestEntry");
+extern "C" void* PS4_SYSV_ABI PosixMmapWithFrame(void* addr, u64 len, s32 prot, s32 flags, s32 fd,
+                                                 s64 phys_addr,
+                                                 VAddr frame) asm("_PosixMmapWithFrame");
+
+#if defined(__x86_64__)
+asm(".att_syntax prefix");
+#endif
+
+// The six arguments stay in their registers. The frame pointer is the seventh, which the calling
+// convention takes from the stack; pushing it also aligns the stack for the call.
+asm(R"(
+.global _PosixMmapGuestEntry
+_PosixMmapGuestEntry:
+    pushq %rbp
+    call _PosixMmapWithFrame
+    addq $8, %rsp
+    ret
+)");
+
+extern "C" void* __attribute__((used)) PS4_SYSV_ABI PosixMmapWithFrame(void* addr, u64 len,
+                                                                       s32 prot, s32 flags, s32 fd,
+                                                                       s64 phys_addr, VAddr frame) {
+    return PosixMmapImpl(addr, len, prot, flags, fd, phys_addr, FrameName(frame));
 }
 
 void RegisterMemory(Core::Loader::SymbolsResolver* sym) {
@@ -1588,8 +1625,11 @@ void RegisterMemory(Core::Loader::SymbolsResolver* sym) {
     LIB_FUNCTION("YN878uKRBbE", "libkernel", 1, "libkernel", sceKernelMemoryPoolBatch);
     LIB_FUNCTION("bvD+95Q6asU", "libkernel", 1, "libkernel", sceKernelMemoryPoolGetBlockStats);
 
-    LIB_FUNCTION_WITH_CALLER("BPE9s9vQQXo", "libkernel", 1, "libkernel", PosixMmapFromGuest);
-    LIB_FUNCTION_WITH_CALLER("BPE9s9vQQXo", "libScePosix", 1, "libkernel", PosixMmapFromGuest);
+    // Linked without a host call wrapper: the entry needs rbp as the guest left it.
+    LinkSymbolImpl(sym, "BPE9s9vQQXo", "libkernel", 1, "libkernel",
+                   reinterpret_cast<u64>(&PosixMmapGuestEntry), Core::Loader::SymbolType::Function);
+    LinkSymbolImpl(sym, "BPE9s9vQQXo", "libScePosix", 1, "libkernel",
+                   reinterpret_cast<u64>(&PosixMmapGuestEntry), Core::Loader::SymbolType::Function);
     LIB_FUNCTION("UqDGjXA5yUM", "libkernel", 1, "libkernel", posix_munmap);
     LIB_FUNCTION("UqDGjXA5yUM", "libScePosix", 1, "libkernel", posix_munmap);
     LIB_FUNCTION("3k6kx-zOOSQ", "libkernel", 1, "libkernel", sceKernelMlock);

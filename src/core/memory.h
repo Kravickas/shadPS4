@@ -153,7 +153,7 @@ struct VirtualMemoryArea {
     // A reservation made by mmap with MAP_VOID that ends where the reserved range it was made in
     // ends, and did not merge when made. Measured on hardware (DmemTest CO2, CO3, CO13, CO14): a
     // mapping made later to its left never merges with it. Not set when a reservation of the same
-    // kind was on its left already and only the name kept them apart (DmemTest FR11).
+    // kind was on its left already (DmemTest FR11, FR30, FR32).
     bool no_merge_from_left = false;
     // For an area made by ReserveVirtualRange: where that reserved range ended, kept when the area
     // is split, so a reservation made inside it can tell whether it ends at the range's end.
@@ -167,6 +167,19 @@ struct VirtualMemoryArea {
     // left neighbour when made, with its right one only when it did not merge left, and mprotect
     // does not merge it.
     bool void_private = false;
+    // A void reservation made by mmap with MAP_SHARED.
+    bool void_shared = false;
+    // For void reservations and inaccessible anonymous mappings (void_private, void_shared): which
+    // of them belong together, 0 for one that stands alone. Measured on hardware (DmemTest
+    // FR1-FR4, FR9-FR33, CO2, CO3, CO16, at SDK 1.00 to 12.00; all 120 result lines checked follow
+    // from these rules):
+    // - One made right after an existing one of its kind (its left neighbour), without
+    //   MAP_SHARED, belongs with it from then on, whatever their names. Any other stands alone.
+    // - Two that belong together merge whenever they have one name.
+    // - Two that stand alone merge when one is made next to the other with the same name, at
+    //   every SDK; once they exist, a rename merges them only from SDK 5.50.
+    // - One that stands alone never merges with one that belongs with another.
+    u64 merge_object = 0;
 
     bool Contains(VAddr addr, u64 size) const {
         return addr >= base && (addr + size) <= (base + this->size);
@@ -215,6 +228,9 @@ struct VirtualMemoryArea {
             return false;
         }
         if (next.no_merge_from_left) {
+            return false;
+        }
+        if (merge_object != next.merge_object) {
             return false;
         }
         if (type == VMAType::File && (!file_merges || !next.file_merges || fd != next.fd ||
@@ -408,6 +424,9 @@ public:
 
     s32 IsStack(VAddr addr, void** start, void** end);
 
+    /// True when every byte of the range lies in a mapping the guest can read.
+    bool IsCpuReadable(VAddr virtual_addr, u64 size);
+
     bool ContainsFlexibleMemory(VAddr addr, u64 size);
 
     bool ContainsVmaType(VAddr addr, u64 size, VMAType type);
@@ -484,6 +503,8 @@ private:
 
 private:
     AddressSpace impl;
+    // The last merge_object given out.
+    u64 last_merge_object = 0;
     PhysMap dmem_map;
     // How many direct mappings cover each range of direct memory; ranges with none are absent.
     boost::icl::interval_map<PAddr, u64> direct_mapping_counts;
