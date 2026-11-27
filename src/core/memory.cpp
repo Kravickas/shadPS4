@@ -984,6 +984,8 @@ s32 MemoryManager::MapMemory(void** out_addr, VAddr virtual_addr, u64 size, Memo
             dmem_area = FindDmemArea(current_phys_addr);
         }
         ASSERT_MSG(remaining_size == 0, "Failed to map physical memory");
+        direct_mapping_counts.add(
+            {boost::icl::interval<PAddr>::right_open(phys_addr, phys_addr + size), 1});
     }
 
     if ((type == VMAType::Reserved && True(flags & MemoryMapFlags::Void)) ||
@@ -992,13 +994,20 @@ s32 MemoryManager::MapMemory(void** out_addr, VAddr virtual_addr, u64 size, Memo
         // MAP_VOID: a new one merges with its left neighbour; with MAP_SHARED also with its right
         // one, without it only when it did not merge left. One that ends where the reserved range
         // it was made in ends and merged with nothing is never merged into from the left later.
+        // Not so when its left neighbour is itself such a reservation without MAP_SHARED, kept
+        // apart from it only by its name: the two merge once they have one name (DmemTest FR11,
+        // every SDK; not measured with MAP_SHARED).
         // (compared by start address: a merge erases new_vma_handle)
         const VAddr own_base = new_vma_handle->second.base;
+        const bool left_is_void_private =
+            new_vma_handle != vma_map.begin() &&
+            std::prev(new_vma_handle)->second.type == VMAType::Reserved &&
+            std::prev(new_vma_handle)->second.void_private;
         const auto merged = MergeWithPrev(vma_map, new_vma_handle);
         const bool merged_left = merged->second.base != own_base;
         const bool merged_right = (True(flags & MemoryMapFlags::Shared) || !merged_left) &&
                                   MergeWithNext(vma_map, merged);
-        if (!merged_left && !merged_right && at_reserved_end) {
+        if (!merged_left && !merged_right && at_reserved_end && !left_is_void_private) {
             merged->second.no_merge_from_left = true;
         }
     } else if (new_vma.type != VMAType::Direct || sdk_version >= Common::ElfInfo::FW_200) {
@@ -1617,6 +1626,37 @@ s32 MemoryManager::UnmapMemory(VAddr virtual_addr, u64 size) {
     return result;
 }
 
+// Measured on hardware (DmemTest TW1-TW5, every SDK): direct memory counts as mapped, for the
+// check a second mapping makes, until the last mapping of it is gone, page by page. A mapping made
+// with MAP_STACK counts like any other; a no-access protection does not end it.
+void MemoryManager::RemoveDirectMapping(PAddr phys_addr, u64 size) {
+    const PAddr end = phys_addr + size;
+    const auto interval = boost::icl::interval<PAddr>::right_open(phys_addr, end);
+    direct_mapping_counts.subtract({interval, 1});
+
+    // The physical range was copied into the mapping when it was made; another mapping may have
+    // split it into several areas since, so carve each area it now spans in turn.
+    const auto mark_allocated = [&](PAddr start, PAddr limit) {
+        while (start < limit) {
+            const u64 chunk = std::min(limit, FindDmemArea(start)->second.GetEnd()) - start;
+            const auto handle = CarvePhysArea(dmem_map, start, chunk);
+            handle->second.dma_type = PhysicalMemoryType::Allocated;
+            // Coalesce with nearby direct memory areas.
+            MergeAdjacent(dmem_map, handle);
+            start += chunk;
+        }
+    };
+
+    // Only the parts no other mapping still covers have lost their last mapping.
+    auto [live, last] = direct_mapping_counts.equal_range(interval);
+    PAddr cursor = phys_addr;
+    for (; live != last; ++live) {
+        mark_allocated(cursor, boost::icl::first(live->first));
+        cursor = boost::icl::last_next(live->first);
+    }
+    mark_allocated(cursor, end);
+}
+
 u64 MemoryManager::UnmapBytesFromEntry(VAddr virtual_addr, VirtualMemoryArea vma_base, u64 size) {
     const auto start_in_vma = virtual_addr - vma_base.base;
     const auto size_in_vma = std::min<u64>(vma_base.size - start_in_vma, size);
@@ -1644,21 +1684,7 @@ u64 MemoryManager::UnmapBytesFromEntry(VAddr virtual_addr, VirtualMemoryArea vma
 
             // Create a new dmem area reflecting the pooled region
             if (vma_type == VMAType::Direct) {
-                // The physical range was copied into this mapping when it was made; another mapping
-                // may have split it into several areas since, so carve each area it now spans in
-                // turn.
-                PAddr dma_addr = phys_addr;
-                u64 dma_remaining = size_in_dma;
-                while (dma_remaining > 0) {
-                    const PAddr area_end = FindDmemArea(dma_addr)->second.GetEnd();
-                    const u64 size_in_dmem = std::min<u64>(dma_remaining, area_end - dma_addr);
-                    const auto new_dmem_handle = CarvePhysArea(dmem_map, dma_addr, size_in_dmem);
-                    new_dmem_handle->second.dma_type = PhysicalMemoryType::Allocated;
-                    // Coalesce with nearby direct memory areas.
-                    MergeAdjacent(dmem_map, new_dmem_handle);
-                    dma_addr += size_in_dmem;
-                    dma_remaining -= size_in_dmem;
-                }
+                RemoveDirectMapping(phys_addr, size_in_dma);
             } else if (vma_type == VMAType::Pooled) {
                 ReturnCommittedPoolBlocks(phys_addr, size_in_dma);
                 PAddr dma_addr = phys_addr;
@@ -2066,6 +2092,7 @@ s32 MemoryManager::VirtualQuery(VAddr addr, s32 flags,
     }
 
     strncpy(info->name, vma.name.data(), ::Libraries::Kernel::ORBIS_KERNEL_MAXIMUM_NAME_LENGTH);
+    std::memset(info->padding, 0, sizeof(info->padding));
 
     return ORBIS_OK;
 }

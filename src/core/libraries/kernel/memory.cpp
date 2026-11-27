@@ -1232,10 +1232,14 @@ static void* PosixMmapImpl(void* addr, u64 len, s32 prot, s32 flags, s32 fd, s64
         result = memory->MapMemory(&addr_out, aligned_addr, aligned_size, mem_prot, mem_flags,
                                    Core::VMAType::Stack, "anon", false);
     } else if (True(mem_flags & Core::MemoryMapFlags::Void)) {
-        // Reserves memory
+        // Reserves memory. Measured on hardware (DmemTest FR9-FR12, every SDK): a void
+        // reservation made by sceKernelMmap without MAP_SHARED is named like an anonymous mapping,
+        // "anon:" and the return address of the call. Not measured with MAP_SHARED.
+        const std::string_view void_name =
+            False(mem_flags & Core::MemoryMapFlags::Shared) ? name : "anon";
         result =
             memory->MapMemory(&addr_out, aligned_addr, aligned_size, Core::MemoryProt::NoAccess,
-                              mem_flags, Core::VMAType::Reserved, "anon", false);
+                              mem_flags, Core::VMAType::Reserved, void_name, false);
     } else {
         // Default to file mapping
         // Measured on hardware (DmemTest FM2): an offset inside a page maps from the start of that

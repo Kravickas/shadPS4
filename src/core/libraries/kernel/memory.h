@@ -73,6 +73,9 @@ struct OrbisVirtualQueryInfo {
     // the whole byte, with these bits 0.
     u8 unused_flags : 3;
     char name[ORBIS_KERNEL_MAXIMUM_NAME_LENGTH];
+    // The 7 bytes up to the size of the struct. Measured on hardware (DmemTest VQ18, every SDK):
+    // the call writes all 0x48 bytes, these as 0.
+    u8 padding[7];
 };
 static_assert(sizeof(OrbisVirtualQueryInfo) == 72,
               "OrbisVirtualQueryInfo struct size is incorrect");

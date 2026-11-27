@@ -11,6 +11,7 @@
 #include <string_view>
 #include <unordered_map>
 #include <vector>
+#include <boost/icl/interval_map.hpp>
 #include "common/enum.h"
 #include "common/shared_first_mutex.h"
 #include "common/singleton.h"
@@ -151,7 +152,8 @@ struct VirtualMemoryArea {
     bool file_write_only = false;
     // A reservation made by mmap with MAP_VOID that ends where the reserved range it was made in
     // ends, and did not merge when made. Measured on hardware (DmemTest CO2, CO3, CO13, CO14): a
-    // mapping made later to its left never merges with it.
+    // mapping made later to its left never merges with it. Not set when a reservation of the same
+    // kind was on its left already and only the name kept them apart (DmemTest FR11).
     bool no_merge_from_left = false;
     // For an area made by ReserveVirtualRange: where that reserved range ended, kept when the area
     // is split, so a reservation made inside it can tell whether it ends at the range's end.
@@ -474,6 +476,8 @@ private:
     void ReturnCommittedPoolBlocks(PAddr base, u64 size);
     void SetCommittedPoolBlockType(PAddr base, u64 size, s32 memory_type);
 
+    void RemoveDirectMapping(PAddr phys_addr, u64 size);
+
     u64 UnmapBytesFromEntry(VAddr virtual_addr, VirtualMemoryArea vma_base, u64 size);
 
     s32 UnmapMemoryImpl(VAddr virtual_addr, u64 size);
@@ -481,6 +485,8 @@ private:
 private:
     AddressSpace impl;
     PhysMap dmem_map;
+    // How many direct mappings cover each range of direct memory; ranges with none are absent.
+    boost::icl::interval_map<PAddr, u64> direct_mapping_counts;
     PhysMap fmem_map;
     VMAMap vma_map;
     Common::SharedFirstMutex mutex{};
