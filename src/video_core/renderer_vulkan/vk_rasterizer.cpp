@@ -1386,12 +1386,6 @@ void Rasterizer::UpdateViewportScissorState() const {
     boost::container::static_vector<vk::Viewport, AmdGpu::NUM_VIEWPORTS> viewports;
     boost::container::static_vector<vk::Rect2D, AmdGpu::NUM_VIEWPORTS> scissors;
 
-    if (regs.polygon_control.enable_window_offset &&
-        (regs.window_offset.window_x_offset != 0 || regs.window_offset.window_y_offset != 0)) {
-        LOG_ERROR(Render_Vulkan,
-                  "PA_SU_SC_MODE_CNTL.VTX_WINDOW_OFFSET_ENABLE support is not yet implemented.");
-    }
-
     const auto& vp_ctl = regs.viewport_control;
     for (u32 i = 0; i < AmdGpu::NUM_VIEWPORTS; i++) {
         const auto& vp = regs.viewports[i];
@@ -1447,14 +1441,12 @@ void Rasterizer::UpdateViewportScissorState() const {
 
         auto vp_scsr = scsr;
         if (regs.mode_control.vport_scissor_enable) {
-            vp_scsr.top_left_x =
-                std::max(vp_scsr.top_left_x, s16(regs.viewport_scissors[i].top_left_x));
-            vp_scsr.top_left_y =
-                std::max(vp_scsr.top_left_y, s16(regs.viewport_scissors[i].top_left_y));
-            vp_scsr.bottom_right_x =
-                std::min(vp_scsr.bottom_right_x, s16(regs.viewport_scissors[i].bottom_right_x));
-            vp_scsr.bottom_right_y =
-                std::min(vp_scsr.bottom_right_y, s16(regs.viewport_scissors[i].bottom_right_y));
+            const AmdGpu::Scissor vp_scissor =
+                regs.viewport_scissors[i].GetOffsetScissor(regs.window_offset);
+            vp_scsr.top_left_x = std::max(vp_scsr.top_left_x, vp_scissor.top_left_x);
+            vp_scsr.top_left_y = std::max(vp_scsr.top_left_y, vp_scissor.top_left_y);
+            vp_scsr.bottom_right_x = std::min(vp_scsr.bottom_right_x, vp_scissor.bottom_right_x);
+            vp_scsr.bottom_right_y = std::min(vp_scsr.bottom_right_y, vp_scissor.bottom_right_y);
         }
         scissors.push_back({
             .offset = {vp_scsr.top_left_x, vp_scsr.top_left_y},

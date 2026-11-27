@@ -152,11 +152,11 @@ struct Scissor {
     }
 
     u32 GetWidth() const {
-        return static_cast<u32>(Clamp(bottom_right_x) - Clamp(top_left_x));
+        return static_cast<u32>(std::max(Clamp(bottom_right_x) - Clamp(top_left_x), 0));
     }
 
     u32 GetHeight() const {
-        return static_cast<u32>(Clamp(bottom_right_y) - Clamp(top_left_y));
+        return static_cast<u32>(std::max(Clamp(bottom_right_y) - Clamp(top_left_y), 0));
     }
 };
 
@@ -182,6 +182,17 @@ struct ViewportScissor {
 
     u32 GetHeight() const {
         return bottom_right_y - top_left_y;
+    }
+
+    Scissor GetOffsetScissor(const WindowOffset& offset) const {
+        const s16 x_offset = window_offset_disable ? 0 : s16(offset.window_x_offset);
+        const s16 y_offset = window_offset_disable ? 0 : s16(offset.window_y_offset);
+        Scissor scissor{};
+        scissor.top_left_x = s16(top_left_x + x_offset);
+        scissor.top_left_y = s16(top_left_y + y_offset);
+        scissor.bottom_right_x = s16(bottom_right_x + x_offset);
+        scissor.bottom_right_y = s16(bottom_right_y + y_offset);
+        return scissor;
     }
 };
 
