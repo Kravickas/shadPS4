@@ -1,4 +1,4 @@
-// SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
+// SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #pragma once
@@ -108,7 +108,7 @@ struct StageSpecialization {
                                                            : 1);
                              }
                              spec.num_class = AmdGpu::GetNumberClass(sharp.GetNumberFmt());
-                             spec.dst_select = sharp.DstSelect();
+                             spec.dst_select = sharp.LoadDstSelect();
                          });
         }
         u32 binding{};

@@ -1217,7 +1217,7 @@ void Translator::EmitFetch(const GcnInst& inst) {
                                   ir.GetAttribute(attr, 2), ir.GetAttribute(attr, 3));
         const auto converted =
             IR::ApplyReadNumberConversionVec4(ir, values, buffer.GetNumberConversion());
-        const auto swizzled = ApplySwizzle(ir, converted, buffer.DstSelect());
+        const auto swizzled = ApplySwizzle(ir, converted, buffer.LoadDstSelect());
         for (u32 i = 0; i < attrib.num_elements; i++) {
             ir.SetVectorReg(dst_reg++, IR::F32{ir.CompositeExtract(swizzled, i)});
         }

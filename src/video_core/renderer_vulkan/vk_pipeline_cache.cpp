@@ -163,10 +163,6 @@ const Shader::RuntimeInfo& PipelineCache::BuildRuntimeInfo(HwStage stage, SwStag
             !instance.IsDepthClipControlSupported() &&
             regs.clipper_control.clip_space == AmdGpu::ClipSpace::MinusWToW;
         info.hw.vs.clip_disable = regs.IsClipDisabled();
-        if (regs.polygon_control.enable_window_offset) {
-            info.hw.vs.window_offset_x = s16(regs.window_offset.window_x_offset);
-            info.hw.vs.window_offset_y = s16(regs.window_offset.window_y_offset);
-        }
         break;
     }
     case HwStage::Fragment: {

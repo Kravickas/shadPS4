@@ -60,44 +60,13 @@ void ConvertPositionToClipSpace(EmitContext& ctx) {
     const Id yscale{ctx.OpLoad(type, yscale_ptr)};
     const Id vport_w =
         ctx.Constant(type, float(std::min<u32>(ctx.profile.max_viewport_width / 2, 8_KB)));
-    const auto& vs_info = ctx.runtime_info.hw.vs;
-    const Id wnd_x = ctx.OpFAdd(type, ctx.OpFAdd(type, ctx.OpFMul(type, x, xscale), xoffset),
-                                ctx.Constant(type, float(vs_info.window_offset_x)));
+    const Id wnd_x = ctx.OpFAdd(type, ctx.OpFMul(type, x, xscale), xoffset);
     const Id ndc_x = ctx.OpFSub(type, ctx.OpFDiv(type, wnd_x, vport_w), ctx.Constant(type, 1.f));
     const Id vport_h =
         ctx.Constant(type, float(std::min<u32>(ctx.profile.max_viewport_height / 2, 8_KB)));
-    const Id wnd_y = ctx.OpFAdd(type, ctx.OpFAdd(type, ctx.OpFMul(type, y, yscale), yoffset),
-                                ctx.Constant(type, float(vs_info.window_offset_y)));
+    const Id wnd_y = ctx.OpFAdd(type, ctx.OpFMul(type, y, yscale), yoffset);
     const Id ndc_y = ctx.OpFSub(type, ctx.OpFDiv(type, wnd_y, vport_h), ctx.Constant(type, 1.f));
     const Id vector{ctx.OpCompositeConstruct(ctx.F32[4], std::array<Id, 4>({ndc_x, ndc_y, z, w}))};
-    ctx.OpStore(ctx.output_position, vector);
-}
-
-void ApplyWindowOffset(EmitContext& ctx) {
-    ASSERT_MSG(!ctx.info.stores.GetAny(IR::Attribute::ViewportIndex),
-               "Multi-viewport with vertex window offset not yet implemented.");
-
-    const Id type{ctx.F32[1]};
-    const Id position{ctx.OpLoad(ctx.F32[4], ctx.output_position)};
-    const Id x{ctx.OpCompositeExtract(type, position, 0u)};
-    const Id y{ctx.OpCompositeExtract(type, position, 1u)};
-    const Id z{ctx.OpCompositeExtract(type, position, 2u)};
-    const Id w{ctx.OpCompositeExtract(type, position, 3u)};
-    const Id xscale_ptr{ctx.OpAccessChain(ctx.TypePointer(spv::StorageClass::PushConstant, type),
-                                          ctx.push_data_block,
-                                          ctx.ConstU32(PushData::XScaleIndex))};
-    const Id xscale{ctx.OpLoad(type, xscale_ptr)};
-    const Id yscale_ptr{ctx.OpAccessChain(ctx.TypePointer(spv::StorageClass::PushConstant, type),
-                                          ctx.push_data_block,
-                                          ctx.ConstU32(PushData::YScaleIndex))};
-    const Id yscale{ctx.OpLoad(type, yscale_ptr)};
-    const auto& vs_info = ctx.runtime_info.hw.vs;
-    const Id offset_x{ctx.OpFDiv(type, ctx.Constant(type, float(vs_info.window_offset_x)), xscale)};
-    const Id offset_y{ctx.OpFDiv(type, ctx.Constant(type, float(vs_info.window_offset_y)), yscale)};
-    const Id clip_x{ctx.OpFAdd(type, x, ctx.OpFMul(type, w, offset_x))};
-    const Id clip_y{ctx.OpFAdd(type, y, ctx.OpFMul(type, w, offset_y))};
-    const Id vector{
-        ctx.OpCompositeConstruct(ctx.F32[4], std::array<Id, 4>({clip_x, clip_y, z, w}))};
     ctx.OpStore(ctx.output_position, vector);
 }
 
@@ -108,9 +77,6 @@ void EmitEpilogue(EmitContext& ctx) {
     }
     if (ctx.hw_stage == HwStage::Vertex && ctx.runtime_info.hw.vs.clip_disable) {
         ConvertPositionToClipSpace(ctx);
-    } else if (ctx.hw_stage == HwStage::Vertex && (ctx.runtime_info.hw.vs.window_offset_x != 0 ||
-                                                   ctx.runtime_info.hw.vs.window_offset_y != 0)) {
-        ApplyWindowOffset(ctx);
     }
 }
 

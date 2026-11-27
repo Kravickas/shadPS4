@@ -187,27 +187,15 @@ union Regs {
         return nullptr;
     }
 
-    /// Screen, window and generic scissors combined, the window and generic ones offset by
-    /// PA_SC_WINDOW_OFFSET unless their own WINDOW_OFFSET_DISABLE is set, with negative values
-    /// clamped to 0.
+    /// Screen, window and generic scissors combined, each window offset unless disabled, with
+    /// negative values clamped to 0.
     Scissor GetCombinedScissor() const {
-        const Scissor window_scsr = window_scissor.GetOffsetScissor(window_offset);
-        const Scissor generic_scsr = generic_scissor.GetOffsetScissor(window_offset);
-        const auto top_left = [](s16 screen, s16 window, s16 generic) {
-            return Scissor::Clamp(std::max({screen, window, generic}));
-        };
-        const auto bottom_right = [](s16 screen, s16 window, s16 generic) {
-            return Scissor::Clamp(std::min({screen, window, generic}));
-        };
-        Scissor scissor{};
-        scissor.top_left_x =
-            top_left(screen_scissor.top_left_x, window_scsr.top_left_x, generic_scsr.top_left_x);
-        scissor.top_left_y =
-            top_left(screen_scissor.top_left_y, window_scsr.top_left_y, generic_scsr.top_left_y);
-        scissor.bottom_right_x = bottom_right(
-            screen_scissor.bottom_right_x, window_scsr.bottom_right_x, generic_scsr.bottom_right_x);
-        scissor.bottom_right_y = bottom_right(
-            screen_scissor.bottom_right_y, window_scsr.bottom_right_y, generic_scsr.bottom_right_y);
+        Scissor scissor = screen_scissor.Intersect(window_scissor.GetOffsetScissor(window_offset))
+                              .Intersect(generic_scissor.GetOffsetScissor(window_offset));
+        scissor.top_left_x = Scissor::Clamp(scissor.top_left_x);
+        scissor.top_left_y = Scissor::Clamp(scissor.top_left_y);
+        scissor.bottom_right_x = Scissor::Clamp(scissor.bottom_right_x);
+        scissor.bottom_right_y = Scissor::Clamp(scissor.bottom_right_y);
         return scissor;
     }
 

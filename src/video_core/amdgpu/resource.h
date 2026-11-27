@@ -69,6 +69,10 @@ struct Buffer {
         return RemapSwizzle(DataFormat(data_format), dst_sel);
     }
 
+    CompMapping LoadDstSelect() const {
+        return RepeatPastComponents(DataFormat(data_format), DstSelect());
+    }
+
     NumberFormat GetNumberFmt() const noexcept {
         return RemapNumberFormat(NumberFormat(num_format), DataFormat(data_format));
     }
@@ -103,7 +107,6 @@ struct Buffer {
         return 2 << element_size;
     }
 
-    /// Formatted accesses ignore the address bits below the smaller of the format size and a dword.
     u32 GetFormatAlignment() const noexcept {
         const s32 bits = NumBitsPerBlock(DataFormat(data_format));
         return bits > 0 ? std::min<u32>(u32(bits) / 8, sizeof(u32)) : 1;

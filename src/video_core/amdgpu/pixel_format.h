@@ -1,4 +1,4 @@
-// SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
+// SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #pragma once
@@ -314,6 +314,36 @@ constexpr CompMapping RemapSwizzle(const DataFormat format, const CompMapping sw
     default:
         return swizzle;
     }
+}
+
+/// Formatted buffer loads return, for a component past the format's last, the component at its
+/// index modulo the format's component count.
+constexpr CompMapping RepeatPastComponents(const DataFormat format, CompMapping swizzle) {
+    u32 num_components;
+    switch (format) {
+    case DataFormat::Format8:
+    case DataFormat::Format16:
+    case DataFormat::Format32:
+        num_components = 1;
+        break;
+    case DataFormat::Format8_8:
+    case DataFormat::Format16_16:
+    case DataFormat::Format32_32:
+        num_components = 2;
+        break;
+    case DataFormat::Format32_32_32:
+        num_components = 3;
+        break;
+    default:
+        return swizzle;
+    }
+    for (auto& component : swizzle.array) {
+        if (component >= CompSwizzle::Red) {
+            const u32 index = u32(component) - u32(CompSwizzle::Red);
+            component = CompSwizzle(u32(CompSwizzle::Red) + index % num_components);
+        }
+    }
+    return swizzle;
 }
 
 constexpr NumberConversion MapNumberConversion(const NumberFormat num_fmt,

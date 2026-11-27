@@ -1,4 +1,4 @@
-// SPDX-FileCopyrightText: Copyright 2025 shadPS4 Emulator Project
+// SPDX-FileCopyrightText: Copyright 2025-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include "shader_recompiler/info.h"
@@ -205,7 +205,8 @@ static void LowerBufferFormatInst(IR::Block& block, IR::Inst& inst, Info& info) 
                           : buffer.GetNumberFmt(),
         .swizzle = is_inst_typed
                        ? AmdGpu::RemapSwizzle(flags.inst_data_fmt.Value(), AmdGpu::IdentityMapping)
-                       : buffer.DstSelect(),
+                   : IsBufferFormatLoad(inst) ? buffer.LoadDstSelect()
+                                              : buffer.DstSelect(),
         .num_conversion = is_inst_typed ? AmdGpu::MapNumberConversion(flags.inst_num_fmt.Value(),
                                                                       flags.inst_data_fmt.Value())
                                         : buffer.GetNumberConversion(),

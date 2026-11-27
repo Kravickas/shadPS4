@@ -1437,16 +1437,17 @@ void Rasterizer::UpdateViewportScissorState() const {
             viewport.height = yscale * 2.0f;
         }
 
+        if (regs.polygon_control.enable_window_offset) {
+            viewport.x += float(regs.window_offset.window_x_offset);
+            viewport.y += float(regs.window_offset.window_y_offset);
+        }
+
         viewports.push_back(viewport);
 
         auto vp_scsr = scsr;
         if (regs.mode_control.vport_scissor_enable) {
-            const AmdGpu::Scissor vp_scissor =
-                regs.viewport_scissors[i].GetOffsetScissor(regs.window_offset);
-            vp_scsr.top_left_x = std::max(vp_scsr.top_left_x, vp_scissor.top_left_x);
-            vp_scsr.top_left_y = std::max(vp_scsr.top_left_y, vp_scissor.top_left_y);
-            vp_scsr.bottom_right_x = std::min(vp_scsr.bottom_right_x, vp_scissor.bottom_right_x);
-            vp_scsr.bottom_right_y = std::min(vp_scsr.bottom_right_y, vp_scissor.bottom_right_y);
+            vp_scsr =
+                vp_scsr.Intersect(regs.viewport_scissors[i].GetOffsetScissor(regs.window_offset));
         }
         scissors.push_back({
             .offset = {vp_scsr.top_left_x, vp_scsr.top_left_y},

@@ -151,6 +151,15 @@ struct Scissor {
         return std::max(s16(0), value);
     }
 
+    Scissor Intersect(const Scissor& other) const {
+        Scissor scissor{};
+        scissor.top_left_x = std::max(top_left_x, other.top_left_x);
+        scissor.top_left_y = std::max(top_left_y, other.top_left_y);
+        scissor.bottom_right_x = std::min(bottom_right_x, other.bottom_right_x);
+        scissor.bottom_right_y = std::min(bottom_right_y, other.bottom_right_y);
+        return scissor;
+    }
+
     u32 GetWidth() const {
         return static_cast<u32>(std::max(Clamp(bottom_right_x) - Clamp(top_left_x), 0));
     }
