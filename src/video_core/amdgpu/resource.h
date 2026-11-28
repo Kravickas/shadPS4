@@ -1,8 +1,9 @@
-// SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
+// SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #pragma once
 
+#include <algorithm>
 #include <cstring>
 #include "common/alignment.h"
 #include "common/assert.h"
@@ -100,6 +101,12 @@ struct Buffer {
     u32 GetElementSize() const noexcept {
         // Element size is 2 bits, meaning 2, 4, 8, or 16.
         return 2 << element_size;
+    }
+
+    /// Formatted accesses ignore the address bits below the smaller of the format size and a dword.
+    u32 GetFormatAlignment() const noexcept {
+        const s32 bits = NumBitsPerBlock(DataFormat(data_format));
+        return bits > 0 ? std::min<u32>(u32(bits) / 8, sizeof(u32)) : 1;
     }
 };
 static_assert(sizeof(Buffer) == 16); // 128bits

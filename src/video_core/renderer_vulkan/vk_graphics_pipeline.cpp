@@ -462,7 +462,11 @@ void GraphicsPipeline::GetVertexInputs(
                 .divisor = divisor,
             });
         }
-        guest_buffers.emplace_back(buffer);
+        auto& guest_buffer = guest_buffers.emplace_back(buffer);
+        const u32 alignment = buffer.GetFormatAlignment();
+        if (buffer.GetStride() % alignment == 0) {
+            guest_buffer.base_address = Common::AlignDown(guest_buffer.base_address, alignment);
+        }
     }
 }
 
