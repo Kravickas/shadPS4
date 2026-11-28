@@ -464,6 +464,11 @@ void GraphicsPipeline::GetVertexInputs(
         }
         auto& guest_buffer = guest_buffers.emplace_back(buffer);
         const u32 alignment = buffer.GetFormatAlignment();
+        ASSERT_MSG(buffer.base_address % alignment == 0,
+                   "Unaligned vertex buffer: vs {:#x} attribute {} address {:#x} stride {} "
+                   "format {} {}",
+                   vs_info.pgm_hash, semantic, u64(buffer.base_address), buffer.GetStride(),
+                   buffer.GetDataFmt(), buffer.GetNumberFmt());
         if (buffer.GetStride() % alignment == 0) {
             guest_buffer.base_address = Common::AlignDown(guest_buffer.base_address, alignment);
         }
